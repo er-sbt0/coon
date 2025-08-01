@@ -13,7 +13,7 @@ pub struct FunctionList<'a> {
     graph: &'a CallGraph,
     query_engine: &'a GraphQueryEngine<'a>,
     pub state: ListState,
-    functions: Vec<&'a FunctionNode>,
+    pub functions: Vec<&'a FunctionNode>,
     search_query: String,
 }
 

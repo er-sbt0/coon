@@ -1,0 +1,24 @@
+[
+ {
+  "directory": "/home/eransa/code/grid/coon/test_project",
+  "arguments": [
+   "gcc",
+   "-c",
+   "-o",
+   "main.o",
+   "main.c"
+  ],
+  "file": "main.c"
+ },
+ {
+  "directory": "/home/eransa/code/grid/coon/test_project",
+  "arguments": [
+   "gcc",
+   "-c",
+   "-o",
+   "test.o",
+   "test.c"
+  ],
+  "file": "test.c"
+ }
+]

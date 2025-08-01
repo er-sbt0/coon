@@ -10,6 +10,7 @@ use core_data::{CallGraph, DiagnosticSeverity};
 use logic::query::GraphQueryEngine;
 
 pub struct DiagnosticPanel<'a> {
+    #[allow(dead_code)]
     graph: &'a CallGraph,
     query_engine: &'a GraphQueryEngine<'a>,
 }

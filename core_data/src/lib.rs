@@ -45,6 +45,35 @@ impl Location {
     }
 }
 
+/// Enhanced reference information that includes symbol context
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Reference {
+    pub location: Location,
+    pub referencing_symbol: Option<ReferencingSymbol>,
+}
+
+/// Information about the symbol that is making a reference
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReferencingSymbol {
+    pub name: String,
+    pub qualified_name: String,
+    pub kind: ReferenceSymbolKind,
+}
+
+/// Types of symbols that can make references
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ReferenceSymbolKind {
+    Function,
+    Method,
+    Constructor,
+    Variable,
+    Field,
+    Class,
+    Struct,
+    Module,
+    Unknown,
+}
+
 /// Diagnostic information
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Diagnostic {
@@ -69,7 +98,7 @@ pub struct FunctionNode {
     pub name: String,
     pub qualified_name: String,
     pub definition_location: Location,
-    pub references: Vec<Location>,
+    pub references: Vec<Reference>, // Enhanced references with symbol information
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -85,8 +114,58 @@ impl FunctionNode {
         }
     }
 
+    /// Add a simple reference (backward compatibility)
     pub fn add_reference(&mut self, location: Location) {
-        self.references.push(location);
+        self.references.push(Reference {
+            location,
+            referencing_symbol: None,
+        });
+    }
+
+    /// Add an enhanced reference with symbol information
+    pub fn add_reference_with_symbol(
+        &mut self,
+        location: Location,
+        symbol: Option<ReferencingSymbol>,
+    ) {
+        self.references.push(Reference {
+            location,
+            referencing_symbol: symbol,
+        });
+    }
+
+    /// Get the names of functions that reference this function
+    pub fn get_referencing_function_names(&self) -> Vec<&str> {
+        self.references
+            .iter()
+            .filter_map(|r| r.referencing_symbol.as_ref())
+            .filter(|s| {
+                matches!(
+                    s.kind,
+                    ReferenceSymbolKind::Function
+                        | ReferenceSymbolKind::Method
+                        | ReferenceSymbolKind::Constructor
+                )
+            })
+            .map(|s| s.name.as_str())
+            .collect()
+    }
+
+    /// Get all referencing symbols of a specific kind
+    pub fn get_referencing_symbols_by_kind(
+        &self,
+        kind: ReferenceSymbolKind,
+    ) -> Vec<&ReferencingSymbol> {
+        self.references
+            .iter()
+            .filter_map(|r| r.referencing_symbol.as_ref())
+            .filter(|s| s.kind == kind)
+            .collect()
+    }
+
+    /// Get reference locations only (for backward compatibility)
+    pub fn get_reference_locations(&self) -> Vec<&Location> {
+        self.references.iter().map(|r| &r.location).collect()
     }
 
     pub fn add_diagnostic(&mut self, diagnostic: Diagnostic) {
@@ -191,6 +270,34 @@ mod tests {
         assert_eq!(function.definition_location, location);
         assert!(function.references.is_empty());
         assert!(function.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_enhanced_references() {
+        let mut function = FunctionNode::new(
+            "target_func".to_string(),
+            "my_mod::target_func".to_string(),
+            Location::new("test.rs".to_string(), 10, 5),
+        );
+
+        // Add a simple reference (backward compatibility)
+        function.add_reference(Location::new("caller.rs".to_string(), 5, 10));
+
+        // Add an enhanced reference
+        let referencing_symbol = ReferencingSymbol {
+            name: "caller_func".to_string(),
+            qualified_name: "my_mod::caller_func".to_string(),
+            kind: ReferenceSymbolKind::Function,
+        };
+        function.add_reference_with_symbol(
+            Location::new("caller.rs".to_string(), 8, 15),
+            Some(referencing_symbol),
+        );
+
+        assert_eq!(function.references.len(), 2);
+        assert_eq!(function.get_referencing_function_names().len(), 1);
+        assert_eq!(function.get_referencing_function_names()[0], "caller_func");
+        assert_eq!(function.get_reference_locations().len(), 2);
     }
 
     #[test]

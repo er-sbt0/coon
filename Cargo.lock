@@ -161,15 +161,21 @@ dependencies = [
 name = "coon"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "core_data",
+ "crossterm",
  "fern",
  "log",
  "logic",
+ "lsp-types",
  "lsp_integration",
+ "ratatui",
+ "serde",
  "serde_json",
  "tokio",
  "tui_ui",
+ "uuid",
 ]
 
 [[package]]
@@ -663,6 +669,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1141,8 +1148,14 @@ version = "0.1.0"
 dependencies = [
  "core_data",
  "crossterm",
+ "log",
  "logic",
+ "lsp-types",
+ "lsp_integration",
  "ratatui",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
