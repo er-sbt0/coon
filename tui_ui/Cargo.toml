@@ -1,0 +1,10 @@
+[package]
+name = "tui_ui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+core_data = { path = "../core_data" }
+logic = { path = "../logic" }
+ratatui = "0.28"
+crossterm = "0.28"
