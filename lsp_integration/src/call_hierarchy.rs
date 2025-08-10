@@ -5,7 +5,7 @@ use lsp_types as lsp;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::{OutgoingCallsResponse, PrepareCallHierarchyResponse};
+use crate::{IncomingCallsResponse, OutgoingCallsResponse, PrepareCallHierarchyResponse};
 
 /// Helper function to parse prepare call hierarchy response
 pub(crate) fn parse_prepare_call_hierarchy_response_impl(
@@ -125,5 +125,65 @@ pub(crate) fn parse_outgoing_calls_response_impl(
     }
 
     // This response doesn't match any pending outgoingCalls request
+    Ok(None)
+}
+
+/// Helper function to parse incoming calls response
+pub(crate) fn parse_incoming_calls_response_impl(
+    pending_requests: &mut HashMap<i64, String>,
+    response: &Value,
+) -> Result<Option<IncomingCallsResponse>> {
+    if let Some(id) = response.get("id").and_then(|v| v.as_i64()) {
+        if let Some(method) = pending_requests.remove(&id) {
+            if method == "callHierarchy/incomingCalls" {
+                // Check if this is an error response
+                if let Some(error) = response.get("error") {
+                    log::warn!("LSP error for callHierarchy/incomingCalls: {:?}", error);
+                    return Ok(Some(IncomingCallsResponse {
+                        request_id: id,
+                        calls: Vec::new(),
+                    }));
+                }
+
+                if let Some(result) = response.get("result") {
+                    if result.is_null() {
+                        return Ok(Some(IncomingCallsResponse {
+                            request_id: id,
+                            calls: Vec::new(),
+                        }));
+                    }
+
+                    // Try to parse the result as an array of CallHierarchyIncomingCall objects
+                    match serde_json::from_value::<Vec<lsp::CallHierarchyIncomingCall>>(
+                        result.clone(),
+                    ) {
+                        Ok(calls) => {
+                            return Ok(Some(IncomingCallsResponse {
+                                request_id: id,
+                                calls,
+                            }));
+                        }
+                        Err(parse_error) => {
+                            let error_msg = format!(
+                                "Failed to parse incomingCalls result: {}. Raw result: {:?}",
+                                parse_error, result
+                            );
+                            log::error!("{}", error_msg);
+                            return Err(anyhow::anyhow!(error_msg));
+                        }
+                    }
+                }
+
+                // If we get here, there was no result but also no error
+                log::warn!("No result in incomingCalls response");
+                return Ok(Some(IncomingCallsResponse {
+                    request_id: id,
+                    calls: Vec::new(),
+                }));
+            }
+        }
+    }
+
+    // This response doesn't match any pending incomingCalls request
     Ok(None)
 }

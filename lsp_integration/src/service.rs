@@ -1,5 +1,5 @@
 use anyhow::Result;
-use lsp_types::{CallHierarchyItem, DocumentSymbol, Position, Url};
+use lsp_types::{CallHierarchyItem, CallHierarchyOutgoingCall, DocumentSymbol, Position, Url};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
@@ -16,15 +16,43 @@ pub struct LspService {
     worker_handle: Option<JoinHandle<()>>,
 }
 
+/// Request types for tracking LSP requests
+#[derive(Debug, Clone, PartialEq)]
+enum RequestType {
+    CallHierarchy,
+    OutgoingCalls,
+    IncomingCalls,
+    PrepareCallHierarchy,
+    References,
+    ReferencesWithSymbols,
+    DocumentSymbols,
+    WorkspaceSymbols,
+    Hover,
+}
+
 /// Internal state for the LSP worker
 struct LspWorkerState {
     client: LspClient,
     service_requests: HashMap<i64, String>, // Maps LSP ID to service request ID
+    request_types: HashMap<i64, RequestType>, // Track request types
     opened_documents: HashSet<Url>,
     project_files: HashSet<String>, // Set of project file paths for filtering
     document_symbols_cache: HashMap<String, Vec<lsp_types::DocumentSymbol>>, // Cache document symbols by file path
     pending_enhanced_requests: HashMap<String, EnhancedRequestInfo>, // Track enhanced requests needing symbol resolution
     enhanced_lsp_requests: HashSet<i64>, // Track which LSP request IDs are enhanced references
+}
+
+impl LspWorkerState {
+    fn track_request(&mut self, lsp_id: i64, service_id: String, request_type: RequestType) {
+        self.service_requests.insert(lsp_id, service_id.clone());
+        self.request_types.insert(lsp_id, request_type.clone());
+        log::debug!(
+            "Tracking LSP request {}: type={:?}, service_id={}",
+            lsp_id,
+            request_type,
+            service_id
+        );
+    }
 }
 
 /// Information about pending enhanced requests
@@ -39,6 +67,19 @@ struct EnhancedRequestInfo {
 #[derive(Debug, Clone)]
 pub enum LspRequest {
     GetCallHierarchy {
+        request_id: String,
+        document_uri: Url,
+        position: Position,
+    },
+    GetOutgoingCalls {
+        request_id: String,
+        call_hierarchy_item: lsp_types::CallHierarchyItem,
+    },
+    GetIncomingCalls {
+        request_id: String,
+        call_hierarchy_item: lsp_types::CallHierarchyItem,
+    },
+    PrepareCallHierarchy {
         request_id: String,
         document_uri: Url,
         position: Position,
@@ -77,6 +118,18 @@ pub enum LspResponse {
     CallHierarchy {
         request_id: String,
         items: Vec<CallHierarchyItem>,
+    },
+    OutgoingCalls {
+        request_id: String,
+        calls: Vec<CallHierarchyOutgoingCall>,
+    },
+    IncomingCalls {
+        request_id: String,
+        calls: Vec<lsp_types::CallHierarchyIncomingCall>,
+    },
+    CallHierarchyPrepared {
+        request_id: String,
+        items: Vec<lsp_types::CallHierarchyItem>,
     },
     References {
         request_id: String,
@@ -133,6 +186,7 @@ impl LspService {
         let mut state = LspWorkerState {
             client,
             service_requests: HashMap::new(),
+            request_types: HashMap::new(),
             opened_documents: HashSet::new(),
             project_files: HashSet::new(),
             document_symbols_cache: HashMap::new(),
@@ -147,6 +201,15 @@ impl LspService {
                     match request {
                         Some(LspRequest::GetCallHierarchy { request_id, document_uri, position }) => {
                             Self::handle_call_hierarchy_request(&mut state, &response_tx, request_id, document_uri, position).await;
+                        }
+                        Some(LspRequest::GetOutgoingCalls { request_id, call_hierarchy_item }) => {
+                            Self::handle_outgoing_calls_request(&mut state, &response_tx, request_id, call_hierarchy_item).await;
+                        }
+                        Some(LspRequest::GetIncomingCalls { request_id, call_hierarchy_item }) => {
+                            Self::handle_incoming_calls_request(&mut state, &response_tx, request_id, call_hierarchy_item).await;
+                        }
+                        Some(LspRequest::PrepareCallHierarchy { request_id, document_uri, position }) => {
+                            Self::handle_prepare_call_hierarchy_request(&mut state, &response_tx, request_id, document_uri, position).await;
                         }
                         Some(LspRequest::FindReferences { request_id, document_uri, position }) => {
                             Self::handle_references_request(&mut state, &response_tx, request_id, document_uri, position).await;
@@ -243,10 +306,9 @@ impl LspService {
             return;
         }
 
-        let text_document = lsp_types::TextDocumentIdentifier { uri: document_uri };
         match state
             .client
-            .prepare_call_hierarchy(text_document, position)
+            .prepare_call_hierarchy(document_uri, position)
             .await
         {
             Ok(lsp_request_id) => {
@@ -254,7 +316,7 @@ impl LspService {
                     "Sent call hierarchy request to LSP server: lsp_request_id={}",
                     lsp_request_id
                 );
-                state.service_requests.insert(lsp_request_id, request_id);
+                state.track_request(lsp_request_id, request_id, RequestType::CallHierarchy);
             }
             Err(e) => {
                 log::error!("Failed to send call hierarchy request: {}", e);
@@ -262,6 +324,131 @@ impl LspService {
                     .send(LspResponse::Error {
                         request_id,
                         error: format!("Failed to request call hierarchy: {}", e),
+                    })
+                    .await;
+            }
+        }
+    }
+
+    /// Handle outgoing calls request
+    async fn handle_outgoing_calls_request(
+        state: &mut LspWorkerState,
+        response_tx: &mpsc::Sender<LspResponse>,
+        request_id: String,
+        call_hierarchy_item: lsp_types::CallHierarchyItem,
+    ) {
+        log::info!(
+            "Handling outgoing calls request for: name='{}', request_id={}",
+            call_hierarchy_item.name,
+            request_id
+        );
+
+        match state.client.get_outgoing_calls(call_hierarchy_item).await {
+            Ok(lsp_request_id) => {
+                log::info!(
+                    "Sent outgoing calls request to LSP server: lsp_request_id={}",
+                    lsp_request_id
+                );
+                state.track_request(lsp_request_id, request_id, RequestType::OutgoingCalls);
+            }
+            Err(e) => {
+                log::error!("Failed to send outgoing calls request: {}", e);
+                let _ = response_tx
+                    .send(LspResponse::Error {
+                        request_id,
+                        error: format!("Failed to request outgoing calls: {}", e),
+                    })
+                    .await;
+            }
+        }
+    }
+
+    /// Handle incoming calls request
+    async fn handle_incoming_calls_request(
+        state: &mut LspWorkerState,
+        response_tx: &mpsc::Sender<LspResponse>,
+        request_id: String,
+        call_hierarchy_item: lsp_types::CallHierarchyItem,
+    ) {
+        log::info!(
+            "Handling incoming calls request for: name='{}', request_id={}",
+            call_hierarchy_item.name,
+            request_id
+        );
+
+        match state.client.get_incoming_calls(call_hierarchy_item).await {
+            Ok(lsp_request_id) => {
+                log::info!(
+                    "Sent incoming calls request to LSP server: lsp_request_id={}",
+                    lsp_request_id
+                );
+                state.track_request(lsp_request_id, request_id, RequestType::IncomingCalls);
+            }
+            Err(e) => {
+                log::error!("Failed to send incoming calls request: {}", e);
+                let _ = response_tx
+                    .send(LspResponse::Error {
+                        request_id,
+                        error: format!("Failed to request incoming calls: {}", e),
+                    })
+                    .await;
+            }
+        }
+    }
+
+    /// Handle prepare call hierarchy request
+    async fn handle_prepare_call_hierarchy_request(
+        state: &mut LspWorkerState,
+        response_tx: &mpsc::Sender<LspResponse>,
+        request_id: String,
+        document_uri: Url,
+        position: Position,
+    ) {
+        log::info!(
+            "Handling prepare call hierarchy request: uri={}, position={}:{}, request_id={}",
+            document_uri,
+            position.line,
+            position.character,
+            request_id
+        );
+
+        // Ensure document is opened
+        if let Err(e) = Self::ensure_document_opened(state, &document_uri).await {
+            log::error!(
+                "Failed to open document for call hierarchy preparation: {}",
+                e
+            );
+            let _ = response_tx
+                .send(LspResponse::Error {
+                    request_id,
+                    error: format!("Failed to open document: {}", e),
+                })
+                .await;
+            return;
+        }
+
+        match state
+            .client
+            .prepare_call_hierarchy(document_uri, position)
+            .await
+        {
+            Ok(lsp_request_id) => {
+                log::info!(
+                    "Sent prepare call hierarchy request to LSP server: lsp_request_id={}",
+                    lsp_request_id
+                );
+                state.track_request(
+                    lsp_request_id,
+                    request_id,
+                    RequestType::PrepareCallHierarchy,
+                );
+            }
+            Err(e) => {
+                log::error!("Failed to send prepare call hierarchy request: {}", e);
+                let _ = response_tx
+                    .send(LspResponse::Error {
+                        request_id,
+                        error: format!("Failed to prepare call hierarchy: {}", e),
                     })
                     .await;
             }
@@ -303,7 +490,7 @@ impl LspService {
                     "Sent references request to LSP server: lsp_request_id={}",
                     lsp_request_id
                 );
-                state.service_requests.insert(lsp_request_id, request_id);
+                state.track_request(lsp_request_id, request_id, RequestType::References);
             }
             Err(e) => {
                 log::error!("Failed to send references request: {}", e);
@@ -356,7 +543,11 @@ impl LspService {
                     "Sent enhanced references request to LSP server: lsp_request_id={}",
                     lsp_request_id
                 );
-                state.service_requests.insert(lsp_request_id, request_id);
+                state.track_request(
+                    lsp_request_id,
+                    request_id,
+                    RequestType::ReferencesWithSymbols,
+                );
                 state.enhanced_lsp_requests.insert(lsp_request_id); // Track as enhanced
             }
             Err(e) => {
@@ -403,7 +594,7 @@ impl LspService {
                     "Sent document symbols request to LSP server: lsp_request_id={}",
                     lsp_request_id
                 );
-                state.service_requests.insert(lsp_request_id, request_id);
+                state.track_request(lsp_request_id, request_id, RequestType::DocumentSymbols);
             }
             Err(e) => {
                 log::error!("Failed to send document symbols request: {}", e);
@@ -435,7 +626,7 @@ impl LspService {
                     "Sent workspace symbols request to LSP server: lsp_request_id={}",
                     lsp_request_id
                 );
-                state.service_requests.insert(lsp_request_id, request_id);
+                state.track_request(lsp_request_id, request_id, RequestType::WorkspaceSymbols);
             }
             Err(e) => {
                 log::error!("Failed to send workspace symbols request: {}", e);
@@ -519,536 +710,1016 @@ impl LspService {
     ) {
         if let Some(id) = message.get("id").and_then(|i| i.as_i64()) {
             if let Some(request_id) = state.service_requests.remove(&id) {
-                // Try to parse different response types
-                if let Ok(Some(call_hierarchy_response)) =
-                    state.client.parse_prepare_call_hierarchy_response(&message)
-                {
-                    // Remove from enhanced tracking now that we know it's not a references request
-                    state.enhanced_lsp_requests.remove(&id);
+                let request_type = state.request_types.remove(&id);
 
-                    log::info!(
-                        "LSP Call Hierarchy Response: found {} items for request {}",
-                        call_hierarchy_response.items.len(),
-                        request_id
-                    );
-
-                    // Log each call hierarchy item
-                    for (i, item) in call_hierarchy_response.items.iter().enumerate() {
-                        log::info!("  Call hierarchy item {}: name='{}', kind={:?}, uri={}, range={}:{}-{}:{}", 
-                            i, item.name, item.kind, item.uri,
-                            item.range.start.line, item.range.start.character,
-                            item.range.end.line, item.range.end.character);
-                    }
-
-                    let _ = response_tx
-                        .send(LspResponse::CallHierarchy {
+                // Dispatch based on request type
+                match request_type {
+                    Some(RequestType::CallHierarchy) => {
+                        Self::handle_call_hierarchy_response(
+                            message,
                             request_id,
-                            items: call_hierarchy_response.items,
-                        })
-                        .await;
-                } else if Self::is_references_response(&message) {
-                    // Check if this was an enhanced references request
-                    if Self::was_enhanced_references_request(&message, state) {
-                        // Parse enhanced references with symbol information
-                        let enhanced_references = Self::parse_enhanced_references_response(
-                            &message,
-                            &request_id,
                             state,
                             response_tx,
                         )
                         .await;
-
-                        // Only send response if we got results immediately
-                        if !enhanced_references.is_empty() {
-                            log::info!(
-                                "LSP Enhanced References Response: found {} references for request {}",
-                                enhanced_references.len(),
-                                request_id
-                            );
-
-                            // Log each enhanced reference
-                            for (i, ref_info) in enhanced_references.iter().enumerate() {
-                                if let Some(symbol) = &ref_info.referencing_symbol {
-                                    log::info!(
-                                        "  Enhanced Reference {}: {}:{}:{} (from {}::{})",
-                                        i,
-                                        ref_info.location.file_path,
-                                        ref_info.location.line,
-                                        ref_info.location.column,
-                                        symbol.qualified_name,
-                                        symbol.name
-                                    );
-                                } else {
-                                    log::info!(
-                                        "  Enhanced Reference {}: {}:{}:{} (no symbol info)",
-                                        i,
-                                        ref_info.location.file_path,
-                                        ref_info.location.line,
-                                        ref_info.location.column
-                                    );
-                                }
-                            }
-
-                            let _ = response_tx
-                                .send(LspResponse::ReferencesWithSymbols {
-                                    request_id,
-                                    references: enhanced_references,
-                                })
-                                .await;
-                        }
-                        // If empty, the response will be sent later when symbols arrive
-
-                        // Remove from enhanced tracking after processing enhanced references
-                        state.enhanced_lsp_requests.remove(&id);
-                    } else {
-                        // Parse regular references response
-                        let locations = Self::parse_references_response_content(&message);
-
-                        log::info!(
-                            "LSP References Response: found {} references for request {}",
-                            locations.len(),
-                            request_id
-                        );
-
-                        // Log each reference location
-                        for (i, loc) in locations.iter().enumerate() {
-                            log::info!(
-                                "  Reference {}: {}:{}:{}",
-                                i,
-                                loc.file_path,
-                                loc.line,
-                                loc.column
-                            );
-                        }
-
-                        let _ = response_tx
-                            .send(LspResponse::References {
-                                request_id,
-                                locations,
-                            })
+                    }
+                    Some(RequestType::OutgoingCalls) => {
+                        Self::handle_outgoing_calls_response(
+                            message,
+                            request_id,
+                            state,
+                            response_tx,
+                        )
+                        .await;
+                    }
+                    Some(RequestType::IncomingCalls) => {
+                        Self::handle_incoming_calls_response(
+                            message,
+                            request_id,
+                            state,
+                            response_tx,
+                        )
+                        .await;
+                    }
+                    Some(RequestType::PrepareCallHierarchy) => {
+                        Self::handle_prepare_call_hierarchy_response(
+                            message,
+                            request_id,
+                            state,
+                            response_tx,
+                        )
+                        .await;
+                    }
+                    Some(RequestType::References) => {
+                        Self::handle_references_response(message, request_id, state, response_tx)
                             .await;
-
-                        // Remove from enhanced tracking after processing regular references
-                        state.enhanced_lsp_requests.remove(&id);
                     }
-                } else if let Ok(Some(hover_response)) = state.client.parse_hover_response(&message)
-                {
-                    log::debug!(
-                        "LSP Hover Response for request {}: hover_info={:?}",
-                        request_id,
-                        hover_response.hover_info
-                    );
-
-                    // Check if this is a hover request for enhanced references
-                    if request_id.starts_with("hover_for_") {
-                        log::debug!("Raw hover response message for {}: {}", request_id, message);
-
-                        Self::handle_hover_for_enhanced_references(
-                            hover_response,
-                            &request_id,
+                    Some(RequestType::ReferencesWithSymbols) => {
+                        Self::handle_references_with_symbols_response(
+                            message,
+                            request_id,
                             state,
                             response_tx,
                         )
                         .await;
                     }
+                    Some(RequestType::DocumentSymbols) => {
+                        Self::handle_document_symbols_response(
+                            message,
+                            request_id,
+                            state,
+                            response_tx,
+                        )
+                        .await;
+                    }
+                    Some(RequestType::WorkspaceSymbols) => {
+                        Self::handle_workspace_symbols_response(
+                            message,
+                            request_id,
+                            state,
+                            response_tx,
+                        )
+                        .await;
+                    }
+                    Some(RequestType::Hover) => {
+                        Self::handle_hover_response(message, request_id, state, response_tx).await;
+                    }
+                    None => {
+                        // Handle legacy cases where request type wasn't tracked
+                        log::warn!("No request type tracked for LSP request {}, falling back to content detection", id);
+                        Self::handle_legacy_response_detection(
+                            message,
+                            request_id,
+                            state,
+                            response_tx,
+                        )
+                        .await;
+                    }
+                }
 
-                    // Remove from enhanced tracking after processing hover
-                    state.enhanced_lsp_requests.remove(&id);
-                } else if let Ok(Some(document_symbols_response)) =
-                    state.client.parse_document_symbol_response(&message)
+                // Remove from enhanced tracking after processing any response
+                state.enhanced_lsp_requests.remove(&id);
+            }
+        }
+    }
+
+    /// Handle call hierarchy response
+    async fn handle_call_hierarchy_response(
+        message: Value,
+        request_id: String,
+        state: &mut LspWorkerState,
+        response_tx: &mpsc::Sender<LspResponse>,
+    ) {
+        // Handle error responses first
+        if let Some(error) = message.get("error") {
+            let error_msg = error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Unknown LSP error");
+
+            log::error!(
+                "LSP Error Response for call hierarchy request {}: {}",
+                request_id,
+                error_msg
+            );
+
+            let _ = response_tx
+                .send(LspResponse::Error {
+                    request_id,
+                    error: error_msg.to_string(),
+                })
+                .await;
+            return;
+        }
+
+        if let Ok(Some(call_hierarchy_response)) =
+            state.client.parse_prepare_call_hierarchy_response(&message)
+        {
+            log::info!(
+                "LSP Call Hierarchy Response: found {} items for request {}",
+                call_hierarchy_response.items.len(),
+                request_id
+            );
+
+            // Log each call hierarchy item
+            for (i, item) in call_hierarchy_response.items.iter().enumerate() {
+                log::info!(
+                    "  Call hierarchy item {}: name='{}', kind={:?}, uri={}, range={}:{}-{}:{}",
+                    i,
+                    item.name,
+                    item.kind,
+                    item.uri,
+                    item.range.start.line,
+                    item.range.start.character,
+                    item.range.end.line,
+                    item.range.end.character
+                );
+            }
+
+            let _ = response_tx
+                .send(LspResponse::CallHierarchy {
+                    request_id,
+                    items: call_hierarchy_response.items,
+                })
+                .await;
+        } else {
+            log::error!(
+                "Failed to parse call hierarchy response for request {}",
+                request_id
+            );
+            log::debug!("Raw response: {}", message);
+
+            let _ = response_tx
+                .send(LspResponse::Error {
+                    request_id,
+                    error: "Failed to parse call hierarchy response".to_string(),
+                })
+                .await;
+        }
+    }
+
+    /// Handle outgoing calls response
+    async fn handle_outgoing_calls_response(
+        message: Value,
+        request_id: String,
+        state: &mut LspWorkerState,
+        response_tx: &mpsc::Sender<LspResponse>,
+    ) {
+        // Handle error responses first
+        if let Some(error) = message.get("error") {
+            let error_msg = error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Unknown LSP error");
+
+            log::error!(
+                "LSP Error Response for outgoing calls request {}: {}",
+                request_id,
+                error_msg
+            );
+
+            let _ = response_tx
+                .send(LspResponse::Error {
+                    request_id,
+                    error: error_msg.to_string(),
+                })
+                .await;
+            return;
+        }
+
+        if let Ok(Some(outgoing_calls_response)) =
+            state.client.parse_outgoing_calls_response(&message)
+        {
+            log::info!(
+                "LSP Outgoing Calls Response: found {} calls for request {}",
+                outgoing_calls_response.calls.len(),
+                request_id
+            );
+
+            // Log each outgoing call
+            for (i, call) in outgoing_calls_response.calls.iter().enumerate() {
+                log::info!(
+                    "  Outgoing call {}: name='{}', kind={:?}, uri={}, range={}:{}-{}:{}",
+                    i,
+                    call.to.name,
+                    call.to.kind,
+                    call.to.uri,
+                    call.to.range.start.line,
+                    call.to.range.start.character,
+                    call.to.range.end.line,
+                    call.to.range.end.character
+                );
+            }
+
+            let _ = response_tx
+                .send(LspResponse::OutgoingCalls {
+                    request_id,
+                    calls: outgoing_calls_response.calls,
+                })
+                .await;
+        } else {
+            log::error!(
+                "Failed to parse outgoing calls response for request {}",
+                request_id
+            );
+            log::debug!("Raw response: {}", message);
+
+            let _ = response_tx
+                .send(LspResponse::Error {
+                    request_id,
+                    error: "Failed to parse outgoing calls response".to_string(),
+                })
+                .await;
+        }
+    }
+
+    /// Handle incoming calls response
+    async fn handle_incoming_calls_response(
+        message: Value,
+        request_id: String,
+        state: &mut LspWorkerState,
+        response_tx: &mpsc::Sender<LspResponse>,
+    ) {
+        // Handle error responses first
+        if let Some(error) = message.get("error") {
+            let error_msg = error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Unknown LSP error");
+
+            log::error!(
+                "LSP Error Response for incoming calls request {}: {}",
+                request_id,
+                error_msg
+            );
+
+            let _ = response_tx
+                .send(LspResponse::Error {
+                    request_id,
+                    error: error_msg.to_string(),
+                })
+                .await;
+            return;
+        }
+
+        if let Ok(Some(incoming_calls_response)) =
+            state.client.parse_incoming_calls_response(&message)
+        {
+            log::info!(
+                "LSP Incoming Calls Response: found {} calls for request {}",
+                incoming_calls_response.calls.len(),
+                request_id
+            );
+
+            // Log each incoming call
+            for (i, call) in incoming_calls_response.calls.iter().enumerate() {
+                log::info!(
+                    "  Incoming call {}: name='{}', kind={:?}, uri={}, range={}:{}-{}:{}",
+                    i,
+                    call.from.name,
+                    call.from.kind,
+                    call.from.uri,
+                    call.from.range.start.line,
+                    call.from.range.start.character,
+                    call.from.range.end.line,
+                    call.from.range.end.character
+                );
+            }
+
+            let _ = response_tx
+                .send(LspResponse::IncomingCalls {
+                    request_id,
+                    calls: incoming_calls_response.calls,
+                })
+                .await;
+        } else {
+            log::error!(
+                "Failed to parse incoming calls response for request {}",
+                request_id
+            );
+            log::debug!("Raw response: {}", message);
+
+            let _ = response_tx
+                .send(LspResponse::Error {
+                    request_id,
+                    error: "Failed to parse incoming calls response".to_string(),
+                })
+                .await;
+        }
+    }
+
+    /// Handle prepare call hierarchy response
+    async fn handle_prepare_call_hierarchy_response(
+        message: Value,
+        request_id: String,
+        state: &mut LspWorkerState,
+        response_tx: &mpsc::Sender<LspResponse>,
+    ) {
+        // Handle error responses first
+        if let Some(error) = message.get("error") {
+            let error_msg = error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Unknown LSP error");
+
+            log::error!(
+                "LSP Error Response for prepare call hierarchy request {}: {}",
+                request_id,
+                error_msg
+            );
+
+            let _ = response_tx
+                .send(LspResponse::Error {
+                    request_id,
+                    error: error_msg.to_string(),
+                })
+                .await;
+            return;
+        }
+
+        if let Ok(Some(call_hierarchy_response)) =
+            state.client.parse_prepare_call_hierarchy_response(&message)
+        {
+            log::info!(
+                "LSP Prepare Call Hierarchy Response: found {} items for request {}",
+                call_hierarchy_response.items.len(),
+                request_id
+            );
+
+            // Log each call hierarchy item
+            for (i, item) in call_hierarchy_response.items.iter().enumerate() {
+                log::info!(
+                    "  Call hierarchy item {}: name='{}', kind={:?}, uri={}, range={}:{}-{}:{}",
+                    i,
+                    item.name,
+                    item.kind,
+                    item.uri,
+                    item.range.start.line,
+                    item.range.start.character,
+                    item.range.end.line,
+                    item.range.end.character
+                );
+            }
+
+            let _ = response_tx
+                .send(LspResponse::CallHierarchyPrepared {
+                    request_id,
+                    items: call_hierarchy_response.items,
+                })
+                .await;
+        } else {
+            log::error!(
+                "Failed to parse prepare call hierarchy response for request {}",
+                request_id
+            );
+            log::debug!("Raw response: {}", message);
+
+            let _ = response_tx
+                .send(LspResponse::Error {
+                    request_id,
+                    error: "Failed to parse prepare call hierarchy response".to_string(),
+                })
+                .await;
+        }
+    }
+
+    /// Handle references response
+    async fn handle_references_response(
+        message: Value,
+        request_id: String,
+        _state: &mut LspWorkerState,
+        response_tx: &mpsc::Sender<LspResponse>,
+    ) {
+        // Handle error responses first
+        if let Some(error) = message.get("error") {
+            let error_msg = error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Unknown LSP error");
+
+            log::error!(
+                "LSP Error Response for references request {}: {}",
+                request_id,
+                error_msg
+            );
+
+            let _ = response_tx
+                .send(LspResponse::Error {
+                    request_id,
+                    error: error_msg.to_string(),
+                })
+                .await;
+            return;
+        }
+
+        // Parse regular references response
+        let locations = Self::parse_references_response_content(&message);
+
+        log::info!(
+            "LSP References Response: found {} references for request {}",
+            locations.len(),
+            request_id
+        );
+
+        // Log each reference location
+        for (i, loc) in locations.iter().enumerate() {
+            log::info!(
+                "  Reference {}: {}:{}:{}",
+                i,
+                loc.file_path,
+                loc.line,
+                loc.column
+            );
+        }
+
+        let _ = response_tx
+            .send(LspResponse::References {
+                request_id,
+                locations,
+            })
+            .await;
+    }
+
+    /// Handle references with symbols response
+    async fn handle_references_with_symbols_response(
+        message: Value,
+        request_id: String,
+        state: &mut LspWorkerState,
+        response_tx: &mpsc::Sender<LspResponse>,
+    ) {
+        // Handle error responses first
+        if let Some(error) = message.get("error") {
+            let error_msg = error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Unknown LSP error");
+
+            log::error!(
+                "LSP Error Response for enhanced references request {}: {}",
+                request_id,
+                error_msg
+            );
+
+            let _ = response_tx
+                .send(LspResponse::Error {
+                    request_id,
+                    error: error_msg.to_string(),
+                })
+                .await;
+            return;
+        }
+
+        // Parse enhanced references with symbol information
+        let enhanced_references =
+            Self::parse_enhanced_references_response(&message, &request_id, state, response_tx)
+                .await;
+
+        // Only send response if we got results immediately
+        if !enhanced_references.is_empty() {
+            log::info!(
+                "LSP Enhanced References Response: found {} references for request {}",
+                enhanced_references.len(),
+                request_id
+            );
+
+            // Log each enhanced reference
+            for (i, ref_info) in enhanced_references.iter().enumerate() {
+                if let Some(symbol) = &ref_info.referencing_symbol {
+                    log::info!(
+                        "  Enhanced Reference {}: {}:{}:{} (from {}::{})",
+                        i,
+                        ref_info.location.file_path,
+                        ref_info.location.line,
+                        ref_info.location.column,
+                        symbol.qualified_name,
+                        symbol.name
+                    );
+                } else {
+                    log::info!(
+                        "  Enhanced Reference {}: {}:{}:{} (no symbol info)",
+                        i,
+                        ref_info.location.file_path,
+                        ref_info.location.line,
+                        ref_info.location.column
+                    );
+                }
+            }
+
+            let _ = response_tx
+                .send(LspResponse::ReferencesWithSymbols {
+                    request_id,
+                    references: enhanced_references,
+                })
+                .await;
+        }
+        // If empty, the response will be sent later when symbols arrive
+    }
+
+    /// Handle document symbols response
+    async fn handle_document_symbols_response(
+        message: Value,
+        request_id: String,
+        state: &mut LspWorkerState,
+        response_tx: &mpsc::Sender<LspResponse>,
+    ) {
+        // Handle error responses first
+        if let Some(error) = message.get("error") {
+            let error_msg = error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Unknown LSP error");
+
+            log::error!(
+                "LSP Error Response for document symbols request {}: {}",
+                request_id,
+                error_msg
+            );
+
+            let _ = response_tx
+                .send(LspResponse::Error {
+                    request_id,
+                    error: error_msg.to_string(),
+                })
+                .await;
+            return;
+        }
+
+        if let Ok(Some(document_symbols_response)) =
+            state.client.parse_document_symbol_response(&message)
+        {
+            log::info!(
+                "LSP Document Symbols Response: found {} symbols for request {}",
+                document_symbols_response.symbols.len(),
+                request_id
+            );
+
+            // Log each document symbol
+            for (i, sym) in document_symbols_response.symbols.iter().enumerate() {
+                log::info!(
+                    "  Document symbol {}: name='{}', kind={:?}, container={:?}, location={}:{}:{}",
+                    i,
+                    sym.name,
+                    sym.kind,
+                    sym.container_name.as_deref().unwrap_or("None"),
+                    sym.location.file_path,
+                    sym.location.line,
+                    sym.location.column
+                );
+            }
+
+            // Check if this is a document symbols request for enhanced references
+            if request_id.starts_with("document_symbols_for_") {
+                // This is a special case - we need to handle it differently
+                // by parsing the raw response directly as lsp_types::DocumentSymbol
+                Self::handle_legacy_document_symbols_for_enhanced_references(
+                    message,
+                    request_id,
+                    state,
+                    response_tx,
+                )
+                .await;
+            } else {
+                // Regular document symbols request - send normal response
+                let symbols = document_symbols_response
+                    .symbols
+                    .into_iter()
+                    .map(|sym| DocumentSymbol {
+                        name: sym.name,
+                        detail: sym.container_name,
+                        kind: sym.kind,
+                        tags: None,
+                        #[allow(deprecated)]
+                        deprecated: Some(false),
+                        range: lsp_types::Range::default(), // Will need proper conversion
+                        selection_range: lsp_types::Range::default(),
+                        children: None,
+                    })
+                    .collect();
+
+                let _ = response_tx
+                    .send(LspResponse::DocumentSymbols {
+                        request_id,
+                        symbols,
+                    })
+                    .await;
+            }
+        } else {
+            log::error!(
+                "Failed to parse document symbols response for request {}",
+                request_id
+            );
+            log::debug!("Raw response: {}", message);
+
+            let _ = response_tx
+                .send(LspResponse::Error {
+                    request_id,
+                    error: "Failed to parse document symbols response".to_string(),
+                })
+                .await;
+        }
+    }
+
+    /// Handle workspace symbols response
+    async fn handle_workspace_symbols_response(
+        message: Value,
+        request_id: String,
+        state: &mut LspWorkerState,
+        response_tx: &mpsc::Sender<LspResponse>,
+    ) {
+        // Handle error responses first
+        if let Some(error) = message.get("error") {
+            let error_msg = error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Unknown LSP error");
+
+            log::error!(
+                "LSP Error Response for workspace symbols request {}: {}",
+                request_id,
+                error_msg
+            );
+
+            let _ = response_tx
+                .send(LspResponse::Error {
+                    request_id,
+                    error: error_msg.to_string(),
+                })
+                .await;
+            return;
+        }
+
+        if let Some(result) = message.get("result") {
+            if !result.is_null() {
+                if let Ok(workspace_symbols) =
+                    serde_json::from_value::<Vec<lsp_types::WorkspaceSymbol>>(result.clone())
                 {
                     log::info!(
-                        "LSP Document Symbols Response: found {} symbols for request {}",
-                        document_symbols_response.symbols.len(),
+                        "LSP Workspace Symbols Response: found {} symbols for request {}",
+                        workspace_symbols.len(),
                         request_id
                     );
 
-                    // Log each document symbol
-                    for (i, sym) in document_symbols_response.symbols.iter().enumerate() {
-                        log::info!("  Document symbol {}: name='{}', kind={:?}, container={:?}, location={}:{}:{}", 
+                    // Convert to our WorkspaceSymbolInfo format
+                    let symbols: Vec<crate::WorkspaceSymbolInfo> = workspace_symbols
+                        .iter()
+                        .map(|symbol| {
+                            let location = match &symbol.location {
+                                lsp_types::OneOf::Left(location) => {
+                                    crate::convert_lsp_location(location)
+                                }
+                                lsp_types::OneOf::Right(workspace_location) => {
+                                    core_data::Location {
+                                        file_path: workspace_location
+                                            .uri
+                                            .to_file_path()
+                                            .map(|p| p.to_string_lossy().to_string())
+                                            .unwrap_or_else(|_| workspace_location.uri.to_string()),
+                                        line: 0, // WorkspaceLocation doesn't have range info
+                                        column: 0,
+                                        length: None,
+                                    }
+                                }
+                            };
+                            crate::WorkspaceSymbolInfo {
+                                name: symbol.name.clone(),
+                                kind: symbol.kind,
+                                location,
+                                container_name: symbol.container_name.clone(),
+                            }
+                        })
+                        .collect();
+
+                    // Log each workspace symbol
+                    for (i, sym) in symbols.iter().enumerate() {
+                        log::info!("  Workspace symbol {}: name='{}', kind={:?}, container={:?}, location={}:{}:{}", 
                             i, sym.name, sym.kind,
                             sym.container_name.as_deref().unwrap_or("None"),
                             sym.location.file_path, sym.location.line, sym.location.column);
                     }
 
-                    // Check if this is a document symbols request for enhanced references
-                    if request_id.starts_with("document_symbols_for_") {
-                        let enhanced_request_id = request_id
-                            .strip_prefix("document_symbols_for_")
-                            .unwrap()
-                            .to_string();
-
-                        // TODO: Extract file path from the request or response to cache symbols
-                        // For now, we'll try to determine it from the symbols themselves
-                        if let Some(first_symbol) = document_symbols_response.symbols.first() {
-                            let file_path = first_symbol.location.file_path.clone();
-
-                            // Convert to proper DocumentSymbol format and cache
-                            let doc_symbols: Vec<lsp_types::DocumentSymbol> =
-                                document_symbols_response
-                                    .symbols
-                                    .iter()
-                                    .map(|sym| lsp_types::DocumentSymbol {
-                                        name: sym.name.clone(),
-                                        detail: sym.container_name.clone(),
-                                        kind: sym.kind,
-                                        tags: None,
-                                        #[allow(deprecated)]
-                                        deprecated: Some(false),
-                                        range: lsp_types::Range {
-                                            start: lsp_types::Position {
-                                                line: sym.location.line.saturating_sub(1),
-                                                character: sym.location.column.saturating_sub(1),
-                                            },
-                                            end: lsp_types::Position {
-                                                line: sym.location.line,
-                                                character: sym.location.column + 10, // Estimate
-                                            },
-                                        },
-                                        selection_range: lsp_types::Range {
-                                            start: lsp_types::Position {
-                                                line: sym.location.line.saturating_sub(1),
-                                                character: sym.location.column.saturating_sub(1),
-                                            },
-                                            end: lsp_types::Position {
-                                                line: sym.location.line,
-                                                character: sym.location.column
-                                                    + sym.name.len() as u32,
-                                            },
-                                        },
-                                        children: None,
-                                    })
-                                    .collect();
-
-                            // Cache the symbols
-                            state
-                                .document_symbols_cache
-                                .insert(file_path.clone(), doc_symbols);
-                            log::debug!(
-                                "Cached {} document symbols for file: {}",
-                                document_symbols_response.symbols.len(),
-                                file_path
+                    // Filter to only function symbols from project files and convert to FunctionNode
+                    let function_symbols: Vec<core_data::FunctionNode> = symbols
+                        .into_iter()
+                        .filter(|sym| {
+                            // Check if it's a function/method type
+                            let is_function = matches!(
+                                sym.kind,
+                                lsp_types::SymbolKind::FUNCTION
+                                    | lsp_types::SymbolKind::METHOD
+                                    | lsp_types::SymbolKind::CONSTRUCTOR
                             );
 
-                            // Check if this completes an enhanced references request
-                            if let Some(pending) = state
-                                .pending_enhanced_requests
-                                .get_mut(&enhanced_request_id)
-                            {
-                                pending.pending_symbol_requests.remove(&file_path);
+                            // Check if it's from a project file
+                            let is_project_file = if state.project_files.is_empty() {
+                                // If no project files set, include all symbols (fallback behavior)
+                                true
+                            } else {
+                                // Check if the symbol's file path matches any project file
+                                state.project_files.iter().any(|project_file| {
+                                    sym.location.file_path.contains(project_file)
+                                        || project_file.contains(&sym.location.file_path)
+                                })
+                            };
 
-                                // If no more pending requests, complete the enhanced references
-                                if pending.pending_symbol_requests.is_empty() {
-                                    log::info!(
-                                        "Completing enhanced references request: {}",
-                                        enhanced_request_id
-                                    );
+                            is_function && is_project_file
+                        })
+                        .map(|sym| {
+                            let qualified_name = if let Some(container) = &sym.container_name {
+                                format!("{}::{}", container, sym.name)
+                            } else {
+                                sym.name.clone()
+                            };
+                            core_data::FunctionNode::new(sym.name, qualified_name, sym.location)
+                        })
+                        .collect();
 
-                                    // Group locations by file for enhancement
-                                    let mut locations_by_file: std::collections::HashMap<
-                                        String,
-                                        Vec<core_data::Location>,
-                                    > = std::collections::HashMap::new();
-                                    for location in &pending.locations {
-                                        locations_by_file
-                                            .entry(location.file_path.clone())
-                                            .or_insert_with(Vec::new)
-                                            .push(location.clone());
-                                    }
+                    log::info!("Filtered to {} function symbols", function_symbols.len());
 
-                                    let enhanced_refs =
-                                        Self::enhance_references_with_cached_symbols(
-                                            &pending.locations,
-                                            &locations_by_file,
-                                            &state.document_symbols_cache,
-                                        );
-
-                                    log::info!(
-                                        "Enhanced {} references with symbol information",
-                                        enhanced_refs.len()
-                                    );
-
-                                    // Send the completed response
-                                    let _ = response_tx
-                                        .send(LspResponse::ReferencesWithSymbols {
-                                            request_id: enhanced_request_id.clone(),
-                                            references: enhanced_refs,
-                                        })
-                                        .await;
-
-                                    // Clean up
-                                    state.pending_enhanced_requests.remove(&enhanced_request_id);
-                                }
-                            }
-                        }
-
-                        // Don't send a separate DocumentSymbols response for enhanced requests
-                    } else {
-                        // Regular document symbols request - send normal response
-                        let symbols = document_symbols_response
-                            .symbols
-                            .into_iter()
-                            .map(|sym| DocumentSymbol {
-                                name: sym.name,
-                                detail: sym.container_name,
-                                kind: sym.kind,
-                                tags: None,
-                                #[allow(deprecated)]
-                                deprecated: Some(false),
-                                range: lsp_types::Range::default(), // Will need proper conversion
-                                selection_range: lsp_types::Range::default(),
-                                children: None,
-                            })
-                            .collect();
-
-                        let _ = response_tx
-                            .send(LspResponse::DocumentSymbols {
-                                request_id,
-                                symbols,
-                            })
-                            .await;
-                    }
-
-                    // Remove from enhanced tracking after processing document symbols
-                    state.enhanced_lsp_requests.remove(&id);
-                } else if request_id.starts_with("document_symbol_for_") {
-                    // Handle document symbol response for enhanced references
-                    log::debug!(
-                        "Processing document symbol response for enhanced references: {}",
+                    let _ = response_tx
+                        .send(LspResponse::WorkspaceSymbols {
+                            request_id,
+                            symbols: function_symbols,
+                        })
+                        .await;
+                } else {
+                    log::error!(
+                        "Failed to parse workspace symbols response for request {}",
                         request_id
                     );
-
-                    if let Some(result) = message.get("result") {
-                        if !result.is_null() {
-                            match serde_json::from_value::<Vec<lsp_types::DocumentSymbol>>(
-                                result.clone(),
-                            ) {
-                                Ok(document_symbols) => {
-                                    log::info!(
-                                        "Successfully parsed document symbols for enhanced references request {}: found {} symbols",
-                                        request_id,
-                                        document_symbols.len()
-                                    );
-
-                                    // Extract the base request ID from the document symbol request ID
-                                    if let Some(base_request_id) =
-                                        request_id.strip_prefix("document_symbol_for_")
-                                    {
-                                        Self::handle_document_symbols_for_enhanced_references(
-                                            base_request_id,
-                                            &document_symbols,
-                                            state,
-                                            response_tx,
-                                        )
-                                        .await;
-                                    }
-                                }
-                                Err(_) => {
-                                    // Try parsing as SymbolInformation (what clangd often returns)
-                                    match serde_json::from_value::<Vec<lsp_types::SymbolInformation>>(
-                                        result.clone(),
-                                    ) {
-                                        Ok(symbol_infos) => {
-                                            log::info!(
-                                                "Successfully parsed symbol information for enhanced references request {}: found {} symbols",
-                                                request_id,
-                                                symbol_infos.len()
-                                            );
-
-                                            // Convert SymbolInformation to DocumentSymbol format
-                                            let document_symbols =
-                                                Self::convert_symbol_info_to_document_symbols(
-                                                    &symbol_infos,
-                                                );
-
-                                            // Extract the base request ID from the document symbol request ID
-                                            if let Some(base_request_id) =
-                                                request_id.strip_prefix("document_symbol_for_")
-                                            {
-                                                Self::handle_document_symbols_for_enhanced_references(
-                                                    base_request_id,
-                                                    &document_symbols,
-                                                    state,
-                                                    response_tx,
-                                                ).await;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            log::error!("Error parsing document symbols or symbol information for enhanced references {}: {:?}", request_id, e);
-                                            log::debug!(
-                                                "Raw response: {}",
-                                                serde_json::to_string_pretty(result)
-                                                    .unwrap_or_else(
-                                                        |_| "failed to serialize".to_string()
-                                                    )
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            log::warn!("Document symbols response was null for enhanced references request: {}", request_id);
-                        }
-                    }
-
-                    // Remove from enhanced tracking after processing document symbols
-                    state.enhanced_lsp_requests.remove(&id);
-                } else if let Some(result) = message.get("result") {
-                    // Parse workspace symbols response directly
-                    if !result.is_null() {
-                        if let Ok(workspace_symbols) = serde_json::from_value::<
-                            Vec<lsp_types::WorkspaceSymbol>,
-                        >(result.clone())
-                        {
-                            log::info!(
-                                "LSP Workspace Symbols Response: found {} symbols for request {}",
-                                workspace_symbols.len(),
-                                request_id
-                            );
-
-                            // Convert to our WorkspaceSymbolInfo format
-                            let symbols: Vec<crate::WorkspaceSymbolInfo> = workspace_symbols
-                                .iter()
-                                .map(|symbol| {
-                                    let location = match &symbol.location {
-                                        lsp_types::OneOf::Left(location) => {
-                                            crate::convert_lsp_location(location)
-                                        }
-                                        lsp_types::OneOf::Right(workspace_location) => {
-                                            core_data::Location {
-                                                file_path: workspace_location
-                                                    .uri
-                                                    .to_file_path()
-                                                    .map(|p| p.to_string_lossy().to_string())
-                                                    .unwrap_or_else(|_| {
-                                                        workspace_location.uri.to_string()
-                                                    }),
-                                                line: 0, // WorkspaceLocation doesn't have range info
-                                                column: 0,
-                                                length: None,
-                                            }
-                                        }
-                                    };
-                                    crate::WorkspaceSymbolInfo {
-                                        name: symbol.name.clone(),
-                                        kind: symbol.kind,
-                                        location,
-                                        container_name: symbol.container_name.clone(),
-                                    }
-                                })
-                                .collect();
-
-                            // Log each workspace symbol
-                            for (i, sym) in symbols.iter().enumerate() {
-                                log::info!("  Workspace symbol {}: name='{}', kind={:?}, container={:?}, location={}:{}:{}", 
-                                    i, sym.name, sym.kind,
-                                    sym.container_name.as_deref().unwrap_or("None"),
-                                    sym.location.file_path, sym.location.line, sym.location.column);
-                            }
-
-                            // Filter to only function symbols from project files and convert to FunctionNode
-                            let function_symbols: Vec<core_data::FunctionNode> = symbols
-                                .into_iter()
-                                .filter(|sym| {
-                                    // Check if it's a function/method type
-                                    let is_function = matches!(
-                                        sym.kind,
-                                        lsp_types::SymbolKind::FUNCTION
-                                            | lsp_types::SymbolKind::METHOD
-                                            | lsp_types::SymbolKind::CONSTRUCTOR
-                                    );
-
-                                    // Check if it's from a project file
-                                    let is_project_file = if state.project_files.is_empty() {
-                                        // If no project files set, include all symbols (fallback behavior)
-                                        true
-                                    } else {
-                                        // Check if the symbol's file path matches any project file
-                                        state.project_files.iter().any(|project_file| {
-                                            sym.location.file_path.contains(project_file)
-                                                || project_file.contains(&sym.location.file_path)
-                                        })
-                                    };
-
-                                    is_function && is_project_file
-                                })
-                                .map(|sym| {
-                                    let qualified_name =
-                                        if let Some(container) = &sym.container_name {
-                                            format!("{}::{}", container, sym.name)
-                                        } else {
-                                            sym.name.clone()
-                                        };
-                                    core_data::FunctionNode::new(
-                                        sym.name,
-                                        qualified_name,
-                                        sym.location,
-                                    )
-                                })
-                                .collect();
-
-                            log::info!("Filtered to {} function symbols", function_symbols.len());
-
-                            let _ = response_tx
-                                .send(LspResponse::WorkspaceSymbols {
-                                    request_id,
-                                    symbols: function_symbols,
-                                })
-                                .await;
-                        } else {
-                            log::warn!(
-                                "Failed to parse workspace symbols response for request {}",
-                                request_id
-                            );
-                        }
-                    } else {
-                        log::info!(
-                            "Empty workspace symbols response for request {}",
-                            request_id
-                        );
-                        let _ = response_tx
-                            .send(LspResponse::WorkspaceSymbols {
-                                request_id,
-                                symbols: Vec::new(),
-                            })
-                            .await;
-                    }
-
-                    // Remove from enhanced tracking after processing workspace symbols
-                    state.enhanced_lsp_requests.remove(&id);
-                } else if message.get("error").is_some() {
-                    let error_msg = message
-                        .get("error")
-                        .and_then(|e| e.get("message"))
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("Unknown LSP error");
-
-                    log::error!(
-                        "LSP Error Response for request {}: {}",
-                        request_id,
-                        error_msg
-                    );
-                    log::debug!("Full LSP error message: {}", message);
+                    log::debug!("Raw response: {}", message);
 
                     let _ = response_tx
                         .send(LspResponse::Error {
                             request_id,
-                            error: error_msg.to_string(),
+                            error: "Failed to parse workspace symbols response".to_string(),
                         })
                         .await;
-
-                    // Remove from enhanced tracking after error response
-                    state.enhanced_lsp_requests.remove(&id);
-                } else {
-                    log::warn!(
-                        "Unrecognized LSP response for request {}: {}",
-                        request_id,
-                        message
-                    );
-
-                    // Remove from enhanced tracking for unrecognized responses
-                    state.enhanced_lsp_requests.remove(&id);
                 }
+            } else {
+                log::info!(
+                    "Empty workspace symbols response for request {}",
+                    request_id
+                );
+                let _ = response_tx
+                    .send(LspResponse::WorkspaceSymbols {
+                        request_id,
+                        symbols: Vec::new(),
+                    })
+                    .await;
+            }
+        } else {
+            log::error!(
+                "Missing result field in workspace symbols response for request {}",
+                request_id
+            );
+            let _ = response_tx
+                .send(LspResponse::Error {
+                    request_id,
+                    error: "Missing result field in workspace symbols response".to_string(),
+                })
+                .await;
+        }
+    }
+
+    /// Handle hover response
+    async fn handle_hover_response(
+        message: Value,
+        request_id: String,
+        state: &mut LspWorkerState,
+        response_tx: &mpsc::Sender<LspResponse>,
+    ) {
+        // Handle error responses first
+        if let Some(error) = message.get("error") {
+            let error_msg = error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Unknown LSP error");
+
+            log::error!(
+                "LSP Error Response for hover request {}: {}",
+                request_id,
+                error_msg
+            );
+
+            let _ = response_tx
+                .send(LspResponse::Error {
+                    request_id,
+                    error: error_msg.to_string(),
+                })
+                .await;
+            return;
+        }
+
+        if let Ok(Some(hover_response)) = state.client.parse_hover_response(&message) {
+            log::debug!(
+                "LSP Hover Response for request {}: hover_info={:?}",
+                request_id,
+                hover_response.hover_info
+            );
+
+            // Check if this is a hover request for enhanced references
+            if request_id.starts_with("hover_for_") {
+                log::debug!("Raw hover response message for {}: {}", request_id, message);
+
+                Self::handle_hover_for_enhanced_references(
+                    hover_response,
+                    &request_id,
+                    state,
+                    response_tx,
+                )
+                .await;
+            }
+        } else {
+            log::error!("Failed to parse hover response for request {}", request_id);
+            log::debug!("Raw response: {}", message);
+
+            let _ = response_tx
+                .send(LspResponse::Error {
+                    request_id,
+                    error: "Failed to parse hover response".to_string(),
+                })
+                .await;
+        }
+    }
+
+    /// Handle legacy response detection for backward compatibility
+    async fn handle_legacy_response_detection(
+        message: Value,
+        request_id: String,
+        state: &mut LspWorkerState,
+        response_tx: &mpsc::Sender<LspResponse>,
+    ) {
+        log::warn!("Using legacy response detection for request {}", request_id);
+
+        // Handle error responses first
+        if message.get("error").is_some() {
+            let error_msg = message
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("Unknown LSP error");
+
+            log::error!(
+                "LSP Error Response for request {}: {}",
+                request_id,
+                error_msg
+            );
+            log::debug!("Full LSP error message: {}", message);
+
+            let _ = response_tx
+                .send(LspResponse::Error {
+                    request_id,
+                    error: error_msg.to_string(),
+                })
+                .await;
+            return;
+        }
+
+        // Try to parse different response types in order of specificity
+        if let Ok(Some(_call_hierarchy_response)) =
+            state.client.parse_prepare_call_hierarchy_response(&message)
+        {
+            Self::handle_call_hierarchy_response(message, request_id, state, response_tx).await;
+        } else if let Ok(Some(_)) = state.client.parse_outgoing_calls_response(&message) {
+            Self::handle_outgoing_calls_response(message, request_id, state, response_tx).await;
+        } else if Self::is_references_response(&message) {
+            if Self::was_enhanced_references_request(&message, state) {
+                Self::handle_references_with_symbols_response(
+                    message,
+                    request_id,
+                    state,
+                    response_tx,
+                )
+                .await;
+            } else {
+                Self::handle_references_response(message, request_id, state, response_tx).await;
+            }
+        } else if let Ok(Some(_)) = state.client.parse_hover_response(&message) {
+            Self::handle_hover_response(message, request_id, state, response_tx).await;
+        } else if let Ok(Some(_)) = state.client.parse_document_symbol_response(&message) {
+            Self::handle_document_symbols_response(message, request_id, state, response_tx).await;
+        } else if message.get("result").is_some() {
+            // As a last resort, try workspace symbols - but log a warning
+            log::warn!(
+                "Falling back to workspace symbols parsing for request {} - this may be incorrect!",
+                request_id
+            );
+            Self::handle_workspace_symbols_response(message, request_id, state, response_tx).await;
+        } else {
+            log::error!(
+                "Unrecognized LSP response for request {}: {}",
+                request_id,
+                message
+            );
+            let _ = response_tx
+                .send(LspResponse::Error {
+                    request_id,
+                    error: "Unrecognized LSP response type".to_string(),
+                })
+                .await;
+        }
+    }
+
+    /// Handle legacy document symbols for enhanced references (special case)
+    async fn handle_legacy_document_symbols_for_enhanced_references(
+        message: Value,
+        request_id: String,
+        state: &mut LspWorkerState,
+        response_tx: &mpsc::Sender<LspResponse>,
+    ) {
+        log::debug!(
+            "Processing document symbol response for enhanced references: {}",
+            request_id
+        );
+
+        if let Some(result) = message.get("result") {
+            if !result.is_null() {
+                match serde_json::from_value::<Vec<lsp_types::DocumentSymbol>>(result.clone()) {
+                    Ok(document_symbols) => {
+                        log::info!(
+                            "Successfully parsed document symbols for enhanced references request {}: found {} symbols",
+                            request_id,
+                            document_symbols.len()
+                        );
+
+                        // Extract the base request ID from the document symbol request ID
+                        if let Some(base_request_id) =
+                            request_id.strip_prefix("document_symbol_for_")
+                        {
+                            Self::handle_document_symbols_for_enhanced_references(
+                                base_request_id,
+                                &document_symbols,
+                                state,
+                                response_tx,
+                            )
+                            .await;
+                        }
+                    }
+                    Err(_) => {
+                        // Try parsing as SymbolInformation (what clangd often returns)
+                        match serde_json::from_value::<Vec<lsp_types::SymbolInformation>>(
+                            result.clone(),
+                        ) {
+                            Ok(symbol_infos) => {
+                                log::info!(
+                                    "Successfully parsed symbol information for enhanced references request {}: found {} symbols",
+                                    request_id,
+                                    symbol_infos.len()
+                                );
+
+                                // Convert SymbolInformation to DocumentSymbol format
+                                let document_symbols =
+                                    Self::convert_symbol_info_to_document_symbols(&symbol_infos);
+
+                                // Extract the base request ID from the document symbol request ID
+                                if let Some(base_request_id) =
+                                    request_id.strip_prefix("document_symbol_for_")
+                                {
+                                    Self::handle_document_symbols_for_enhanced_references(
+                                        base_request_id,
+                                        &document_symbols,
+                                        state,
+                                        response_tx,
+                                    )
+                                    .await;
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("Error parsing document symbols or symbol information for enhanced references {}: {:?}", request_id, e);
+                                log::debug!(
+                                    "Raw response: {}",
+                                    serde_json::to_string_pretty(result)
+                                        .unwrap_or_else(|_| "failed to serialize".to_string())
+                                );
+                            }
+                        }
+                    }
+                }
+            } else {
+                log::warn!(
+                    "Document symbols response was null for enhanced references request: {}",
+                    request_id
+                );
             }
         }
     }
@@ -1124,6 +1795,21 @@ impl LspService {
     pub async fn request_workspace_symbols(&self, request_id: String, query: String) -> Result<()> {
         self.request_tx
             .send(LspRequest::GetWorkspaceSymbols { request_id, query })
+            .await?;
+        Ok(())
+    }
+
+    /// Request outgoing calls for a call hierarchy item
+    pub async fn request_outgoing_calls(
+        &self,
+        request_id: String,
+        call_hierarchy_item: lsp_types::CallHierarchyItem,
+    ) -> Result<()> {
+        self.request_tx
+            .send(LspRequest::GetOutgoingCalls {
+                request_id,
+                call_hierarchy_item,
+            })
             .await?;
         Ok(())
     }
@@ -1279,9 +1965,11 @@ impl LspService {
                 match state.client.document_symbol(text_document).await {
                     Ok(lsp_request_id) => {
                         // Track this as a document symbol request for the enhanced references
-                        state.service_requests.insert(
+                        let request_id = format!("document_symbol_for_{}", service_request_id);
+                        state.track_request(
                             lsp_request_id,
-                            format!("document_symbol_for_{}", service_request_id),
+                            request_id,
+                            RequestType::DocumentSymbols,
                         );
                         state.enhanced_lsp_requests.insert(lsp_request_id);
 

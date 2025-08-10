@@ -1,4 +1,4 @@
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use serde_json::Value;
 use std::env;
 use std::path::Path;
@@ -139,8 +139,8 @@ async fn run_with_lsp(project_path: &str) -> Result<(), Box<dyn std::error::Erro
     let source_files = compile_commands::parse_compile_commands(&root_path)?;
     info!("Found {} source files", source_files.len());
 
-    // Create a minimal call graph with just the project structure
-    let mut call_graph = CallGraph::new();
+    // Create a lazy call graph that will load relationships on demand
+    let mut lazy_call_graph = core_data::LazyCallGraph::new();
 
     // Create LSP service for all LSP operations
     let mut lsp_service = LspService::new(lsp_client, rx_for_init).await?;
@@ -173,94 +173,17 @@ async fn run_with_lsp(project_path: &str) -> Result<(), Box<dyn std::error::Erro
 
         // Give some time for preloading to complete
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        // Now request document symbols for each file
-        info!(
-            "Requesting document symbols for {} files...",
-            document_uris.len()
-        );
-        for (i, uri) in document_uris.iter().enumerate() {
-            let request_id = Uuid::new_v4().to_string();
-            match lsp_service
-                .request_document_symbols(request_id.clone(), uri.clone())
-                .await
-            {
-                Ok(()) => {
-                    info!(
-                        "Requested document symbols for {} (request_id: {})",
-                        uri, request_id
-                    );
-
-                    // Process response immediately for the first few files
-                    if i < 3 {
-                        // Wait a bit for the response
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-                        while let Some(response) = lsp_service.try_recv_response() {
-                            if let LspResponse::DocumentSymbols {
-                                request_id: resp_id,
-                                symbols,
-                            } = response
-                            {
-                                if resp_id == request_id {
-                                    info!(
-                                        "Received {} document symbols from {}",
-                                        symbols.len(),
-                                        uri
-                                    );
-
-                                    // Convert DocumentSymbol to FunctionNode
-                                    for doc_symbol in symbols {
-                                        if matches!(
-                                            doc_symbol.kind,
-                                            lsp_types::SymbolKind::FUNCTION
-                                                | lsp_types::SymbolKind::METHOD
-                                        ) {
-                                            let function_node = FunctionNode::new(
-                                                doc_symbol.name.clone(),
-                                                doc_symbol.name.clone(), // Use simple name as qualified name for now
-                                                Location::new(
-                                                    uri.to_file_path()
-                                                        .map(|p| p.to_string_lossy().to_string())
-                                                        .unwrap_or_else(|_| uri.to_string()),
-                                                    doc_symbol.selection_range.start.line + 1, // Convert to 1-based
-                                                    doc_symbol.selection_range.start.character + 1,
-                                                ),
-                                            );
-
-                                            info!(
-                                                "Adding function from document symbols: '{}' from {}:{}:{}",
-                                                function_node.name,
-                                                function_node.definition_location.file_path,
-                                                function_node.definition_location.line,
-                                                function_node.definition_location.column
-                                            );
-
-                                            call_graph.add_function(function_node);
-                                        }
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to request document symbols for {}: {}", uri, e);
-                }
-            }
-        }
     }
 
-    // Also try workspace symbols as a fallback
+    // Use only workspace symbols for fast startup (lazy loading approach)
     let initial_request_id = Uuid::new_v4().to_string();
     lsp_service
         .request_workspace_symbols(initial_request_id.clone(), "".to_string())
         .await?;
     info!("Requested initial workspace symbols for overview");
 
-    // Give a short time for initial symbols (quick startup)
-    let symbol_timeout = tokio::time::Duration::from_millis(1000); // Reduced since we already have some symbols
+    // Give time for initial symbols loading
+    let symbol_timeout = tokio::time::Duration::from_millis(2000); // Increased timeout for workspace symbols
     let symbol_start = std::time::Instant::now();
     let mut initial_symbols_loaded = false;
 
@@ -275,24 +198,33 @@ async fn run_with_lsp(project_path: &str) -> Result<(), Box<dyn std::error::Erro
                     if request_id == initial_request_id {
                         info!("Received {} initial workspace symbols", symbols.len());
 
-                        // Add function symbols to call graph
+                        // Add function symbols to lazy call graph
                         let mut function_count = 0;
-                        for function_node in symbols.into_iter().take(50) {
-                            // Limit to avoid slow startup
+                        for function_node in symbols.into_iter().take(100) {
+                            // Increased limit since lazy loading is faster
                             info!(
-                                "Adding function to call graph: '{}' from {}:{}:{}",
+                                "Adding function to lazy call graph: '{}' from {}:{}:{}",
                                 function_node.qualified_name,
                                 function_node.definition_location.file_path,
                                 function_node.definition_location.line,
                                 function_node.definition_location.column
                             );
 
-                            call_graph.add_function(function_node);
+                            // Convert to workspace symbol info
+                            let workspace_symbol = core_data::WorkspaceSymbolInfo {
+                                name: function_node.name.clone(),
+                                qualified_name: function_node.qualified_name.clone(),
+                                kind: core_data::lsp_types::SymbolKind::FUNCTION,
+                                location: function_node.definition_location.clone(),
+                                container_name: None,
+                            };
+
+                            lazy_call_graph.add_function_from_workspace_symbol(workspace_symbol);
                             function_count += 1;
                         }
 
                         info!(
-                            "Added {} functions to call graph from workspace symbols",
+                            "Added {} functions to lazy call graph from workspace symbols",
                             function_count
                         );
                         initial_symbols_loaded = true;
@@ -312,7 +244,7 @@ async fn run_with_lsp(project_path: &str) -> Result<(), Box<dyn std::error::Erro
     }
 
     // If no functions were found, add a placeholder
-    if call_graph.nodes.is_empty() {
+    if lazy_call_graph.nodes.is_empty() {
         let project_name = std::path::Path::new(project_path)
             .file_name()
             .and_then(|n| n.to_str())
@@ -328,18 +260,23 @@ async fn run_with_lsp(project_path: &str) -> Result<(), Box<dyn std::error::Erro
             )
         };
 
-        let project_func = FunctionNode::new(
-            message.clone(),
-            format!("project::{}", project_path),
-            Location::new(project_path.to_string(), 1, 0),
-        );
-        call_graph.add_function(project_func);
+        let project_symbol = core_data::WorkspaceSymbolInfo {
+            name: message.clone(),
+            qualified_name: format!("project::{}", project_path),
+            kind: core_data::lsp_types::SymbolKind::MODULE,
+            location: core_data::Location::new(project_path.to_string(), 1, 0),
+            container_name: None,
+        };
+        lazy_call_graph.add_function_from_workspace_symbol(project_symbol);
     }
 
     info!(
         "Starting TUI with {} initial functions. Additional data will load on demand...",
-        call_graph.nodes.len()
+        lazy_call_graph.nodes.len()
     );
+
+    // Convert to old CallGraph format for backward compatibility during migration
+    let call_graph = lazy_call_graph.to_call_graph();
 
     // Start TUI with lazy loading
     run_tui_with_lazy_lsp(call_graph, lsp_service).await
@@ -379,6 +316,15 @@ async fn run_tui_with_lazy_lsp(
                             LspRequest::GetCallHierarchy { request_id, document_uri, position } => {
                                 if let Err(e) = lsp_service.request_call_hierarchy(request_id.clone(), document_uri, position).await {
                                     log::error!("Failed to send call hierarchy request: {}", e);
+                                    let _ = tui_response_tx.send(LspResponse::Error {
+                                        request_id,
+                                        error: format!("Request failed: {}", e),
+                                    });
+                                }
+                            }
+                            LspRequest::GetOutgoingCalls { request_id, call_hierarchy_item } => {
+                                if let Err(e) = lsp_service.request_outgoing_calls(request_id.clone(), call_hierarchy_item).await {
+                                    log::error!("Failed to send outgoing calls request: {}", e);
                                     let _ = tui_response_tx.send(LspResponse::Error {
                                         request_id,
                                         error: format!("Request failed: {}", e),

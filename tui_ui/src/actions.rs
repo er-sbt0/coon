@@ -1,12 +1,5 @@
 use core_data::SymbolId;
 
-/// Mode for the tree view in call graph
-#[derive(Debug, Clone, PartialEq)]
-pub enum TreeViewMode {
-    CallHierarchy, // Show caller/callee relationships
-    References,    // Show reference locations
-}
-
 /// Actions that can be performed in the TUI
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -17,7 +10,6 @@ pub enum Action {
     ExpandOrCollapse,
     SwitchTab,
     FindReferences,
-    ToggleViewMode,
     Refresh,
     Quit,
     Help,
@@ -83,7 +75,6 @@ pub struct TreeViewState {
     pub nodes: Vec<TreeNode>,
     pub selected_index: usize,
     pub scroll_offset: usize,
-    pub view_mode: TreeViewMode,
 }
 
 impl TreeViewState {
@@ -92,7 +83,6 @@ impl TreeViewState {
             nodes: Vec::new(),
             selected_index: 0,
             scroll_offset: 0,
-            view_mode: TreeViewMode::References, // Default to references mode
         }
     }
 
@@ -193,12 +183,5 @@ impl TreeViewState {
         self.nodes
             .iter()
             .position(|node| &node.symbol_id == symbol_id)
-    }
-
-    pub fn toggle_view_mode(&mut self) {
-        self.view_mode = match self.view_mode {
-            TreeViewMode::CallHierarchy => TreeViewMode::References,
-            TreeViewMode::References => TreeViewMode::CallHierarchy,
-        };
     }
 }

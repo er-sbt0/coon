@@ -191,6 +191,7 @@ dependencies = [
  "chrono",
  "fern",
  "log",
+ "lsp-types",
  "serde",
  "uuid",
 ]

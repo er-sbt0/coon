@@ -73,6 +73,13 @@ pub struct OutgoingCallsResponse {
     pub calls: Vec<lsp::CallHierarchyOutgoingCall>,
 }
 
+/// Response from LSP callHierarchy/incomingCalls request
+#[derive(Debug, Clone)]
+pub struct IncomingCallsResponse {
+    pub request_id: i64,
+    pub calls: Vec<lsp::CallHierarchyIncomingCall>,
+}
+
 /// Simplified symbol information from LSP
 #[derive(Debug, Clone)]
 pub struct WorkspaceSymbolInfo {
@@ -577,24 +584,16 @@ impl LspClient {
             response,
         )
     }
-    pub async fn prepare_call_hierarchy(
-        &mut self,
-        document_id: lsp::TextDocumentIdentifier,
-        position: lsp::Position,
-    ) -> Result<i64> {
-        let params = lsp::CallHierarchyPrepareParams {
-            text_document_position_params: lsp::TextDocumentPositionParams {
-                text_document: document_id,
-                position,
-            },
-            work_done_progress_params: Default::default(),
-        };
 
-        self.send_request(
-            "textDocument/prepareCallHierarchy",
-            serde_json::to_value(params)?,
+    /// Parse incoming calls response
+    pub fn parse_incoming_calls_response(
+        &mut self,
+        response: &Value,
+    ) -> Result<Option<IncomingCallsResponse>> {
+        crate::call_hierarchy::parse_incoming_calls_response_impl(
+            &mut self.pending_requests,
+            response,
         )
-        .await
     }
 
     /// Request outgoing calls from a call hierarchy item
@@ -607,6 +606,39 @@ impl LspClient {
 
         self.send_request("callHierarchy/outgoingCalls", serde_json::to_value(params)?)
             .await
+    }
+
+    /// Request incoming calls from a call hierarchy item
+    pub async fn get_incoming_calls(&mut self, item: lsp::CallHierarchyItem) -> Result<i64> {
+        let params = lsp::CallHierarchyIncomingCallsParams {
+            item,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        self.send_request("callHierarchy/incomingCalls", serde_json::to_value(params)?)
+            .await
+    }
+
+    /// Prepare call hierarchy for a document position
+    pub async fn prepare_call_hierarchy(
+        &mut self,
+        document_uri: lsp::Url,
+        position: lsp::Position,
+    ) -> Result<i64> {
+        let params = lsp::CallHierarchyPrepareParams {
+            text_document_position_params: lsp::TextDocumentPositionParams {
+                text_document: lsp::TextDocumentIdentifier { uri: document_uri },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+        };
+
+        self.send_request(
+            "textDocument/prepareCallHierarchy",
+            serde_json::to_value(params)?,
+        )
+        .await
     }
 }
 

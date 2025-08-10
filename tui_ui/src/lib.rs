@@ -25,7 +25,7 @@ pub mod call_graph_view;
 pub mod diagnostic_panel;
 pub mod function_list;
 
-pub use actions::{Action, TreeNode, TreeViewMode, TreeViewState};
+pub use actions::{Action, TreeNode, TreeViewState};
 pub use call_graph_view::CallGraphView;
 pub use diagnostic_panel::DiagnosticPanel;
 pub use function_list::FunctionList;
@@ -449,8 +449,75 @@ impl App {
             LspResponse::CallHierarchy { request_id, items } => {
                 if let Some(pending) = self.pending_requests.remove(&request_id) {
                     if let Some(symbol_id) = pending.symbol_id {
-                        // Process call hierarchy items and update the call graph
-                        self.update_function_call_hierarchy(symbol_id.clone(), items);
+                        log::info!(
+                            "Received call hierarchy prepare response for symbol: {:?}, {} items",
+                            symbol_id,
+                            items.len()
+                        );
+
+                        // If we got call hierarchy items, automatically request outgoing calls
+                        if !items.is_empty() {
+                            let first_item = items[0].clone();
+                            log::info!("Requesting outgoing calls for: {}", first_item.name);
+
+                            // Generate a new request ID for the outgoing calls request
+                            let outgoing_request_id = uuid::Uuid::new_v4().to_string();
+
+                            // Record pending request for outgoing calls
+                            self.pending_requests.insert(
+                                outgoing_request_id.clone(),
+                                PendingRequest {
+                                    request_type: LspRequestType::CallHierarchy,
+                                    timestamp: Instant::now(),
+                                    symbol_id: Some(symbol_id.clone()),
+                                },
+                            );
+
+                            // Send outgoing calls request
+                            if let Some(tx) = &self.lsp_request_tx {
+                                let request = LspRequest::GetOutgoingCalls {
+                                    request_id: outgoing_request_id,
+                                    call_hierarchy_item: first_item,
+                                };
+
+                                if let Err(e) = tx.send(request) {
+                                    log::error!("Failed to send outgoing calls request: {}", e);
+                                    self.update_loading_state(
+                                        &symbol_id,
+                                        LoadingState::Failed(
+                                            "Failed to request outgoing calls".to_string(),
+                                        ),
+                                    );
+                                } else {
+                                    self.status_message = "Loading outgoing calls...".to_string();
+                                }
+                            } else {
+                                log::error!("No LSP request channel available");
+                                self.update_loading_state(
+                                    &symbol_id,
+                                    LoadingState::Failed("No LSP channel".to_string()),
+                                );
+                            }
+                        } else {
+                            // No call hierarchy items - this function has no callees
+                            log::info!("No call hierarchy items found for symbol: {:?}", symbol_id);
+                            self.update_loading_state(&symbol_id, LoadingState::Loaded);
+                            self.status_message = "Function has no callees".to_string();
+                        }
+                    }
+                }
+            }
+            LspResponse::OutgoingCalls { request_id, calls } => {
+                if let Some(pending) = self.pending_requests.remove(&request_id) {
+                    if let Some(symbol_id) = pending.symbol_id {
+                        log::info!(
+                            "Processing outgoing calls for symbol_id: {:?}, {} calls",
+                            symbol_id,
+                            calls.len()
+                        );
+
+                        // Process outgoing calls and update the call graph
+                        self.update_function_outgoing_calls(symbol_id.clone(), calls);
 
                         // Update loading state to loaded
                         self.update_loading_state(&symbol_id, LoadingState::Loaded);
@@ -464,7 +531,7 @@ impl App {
                             }
                         }
 
-                        self.status_message = "Call hierarchy loaded".to_string();
+                        self.status_message = "Outgoing calls loaded".to_string();
                     }
                 }
             }
@@ -475,11 +542,6 @@ impl App {
                 if let Some(pending) = self.pending_requests.remove(&request_id) {
                     if let Some(symbol_id) = pending.symbol_id {
                         log::info!("Processing references for symbol_id: {:?}", symbol_id);
-
-                        // Check if we need to update the tree in references mode
-                        let should_update_tree = self.current_tab == 1
-                            && self.tree_view_state.view_mode == TreeViewMode::References
-                            && self.selected_function.as_ref() == Some(&symbol_id);
 
                         // Process references and update the function
                         if let Some(function) = self.call_graph.nodes.get_mut(&symbol_id) {
@@ -513,11 +575,6 @@ impl App {
                                 symbol_id
                             );
                             self.status_message = format!("Found {} reference(s)", locations.len());
-                        }
-
-                        // Update the tree if needed (after releasing the mutable borrow)
-                        if should_update_tree {
-                            self.populate_reference_nodes(&symbol_id, &locations);
                         }
                     } else {
                         log::warn!("Pending request had no symbol_id");
@@ -614,41 +671,74 @@ impl App {
                             function.references = references;
                         }
 
-                        // Update loading state and populate reference nodes
+                        // Update loading state
                         self.update_loading_state(&symbol_id, LoadingState::Loaded);
-                        if let Some(function) = self.call_graph.get_function(&symbol_id) {
-                            let reference_locations: Vec<core_data::Location> = function
-                                .references
-                                .iter()
-                                .map(|r| r.location.clone())
-                                .collect();
-                            self.populate_reference_nodes(&symbol_id, &reference_locations);
+                    }
+                }
+            }
+            LspResponse::IncomingCalls { request_id, calls } => {
+                if let Some(pending) = self.pending_requests.remove(&request_id) {
+                    if let Some(symbol_id) = pending.symbol_id {
+                        log::info!(
+                            "Processing incoming calls for symbol_id: {:?}, {} calls",
+                            symbol_id,
+                            calls.len()
+                        );
+
+                        // Process incoming calls and update the call graph
+                        self.update_function_incoming_calls(symbol_id.clone(), calls);
+
+                        // Update loading state to loaded
+                        self.update_loading_state(&symbol_id, LoadingState::Loaded);
+
+                        self.status_message = "Incoming calls loaded".to_string();
+                    }
+                }
+            }
+            LspResponse::CallHierarchyPrepared { request_id, items } => {
+                if let Some(pending) = self.pending_requests.remove(&request_id) {
+                    if let Some(symbol_id) = pending.symbol_id {
+                        log::info!(
+                            "Call hierarchy prepared for symbol: {:?}, {} items",
+                            symbol_id,
+                            items.len()
+                        );
+
+                        // Mark the call hierarchy as prepared and cache the first item
+                        if !items.is_empty() {
+                            // We'll implement lazy call graph integration here later
+                            self.status_message = format!("Call hierarchy prepared for function");
+                        } else {
+                            self.status_message =
+                                "No call hierarchy available for this function".to_string();
                         }
+
+                        self.update_loading_state(&symbol_id, LoadingState::Loaded);
                     }
                 }
             }
         }
     }
 
-    /// Update function call hierarchy from LSP response
-    fn update_function_call_hierarchy(
+    /// Update function outgoing calls from LSP response
+    fn update_function_outgoing_calls(
         &mut self,
         symbol_id: SymbolId,
-        items: Vec<lsp_types::CallHierarchyItem>,
+        calls: Vec<lsp_types::CallHierarchyOutgoingCall>,
     ) {
-        // Process call hierarchy items and convert them to call graph relationships
-        for item in items {
+        // Process outgoing calls and convert them to call graph relationships
+        for call in calls {
             // Convert LSP location to our Location type
             let location = core_data::Location::new(
-                item.uri.path().to_string(),
-                (item.range.start.line + 1) as u32, // Convert from 0-indexed to 1-indexed
-                (item.range.start.character + 1) as u32,
+                call.to.uri.path().to_string(),
+                (call.to.range.start.line + 1) as u32, // Convert from 0-indexed to 1-indexed
+                (call.to.range.start.character + 1) as u32,
             );
 
             // Create or update the callee function
             let callee_function = core_data::FunctionNode::new(
-                item.name.clone(),
-                format!("{}::{}", item.name, location.file_path),
+                call.to.name.clone(),
+                format!("{}::{}", call.to.name, location.file_path),
                 location,
             );
 
@@ -656,14 +746,54 @@ impl App {
             let callee_id = self.call_graph.add_function(callee_function);
 
             // Create the call edge from the original function to this callee
-            if let Some(caller_function) = self.call_graph.nodes.get(&symbol_id) {
+            // Use the call location from the LSP response
+            for from_range in &call.from_ranges {
                 let call_location = core_data::Location::new(
-                    caller_function.definition_location.file_path.clone(),
-                    caller_function.definition_location.line,
-                    caller_function.definition_location.column,
+                    call.to.uri.path().to_string(), // Use the callee's file for call location
+                    (from_range.start.line + 1) as u32,
+                    (from_range.start.character + 1) as u32,
                 );
                 self.call_graph
-                    .add_call(symbol_id.clone(), callee_id, call_location);
+                    .add_call(symbol_id.clone(), callee_id.clone(), call_location);
+            }
+        }
+    }
+
+    /// Update function incoming calls from LSP response
+    fn update_function_incoming_calls(
+        &mut self,
+        symbol_id: SymbolId,
+        calls: Vec<lsp_types::CallHierarchyIncomingCall>,
+    ) {
+        // Process incoming calls and convert them to call graph relationships
+        for call in calls {
+            // Convert LSP location to our Location type
+            let location = core_data::Location::new(
+                call.from.uri.path().to_string(),
+                (call.from.range.start.line + 1) as u32, // Convert from 0-indexed to 1-indexed
+                (call.from.range.start.character + 1) as u32,
+            );
+
+            // Create or update the caller function
+            let caller_function = core_data::FunctionNode::new(
+                call.from.name.clone(),
+                format!("{}::{}", call.from.name, location.file_path),
+                location,
+            );
+
+            // Add the caller function to the call graph and get its ID
+            let caller_id = self.call_graph.add_function(caller_function);
+
+            // Create the call edge from the caller to the original function
+            // Use the call location from the LSP response
+            for from_range in &call.from_ranges {
+                let call_location = core_data::Location::new(
+                    call.from.uri.path().to_string(), // Use the caller's file for call location
+                    (from_range.start.line + 1) as u32,
+                    (from_range.start.character + 1) as u32,
+                );
+                self.call_graph
+                    .add_call(caller_id.clone(), symbol_id.clone(), call_location);
             }
         }
     }
@@ -764,7 +894,6 @@ impl App {
             Action::ExpandOrCollapse => self.handle_expand_or_collapse(),
             Action::SwitchTab => self.next_tab(),
             Action::FindReferences => self.handle_find_references(),
-            Action::ToggleViewMode => self.handle_toggle_view_mode(),
             Action::Refresh => self.handle_refresh(),
             Action::Quit => self.quit(),
             Action::Help => self.toggle_help(),
@@ -868,27 +997,13 @@ impl App {
     }
 
     fn load_callees_for_node(&mut self, symbol_id: SymbolId) {
-        match self.tree_view_state.view_mode {
-            TreeViewMode::CallHierarchy => {
-                // Get callees for the symbol
-                let callees = self.call_graph.get_callees(&symbol_id);
-                let callee_ids: Vec<SymbolId> = callees.iter().map(|f| f.id.clone()).collect();
+        // Get callees for the symbol
+        let callees = self.call_graph.get_callees(&symbol_id);
+        let callee_ids: Vec<SymbolId> = callees.iter().map(|f| f.id.clone()).collect();
 
-                // Find the node index and insert children
-                if let Some(node_index) = self.tree_view_state.find_node_index(&symbol_id) {
-                    self.tree_view_state.insert_children(node_index, callee_ids);
-                }
-            }
-            TreeViewMode::References => {
-                // In references mode, we don't expand to show more callees
-                // Instead, reference locations are already shown when the tree is built
-                // Mark the node as having no children to expand
-                if let Some(node_index) = self.tree_view_state.find_node_index(&symbol_id) {
-                    if let Some(node) = self.tree_view_state.nodes.get_mut(node_index) {
-                        node.set_children_loaded(false); // References are leaf nodes
-                    }
-                }
-            }
+        // Find the node index and insert children
+        if let Some(node_index) = self.tree_view_state.find_node_index(&symbol_id) {
+            self.tree_view_state.insert_children(node_index, callee_ids);
         }
     }
 
@@ -943,91 +1058,43 @@ impl App {
         self.status_message = "Refreshing project data from LSP server...".to_string();
     }
 
-    fn handle_toggle_view_mode(&mut self) {
-        if self.current_tab == 1 {
-            self.tree_view_state.toggle_view_mode();
-            let mode_name = match self.tree_view_state.view_mode {
-                TreeViewMode::CallHierarchy => "Call Hierarchy",
-                TreeViewMode::References => "References",
-            };
-            self.status_message = format!("Switched to {} view", mode_name);
-
-            // Clear the tree and rebuild with the current function in the new mode
-            if let Some(selected_function) = &self.selected_function.clone() {
-                self.rebuild_tree_for_current_mode(selected_function.clone());
-            }
-        } else {
-            self.status_message = "View mode toggle only available in Call Graph tab".to_string();
-        }
-    }
-
     pub fn start_call_graph_with_function(&mut self, symbol_id: SymbolId) {
+        log::info!(
+            "Starting call graph exploration with function: {:?}",
+            symbol_id
+        );
+
+        // Check if we're already displaying the same function as root
+        if let Some(current_root) = self.tree_view_state.nodes.get(0) {
+            if current_root.symbol_id == symbol_id {
+                log::info!("Function {:?} is already the root of the call graph, switching to call graph tab", symbol_id);
+                self.selected_function = Some(symbol_id);
+                self.current_tab = 1; // Switch to call graph tab
+                return; // Don't create a new tree
+            }
+        }
+
         self.tree_view_state = TreeViewState::new();
         self.tree_view_state.add_root_node(symbol_id.clone());
-        self.selected_function = Some(symbol_id);
+        self.selected_function = Some(symbol_id.clone());
         self.current_tab = 1; // Switch to call graph tab
-        self.status_message = "Started call graph exploration".to_string();
-    }
 
-    fn rebuild_tree_for_current_mode(&mut self, symbol_id: SymbolId) {
-        // Clear current tree and rebuild based on the view mode
-        self.tree_view_state.nodes.clear();
-        self.tree_view_state.selected_index = 0;
-
-        match self.tree_view_state.view_mode {
-            TreeViewMode::CallHierarchy => {
-                // Standard call hierarchy - show what this function calls
-                self.tree_view_state.add_root_node(symbol_id);
-            }
-            TreeViewMode::References => {
-                // References mode - show where this function is referenced/used
-                self.load_references_for_tree(symbol_id);
-            }
-        }
-    }
-
-    fn load_references_for_tree(&mut self, symbol_id: SymbolId) {
-        // Add the root function
-        self.tree_view_state.add_root_node(symbol_id.clone());
-
-        // Get the function to access its references
-        if let Some(function) = self.call_graph.nodes.get(&symbol_id) {
-            let references = function.references.clone();
-
-            if references.is_empty() {
-                // No references loaded yet, request them from LSP
-                self.request_references(&symbol_id);
-            } else {
-                // References are already loaded, display them
-                let reference_locations: Vec<core_data::Location> =
-                    references.iter().map(|r| r.location.clone()).collect();
-                self.populate_reference_nodes(&symbol_id, &reference_locations);
-            }
-        }
-    }
-
-    fn populate_reference_nodes(
-        &mut self,
-        _symbol_id: &SymbolId,
-        references: &[core_data::Location],
-    ) {
-        // Clear all nodes except the root
-        if !self.tree_view_state.nodes.is_empty() {
-            self.tree_view_state.nodes.truncate(1);
-
-            // Mark the root as having references if any exist
-            if let Some(root_node) = self.tree_view_state.nodes.get_mut(0) {
-                root_node.is_expanded = true;
-                root_node.set_children_loaded(references.len() > 0);
-            }
+        // Automatically expand the root node and load its call hierarchy
+        if let Some(root_node) = self.tree_view_state.nodes.get_mut(0) {
+            root_node.expand();
         }
 
-        // Update status with reference count
-        if references.is_empty() {
-            self.status_message = "No references found".to_string();
-        } else {
-            self.status_message = format!("Found {} reference(s)", references.len());
-        }
+        // Immediately request call hierarchy for the root function
+        self.loading_states
+            .insert(symbol_id.clone(), LoadingState::Loading);
+        self.request_call_hierarchy(&symbol_id);
+        self.status_message = "Loading call hierarchy...".to_string();
+
+        log::info!(
+            "Call graph started - nodes: {}, selected_index: {}",
+            self.tree_view_state.nodes.len(),
+            self.tree_view_state.selected_index
+        );
     }
 }
 
@@ -1099,7 +1166,6 @@ impl TuiApp {
                             KeyCode::Enter => Some(Action::ExpandOrCollapse),
                             KeyCode::Char('r') => Some(Action::Refresh),
                             KeyCode::Char('f') => Some(Action::FindReferences),
-                            KeyCode::Char('t') => Some(Action::ToggleViewMode),
                             _ => None,
                         };
 
@@ -1249,7 +1315,6 @@ fn render_help_overlay(f: &mut Frame, area: ratatui::layout::Rect) {
         Line::from("  ← / h     - Collapse selected node"),
         Line::from("  Enter     - Toggle expand/collapse"),
         Line::from("  r         - Find references for selected function"),
-        Line::from("  t         - Toggle between Call Hierarchy and References view"),
         Line::from(""),
         Line::from("Functions List:"),
         Line::from("  Enter     - Start exploring from selected function"),
@@ -1320,136 +1385,69 @@ fn render_tree_call_graph(f: &mut Frame, area: ratatui::layout::Rect, app: &App)
         return;
     }
 
-    let items: Vec<ListItem> = match app.tree_view_state.view_mode {
-        TreeViewMode::CallHierarchy => {
-            // Normal call hierarchy tree view
-            app.tree_view_state
-                .nodes
-                .iter()
-                .enumerate()
-                .map(|(index, node)| {
-                    if let Some(function) = app.call_graph.get_function(&node.symbol_id) {
-                        let indent = "  ".repeat(node.depth);
+    let items: Vec<ListItem> = app
+        .tree_view_state
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| {
+            if let Some(function) = app.call_graph.get_function(&node.symbol_id) {
+                let indent = "  ".repeat(node.depth);
 
-                        let expand_indicator = if node.is_loading {
-                            "⏳"
-                        } else if node.is_expanded {
-                            if node.has_children {
-                                "▼"
-                            } else {
-                                "○"
-                            }
-                        } else if node.children_loaded && !node.has_children {
-                            "○"
-                        } else {
-                            "▶"
-                        };
-
-                        let style = if function.diagnostics.is_empty() {
-                            Style::default().fg(Color::Green)
-                        } else {
-                            let has_errors = function.diagnostics.iter().any(|d| {
-                                matches!(d.severity, core_data::DiagnosticSeverity::Error)
-                            });
-                            if has_errors {
-                                Style::default().fg(Color::Red)
-                            } else {
-                                Style::default().fg(Color::Yellow)
-                            }
-                        };
-
-                        // Highlight selected node
-                        let final_style = if index == app.tree_view_state.selected_index {
-                            style.add_modifier(Modifier::BOLD).bg(Color::DarkGray)
-                        } else {
-                            style
-                        };
-
-                        ListItem::new(Line::from(vec![
-                            Span::raw(indent),
-                            Span::styled(expand_indicator, final_style),
-                            Span::raw(" "),
-                            Span::styled(&function.name, final_style),
-                            Span::raw(" "),
-                            Span::styled(
-                                format!("({})", function.definition_location.file_path),
-                                Style::default().fg(Color::DarkGray),
-                            ),
-                        ]))
+                let expand_indicator = if node.is_loading {
+                    "⏳"
+                } else if node.is_expanded {
+                    if node.has_children {
+                        "▼"
                     } else {
-                        ListItem::new(Line::from("Invalid function"))
+                        "○"
                     }
-                })
-                .collect()
-        }
-        TreeViewMode::References => {
-            // References view - show function and its references
-            let mut items = Vec::new();
+                } else if node.children_loaded && !node.has_children {
+                    "○"
+                } else {
+                    "▶"
+                };
 
-            if let Some(root_node) = app.tree_view_state.nodes.first() {
-                if let Some(function) = app.call_graph.get_function(&root_node.symbol_id) {
-                    // Add the function header
-                    let is_selected = app.tree_view_state.selected_index == 0;
-                    let style = if is_selected {
-                        Style::default()
-                            .fg(Color::Green)
-                            .add_modifier(Modifier::BOLD)
-                            .bg(Color::DarkGray)
+                let style = if function.diagnostics.is_empty() {
+                    Style::default().fg(Color::Green)
+                } else {
+                    let has_errors = function
+                        .diagnostics
+                        .iter()
+                        .any(|d| matches!(d.severity, core_data::DiagnosticSeverity::Error));
+                    if has_errors {
+                        Style::default().fg(Color::Red)
                     } else {
-                        Style::default().fg(Color::Green)
-                    };
-
-                    items.push(ListItem::new(Line::from(vec![Span::styled(
-                        format!("ƒ {} ({})", function.name, function.references.len()),
-                        style,
-                    )])));
-
-                    // Add references
-                    for (i, reference) in function.references.iter().enumerate() {
-                        let is_selected = app.tree_view_state.selected_index == i + 1;
-                        let style = if is_selected {
-                            Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD)
-                                .bg(Color::DarkGray)
-                        } else {
-                            Style::default().fg(Color::Cyan)
-                        };
-
-                        let symbol_text = if let Some(ref symbol) = reference.referencing_symbol {
-                            format!("{} ({})", symbol.name, symbol.qualified_name)
-                        } else {
-                            // Fallback to showing file and line information
-                            let file_name = std::path::Path::new(&reference.location.file_path)
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                                .unwrap_or("unknown");
-                            format!(
-                                "{}:{} [col:{}]",
-                                file_name, reference.location.line, reference.location.column
-                            )
-                        };
-
-                        items.push(ListItem::new(Line::from(vec![
-                            Span::raw("  → "),
-                            Span::styled(symbol_text, style),
-                        ])));
+                        Style::default().fg(Color::Yellow)
                     }
-                }
+                };
+
+                // Highlight selected node
+                let final_style = if index == app.tree_view_state.selected_index {
+                    style.add_modifier(Modifier::BOLD).bg(Color::DarkGray)
+                } else {
+                    style
+                };
+
+                ListItem::new(Line::from(vec![
+                    Span::raw(indent),
+                    Span::styled(expand_indicator, final_style),
+                    Span::raw(" "),
+                    Span::styled(&function.name, final_style),
+                    Span::raw(" "),
+                    Span::styled(
+                        format!("({})", function.definition_location.file_path),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]))
+            } else {
+                ListItem::new(Line::from("Invalid function"))
             }
-
-            items
-        }
-    };
-
-    let mode_name = match app.tree_view_state.view_mode {
-        TreeViewMode::CallHierarchy => "Call Hierarchy",
-        TreeViewMode::References => "References",
-    };
+        })
+        .collect();
 
     let title = format!(
-        "Call Graph - {} ({} nodes) - Use ↑↓/kj, →l/←h, t to toggle mode",
-        mode_name,
+        "Call Graph - Call Hierarchy ({} nodes) - Use ↑↓/kj, →l/←h",
         app.tree_view_state.nodes.len()
     );
 
