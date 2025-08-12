@@ -1,0 +1,3503 @@
+diff --git a/.github/instructions/2D_GRAPH_ENHANCEMENTS_PHASE2.instructions.md b/.github/instructions/2D_GRAPH_ENHANCEMENTS_PHASE2.instructions.md
+new file mode 100644
+index 0000000..627fb03
+--- /dev/null
++++ b/.github/instructions/2D_GRAPH_ENHANCEMENTS_PHASE2.instructions.md
+@@ -0,0 +1,377 @@
++---
++applyTo: 'tui_ui/src/canvas/**'
++---
++# 2D Call Graph Enhancements - Phase 2 Implementation Plan
++
++## Overview
++
++This document outlines the implementation plan to enhance the 2D call graph visualization with the following key requirements:
++
++1. **Node Titles**: Display symbol names directly on nodes in the graph view
++2. **Smooth Lines**: Implement smooth, continuous lines instead of dotted/scattered connections
++3. **Left-to-Right Flow**: Create a hierarchical layout that progresses from left to right
++
++## Current State Analysis
++
++### ✅ **What's Working:**
++- Basic 2D canvas rendering with nodes as rectangles
++- Edge connections as simple lines
++- Force-directed and Grid layout algorithms
++- Pan/zoom navigation
++- View switching between tree and 2D modes
++
++### 🔧 **Current Limitations:**
++1. **Text Rendering**: Node labels are commented out due to Canvas text complexity
++2. **Line Quality**: Using basic Line primitives which appear dotted in Braille mode
++3. **Layout Direction**: Force-directed layout has no directional bias, Grid layout doesn't respect call hierarchy
++
++## Implementation Plan
++
++### **Phase 2.1: Node Titles (Priority: High)**
++
++#### Challenge Analysis:
++Ratatui's Canvas widget has limited text rendering capabilities within the canvas context. Text rendering in Canvas is not straightforward like in other widgets.
++
++#### Solution Strategy:
++**Hybrid Rendering Approach**
++- Use Canvas for geometric elements (nodes, edges)
++- Overlay text using separate Paragraph widgets positioned absolutely
++- Calculate text positions based on canvas coordinate transformation
++
++#### Implementation Steps:
++
++1. **Text Position Calculator** (`tui_ui/src/canvas/text_overlay.rs`):
++```rust
++pub struct TextOverlay {
++    pub text: String,
++    pub world_x: f64,
++    pub world_y: f64,
++    pub style: Style,
++}
++
++pub fn calculate_text_overlays(
++    layout: &GridLayout,
++    call_graph: &CallGraph,
++    viewport: &Viewport,
++    area: Rect,
++) -> Vec<(TextOverlay, Rect)> {
++    // Convert world coordinates to screen positions
++    // Filter visible nodes based on viewport
++    // Calculate text positioning to avoid overlap
++}
++```
++
++2. **Enhanced Canvas Renderer** (`tui_ui/src/canvas/canvas_renderer.rs`):
++```rust
++pub fn render_canvas_with_labels(
++    f: &mut Frame,
++    area: Rect,
++    layout: &GridLayout,
++    call_graph: &CallGraph,
++    selected_function: Option<&SymbolId>,
++) -> Vec<(TextOverlay, Rect)> {
++    // Render canvas as before
++    render_canvas_call_graph(f, area, layout, call_graph, selected_function);
++    
++    // Calculate text overlay positions
++    calculate_text_overlays(layout, call_graph, &layout.viewport, area)
++}
++```
++
++3. **Text Overlay Rendering** (in main UI function):
++```rust
++// After rendering canvas
++let text_overlays = render_canvas_with_labels(f, chunks[1], layout, call_graph, selected);
++for (overlay, text_area) in text_overlays {
++    let paragraph = Paragraph::new(overlay.text)
++        .style(overlay.style)
++        .alignment(Alignment::Center);
++    f.render_widget(paragraph, text_area);
++}
++```
++
++#### Alternative Approach (Simpler):
++**Text-on-Canvas using Points**
++- Use dense point patterns to "draw" text characters
++- Create a bitmap font renderer for basic characters
++- Less clean but works entirely within Canvas
++
++### **Phase 2.2: Smooth Lines (Priority: Medium)**
++
++#### Challenge Analysis:
++Ratatui Canvas uses Braille characters for high resolution, but Line primitives create dotted appearance due to discrete point plotting.
++
++#### Solution Strategy:
++**Custom Line Rendering with Dense Points**
++
++#### Implementation Steps:
++
++1. **Smooth Line Renderer** (`tui_ui/src/canvas/smooth_lines.rs`):
++```rust
++pub struct SmoothLine {
++    pub start: Vector2D,
++    pub end: Vector2D,
++    pub color: Color,
++    pub thickness: f32,
++}
++
++impl SmoothLine {
++    pub fn render(&self, ctx: &mut Context) {
++        // Use Bresenham's line algorithm with anti-aliasing
++        // Plot dense points along the line path
++        let points = self.calculate_line_points();
++        for point in points {
++            ctx.draw(&Point {
++                x: point.x,
++                y: point.y,
++                color: self.color,
++            });
++        }
++    }
++    
++    fn calculate_line_points(&self) -> Vec<Vector2D> {
++        // Dense point sampling for smooth appearance
++        // Interpolate between start and end with small steps
++    }
++}
++```
++
++2. **Enhanced Edge Rendering** (`tui_ui/src/canvas/canvas_renderer.rs`):
++```rust
++fn render_smooth_edges(ctx: &mut Context, layout: &GridLayout) {
++    for edge in &layout.edges {
++        if let (Some(from_node), Some(to_node)) = (
++            layout.nodes.get(&edge.from_symbol),
++            layout.nodes.get(&edge.to_symbol),
++        ) {
++            let smooth_line = SmoothLine {
++                start: Vector2D::new(from_node.position.x, from_node.position.y),
++                end: Vector2D::new(to_node.position.x, to_node.position.y),
++                color: edge.color,
++                thickness: edge.weight,
++            };
++            smooth_line.render(ctx);
++        }
++    }
++}
++```
++
++3. **Marker Enhancement**:
++- Experiment with different markers: `Marker::Dot`, `Marker::Block`
++- Test combination of markers for better line quality
++
++### **Phase 2.3: Left-to-Right Hierarchical Layout (Priority: High)**
++
++#### Current Issue:
++The hierarchical layout is defined but not implemented. Force-directed layout doesn't respect call direction.
++
++#### Solution Strategy:
++**Sugiyama-style Layered Layout Algorithm**
++
++#### Implementation Steps:
++
++1. **Call Graph Analysis** (`tui_ui/src/canvas/graph_analysis.rs`):
++```rust
++pub struct GraphLayers {
++    pub layers: Vec<Vec<SymbolId>>,
++    pub max_layer: usize,
++}
++
++pub fn analyze_call_hierarchy(call_graph: &CallGraph, root_nodes: &[SymbolId]) -> GraphLayers {
++    // Perform topological sort to identify layers
++    // Layer 0: Root functions (entry points)
++    // Layer 1: Functions called by Layer 0
++    // Layer N: Functions called by Layer N-1
++    // Handle cycles by promoting nodes to earlier layers
++}
++
++pub fn detect_cycles(call_graph: &CallGraph) -> Vec<Vec<SymbolId>> {
++    // Use DFS to detect strongly connected components
++    // Break cycles by removing back edges
++}
++```
++
++2. **Hierarchical Layout Implementation** (`tui_ui/src/canvas/layout_algorithms.rs`):
++```rust
++pub struct HierarchicalLayout {
++    config: HierarchicalConfig,
++    layers: GraphLayers,
++}
++
++impl HierarchicalLayout {
++    pub fn calculate_layout(&mut self, call_graph: &CallGraph) -> GridLayout {
++        // Step 1: Analyze call hierarchy and assign layers
++        let root_nodes = self.find_root_nodes(call_graph);
++        self.layers = analyze_call_hierarchy(call_graph, &root_nodes);
++        
++        // Step 2: Position nodes layer by layer
++        let mut layout = GridLayout::new();
++        
++        for (layer_index, layer_nodes) in self.layers.layers.iter().enumerate() {
++            let x = layer_index as f64 * self.config.layer_spacing;
++            
++            // Distribute nodes vertically within the layer
++            let node_count = layer_nodes.len();
++            let total_height = (node_count - 1) as f64 * self.config.node_spacing;
++            let start_y = -total_height / 2.0;
++            
++            for (node_index, symbol_id) in layer_nodes.iter().enumerate() {
++                let y = start_y + node_index as f64 * self.config.node_spacing;
++                
++                let position = NodePosition::new(x, y);
++                let node = VisualNode::new(symbol_id.clone(), position)
++                    .with_color(self.get_layer_color(layer_index));
++                
++                layout.add_node(node);
++            }
++        }
++        
++        // Step 3: Add edges with proper routing
++        self.add_hierarchical_edges(&mut layout, call_graph);
++        
++        layout.center_viewport_on_bounds();
++        layout
++    }
++    
++    fn find_root_nodes(&self, call_graph: &CallGraph) -> Vec<SymbolId> {
++        // Find nodes with no incoming calls (entry points)
++        call_graph.nodes.keys()
++            .filter(|id| call_graph.get_callers(id).is_empty())
++            .cloned()
++            .collect()
++    }
++    
++    fn get_layer_color(&self, layer_index: usize) -> Color {
++        // Color gradient from left to right
++        match layer_index % 5 {
++            0 => Color::Red,     // Entry points
++            1 => Color::Yellow,  // First level
++            2 => Color::Blue,    // Second level
++            3 => Color::Green,   // Third level
++            _ => Color::Cyan,    // Deeper levels
++        }
++    }
++}
++```
++
++3. **Edge Routing for Hierarchical Layout** (`tui_ui/src/canvas/edge_routing.rs`):
++```rust
++pub fn route_hierarchical_edge(
++    from_node: &VisualNode,
++    to_node: &VisualNode,
++    config: &HierarchicalConfig,
++) -> Vec<Vector2D> {
++    // Calculate edge path that avoids node overlaps
++    // For left-right layout:
++    // - Start from right edge of source node
++    // - End at left edge of target node
++    // - Use bezier curves or right-angle routing for clean appearance
++    
++    match config.direction {
++        LayoutDirection::LeftRight => {
++            vec![
++                Vector2D::new(from_node.position.x + from_node.width/2.0, from_node.position.y),
++                Vector2D::new(to_node.position.x - to_node.width/2.0, to_node.position.y),
++            ]
++        }
++        // Handle other directions...
++        _ => todo!("Implement other directions")
++    }
++}
++```
++
++4. **Integration with Layout Manager** (`tui_ui/src/canvas/grid_layout.rs`):
++```rust
++impl GridLayoutManager {
++    pub fn calculate_layout(&mut self, call_graph: &core_data::CallGraph) {
++        match &self.layout_algorithm {
++            LayoutAlgorithm::Hierarchical(config) => {
++                let mut algorithm = HierarchicalLayout::new(config.clone());
++                self.current_layout = algorithm.calculate_layout(call_graph);
++            }
++            // ... existing implementations
++        }
++    }
++}
++```
++
++## File Structure Changes
++
++### New Files:
++```
++tui_ui/src/canvas/
++├── text_overlay.rs          # Text positioning and overlay management
++├── smooth_lines.rs          # Smooth line rendering with dense points
++├── graph_analysis.rs        # Call hierarchy analysis and layer detection
++├── edge_routing.rs          # Advanced edge routing for clean layouts
++└── hierarchical_layout.rs   # Complete hierarchical layout implementation
++```
++
++### Modified Files:
++```
++tui_ui/src/canvas/
++├── canvas_renderer.rs       # Enhanced with text overlay support
++├── layout_algorithms.rs     # Complete hierarchical implementation
++├── mod.rs                   # Export new modules
++└── visual_elements.rs       # Enhanced with text positioning data
++```
++
++## Implementation Priority
++
++### **Sprint 1 (Week 1): Node Titles**
++1. Implement text overlay system
++2. Create coordinate transformation utilities
++3. Add basic text rendering with function names
++4. Test with different zoom levels
++
++### **Sprint 2 (Week 2): Hierarchical Layout**
++1. Implement graph analysis and layer detection
++2. Create hierarchical layout algorithm
++3. Add left-to-right progression
++4. Test with various call graph structures
++
++### **Sprint 3 (Week 3): Smooth Lines**
++1. Implement smooth line rendering
++2. Test different markers and rendering approaches
++3. Optimize for performance
++4. Add line styling options
++
++### **Sprint 4 (Week 4): Polish & Integration**
++1. Fine-tune all features together
++2. Add configuration options
++3. Performance optimization
++4. User experience improvements
++
++## Configuration Options
++
++Add to user settings:
++```rust
++pub struct Canvas2DConfig {
++    pub show_node_labels: bool,
++    pub label_font_size: f32,
++    pub smooth_lines: bool,
++    pub line_density: f32,
++    pub hierarchical_direction: LayoutDirection,
++    pub layer_spacing: f64,
++    pub auto_layout_direction: bool, // Auto-detect best direction
++}
++```
++
++## Testing Strategy
++
++1. **Unit Tests**: Test each layout algorithm separately
++2. **Integration Tests**: Test text overlay positioning accuracy
++3. **Performance Tests**: Measure rendering performance with large graphs
++4. **Visual Tests**: Manual verification of layout quality
++
++## Success Criteria
++
++✅ **Node Titles**: Function names clearly visible on nodes at appropriate zoom levels
++✅ **Smooth Lines**: Edges appear as continuous lines without dotting artifacts  
++✅ **Left-Right Flow**: Call graph flows logically from entry points (left) to leaf functions (right)
++✅ **Performance**: Smooth navigation and layout switching for graphs up to 100+ nodes
++✅ **Integration**: All features work together seamlessly with existing functionality
++
++---
++
++*This implementation plan provides a comprehensive roadmap for enhancing the 2D call graph visualization while maintaining the existing functionality and performance characteristics.*
+diff --git a/.github/instructions/2D_GRID_REFACTOR.instructions.md b/.github/instructions/2D_GRID_REFACTOR.instructions.md
+new file mode 100644
+index 0000000..3ef780e
+--- /dev/null
++++ b/.github/instructions/2D_GRID_REFACTOR.instructions.md
+@@ -0,0 +1,597 @@
++---
++applyTo: '**'
++---
++# 2D Grid Call Graph Visualization Refactor Plan
++
++## Current State Analysis
++
++The current call graph UI in Coon uses a simple tree view with text-based indentation to show hierarchical relationships. This is rendered in `render_tree_call_graph()` using ratatui's `List` widget, which displays functions as text items with indentation indicating depth.
++
++### Current Call Graph UI Architecture
++- **Location**: `tui_ui/src/lib.rs` - `render_tree_call_graph()` function
++- **Current Tab**: Tab index 1 ("Call Graph")
++- **Rendering**: Uses `List` widget with text-based indentation
++- **Navigation**: Tree-like with expand/collapse functionality
++- **State**: `TreeViewState` manages the hierarchical structure
++
++### Limitations of Current Approach
++- No visual representation of actual graph structure
++- Difficult to see complex relationships and cycles
++- Limited space utilization - only shows one path at a time
++- No visual indication of connection strength or types
++- Cannot show multiple entry points simultaneously
++
++## Ratatui 2D Graphics Capabilities
++
++Ratatui 0.28 provides excellent 2D graphics support through its `Canvas` widget module:
++
++### Available Drawing Primitives
++- **Canvas**: Main drawing surface with coordinate system
++- **Rectangle**: For drawing node boxes
++- **Line**: For drawing edges between nodes
++- **Circle**: Alternative node representation
++- **Points**: For decorative elements or small nodes
++- **Label**: For adding text labels to nodes
++
++### Key Features
++- Coordinate-based positioning (x, y coordinates)
++- Color support for visual differentiation
++- Custom shapes through the `Shape` trait
++- Scalable coordinate system
++- Mouse interaction potential (though limited in terminal)
++
++## Proposed 2D Grid Architecture
++
++### 1. Core Data Structures
++
++#### Node Positioning
++```rust
++#[derive(Debug, Clone)]
++pub struct NodePosition {
++    pub x: f64,
++    pub y: f64,
++}
++
++#[derive(Debug, Clone)]
++pub struct VisualNode {
++    pub symbol_id: SymbolId,
++    pub position: NodePosition,
++    pub width: f64,
++    pub height: f64,
++    pub is_selected: bool,
++    pub is_highlighted: bool,
++    pub color: Color,
++}
++```
++
++#### Edge Representation
++```rust
++#[derive(Debug, Clone)]
++pub struct VisualEdge {
++    pub from_symbol: SymbolId,
++    pub to_symbol: SymbolId,
++    pub edge_type: EdgeType,
++    pub color: Color,
++    pub weight: f32, // For line thickness
++}
++
++#[derive(Debug, Clone)]
++pub enum EdgeType {
++    Call,
++    Reference,
++    Inheritance,
++    Dependency,
++}
++```
++
++#### Grid Layout System
++```rust
++#[derive(Debug, Clone)]
++pub struct GridLayout {
++    pub nodes: HashMap<SymbolId, VisualNode>,
++    pub edges: Vec<VisualEdge>,
++    pub viewport: Viewport,
++    pub grid_bounds: Rect,
++}
++
++#[derive(Debug, Clone)]
++pub struct Viewport {
++    pub center_x: f64,
++    pub center_y: f64,
++    pub zoom_level: f64,
++}
++```
++
++### 2. Layout Algorithms
++
++#### Force-Directed Layout (Primary)
++- **Algorithm**: Modified Fruchterman-Reingold
++- **Benefits**: Natural clustering, handles cycles well
++- **Implementation**: Iterative physics simulation
++- **Features**: 
++  - Repulsion between nodes prevents overlap
++  - Attraction along edges creates logical grouping
++  - Configurable parameters for different graph types
++
++#### Hierarchical Layout (Alternative)
++- **Algorithm**: Sugiyama-style layered layout
++- **Benefits**: Clear hierarchy visualization
++- **Use Case**: When call direction is important
++- **Features**:
++  - Layer assignment based on call depth
++  - Minimized edge crossings
++  - Proper ancestor-descendant relationships
++
++#### Grid-Based Layout (Simple)
++- **Algorithm**: Regular grid positioning
++- **Benefits**: Predictable, fast
++- **Use Case**: Small graphs or debugging
++- **Features**:
++  - Fixed grid spacing
++  - Alphabetical or usage-based ordering
++
++### 3. New UI Component Architecture
++
++#### Canvas Call Graph Widget
++```rust
++pub struct CanvasCallGraphWidget<'a> {
++    call_graph: &'a CallGraph,
++    layout: &'a GridLayout,
++    selected_function: Option<&'a SymbolId>,
++    view_mode: ViewMode,
++}
++
++#[derive(Debug, Clone, PartialEq)]
++pub enum ViewMode {
++    Overview,      // Show all nodes
++    Focused,       // Center on selected function with neighbors
++    Path,          // Show path between two functions
++    Cluster,       // Show logical clusters/modules
++}
++```
++
++#### Grid Layout Manager
++```rust
++pub struct GridLayoutManager {
++    layout_algorithm: LayoutAlgorithm,
++    layout_cache: HashMap<String, GridLayout>,
++    animation_state: AnimationState,
++}
++
++#[derive(Debug, Clone)]
++pub enum LayoutAlgorithm {
++    ForceDirected(ForceDirectedConfig),
++    Hierarchical(HierarchicalConfig),
++    Grid(GridConfig),
++}
++```
++
++### 4. Integration with Existing System
++
++#### Modified App State
++```rust
++pub struct App {
++    // ... existing fields ...
++    
++    // New fields for 2D grid
++    pub grid_layout: GridLayout,
++    pub layout_manager: GridLayoutManager,
++    pub graph_view_mode: ViewMode,
++    pub canvas_viewport: Viewport,
++    pub selected_node_position: Option<NodePosition>,
++    
++    // Animation and interaction
++    pub layout_animation_progress: f32,
++    pub mouse_interaction: MouseState,
++}
++```
++
++#### New Actions
++```rust
++#[derive(Debug, Clone, PartialEq)]
++pub enum Action {
++    // ... existing actions ...
++    
++    // Grid-specific actions
++    ZoomIn,
++    ZoomOut,
++    PanUp,
++    PanDown,
++    PanLeft,
++    PanRight,
++    CenterOnSelected,
++    ResetZoom,
++    ToggleViewMode,
++    RelayoutGraph,
++    SelectLayoutAlgorithm(LayoutAlgorithm),
++}
++```
++
++### 5. Rendering Pipeline
++
++#### Canvas Rendering Function
++```rust
++fn render_canvas_call_graph(f: &mut Frame, area: Rect, app: &App) {
++    let canvas = Canvas::default()
++        .block(
++            Block::default()
++                .borders(Borders::ALL)
++                .title(format!(
++                    "Call Graph - 2D View ({} nodes) - WASD/hjkl to pan, +/- to zoom, Space to center",
++                    app.grid_layout.nodes.len()
++                ))
++        )
++        .paint(|ctx| {
++            // Render edges first (background)
++            render_edges(ctx, &app.grid_layout, &app.canvas_viewport);
++            
++            // Render nodes (foreground)
++            render_nodes(ctx, &app.grid_layout, &app.canvas_viewport, app.selected_function.as_ref());
++            
++            // Render labels
++            render_labels(ctx, &app.grid_layout, &app.canvas_viewport, &app.call_graph);
++        })
++        .marker(Marker::Braille) // High resolution
++        .x_bounds([
++            app.canvas_viewport.center_x - (area.width as f64 / app.canvas_viewport.zoom_level / 2.0),
++            app.canvas_viewport.center_x + (area.width as f64 / app.canvas_viewport.zoom_level / 2.0),
++        ])
++        .y_bounds([
++            app.canvas_viewport.center_y - (area.height as f64 / app.canvas_viewport.zoom_level / 2.0),
++            app.canvas_viewport.center_y + (area.height as f64 / app.canvas_viewport.zoom_level / 2.0),
++        ]);
++
++    f.render_widget(canvas, area);
++}
++```
++
++#### Node Rendering
++```rust
++fn render_nodes(ctx: &mut Context, layout: &GridLayout, viewport: &Viewport, selected: Option<&SymbolId>) {
++    for (symbol_id, visual_node) in &layout.nodes {
++        let color = if Some(symbol_id) == selected {
++            Color::Yellow
++        } else {
++            visual_node.color
++        };
++        
++        // Draw node as rectangle
++        let rect = Rectangle {
++            x: visual_node.position.x - visual_node.width / 2.0,
++            y: visual_node.position.y - visual_node.height / 2.0,
++            width: visual_node.width,
++            height: visual_node.height,
++            color,
++        };
++        
++        ctx.draw(&rect);
++        
++        // Add selection highlight
++        if visual_node.is_selected {
++            let highlight = Rectangle {
++                x: visual_node.position.x - visual_node.width / 2.0 - 1.0,
++                y: visual_node.position.y - visual_node.height / 2.0 - 1.0,
++                width: visual_node.width + 2.0,
++                height: visual_node.height + 2.0,
++                color: Color::White,
++            };
++            ctx.draw(&highlight);
++        }
++    }
++}
++```
++
++#### Edge Rendering
++```rust
++fn render_edges(ctx: &mut Context, layout: &GridLayout, viewport: &Viewport) {
++    for edge in &layout.edges {
++        if let (Some(from_node), Some(to_node)) = (
++            layout.nodes.get(&edge.from_symbol),
++            layout.nodes.get(&edge.to_symbol),
++        ) {
++            let line = Line {
++                x1: from_node.position.x,
++                y1: from_node.position.y,
++                x2: to_node.position.x,
++                y2: to_node.position.y,
++                color: edge.color,
++            };
++            
++            ctx.draw(&line);
++            
++            // Optional: Draw arrow heads for directed edges
++            if matches!(edge.edge_type, EdgeType::Call) {
++                draw_arrow_head(ctx, &from_node.position, &to_node.position, edge.color);
++            }
++        }
++    }
++}
++```
++
++### 6. Layout Algorithm Implementation
++
++#### Force-Directed Layout Core
++```rust
++pub struct ForceDirectedLayout {
++    config: ForceDirectedConfig,
++    node_forces: HashMap<SymbolId, Vector2D>,
++    iteration_count: usize,
++}
++
++impl ForceDirectedLayout {
++    pub fn calculate_layout(&mut self, call_graph: &CallGraph) -> GridLayout {
++        let mut layout = self.initialize_layout(call_graph);
++        
++        for _ in 0..self.config.max_iterations {
++            self.calculate_forces(&layout, call_graph);
++            self.apply_forces(&mut layout);
++            
++            if self.forces_converged() {
++                break;
++            }
++        }
++        
++        layout
++    }
++    
++    fn calculate_forces(&mut self, layout: &GridLayout, call_graph: &CallGraph) {
++        // Calculate repulsive forces between all nodes
++        for (id1, node1) in &layout.nodes {
++            for (id2, node2) in &layout.nodes {
++                if id1 != id2 {
++                    let repulsion = self.calculate_repulsion(&node1.position, &node2.position);
++                    self.node_forces.entry(id1.clone()).or_default().add(repulsion);
++                }
++            }
++        }
++        
++        // Calculate attractive forces along edges
++        for edge in call_graph.edges.iter() {
++            if let (Some(from_node), Some(to_node)) = (
++                layout.nodes.get(&edge.caller),
++                layout.nodes.get(&edge.callee),
++            ) {
++                let attraction = self.calculate_attraction(&from_node.position, &to_node.position);
++                self.node_forces.entry(edge.caller.clone()).or_default().add(attraction);
++                self.node_forces.entry(edge.callee.clone()).or_default().subtract(attraction);
++            }
++        }
++    }
++}
++```
++
++### 7. User Interaction and Navigation
++
++#### New Key Bindings
++```rust
++// In input handling
++KeyCode::Char('w') | KeyCode::Up => Some(Action::PanUp),
++KeyCode::Char('s') | KeyCode::Down => Some(Action::PanDown),
++KeyCode::Char('a') | KeyCode::Left => Some(Action::PanLeft),
++KeyCode::Char('d') | KeyCode::Right => Some(Action::PanRight),
++KeyCode::Char('+') | KeyCode::Char('=') => Some(Action::ZoomIn),
++KeyCode::Char('-') => Some(Action::ZoomOut),
++KeyCode::Char(' ') => Some(Action::CenterOnSelected),
++KeyCode::Char('0') => Some(Action::ResetZoom),
++KeyCode::Char('v') => Some(Action::ToggleViewMode),
++KeyCode::Char('l') => Some(Action::RelayoutGraph),
++```
++
++#### Mouse Support (Future Enhancement)
++```rust
++// Mouse wheel for zooming
++// Click and drag for panning  
++// Click to select nodes
++// Double-click to focus on node
++```
++
++### 8. Performance Optimizations
++
++#### Level of Detail (LOD)
++- Show simplified representation when zoomed out
++- Hide labels when nodes are too small
++- Use different node shapes at different zoom levels
++- Cull off-screen elements
++
++#### Caching Strategy
++- Cache layout calculations
++- Incremental updates for small changes
++- Dirty flagging for selective re-rendering
++- Background layout computation
++
++#### Memory Management
++- Limit visible nodes based on viewport
++- Lazy loading of graph sections
++- Memory-mapped large graphs
++- Configurable detail levels
++
++## Implementation Phases
++
++### Phase 1: Core Infrastructure (Week 1-2)
++1. **New Data Structures**
++   - Add `NodePosition`, `VisualNode`, `VisualEdge` structs
++   - Create `GridLayout` and `Viewport` management
++   - Update `App` struct with new fields
++
++2. **Basic Canvas Rendering**
++   - Replace `render_tree_call_graph()` with `render_canvas_call_graph()`
++   - Implement basic rectangle nodes and line edges
++   - Add simple grid-based layout as starting point
++
++3. **Navigation Controls**
++   - Add pan and zoom actions
++   - Implement basic keyboard navigation (WASD)
++   - Add zoom in/out functionality
++
++### Phase 2: Layout Algorithms (Week 3-4)
++1. **Force-Directed Layout**
++   - Implement Fruchterman-Reingold algorithm
++   - Add configurable parameters
++   - Create smooth animation transitions
++
++2. **Hierarchical Layout**
++   - Implement layered layout for call hierarchies
++   - Add proper edge routing
++   - Support for direction toggles (incoming/outgoing)
++
++3. **Layout Management**
++   - Create layout algorithm selection
++   - Add caching for computed layouts
++   - Implement incremental updates
++
++### Phase 3: Enhanced Visualization (Week 5-6)
++1. **Visual Enhancements**
++   - Color coding for different node types
++   - Edge styling (thickness, color, patterns)
++   - Node size based on importance/complexity
++   - Visual feedback for selections
++
++2. **View Modes**
++   - Overview mode (all nodes)
++   - Focused mode (selected + neighbors)
++   - Path mode (shortest path between nodes)
++   - Cluster mode (logical groupings)
++
++3. **Interactive Features**
++   - Node selection in 2D space
++   - Hover effects and tooltips
++   - Contextual information display
++
++### Phase 4: Performance and Polish (Week 7-8)
++1. **Performance Optimizations**
++   - Level of detail rendering
++   - Viewport culling
++   - Layout caching and incremental updates
++   - Memory optimization for large graphs
++
++2. **User Experience**
++   - Smooth animations
++   - Intuitive controls
++   - Help overlay for 2D navigation
++   - Export capabilities
++
++3. **Integration Testing**
++   - Test with large codebases
++   - Performance benchmarking
++   - User interface refinement
++
++## File Structure Changes
++
++### New Files
++```
++tui_ui/src/
++├── canvas/
++│   ├── mod.rs                    # Canvas module exports
++│   ├── grid_layout.rs           # Layout data structures
++│   ├── layout_algorithms.rs     # Force-directed, hierarchical layouts
++│   ├── visual_elements.rs       # VisualNode, VisualEdge definitions
++│   ├── viewport.rs              # Viewport and navigation
++│   ├── canvas_renderer.rs       # Main canvas rendering logic
++│   └── node_selection.rs        # 2D node selection logic
++├── geometry/
++│   ├── mod.rs                   # Geometry utilities
++│   ├── vector2d.rs              # 2D vector math
++│   ├── bounds.rs                # Bounding box calculations
++│   └── collision.rs             # Collision detection for selection
++```
++
++### Modified Files
++```
++tui_ui/src/
++├── lib.rs                       # Update App struct, add canvas rendering
++├── actions.rs                   # Add 2D navigation actions
++└── call_graph_view.rs          # Keep original for fallback mode
++```
++
++## Backward Compatibility
++
++### Dual Mode Support
++- Keep existing tree view as "Tree Mode"
++- Add new 2D view as "Graph Mode"
++- Toggle between modes with 'g' key
++- Both modes share the same underlying data
++
++### Gradual Migration
++- Phase 1: Add 2D view alongside existing tree view
++- Phase 2: Make 2D view the default
++- Phase 3: Optionally remove tree view or keep as compact mode
++
++## Configuration Options
++
++### Layout Configuration
++```rust
++#[derive(Debug, Clone)]
++pub struct LayoutConfig {
++    pub default_algorithm: LayoutAlgorithm,
++    pub force_directed: ForceDirectedConfig,
++    pub hierarchical: HierarchicalConfig,
++    pub animation_speed: f32,
++    pub auto_layout: bool,
++}
++
++#[derive(Debug, Clone)]
++pub struct ForceDirectedConfig {
++    pub repulsion_strength: f32,
++    pub attraction_strength: f32,
++    pub damping: f32,
++    pub max_iterations: usize,
++    pub convergence_threshold: f32,
++}
++```
++
++### Visual Configuration
++```rust
++#[derive(Debug, Clone)]
++pub struct VisualConfig {
++    pub node_size: f32,
++    pub edge_thickness: f32,
++    pub color_scheme: ColorScheme,
++    pub show_labels: bool,
++    pub label_size: f32,
++}
++```
++
++## Testing Strategy
++
++### Unit Tests
++- Layout algorithm correctness
++- Viewport calculations
++- Node positioning
++- Edge routing
++
++### Integration Tests
++- Canvas rendering pipeline
++- User interaction handling
++- Performance with large graphs
++- Memory usage patterns
++
++### User Testing
++- Navigation intuitiveness
++- Visual clarity
++- Performance on target hardware
++- Accessibility considerations
++
++## Future Enhancements
++
++### Advanced Features
++- **Minimap**: Small overview in corner showing full graph
++- **Search Highlighting**: Visual search result highlighting
++- **Filtering**: Hide/show nodes based on criteria
++- **Clustering**: Automatic grouping of related functions
++- **Time-based Views**: Show evolution of call graph over time
++
++### Export Capabilities
++- SVG export for documentation
++- PNG/JPEG export for presentations
++- GraphViz DOT format export
++- JSON layout export for external tools
++
++### Advanced Interactions
++- **Node Grouping**: Manual grouping and ungrouping
++- **Path Highlighting**: Show execution paths
++- **Metrics Overlay**: Show performance metrics on nodes
++- **Diff Mode**: Compare two versions of the same codebase
++
++---
++
++This refactor will transform Coon from a simple tree-based call graph viewer into a powerful 2D graph visualization tool, making it much easier to understand complex code relationships and navigate large codebases. The phased approach ensures that the existing functionality is preserved while gradually building up the new capabilities.
+diff --git a/tui_ui/src/actions.rs b/tui_ui/src/actions.rs
+index 951b316..134a636 100644
+--- a/tui_ui/src/actions.rs
++++ b/tui_ui/src/actions.rs
+@@ -14,6 +14,19 @@ pub enum Action {
+     Quit,
+     Help,
+     ToggleCallDirection,
++    
++    // 2D Grid actions
++    Toggle2DView,
++    PanLeft,
++    PanRight,
++    PanUp,
++    PanDown,
++    ZoomIn,
++    ZoomOut,
++    CenterView,
++    FocusOnSelected,
++    SelectNodeAtCursor,
++    ChangeLayoutAlgorithm,
+ }
+ 
+ /// Represents a node in the tree view with expand/collapse state
+diff --git a/tui_ui/src/canvas/canvas_renderer.rs b/tui_ui/src/canvas/canvas_renderer.rs
+new file mode 100644
+index 0000000..51c98d6
+--- /dev/null
++++ b/tui_ui/src/canvas/canvas_renderer.rs
+@@ -0,0 +1,182 @@
++use super::*;
++use core_data::CallGraph;
++use ratatui::{
++    layout::Rect,
++    style::Color,
++    symbols::Marker,
++    widgets::{
++        canvas::{Canvas, Context, Line, Rectangle},
++        Block, Borders,
++    },
++    Frame,
++};
++
++/// Main canvas rendering function for the 2D call graph with text overlays
++pub fn render_canvas_with_labels(
++    f: &mut Frame,
++    area: Rect,
++    layout: &GridLayout,
++    call_graph: &CallGraph,
++    selected_function: Option<&core_data::SymbolId>,
++) -> Vec<(TextOverlay, Rect)> {
++    // Render canvas as before
++    render_canvas_call_graph(f, area, layout, call_graph, selected_function);
++    
++    // Calculate text overlay positions
++    calculate_text_overlays(layout, call_graph, &layout.viewport, area)
++}
++
++/// Main canvas rendering function for the 2D call graph
++pub fn render_canvas_call_graph(f: &mut Frame, area: Rect, layout: &GridLayout, _call_graph: &CallGraph, selected_function: Option<&core_data::SymbolId>) {
++    let viewport = &layout.viewport;
++    
++    let canvas = Canvas::default()
++        .block(
++            Block::default()
++                .borders(Borders::ALL)
++                .title(format!(
++                    "Call Graph - 2D View ({} nodes) - WASD/hjkl to pan, +/- to zoom, Space to center",
++                    layout.nodes.len()
++                ))
++        )
++        .paint(|ctx| {
++            // Render edges first (background) using smooth lines
++            render_smooth_edges(ctx, layout);
++            
++            // Render nodes (foreground)
++            render_nodes(ctx, layout, selected_function);
++        })
++        .marker(Marker::Braille) // High resolution
++        .x_bounds([
++            viewport.center_x - (area.width as f64 / viewport.zoom_level / 2.0),
++            viewport.center_x + (area.width as f64 / viewport.zoom_level / 2.0),
++        ])
++        .y_bounds([
++            viewport.center_y - (area.height as f64 / viewport.zoom_level / 2.0),
++            viewport.center_y + (area.height as f64 / viewport.zoom_level / 2.0),
++        ]);
++
++    f.render_widget(canvas, area);
++}
++
++/// Render all nodes in the layout
++fn render_nodes(ctx: &mut Context, layout: &GridLayout, selected: Option<&core_data::SymbolId>) {
++    for (symbol_id, visual_node) in &layout.nodes {
++        let color = if Some(symbol_id) == selected {
++            Color::Yellow
++        } else if visual_node.is_selected {
++            Color::White
++        } else {
++            visual_node.color
++        };
++        
++        // Draw node as rectangle
++        let rect = Rectangle {
++            x: visual_node.position.x - visual_node.width / 2.0,
++            y: visual_node.position.y - visual_node.height / 2.0,
++            width: visual_node.width,
++            height: visual_node.height,
++            color,
++        };
++        
++        ctx.draw(&rect);
++        
++        // Add selection highlight
++        if visual_node.is_selected || Some(symbol_id) == selected {
++            let highlight = Rectangle {
++                x: visual_node.position.x - visual_node.width / 2.0 - 1.0,
++                y: visual_node.position.y - visual_node.height / 2.0 - 1.0,
++                width: visual_node.width + 2.0,
++                height: visual_node.height + 2.0,
++                color: Color::White,
++            };
++            ctx.draw(&highlight);
++        }
++    }
++}
++
++/// Render all edges in the layout
++fn render_edges(ctx: &mut Context, layout: &GridLayout) {
++    for edge in &layout.edges {
++        if let (Some(from_node), Some(to_node)) = (
++            layout.nodes.get(&edge.from_symbol),
++            layout.nodes.get(&edge.to_symbol),
++        ) {
++            let line = Line {
++                x1: from_node.position.x,
++                y1: from_node.position.y,
++                x2: to_node.position.x,
++                y2: to_node.position.y,
++                color: edge.color,
++            };
++            
++            ctx.draw(&line);
++            
++            // Optional: Draw arrow heads for directed edges
++            if matches!(edge.edge_type, EdgeType::Call) && layout.viewport.zoom_level > 1.0 {
++                draw_arrow_head(ctx, &from_node.position, &to_node.position, edge.color);
++            }
++        }
++    }
++}
++
++/// Render node labels (when zoomed in enough)
++fn render_labels(ctx: &mut Context, layout: &GridLayout, call_graph: &CallGraph) {
++    for (symbol_id, visual_node) in &layout.nodes {
++        if let Some(function_node) = call_graph.nodes.get(symbol_id) {
++            // Simple label - just show function name
++            let label_text = function_node.name.clone();
++            
++            // For now, we'll skip text rendering as it's complex in canvas
++            // This would be enhanced in future iterations
++            let _ = (label_text, &*ctx, visual_node);
++        }
++    }
++}
++
++/// Draw an arrow head at the end of an edge
++fn draw_arrow_head(ctx: &mut Context, from: &NodePosition, to: &NodePosition, color: Color) {
++    let dx = to.x - from.x;
++    let dy = to.y - from.y;
++    let length = (dx * dx + dy * dy).sqrt();
++    
++    if length < 1.0 {
++        return;
++    }
++    
++    let unit_x = dx / length;
++    let unit_y = dy / length;
++    
++    let arrow_length = 2.0;
++    let arrow_width = 1.0;
++    
++    // Calculate arrow head points
++    let tip_x = to.x;
++    let tip_y = to.y;
++    
++    let base_x = tip_x - arrow_length * unit_x;
++    let base_y = tip_y - arrow_length * unit_y;
++    
++    let perp_x = -unit_y * arrow_width;
++    let perp_y = unit_x * arrow_width;
++    
++    // Draw arrow head lines
++    let line1 = Line {
++        x1: tip_x,
++        y1: tip_y,
++        x2: base_x + perp_x,
++        y2: base_y + perp_y,
++        color,
++    };
++    
++    let line2 = Line {
++        x1: tip_x,
++        y1: tip_y,
++        x2: base_x - perp_x,
++        y2: base_y - perp_y,
++        color,
++    };
++    
++    ctx.draw(&line1);
++    ctx.draw(&line2);
++}
+diff --git a/tui_ui/src/canvas/edge_routing.rs b/tui_ui/src/canvas/edge_routing.rs
+new file mode 100644
+index 0000000..9126207
+--- /dev/null
++++ b/tui_ui/src/canvas/edge_routing.rs
+@@ -0,0 +1,221 @@
++use super::*;
++use crate::geometry::Vector2D;
++
++/// Edge routing for different layout types
++pub fn route_hierarchical_edge(
++    from_node: &VisualNode,
++    to_node: &VisualNode,
++    config: &HierarchicalConfig,
++) -> Vec<Vector2D> {
++    match config.direction {
++        LayoutDirection::LeftRight => route_left_right_edge(from_node, to_node),
++        LayoutDirection::RightLeft => route_right_left_edge(from_node, to_node),
++        LayoutDirection::TopDown => route_top_down_edge(from_node, to_node),
++        LayoutDirection::BottomUp => route_bottom_up_edge(from_node, to_node),
++    }
++}
++
++/// Route edge for left-to-right layout
++fn route_left_right_edge(from_node: &VisualNode, to_node: &VisualNode) -> Vec<Vector2D> {
++    // Start from right edge of source node
++    let start_x = from_node.position.x + from_node.width / 2.0;
++    let start_y = from_node.position.y;
++    
++    // End at left edge of target node
++    let end_x = to_node.position.x - to_node.width / 2.0;
++    let end_y = to_node.position.y;
++    
++    // If target is to the right, use direct connection
++    if end_x > start_x {
++        vec![
++            Vector2D::new(start_x, start_y),
++            Vector2D::new(end_x, end_y),
++        ]
++    } else {
++        // Target is to the left or same column - use curved routing
++        route_curved_edge(start_x, start_y, end_x, end_y)
++    }
++}
++
++/// Route edge for right-to-left layout
++fn route_right_left_edge(from_node: &VisualNode, to_node: &VisualNode) -> Vec<Vector2D> {
++    // Start from left edge of source node
++    let start_x = from_node.position.x - from_node.width / 2.0;
++    let start_y = from_node.position.y;
++    
++    // End at right edge of target node
++    let end_x = to_node.position.x + to_node.width / 2.0;
++    let end_y = to_node.position.y;
++    
++    // If target is to the left, use direct connection
++    if end_x < start_x {
++        vec![
++            Vector2D::new(start_x, start_y),
++            Vector2D::new(end_x, end_y),
++        ]
++    } else {
++        // Target is to the right or same column - use curved routing
++        route_curved_edge(start_x, start_y, end_x, end_y)
++    }
++}
++
++/// Route edge for top-down layout
++fn route_top_down_edge(from_node: &VisualNode, to_node: &VisualNode) -> Vec<Vector2D> {
++    // Start from bottom edge of source node
++    let start_x = from_node.position.x;
++    let start_y = from_node.position.y + from_node.height / 2.0;
++    
++    // End at top edge of target node
++    let end_x = to_node.position.x;
++    let end_y = to_node.position.y - to_node.height / 2.0;
++    
++    // If target is below, use direct connection
++    if end_y > start_y {
++        vec![
++            Vector2D::new(start_x, start_y),
++            Vector2D::new(end_x, end_y),
++        ]
++    } else {
++        // Target is above or same row - use curved routing
++        route_curved_edge(start_x, start_y, end_x, end_y)
++    }
++}
++
++/// Route edge for bottom-up layout
++fn route_bottom_up_edge(from_node: &VisualNode, to_node: &VisualNode) -> Vec<Vector2D> {
++    // Start from top edge of source node
++    let start_x = from_node.position.x;
++    let start_y = from_node.position.y - from_node.height / 2.0;
++    
++    // End at bottom edge of target node
++    let end_x = to_node.position.x;
++    let end_y = to_node.position.y + to_node.height / 2.0;
++    
++    // If target is above, use direct connection
++    if end_y < start_y {
++        vec![
++            Vector2D::new(start_x, start_y),
++            Vector2D::new(end_x, end_y),
++        ]
++    } else {
++        // Target is below or same row - use curved routing
++        route_curved_edge(start_x, start_y, end_x, end_y)
++    }
++}
++
++/// Route curved edge to avoid overlap
++fn route_curved_edge(start_x: f64, start_y: f64, end_x: f64, end_y: f64) -> Vec<Vector2D> {
++    let mid_x = (start_x + end_x) / 2.0;
++    let mid_y = (start_y + end_y) / 2.0;
++    
++    // Add curve points for smoother appearance
++    let control_offset = 20.0;
++    
++    vec![
++        Vector2D::new(start_x, start_y),
++        Vector2D::new(start_x + control_offset, start_y),
++        Vector2D::new(mid_x, mid_y),
++        Vector2D::new(end_x - control_offset, end_y),
++        Vector2D::new(end_x, end_y),
++    ]
++}
++
++/// Route edge with bezier curve
++pub fn route_bezier_edge(
++    from_node: &VisualNode,
++    to_node: &VisualNode,
++    control_strength: f64,
++) -> Vec<Vector2D> {
++    let start = Vector2D::new(from_node.position.x, from_node.position.y);
++    let end = Vector2D::new(to_node.position.x, to_node.position.y);
++    
++    // Calculate control points
++    let direction = end.subtract(&start);
++    let distance = direction.magnitude();
++    let control_distance = distance * control_strength;
++    
++    let control1 = start.add(&direction.normalize().scale(control_distance * 0.3));
++    let control2 = end.subtract(&direction.normalize().scale(control_distance * 0.3));
++    
++    // Generate bezier curve points
++    bezier_curve_points(&start, &control1, &control2, &end, 20)
++}
++
++/// Generate points along a cubic bezier curve
++fn bezier_curve_points(
++    p0: &Vector2D,
++    p1: &Vector2D,
++    p2: &Vector2D,
++    p3: &Vector2D,
++    num_points: usize,
++) -> Vec<Vector2D> {
++    let mut points = Vec::with_capacity(num_points);
++    
++    for i in 0..=num_points {
++        let t = i as f64 / num_points as f64;
++        let point = cubic_bezier_point(p0, p1, p2, p3, t);
++        points.push(point);
++    }
++    
++    points
++}
++
++/// Calculate point on cubic bezier curve at parameter t
++fn cubic_bezier_point(
++    p0: &Vector2D,
++    p1: &Vector2D,
++    p2: &Vector2D,
++    p3: &Vector2D,
++    t: f64,
++) -> Vector2D {
++    let u = 1.0 - t;
++    let tt = t * t;
++    let uu = u * u;
++    let uuu = uu * u;
++    let ttt = tt * t;
++    
++    let mut point = p0.scale(uuu);
++    point = point.add(&p1.scale(3.0 * uu * t));
++    point = point.add(&p2.scale(3.0 * u * tt));
++    point.add(&p3.scale(ttt))
++}
++
++/// Check if two edges would visually overlap
++pub fn edges_overlap(
++    edge1_start: &Vector2D,
++    edge1_end: &Vector2D,
++    edge2_start: &Vector2D,
++    edge2_end: &Vector2D,
++    threshold: f64,
++) -> bool {
++    // Simple check: if edges are very close and parallel
++    let dist1 = point_to_line_distance(edge1_start, edge2_start, edge2_end);
++    let dist2 = point_to_line_distance(edge1_end, edge2_start, edge2_end);
++    
++    (dist1 < threshold && dist2 < threshold) || 
++    (point_to_line_distance(edge2_start, edge1_start, edge1_end) < threshold &&
++     point_to_line_distance(edge2_end, edge1_start, edge1_end) < threshold)
++}
++
++/// Calculate distance from point to line segment
++fn point_to_line_distance(point: &Vector2D, line_start: &Vector2D, line_end: &Vector2D) -> f64 {
++    let line_vec = line_end.subtract(line_start);
++    let point_vec = point.subtract(line_start);
++    
++    let line_length = line_vec.magnitude();
++    if line_length < 0.001 {
++        return point_vec.magnitude();
++    }
++    
++    let line_unit = line_vec.scale(1.0 / line_length);
++    let projection = point_vec.dot(&line_unit);
++    
++    if projection <= 0.0 {
++        point_vec.magnitude()
++    } else if projection >= line_length {
++        point.subtract(line_end).magnitude()
++    } else {
++        let closest_point = line_start.add(&line_unit.scale(projection));
++        point.subtract(&closest_point).magnitude()
++    }
++}
+diff --git a/tui_ui/src/canvas/graph_analysis.rs b/tui_ui/src/canvas/graph_analysis.rs
+new file mode 100644
+index 0000000..0d31826
+--- /dev/null
++++ b/tui_ui/src/canvas/graph_analysis.rs
+@@ -0,0 +1,213 @@
++use core_data::{CallGraph, SymbolId};
++use std::collections::{HashMap, HashSet, VecDeque};
++
++/// Graph layers for hierarchical layout
++#[derive(Debug, Clone)]
++pub struct GraphLayers {
++    pub layers: Vec<Vec<SymbolId>>,
++    pub max_layer: usize,
++    pub layer_map: HashMap<SymbolId, usize>,
++}
++
++impl GraphLayers {
++    pub fn new() -> Self {
++        Self {
++            layers: Vec::new(),
++            max_layer: 0,
++            layer_map: HashMap::new(),
++        }
++    }
++    
++    pub fn get_layer(&self, symbol_id: &SymbolId) -> Option<usize> {
++        self.layer_map.get(symbol_id).copied()
++    }
++    
++    pub fn add_to_layer(&mut self, symbol_id: SymbolId, layer: usize) {
++        // Ensure we have enough layers
++        while self.layers.len() <= layer {
++            self.layers.push(Vec::new());
++        }
++        
++        self.layers[layer].push(symbol_id.clone());
++        self.layer_map.insert(symbol_id, layer);
++        self.max_layer = self.max_layer.max(layer);
++    }
++}
++
++/// Analyze call hierarchy and assign nodes to layers
++pub fn analyze_call_hierarchy(call_graph: &CallGraph, root_nodes: &[SymbolId]) -> GraphLayers {
++    let mut layers = GraphLayers::new();
++    let mut visited = HashSet::new();
++    let mut queue = VecDeque::new();
++    
++    // Start with root nodes at layer 0
++    for root_id in root_nodes {
++        if call_graph.nodes.contains_key(root_id) {
++            queue.push_back((root_id.clone(), 0));
++        }
++    }
++    
++    // If no root nodes found, use all nodes with no incoming calls
++    if queue.is_empty() {
++        let roots = find_root_nodes(call_graph);
++        for root_id in roots {
++            queue.push_back((root_id, 0));
++        }
++    }
++    
++    // If still no roots (circular graph), pick any node
++    if queue.is_empty() && !call_graph.nodes.is_empty() {
++        if let Some(first_node) = call_graph.nodes.keys().next() {
++            queue.push_back((first_node.clone(), 0));
++        }
++    }
++    
++    // Breadth-first traversal to assign layers
++    while let Some((symbol_id, layer)) = queue.pop_front() {
++        if visited.contains(&symbol_id) {
++            continue;
++        }
++        
++        visited.insert(symbol_id.clone());
++        layers.add_to_layer(symbol_id.clone(), layer);
++        
++        // Add callees to next layer
++        let callees = call_graph.get_callees(&symbol_id);
++        for callee in callees {
++            if !visited.contains(&callee.id) {
++                queue.push_back((callee.id.clone(), layer + 1));
++            }
++        }
++    }
++    
++    // Handle any remaining unvisited nodes (disconnected components)
++    for symbol_id in call_graph.nodes.keys() {
++        if !visited.contains(symbol_id) {
++            layers.add_to_layer(symbol_id.clone(), layers.max_layer + 1);
++        }
++    }
++    
++    layers
++}
++
++/// Find root nodes (nodes with no incoming calls)
++pub fn find_root_nodes(call_graph: &CallGraph) -> Vec<SymbolId> {
++    let mut has_incoming = HashSet::new();
++    
++    // Mark all nodes that have incoming calls
++    for edge in &call_graph.edges {
++        has_incoming.insert(&edge.callee);
++    }
++    
++    // Find nodes with no incoming calls
++    call_graph
++        .nodes
++        .keys()
++        .filter(|id| !has_incoming.contains(id))
++        .cloned()
++        .collect()
++}
++
++/// Detect strongly connected components (cycles)
++pub fn detect_cycles(call_graph: &CallGraph) -> Vec<Vec<SymbolId>> {
++    let mut index_counter = 0;
++    let mut stack = Vec::new();
++    let mut indices = HashMap::new();
++    let mut lowlinks = HashMap::new();
++    let mut on_stack = HashSet::new();
++    let mut sccs = Vec::new();
++    
++    for node_id in call_graph.nodes.keys() {
++        if !indices.contains_key(node_id) {
++            tarjan_strongconnect(
++                node_id,
++                call_graph,
++                &mut index_counter,
++                &mut stack,
++                &mut indices,
++                &mut lowlinks,
++                &mut on_stack,
++                &mut sccs,
++            );
++        }
++    }
++    
++    // Filter out single-node SCCs (unless they have self-loops)
++    sccs.into_iter()
++        .filter(|scc| {
++            scc.len() > 1 || 
++            (scc.len() == 1 && call_graph.edges.iter().any(|e| e.caller == scc[0] && e.callee == scc[0]))
++        })
++        .collect()
++}
++
++/// Tarjan's algorithm for finding strongly connected components
++fn tarjan_strongconnect(
++    v: &SymbolId,
++    call_graph: &CallGraph,
++    index_counter: &mut usize,
++    stack: &mut Vec<SymbolId>,
++    indices: &mut HashMap<SymbolId, usize>,
++    lowlinks: &mut HashMap<SymbolId, usize>,
++    on_stack: &mut HashSet<SymbolId>,
++    sccs: &mut Vec<Vec<SymbolId>>,
++) {
++    indices.insert(v.clone(), *index_counter);
++    lowlinks.insert(v.clone(), *index_counter);
++    *index_counter += 1;
++    stack.push(v.clone());
++    on_stack.insert(v.clone());
++    
++    // Consider successors of v
++    let callees = call_graph.get_callees(v);
++    for callee in callees {
++        let w = &callee.id;
++        
++        if !indices.contains_key(w) {
++            // Successor w has not yet been visited; recurse on it
++            tarjan_strongconnect(
++                w,
++                call_graph,
++                index_counter,
++                stack,
++                indices,
++                lowlinks,
++                on_stack,
++                sccs,
++            );
++            lowlinks.insert(v.clone(), lowlinks[v].min(lowlinks[w]));
++        } else if on_stack.contains(w) {
++            // Successor w is in stack and hence in the current SCC
++            lowlinks.insert(v.clone(), lowlinks[v].min(indices[w]));
++        }
++    }
++    
++    // If v is a root node, pop the stack and create an SCC
++    if lowlinks[v] == indices[v] {
++        let mut scc = Vec::new();
++        loop {
++            let w = stack.pop().unwrap();
++            on_stack.remove(&w);
++            scc.push(w.clone());
++            if w == *v {
++                break;
++            }
++        }
++        sccs.push(scc);
++    }
++}
++
++/// Calculate node importance for layout prioritization
++pub fn calculate_node_importance(call_graph: &CallGraph, symbol_id: &SymbolId) -> f64 {
++    let incoming_count = call_graph.get_callers(symbol_id).len() as f64;
++    let outgoing_count = call_graph.get_callees(symbol_id).len() as f64;
++    
++    // Importance based on connectivity (more connections = more important)
++    // Root nodes (no incoming) get bonus importance
++    let root_bonus = if incoming_count == 0.0 && outgoing_count > 0.0 { 10.0 } else { 0.0 };
++    
++    // Leaf nodes (no outgoing) get slight penalty
++    let leaf_penalty = if outgoing_count == 0.0 && incoming_count > 0.0 { -2.0 } else { 0.0 };
++    
++    incoming_count + outgoing_count + root_bonus + leaf_penalty
++}
+diff --git a/tui_ui/src/canvas/grid_layout.rs b/tui_ui/src/canvas/grid_layout.rs
+new file mode 100644
+index 0000000..878fc9b
+--- /dev/null
++++ b/tui_ui/src/canvas/grid_layout.rs
+@@ -0,0 +1,55 @@
++use super::*;
++
++pub use visual_elements::{GridLayout, Viewport};
++
++/// Layout manager that handles different layout algorithms and caching
++pub struct GridLayoutManager {
++    pub layout_algorithm: LayoutAlgorithm,
++    pub current_layout: GridLayout,
++    pub animation_progress: f32,
++}
++
++impl GridLayoutManager {
++    pub fn new() -> Self {
++        Self {
++            layout_algorithm: LayoutAlgorithm::ForceDirected(ForceDirectedConfig::default()),
++            current_layout: GridLayout::new(),
++            animation_progress: 1.0, // Fully loaded initially
++        }
++    }
++
++    pub fn calculate_layout(&mut self, call_graph: &core_data::CallGraph) {
++        match &self.layout_algorithm {
++            LayoutAlgorithm::ForceDirected(config) => {
++                let mut algorithm = ForceDirectedLayout::new(config.clone());
++                self.current_layout = algorithm.calculate_layout(call_graph);
++            }
++            LayoutAlgorithm::Grid(config) => {
++                let algorithm = GridLayoutAlgorithm::new(config.clone());
++                self.current_layout = algorithm.calculate_layout(call_graph);
++            }
++            LayoutAlgorithm::Hierarchical(config) => {
++                let mut algorithm = HierarchicalLayout::new(config.clone());
++                self.current_layout = algorithm.calculate_layout(call_graph);
++            }
++        }
++    }
++
++    pub fn set_algorithm(&mut self, algorithm: LayoutAlgorithm) {
++        self.layout_algorithm = algorithm;
++    }
++
++    pub fn get_layout(&self) -> &GridLayout {
++        &self.current_layout
++    }
++
++    pub fn get_layout_mut(&mut self) -> &mut GridLayout {
++        &mut self.current_layout
++    }
++}
++
++impl Default for GridLayoutManager {
++    fn default() -> Self {
++        Self::new()
++    }
++}
+diff --git a/tui_ui/src/canvas/hierarchical_layout.rs b/tui_ui/src/canvas/hierarchical_layout.rs
+new file mode 100644
+index 0000000..c93afab
+--- /dev/null
++++ b/tui_ui/src/canvas/hierarchical_layout.rs
+@@ -0,0 +1,194 @@
++use super::*;
++use crate::canvas::graph_analysis::{analyze_call_hierarchy, find_root_nodes, calculate_node_importance};
++use core_data::{CallGraph, SymbolId};
++use ratatui::style::Color;
++
++/// Hierarchical layout implementation
++pub struct HierarchicalLayout {
++    config: HierarchicalConfig,
++    layers: Option<crate::canvas::graph_analysis::GraphLayers>,
++}
++
++impl HierarchicalLayout {
++    pub fn new(config: HierarchicalConfig) -> Self {
++        Self {
++            config,
++            layers: None,
++        }
++    }
++
++    pub fn calculate_layout(&mut self, call_graph: &CallGraph) -> GridLayout {
++        // Step 1: Analyze call hierarchy and assign layers
++        let root_nodes = self.find_root_nodes(call_graph);
++        self.layers = Some(analyze_call_hierarchy(call_graph, &root_nodes));
++        
++        // Step 2: Position nodes layer by layer
++        let mut layout = GridLayout::new();
++        
++        if let Some(ref layers) = self.layers {
++            for (layer_index, layer_nodes) in layers.layers.iter().enumerate() {
++                self.position_layer_nodes(&mut layout, call_graph, layer_index, layer_nodes);
++            }
++            
++            // Step 3: Add edges with proper routing
++            self.add_hierarchical_edges(&mut layout, call_graph);
++        }
++        
++        layout.center_viewport_on_bounds();
++        layout
++    }
++    
++    fn find_root_nodes(&self, call_graph: &CallGraph) -> Vec<SymbolId> {
++        let roots = find_root_nodes(call_graph);
++        
++        // If no clear roots found, pick the most important nodes
++        if roots.is_empty() && !call_graph.nodes.is_empty() {
++            let mut nodes_with_importance: Vec<_> = call_graph.nodes.keys()
++                .map(|id| (id, calculate_node_importance(call_graph, id)))
++                .collect();
++            
++            nodes_with_importance.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
++            
++            // Take top 20% as roots, but at least 1
++            let num_roots = (nodes_with_importance.len() / 5).max(1);
++            nodes_with_importance.into_iter()
++                .take(num_roots)
++                .map(|(id, _)| id.clone())
++                .collect()
++        } else {
++            roots
++        }
++    }
++    
++    fn position_layer_nodes(
++        &self,
++        layout: &mut GridLayout,
++        call_graph: &CallGraph,
++        layer_index: usize,
++        layer_nodes: &[SymbolId],
++    ) {
++        let (x, y_start) = self.calculate_layer_position(layer_index, layer_nodes.len());
++        
++        // Sort nodes in layer by importance for better positioning
++        let mut sorted_nodes: Vec<_> = layer_nodes.iter()
++            .map(|id| (id, calculate_node_importance(call_graph, id)))
++            .collect();
++        sorted_nodes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
++        
++        for (node_index, (symbol_id, _)) in sorted_nodes.iter().enumerate() {
++            let y = y_start + node_index as f64 * self.config.node_spacing;
++            
++            let position = NodePosition::new(x, y);
++            let mut node = VisualNode::new((*symbol_id).clone(), position);
++            
++            // Set node properties
++            node.color = self.get_layer_color(layer_index);
++            node.width = self.calculate_node_width(call_graph, symbol_id);
++            node.height = 4.0; // Standard height
++            
++            layout.add_node(node);
++        }
++    }
++    
++    fn calculate_layer_position(&self, layer_index: usize, node_count: usize) -> (f64, f64) {
++        let x = match self.config.direction {
++            LayoutDirection::LeftRight => layer_index as f64 * self.config.layer_spacing,
++            LayoutDirection::RightLeft => -(layer_index as f64) * self.config.layer_spacing,
++            LayoutDirection::TopDown | LayoutDirection::BottomUp => 0.0, // Center horizontally
++        };
++        
++        let y = match self.config.direction {
++            LayoutDirection::TopDown => layer_index as f64 * self.config.layer_spacing,
++            LayoutDirection::BottomUp => -(layer_index as f64) * self.config.layer_spacing,
++            LayoutDirection::LeftRight | LayoutDirection::RightLeft => {
++                // Center vertically
++                let total_height = (node_count.saturating_sub(1)) as f64 * self.config.node_spacing;
++                -total_height / 2.0
++            }
++        };
++        
++        (x, y)
++    }
++    
++    fn get_layer_color(&self, layer_index: usize) -> Color {
++        // Color gradient based on layer depth
++        match layer_index % 6 {
++            0 => Color::Red,     // Entry points
++            1 => Color::Yellow,  // First level
++            2 => Color::Green,   // Second level
++            3 => Color::Blue,    // Third level
++            4 => Color::Magenta, // Fourth level
++            _ => Color::Cyan,    // Deeper levels
++        }
++    }
++    
++    fn calculate_node_width(&self, call_graph: &CallGraph, symbol_id: &SymbolId) -> f64 {
++        if let Some(function_node) = call_graph.nodes.get(symbol_id) {
++            // Base width on function name length
++            let name_length = function_node.name.len() as f64;
++            (name_length * 0.8 + 4.0).min(20.0).max(6.0)
++        } else {
++            8.0 // Default width
++        }
++    }
++    
++    fn add_hierarchical_edges(&self, layout: &mut GridLayout, call_graph: &CallGraph) {
++        for edge in &call_graph.edges {
++            if layout.nodes.contains_key(&edge.caller) && layout.nodes.contains_key(&edge.callee) {
++                let visual_edge = VisualEdge::new(
++                    edge.caller.clone(),
++                    edge.callee.clone(),
++                    EdgeType::Call,
++                ).with_color(self.get_edge_color(&edge.caller, &edge.callee, layout));
++                
++                layout.add_edge(visual_edge);
++            }
++        }
++    }
++    
++    fn get_edge_color(
++        &self,
++        from_symbol: &SymbolId,
++        to_symbol: &SymbolId,
++        layout: &GridLayout,
++    ) -> Color {
++        // Color edges based on the direction relative to layout flow
++        if let (Some(from_node), Some(to_node)) = (
++            layout.nodes.get(from_symbol),
++            layout.nodes.get(to_symbol),
++        ) {
++            match self.config.direction {
++                LayoutDirection::LeftRight => {
++                    if to_node.position.x > from_node.position.x {
++                        Color::Green // Forward edge
++                    } else {
++                        Color::Red // Back edge (potential cycle)
++                    }
++                }
++                LayoutDirection::RightLeft => {
++                    if to_node.position.x < from_node.position.x {
++                        Color::Green // Forward edge
++                    } else {
++                        Color::Red // Back edge
++                    }
++                }
++                LayoutDirection::TopDown => {
++                    if to_node.position.y > from_node.position.y {
++                        Color::Green // Forward edge
++                    } else {
++                        Color::Red // Back edge
++                    }
++                }
++                LayoutDirection::BottomUp => {
++                    if to_node.position.y < from_node.position.y {
++                        Color::Green // Forward edge
++                    } else {
++                        Color::Red // Back edge
++                    }
++                }
++            }
++        } else {
++            Color::Gray // Default
++        }
++    }
++}
+diff --git a/tui_ui/src/canvas/layout_algorithms.rs b/tui_ui/src/canvas/layout_algorithms.rs
+new file mode 100644
+index 0000000..0fd8363
+--- /dev/null
++++ b/tui_ui/src/canvas/layout_algorithms.rs
+@@ -0,0 +1,276 @@
++use super::*;
++use crate::geometry::Vector2D;
++use core_data::{CallGraph, SymbolId};
++use ratatui::style::Color;
++use std::collections::HashMap;
++
++/// Different layout algorithms available
++#[derive(Debug, Clone, PartialEq)]
++pub enum LayoutAlgorithm {
++    ForceDirected(ForceDirectedConfig),
++    Hierarchical(HierarchicalConfig),
++    Grid(GridConfig),
++}
++
++/// Configuration for force-directed layout
++#[derive(Debug, Clone, PartialEq)]
++pub struct ForceDirectedConfig {
++    pub repulsion_strength: f32,
++    pub attraction_strength: f32,
++    pub damping: f32,
++    pub max_iterations: usize,
++    pub convergence_threshold: f32,
++}
++
++impl Default for ForceDirectedConfig {
++    fn default() -> Self {
++        Self {
++            repulsion_strength: 1000.0,
++            attraction_strength: 0.1,
++            damping: 0.9,
++            max_iterations: 100,
++            convergence_threshold: 1.0,
++        }
++    }
++}
++
++/// Configuration for hierarchical layout
++#[derive(Debug, Clone, PartialEq)]
++pub struct HierarchicalConfig {
++    pub layer_spacing: f64,
++    pub node_spacing: f64,
++    pub direction: LayoutDirection,
++}
++
++#[derive(Debug, Clone, PartialEq)]
++pub enum LayoutDirection {
++    TopDown,
++    BottomUp,
++    LeftRight,
++    RightLeft,
++}
++
++impl Default for HierarchicalConfig {
++    fn default() -> Self {
++        Self {
++            layer_spacing: 50.0,
++            node_spacing: 30.0,
++            direction: LayoutDirection::TopDown,
++        }
++    }
++}
++
++/// Configuration for grid layout
++#[derive(Debug, Clone, PartialEq)]
++pub struct GridConfig {
++    pub spacing: f64,
++    pub columns: Option<usize>, // None for auto-calculate
++}
++
++impl Default for GridConfig {
++    fn default() -> Self {
++        Self {
++            spacing: 20.0,
++            columns: None,
++        }
++    }
++}
++
++/// Force-directed layout implementation
++pub struct ForceDirectedLayout {
++    config: ForceDirectedConfig,
++    node_forces: HashMap<SymbolId, Vector2D>,
++    iteration_count: usize,
++}
++
++impl ForceDirectedLayout {
++    pub fn new(config: ForceDirectedConfig) -> Self {
++        Self {
++            config,
++            node_forces: HashMap::new(),
++            iteration_count: 0,
++        }
++    }
++
++    pub fn calculate_layout(&mut self, call_graph: &CallGraph) -> GridLayout {
++        let mut layout = self.initialize_layout(call_graph);
++        
++        for _ in 0..self.config.max_iterations {
++            self.calculate_forces(&layout, call_graph);
++            self.apply_forces(&mut layout);
++            
++            if self.forces_converged() {
++                break;
++            }
++        }
++        
++        layout.center_viewport_on_bounds();
++        layout
++    }
++
++    fn initialize_layout(&self, call_graph: &CallGraph) -> GridLayout {
++        let mut layout = GridLayout::new();
++        
++        // Place nodes in a circle initially
++        let node_count = call_graph.nodes.len();
++        let radius = (node_count as f64 * 10.0).sqrt();
++        
++        for (i, symbol_id) in call_graph.nodes.keys().enumerate() {
++            let angle = 2.0 * std::f64::consts::PI * i as f64 / node_count as f64;
++            let x = radius * angle.cos();
++            let y = radius * angle.sin();
++            
++            let position = NodePosition::new(x, y);
++            let mut node = VisualNode::new(symbol_id.clone(), position);
++            
++            // Color based on node type or properties
++            node.color = if call_graph.get_callees(symbol_id).is_empty() {
++                Color::Green // Leaf nodes
++            } else if call_graph.get_callers(symbol_id).is_empty() {
++                Color::Red // Root nodes
++            } else {
++                Color::Blue // Intermediate nodes
++            };
++            
++            layout.add_node(node);
++        }
++
++        // Add edges
++        for edge in &call_graph.edges {
++            let visual_edge = VisualEdge::new(
++                edge.caller.clone(),
++                edge.callee.clone(),
++                EdgeType::Call,
++            ).with_color(Color::Gray);
++            
++            layout.add_edge(visual_edge);
++        }
++
++        layout
++    }
++
++    fn calculate_forces(&mut self, layout: &GridLayout, call_graph: &CallGraph) {
++        // Clear previous forces
++        self.node_forces.clear();
++
++        // Calculate repulsive forces between all nodes
++        for (id1, node1) in &layout.nodes {
++            for (id2, node2) in &layout.nodes {
++                if id1 != id2 {
++                    let repulsion = self.calculate_repulsion(&node1.position, &node2.position);
++                    *self.node_forces.entry(id1.clone()).or_insert(Vector2D::zero()) = 
++                        self.node_forces.get(id1).unwrap_or(&Vector2D::zero()).add(&repulsion);
++                }
++            }
++        }
++
++        // Calculate attractive forces along edges
++        for edge in &call_graph.edges {
++            if let (Some(from_node), Some(to_node)) = (
++                layout.nodes.get(&edge.caller),
++                layout.nodes.get(&edge.callee),
++            ) {
++                let attraction = self.calculate_attraction(&from_node.position, &to_node.position);
++                
++                *self.node_forces.entry(edge.caller.clone()).or_insert(Vector2D::zero()) =
++                    self.node_forces.get(&edge.caller).unwrap_or(&Vector2D::zero()).add(&attraction);
++                
++                *self.node_forces.entry(edge.callee.clone()).or_insert(Vector2D::zero()) =
++                    self.node_forces.get(&edge.callee).unwrap_or(&Vector2D::zero()).subtract(&attraction);
++            }
++        }
++    }
++
++    fn calculate_repulsion(&self, pos1: &NodePosition, pos2: &NodePosition) -> Vector2D {
++        let dx = pos1.x - pos2.x;
++        let dy = pos1.y - pos2.y;
++        let distance = (dx * dx + dy * dy).sqrt().max(1.0);
++        
++        let force_magnitude = self.config.repulsion_strength as f64 / (distance * distance);
++        let direction = Vector2D::new(dx, dy).normalize();
++        
++        direction.scale(force_magnitude)
++    }
++
++    fn calculate_attraction(&self, pos1: &NodePosition, pos2: &NodePosition) -> Vector2D {
++        let dx = pos2.x - pos1.x;
++        let dy = pos2.y - pos1.y;
++        let distance = (dx * dx + dy * dy).sqrt();
++        
++        let force_magnitude = self.config.attraction_strength as f64 * distance;
++        let direction = Vector2D::new(dx, dy).normalize();
++        
++        direction.scale(force_magnitude)
++    }
++
++    fn apply_forces(&mut self, layout: &mut GridLayout) {
++        for (symbol_id, force) in &self.node_forces {
++            if let Some(node) = layout.get_node_mut(symbol_id) {
++                // Apply damping
++                let damped_force = force.scale(self.config.damping as f64);
++                
++                // Update position
++                node.position.x += damped_force.x;
++                node.position.y += damped_force.y;
++            }
++        }
++        
++        layout.update_bounds();
++    }
++
++    fn forces_converged(&self) -> bool {
++        let total_force: f64 = self.node_forces
++            .values()
++            .map(|force| force.magnitude())
++            .sum();
++        
++        total_force < self.config.convergence_threshold as f64
++    }
++}
++
++/// Grid layout implementation (simple, fast)
++pub struct GridLayoutAlgorithm {
++    config: GridConfig,
++}
++
++impl GridLayoutAlgorithm {
++    pub fn new(config: GridConfig) -> Self {
++        Self { config }
++    }
++
++    pub fn calculate_layout(&self, call_graph: &CallGraph) -> GridLayout {
++        let mut layout = GridLayout::new();
++        
++        let node_ids: Vec<_> = call_graph.nodes.keys().cloned().collect();
++        let node_count = node_ids.len();
++        
++        let columns = self.config.columns.unwrap_or_else(|| {
++            (node_count as f64).sqrt().ceil() as usize
++        });
++        
++        for (i, symbol_id) in node_ids.iter().enumerate() {
++            let row = i / columns;
++            let col = i % columns;
++            
++            let x = col as f64 * self.config.spacing;
++            let y = row as f64 * self.config.spacing;
++            
++            let position = NodePosition::new(x, y);
++            let node = VisualNode::new(symbol_id.clone(), position);
++            layout.add_node(node);
++        }
++
++        // Add edges
++        for edge in &call_graph.edges {
++            let visual_edge = VisualEdge::new(
++                edge.caller.clone(),
++                edge.callee.clone(),
++                EdgeType::Call,
++            );
++            layout.add_edge(visual_edge);
++        }
++
++        layout.center_viewport_on_bounds();
++        layout
++    }
++}
+diff --git a/tui_ui/src/canvas/mod.rs b/tui_ui/src/canvas/mod.rs
+new file mode 100644
+index 0000000..9d5c4ac
+--- /dev/null
++++ b/tui_ui/src/canvas/mod.rs
+@@ -0,0 +1,23 @@
++pub mod grid_layout;
++pub mod layout_algorithms;
++pub mod visual_elements;
++pub mod viewport;
++pub mod canvas_renderer;
++pub mod node_selection;
++pub mod text_overlay;
++pub mod smooth_lines;
++pub mod graph_analysis;
++pub mod edge_routing;
++pub mod hierarchical_layout;
++
++pub use grid_layout::*;
++pub use layout_algorithms::*;
++pub use visual_elements::*;
++pub use viewport::*;
++pub use canvas_renderer::*;
++pub use node_selection::*;
++pub use text_overlay::*;
++pub use smooth_lines::*;
++pub use graph_analysis::*;
++pub use edge_routing::*;
++pub use hierarchical_layout::HierarchicalLayout;
+diff --git a/tui_ui/src/canvas/node_selection.rs b/tui_ui/src/canvas/node_selection.rs
+new file mode 100644
+index 0000000..3530953
+--- /dev/null
++++ b/tui_ui/src/canvas/node_selection.rs
+@@ -0,0 +1,61 @@
++use super::*;
++use crate::geometry::Vector2D;
++use core_data::SymbolId;
++
++/// Node selection in 2D space
++pub fn find_node_at_position(
++    layout: &GridLayout,
++    world_x: f64,
++    world_y: f64,
++) -> Option<SymbolId> {
++    for (symbol_id, node) in &layout.nodes {
++        if is_point_in_node(world_x, world_y, node) {
++            return Some(symbol_id.clone());
++        }
++    }
++    None
++}
++
++/// Check if a point is inside a node's bounds
++pub fn is_point_in_node(x: f64, y: f64, node: &VisualNode) -> bool {
++    let half_width = node.width / 2.0;
++    let half_height = node.height / 2.0;
++    
++    x >= node.position.x - half_width
++        && x <= node.position.x + half_width
++        && y >= node.position.y - half_height
++        && y <= node.position.y + half_height
++}
++
++/// Find the closest node to a given position
++pub fn find_closest_node(
++    layout: &GridLayout,
++    world_x: f64,
++    world_y: f64,
++    max_distance: Option<f64>,
++) -> Option<(SymbolId, f64)> {
++    let mut closest: Option<(SymbolId, f64)> = None;
++    let point = Vector2D::new(world_x, world_y);
++    
++    for (symbol_id, node) in &layout.nodes {
++        let node_pos = Vector2D::new(node.position.x, node.position.y);
++        let distance = point.distance_to(&node_pos);
++        
++        if let Some(max_dist) = max_distance {
++            if distance > max_dist {
++                continue;
++            }
++        }
++        
++        match &closest {
++            None => closest = Some((symbol_id.clone(), distance)),
++            Some((_, closest_dist)) => {
++                if distance < *closest_dist {
++                    closest = Some((symbol_id.clone(), distance));
++                }
++            }
++        }
++    }
++    
++    closest
++}
+diff --git a/tui_ui/src/canvas/smooth_lines.rs b/tui_ui/src/canvas/smooth_lines.rs
+new file mode 100644
+index 0000000..cae1469
+--- /dev/null
++++ b/tui_ui/src/canvas/smooth_lines.rs
+@@ -0,0 +1,163 @@
++use super::*;
++use crate::geometry::Vector2D;
++use ratatui::{
++    style::Color,
++    widgets::canvas::{Context, Points},
++};
++
++/// Smooth line renderer using dense points
++#[derive(Debug, Clone)]
++pub struct SmoothLine {
++    pub start: Vector2D,
++    pub end: Vector2D,
++    pub color: Color,
++    pub thickness: f32,
++}
++
++impl SmoothLine {
++    pub fn new(start: Vector2D, end: Vector2D, color: Color) -> Self {
++        Self {
++            start,
++            end,
++            color,
++            thickness: 1.0,
++        }
++    }
++    
++    pub fn with_thickness(mut self, thickness: f32) -> Self {
++        self.thickness = thickness;
++        self
++    }
++
++    /// Render smooth line using dense point sampling
++    pub fn render(&self, ctx: &mut Context) {
++        let points = self.calculate_line_points();
++        
++        // Use thickness to determine how many parallel lines to draw
++        let thickness_lines = (self.thickness.max(1.0) as usize).min(3);
++        
++        for i in 0..thickness_lines {
++            let offset = if thickness_lines == 1 {
++                0.0
++            } else {
++                (i as f64 - (thickness_lines - 1) as f64 / 2.0) * 0.5
++            };
++            
++            let offset_points: Vec<(f64, f64)> = points
++                .iter()
++                .map(|&(x, y)| {
++                    // Add small perpendicular offset for thickness
++                    let dx = self.end.x - self.start.x;
++                    let dy = self.end.y - self.start.y;
++                    let length = (dx * dx + dy * dy).sqrt();
++                    
++                    if length > 0.0 {
++                        let perp_x = -dy / length * offset;
++                        let perp_y = dx / length * offset;
++                        (x + perp_x, y + perp_y)
++                    } else {
++                        (x, y)
++                    }
++                })
++                .collect();
++            
++            let points_widget = Points {
++                coords: &offset_points,
++                color: self.color,
++            };
++            
++            ctx.draw(&points_widget);
++        }
++    }
++    
++    /// Calculate dense points along the line for smooth appearance
++    fn calculate_line_points(&self) -> Vec<(f64, f64)> {
++        let dx = self.end.x - self.start.x;
++        let dy = self.end.y - self.start.y;
++        let distance = (dx * dx + dy * dy).sqrt();
++        
++        if distance < 0.1 {
++            return vec![(self.start.x, self.start.y)];
++        }
++        
++        // Calculate number of points based on distance
++        // Use higher density for smooth appearance
++        let num_points = (distance * 2.0).max(2.0) as usize;
++        let mut points = Vec::with_capacity(num_points);
++        
++        for i in 0..=num_points {
++            let t = i as f64 / num_points as f64;
++            let x = self.start.x + t * dx;
++            let y = self.start.y + t * dy;
++            points.push((x, y));
++        }
++        
++        points
++    }
++}
++
++/// Enhanced edge rendering with smooth lines
++pub fn render_smooth_edges(ctx: &mut Context, layout: &GridLayout) {
++    for edge in &layout.edges {
++        if let (Some(from_node), Some(to_node)) = (
++            layout.nodes.get(&edge.from_symbol),
++            layout.nodes.get(&edge.to_symbol),
++        ) {
++            let start = Vector2D::new(from_node.position.x, from_node.position.y);
++            let end = Vector2D::new(to_node.position.x, to_node.position.y);
++            
++            let smooth_line = SmoothLine::new(start, end, edge.color)
++                .with_thickness(edge.weight);
++            
++            smooth_line.render(ctx);
++            
++            // Draw arrow head for directed edges
++            if matches!(edge.edge_type, EdgeType::Call) && layout.viewport.zoom_level > 1.0 {
++                draw_smooth_arrow_head(ctx, &start, &end, edge.color);
++            }
++        }
++    }
++}
++
++/// Draw a smooth arrow head using points
++fn draw_smooth_arrow_head(ctx: &mut Context, from: &Vector2D, to: &Vector2D, color: Color) {
++    let dx = to.x - from.x;
++    let dy = to.y - from.y;
++    let length = (dx * dx + dy * dy).sqrt();
++    
++    if length < 1.0 {
++        return;
++    }
++    
++    let unit_x = dx / length;
++    let unit_y = dy / length;
++    
++    let arrow_length = 3.0;
++    let arrow_width = 1.5;
++    
++    // Calculate arrow head points
++    let tip_x = to.x;
++    let tip_y = to.y;
++    
++    let base_x = tip_x - arrow_length * unit_x;
++    let base_y = tip_y - arrow_length * unit_y;
++    
++    let perp_x = -unit_y * arrow_width;
++    let perp_y = unit_x * arrow_width;
++    
++    // Create smooth arrow lines
++    let line1 = SmoothLine::new(
++        Vector2D::new(tip_x, tip_y),
++        Vector2D::new(base_x + perp_x, base_y + perp_y),
++        color,
++    );
++    
++    let line2 = SmoothLine::new(
++        Vector2D::new(tip_x, tip_y),
++        Vector2D::new(base_x - perp_x, base_y - perp_y),
++        color,
++    );
++    
++    line1.render(ctx);
++    line2.render(ctx);
++}
+diff --git a/tui_ui/src/canvas/text_overlay.rs b/tui_ui/src/canvas/text_overlay.rs
+new file mode 100644
+index 0000000..68949d9
+--- /dev/null
++++ b/tui_ui/src/canvas/text_overlay.rs
+@@ -0,0 +1,120 @@
++use super::*;
++use core_data::CallGraph;
++use ratatui::{
++    layout::{Alignment, Rect},
++    style::Style,
++    widgets::Paragraph,
++    Frame,
++};
++
++/// Text overlay information for rendering outside canvas
++#[derive(Debug, Clone)]
++pub struct TextOverlay {
++    pub text: String,
++    pub world_x: f64,
++    pub world_y: f64,
++    pub style: Style,
++}
++
++/// Calculate text overlay positions for all visible nodes
++pub fn calculate_text_overlays(
++    layout: &GridLayout,
++    call_graph: &CallGraph,
++    viewport: &Viewport,
++    area: Rect,
++) -> Vec<(TextOverlay, Rect)> {
++    let mut overlays = Vec::new();
++    
++    // Calculate visible bounds
++    let view_width = area.width as f64 / viewport.zoom_level;
++    let view_height = area.height as f64 / viewport.zoom_level;
++    let left = viewport.center_x - view_width / 2.0;
++    let right = viewport.center_x + view_width / 2.0;
++    let top = viewport.center_y - view_height / 2.0;
++    let bottom = viewport.center_y + view_height / 2.0;
++    
++    for (symbol_id, visual_node) in &layout.nodes {
++        // Check if node is visible
++        if visual_node.position.x >= left && visual_node.position.x <= right
++            && visual_node.position.y >= top && visual_node.position.y <= bottom
++        {
++            // Get function name from call graph
++            if let Some(function_node) = call_graph.nodes.get(symbol_id) {
++                let text = truncate_function_name(&function_node.name, viewport.zoom_level);
++                
++                // Convert world coordinates to screen coordinates
++                let screen_x = ((visual_node.position.x - left) / view_width * area.width as f64) as u16;
++                let screen_y = ((visual_node.position.y - top) / view_height * area.height as f64) as u16;
++                
++                // Calculate text area (ensure it fits within screen bounds)
++                let text_width = text.len().min(area.width as usize - screen_x as usize) as u16;
++                let text_height = 1u16;
++                
++                if screen_x < area.width && screen_y < area.height && text_width > 0 {
++                    let text_area = Rect {
++                        x: area.x + screen_x.saturating_sub(text_width / 2),
++                        y: area.y + screen_y,
++                        width: text_width,
++                        height: text_height,
++                    };
++                    
++                    let overlay = TextOverlay {
++                        text,
++                        world_x: visual_node.position.x,
++                        world_y: visual_node.position.y,
++                        style: get_text_style(visual_node, Some(symbol_id) == layout.get_selected_node()),
++                    };
++                    
++                    overlays.push((overlay, text_area));
++                }
++            }
++        }
++    }
++    
++    overlays
++}
++
++/// Render text overlays on top of the canvas
++pub fn render_text_overlays(f: &mut Frame, overlays: Vec<(TextOverlay, Rect)>) {
++    for (overlay, text_area) in overlays {
++        let paragraph = Paragraph::new(overlay.text)
++            .style(overlay.style)
++            .alignment(Alignment::Center);
++        f.render_widget(paragraph, text_area);
++    }
++}
++
++/// Truncate function name based on zoom level
++fn truncate_function_name(name: &str, zoom_level: f64) -> String {
++    let max_length = if zoom_level > 2.0 {
++        20
++    } else if zoom_level > 1.0 {
++        12
++    } else if zoom_level > 0.5 {
++        8
++    } else {
++        4
++    };
++    
++    if name.len() <= max_length {
++        name.to_string()
++    } else {
++        format!("{}…", &name[..max_length.saturating_sub(1)])
++    }
++}
++
++/// Get text style based on node state
++fn get_text_style(visual_node: &VisualNode, is_selected: bool) -> Style {
++    if is_selected || visual_node.is_selected {
++        Style::default()
++            .fg(ratatui::style::Color::Black)
++            .bg(ratatui::style::Color::Yellow)
++    } else if visual_node.is_highlighted {
++        Style::default()
++            .fg(ratatui::style::Color::White)
++            .bg(ratatui::style::Color::Blue)
++    } else {
++        Style::default()
++            .fg(ratatui::style::Color::White)
++    }
++}
+diff --git a/tui_ui/src/canvas/viewport.rs b/tui_ui/src/canvas/viewport.rs
+new file mode 100644
+index 0000000..c16ec2b
+--- /dev/null
++++ b/tui_ui/src/canvas/viewport.rs
+@@ -0,0 +1,43 @@
++use super::*;
++
++/// View modes for the 2D graph
++#[derive(Debug, Clone, PartialEq)]
++pub enum ViewMode {
++    Overview,      // Show all nodes
++    Focused,       // Center on selected function with neighbors
++    Path,          // Show path between two functions
++    Cluster,       // Show logical clusters/modules
++}
++
++impl Default for ViewMode {
++    fn default() -> Self {
++        ViewMode::Overview
++    }
++}
++
++/// Viewport management for 2D navigation
++impl Viewport {
++    pub fn get_bounds_for_area(&self, area_width: u16, area_height: u16) -> (f64, f64, f64, f64) {
++        let width_world = area_width as f64 / self.zoom_level;
++        let height_world = area_height as f64 / self.zoom_level;
++        
++        let min_x = self.center_x - width_world / 2.0;
++        let max_x = self.center_x + width_world / 2.0;
++        let min_y = self.center_y - height_world / 2.0;
++        let max_y = self.center_y + height_world / 2.0;
++        
++        (min_x, min_y, max_x, max_y)
++    }
++
++    pub fn world_to_screen(&self, world_x: f64, world_y: f64, area_width: u16, area_height: u16) -> (f64, f64) {
++        let screen_x = (world_x - self.center_x) * self.zoom_level + (area_width as f64 / 2.0);
++        let screen_y = (world_y - self.center_y) * self.zoom_level + (area_height as f64 / 2.0);
++        (screen_x, screen_y)
++    }
++
++    pub fn screen_to_world(&self, screen_x: f64, screen_y: f64, area_width: u16, area_height: u16) -> (f64, f64) {
++        let world_x = (screen_x - area_width as f64 / 2.0) / self.zoom_level + self.center_x;
++        let world_y = (screen_y - area_height as f64 / 2.0) / self.zoom_level + self.center_y;
++        (world_x, world_y)
++    }
++}
+diff --git a/tui_ui/src/canvas/visual_elements.rs b/tui_ui/src/canvas/visual_elements.rs
+new file mode 100644
+index 0000000..a85de3c
+--- /dev/null
++++ b/tui_ui/src/canvas/visual_elements.rs
+@@ -0,0 +1,240 @@
++use core_data::SymbolId;
++use ratatui::style::Color;
++use std::collections::HashMap;
++
++use crate::geometry::Vector2D;
++
++/// Position of a node in 2D space
++#[derive(Debug, Clone, PartialEq)]
++pub struct NodePosition {
++    pub x: f64,
++    pub y: f64,
++}
++
++impl NodePosition {
++    pub fn new(x: f64, y: f64) -> Self {
++        Self { x, y }
++    }
++
++    pub fn to_vector(&self) -> Vector2D {
++        Vector2D::new(self.x, self.y)
++    }
++
++    pub fn from_vector(v: &Vector2D) -> Self {
++        Self::new(v.x, v.y)
++    }
++}
++
++impl Default for NodePosition {
++    fn default() -> Self {
++        Self::new(0.0, 0.0)
++    }
++}
++
++/// Visual representation of a node in the 2D graph
++#[derive(Debug, Clone)]
++pub struct VisualNode {
++    pub symbol_id: SymbolId,
++    pub position: NodePosition,
++    pub width: f64,
++    pub height: f64,
++    pub is_selected: bool,
++    pub is_highlighted: bool,
++    pub color: Color,
++}
++
++impl VisualNode {
++    pub fn new(symbol_id: SymbolId, position: NodePosition) -> Self {
++        Self {
++            symbol_id,
++            position,
++            width: 8.0,
++            height: 4.0,
++            is_selected: false,
++            is_highlighted: false,
++            color: Color::Blue,
++        }
++    }
++
++    pub fn with_size(mut self, width: f64, height: f64) -> Self {
++        self.width = width;
++        self.height = height;
++        self
++    }
++
++    pub fn with_color(mut self, color: Color) -> Self {
++        self.color = color;
++        self
++    }
++}
++
++/// Types of edges in the graph
++#[derive(Debug, Clone, PartialEq)]
++pub enum EdgeType {
++    Call,
++    Reference,
++    Inheritance,
++    Dependency,
++}
++
++/// Visual representation of an edge between nodes
++#[derive(Debug, Clone)]
++pub struct VisualEdge {
++    pub from_symbol: SymbolId,
++    pub to_symbol: SymbolId,
++    pub edge_type: EdgeType,
++    pub color: Color,
++    pub weight: f32, // For line thickness
++}
++
++impl VisualEdge {
++    pub fn new(from_symbol: SymbolId, to_symbol: SymbolId, edge_type: EdgeType) -> Self {
++        Self {
++            from_symbol,
++            to_symbol,
++            edge_type,
++            color: Color::Gray,
++            weight: 1.0,
++        }
++    }
++
++    pub fn with_color(mut self, color: Color) -> Self {
++        self.color = color;
++        self
++    }
++
++    pub fn with_weight(mut self, weight: f32) -> Self {
++        self.weight = weight;
++        self
++    }
++}
++
++/// Viewport configuration for the 2D canvas
++#[derive(Debug, Clone)]
++pub struct Viewport {
++    pub center_x: f64,
++    pub center_y: f64,
++    pub zoom_level: f64,
++}
++
++impl Viewport {
++    pub fn new() -> Self {
++        Self {
++            center_x: 0.0,
++            center_y: 0.0,
++            zoom_level: 1.0,
++        }
++    }
++
++    pub fn pan(&mut self, dx: f64, dy: f64) {
++        self.center_x += dx / self.zoom_level;
++        self.center_y += dy / self.zoom_level;
++    }
++
++    pub fn zoom(&mut self, factor: f64) {
++        self.zoom_level = (self.zoom_level * factor).clamp(0.1, 10.0);
++    }
++
++    pub fn center_on(&mut self, x: f64, y: f64) {
++        self.center_x = x;
++        self.center_y = y;
++    }
++
++    pub fn reset(&mut self) {
++        self.center_x = 0.0;
++        self.center_y = 0.0;
++        self.zoom_level = 1.0;
++    }
++}
++
++impl Default for Viewport {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++/// Complete 2D layout of the graph
++#[derive(Debug, Clone)]
++pub struct GridLayout {
++    pub nodes: HashMap<SymbolId, VisualNode>,
++    pub edges: Vec<VisualEdge>,
++    pub viewport: Viewport,
++    pub bounds: (f64, f64, f64, f64), // min_x, min_y, max_x, max_y
++}
++
++impl GridLayout {
++    pub fn new() -> Self {
++        Self {
++            nodes: HashMap::new(),
++            edges: Vec::new(),
++            viewport: Viewport::new(),
++            bounds: (0.0, 0.0, 0.0, 0.0),
++        }
++    }
++
++    pub fn add_node(&mut self, node: VisualNode) {
++        self.nodes.insert(node.symbol_id.clone(), node);
++        self.update_bounds();
++    }
++
++    pub fn add_edge(&mut self, edge: VisualEdge) {
++        self.edges.push(edge);
++    }
++
++    pub fn get_node_mut(&mut self, symbol_id: &SymbolId) -> Option<&mut VisualNode> {
++        self.nodes.get_mut(symbol_id)
++    }
++
++    pub fn select_node(&mut self, symbol_id: &SymbolId) {
++        // Deselect all nodes first
++        for node in self.nodes.values_mut() {
++            node.is_selected = false;
++        }
++        
++        // Select the target node
++        if let Some(node) = self.nodes.get_mut(symbol_id) {
++            node.is_selected = true;
++        }
++    }
++
++    pub fn update_bounds(&mut self) {
++        if self.nodes.is_empty() {
++            self.bounds = (0.0, 0.0, 0.0, 0.0);
++            return;
++        }
++
++        let mut min_x = f64::INFINITY;
++        let mut max_x = f64::NEG_INFINITY;
++        let mut min_y = f64::INFINITY;
++        let mut max_y = f64::NEG_INFINITY;
++
++        for node in self.nodes.values() {
++            let half_width = node.width / 2.0;
++            let half_height = node.height / 2.0;
++            
++            min_x = min_x.min(node.position.x - half_width);
++            max_x = max_x.max(node.position.x + half_width);
++            min_y = min_y.min(node.position.y - half_height);
++            max_y = max_y.max(node.position.y + half_height);
++        }
++
++        self.bounds = (min_x, min_y, max_x, max_y);
++    }
++
++    pub fn center_viewport_on_bounds(&mut self) {
++        let (min_x, min_y, max_x, max_y) = self.bounds;
++        self.viewport.center_on((min_x + max_x) / 2.0, (min_y + max_y) / 2.0);
++    }
++    
++    pub fn get_selected_node(&self) -> Option<&SymbolId> {
++        self.nodes.iter()
++            .find(|(_, node)| node.is_selected)
++            .map(|(id, _)| id)
++    }
++}
++
++impl Default for GridLayout {
++    fn default() -> Self {
++        Self::new()
++    }
++}
+diff --git a/tui_ui/src/geometry/bounds.rs b/tui_ui/src/geometry/bounds.rs
+new file mode 100644
+index 0000000..7511f75
+--- /dev/null
++++ b/tui_ui/src/geometry/bounds.rs
+@@ -0,0 +1,57 @@
++/// Bounding box for spatial calculations
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub struct Bounds {
++    pub min_x: f64,
++    pub max_x: f64,
++    pub min_y: f64,
++    pub max_y: f64,
++}
++
++impl Bounds {
++    pub fn new(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Self {
++        Self {
++            min_x,
++            max_x,
++            min_y,
++            max_y,
++        }
++    }
++
++    pub fn from_center(center_x: f64, center_y: f64, width: f64, height: f64) -> Self {
++        let half_width = width / 2.0;
++        let half_height = height / 2.0;
++        Self::new(
++            center_x - half_width,
++            center_y - half_height,
++            center_x + half_width,
++            center_y + half_height,
++        )
++    }
++
++    pub fn contains_point(&self, x: f64, y: f64) -> bool {
++        x >= self.min_x && x <= self.max_x && y >= self.min_y && y <= self.max_y
++    }
++
++    pub fn intersects(&self, other: &Bounds) -> bool {
++        !(self.max_x < other.min_x
++            || self.min_x > other.max_x
++            || self.max_y < other.min_y
++            || self.min_y > other.max_y)
++    }
++
++    pub fn width(&self) -> f64 {
++        self.max_x - self.min_x
++    }
++
++    pub fn height(&self) -> f64 {
++        self.max_y - self.min_y
++    }
++
++    pub fn center_x(&self) -> f64 {
++        (self.min_x + self.max_x) / 2.0
++    }
++
++    pub fn center_y(&self) -> f64 {
++        (self.min_y + self.max_y) / 2.0
++    }
++}
+diff --git a/tui_ui/src/geometry/collision.rs b/tui_ui/src/geometry/collision.rs
+new file mode 100644
+index 0000000..9285f7c
+--- /dev/null
++++ b/tui_ui/src/geometry/collision.rs
+@@ -0,0 +1,40 @@
++use super::{Bounds, Vector2D};
++
++/// Check if a point is inside a rectangular area
++pub fn point_in_rect(point: &Vector2D, center: &Vector2D, width: f64, height: f64) -> bool {
++    let bounds = Bounds::from_center(center.x, center.y, width, height);
++    bounds.contains_point(point.x, point.y)
++}
++
++/// Find the closest point on a rectangle to a given point
++pub fn closest_point_on_rect(
++    point: &Vector2D,
++    rect_center: &Vector2D,
++    width: f64,
++    height: f64,
++) -> Vector2D {
++    let half_width = width / 2.0;
++    let half_height = height / 2.0;
++
++    let clamped_x = point.x.clamp(
++        rect_center.x - half_width,
++        rect_center.x + half_width,
++    );
++    let clamped_y = point.y.clamp(
++        rect_center.y - half_height,
++        rect_center.y + half_height,
++    );
++
++    Vector2D::new(clamped_x, clamped_y)
++}
++
++/// Calculate distance from a point to a rectangle
++pub fn distance_to_rect(
++    point: &Vector2D,
++    rect_center: &Vector2D,
++    width: f64,
++    height: f64,
++) -> f64 {
++    let closest = closest_point_on_rect(point, rect_center, width, height);
++    point.distance_to(&closest)
++}
+diff --git a/tui_ui/src/geometry/mod.rs b/tui_ui/src/geometry/mod.rs
+new file mode 100644
+index 0000000..64d348a
+--- /dev/null
++++ b/tui_ui/src/geometry/mod.rs
+@@ -0,0 +1,7 @@
++pub mod vector2d;
++pub mod bounds;
++pub mod collision;
++
++pub use vector2d::Vector2D;
++pub use bounds::Bounds;
++pub use collision::*;
+diff --git a/tui_ui/src/geometry/vector2d.rs b/tui_ui/src/geometry/vector2d.rs
+new file mode 100644
+index 0000000..4037be2
+--- /dev/null
++++ b/tui_ui/src/geometry/vector2d.rs
+@@ -0,0 +1,81 @@
++/// 2D vector for force calculations and positioning
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub struct Vector2D {
++    pub x: f64,
++    pub y: f64,
++}
++
++impl Vector2D {
++    pub fn new(x: f64, y: f64) -> Self {
++        Self { x, y }
++    }
++
++    pub fn zero() -> Self {
++        Self::new(0.0, 0.0)
++    }
++
++    pub fn magnitude(&self) -> f64 {
++        (self.x * self.x + self.y * self.y).sqrt()
++    }
++
++    pub fn normalize(&self) -> Self {
++        let mag = self.magnitude();
++        if mag > 0.0 {
++            Self::new(self.x / mag, self.y / mag)
++        } else {
++            Self::zero()
++        }
++    }
++
++    pub fn scale(&self, factor: f64) -> Self {
++        Self::new(self.x * factor, self.y * factor)
++    }
++
++    pub fn add(&self, other: &Vector2D) -> Self {
++        Self::new(self.x + other.x, self.y + other.y)
++    }
++
++    pub fn subtract(&self, other: &Vector2D) -> Self {
++        Self::new(self.x - other.x, self.y - other.y)
++    }
++
++    pub fn distance_to(&self, other: &Vector2D) -> f64 {
++        let dx = self.x - other.x;
++        let dy = self.y - other.y;
++        (dx * dx + dy * dy).sqrt()
++    }
++    
++    pub fn dot(&self, other: &Vector2D) -> f64 {
++        self.x * other.x + self.y * other.y
++    }
++}
++
++impl Default for Vector2D {
++    fn default() -> Self {
++        Self::zero()
++    }
++}
++
++impl std::ops::Add for Vector2D {
++    type Output = Self;
++
++    fn add(self, other: Self) -> Self {
++        Self::new(self.x + other.x, self.y + other.y)
++    }
++}
++
++impl std::ops::Sub for Vector2D {
++    type Output = Self;
++
++    fn sub(self, other: Self) -> Self {
++        Self::new(self.x - other.x, self.y - other.y)
++    }
++}
++
++impl std::ops::Mul<f64> for Vector2D {
++    type Output = Self;
++
++    fn mul(self, scalar: f64) -> Self {
++        self.scale(scalar)
++    }
++}
+diff --git a/tui_ui/src/lib.rs b/tui_ui/src/lib.rs
+index c8372bf..cf7e900 100644
+--- a/tui_ui/src/lib.rs
++++ b/tui_ui/src/lib.rs
+@@ -24,11 +24,14 @@ pub mod actions;
+ pub mod call_graph_view;
+ pub mod diagnostic_panel;
+ pub mod function_list;
++pub mod canvas;
++pub mod geometry;
+ 
+ pub use actions::{Action, TreeNode, TreeViewState};
+ pub use call_graph_view::CallGraphView;
+ pub use diagnostic_panel::DiagnosticPanel;
+ pub use function_list::FunctionList;
++pub use canvas::*;
+ 
+ /// Loading state for LSP operations
+ #[derive(Debug, Clone, PartialEq)]
+@@ -78,6 +81,13 @@ pub struct App {
+     pub show_help: bool,
+     pub call_direction: CallDirection,
+ 
++    // 2D Grid fields
++    pub grid_layout_manager: GridLayoutManager,
++    pub graph_view_mode: ViewMode,
++    pub canvas_viewport: Viewport,
++    pub selected_node_position: Option<NodePosition>,
++    pub use_2d_view: bool, // Toggle between tree and 2D view
++
+     // Lazy loading fields
+     pub loading_states: HashMap<SymbolId, LoadingState>,
+     pub lsp_response_rx: Option<mpsc::UnboundedReceiver<LspResponse>>,
+@@ -115,6 +125,14 @@ impl App {
+             tree_view_state: TreeViewState::new(),
+             show_help: false,
+             call_direction: CallDirection::Outgoing, // Default to outgoing calls (current behavior)
++            
++            // Initialize 2D Grid fields
++            grid_layout_manager: GridLayoutManager::new(),
++            graph_view_mode: ViewMode::default(),
++            canvas_viewport: Viewport::new(),
++            selected_node_position: None,
++            use_2d_view: false, // Start with tree view
++            
+             loading_states: HashMap::new(),
+             lsp_response_rx: None,
+             lsp_request_tx: None,
+@@ -138,8 +156,13 @@ impl App {
+     }
+ 
+     pub fn select_function(&mut self, id: SymbolId) {
+-        self.selected_function = Some(id);
++        self.selected_function = Some(id.clone());
+         self.status_message = "Function selected".to_string();
++        
++        // Update 2D layout if it exists
++        if !self.grid_layout_manager.current_layout.nodes.is_empty() {
++            self.grid_layout_manager.get_layout_mut().select_node(&id);
++        }
+     }
+ 
+     pub fn select_current_function(&mut self) {
+@@ -977,6 +1000,19 @@ impl App {
+             Action::Quit => self.quit(),
+             Action::Help => self.toggle_help(),
+             Action::ToggleCallDirection => self.handle_toggle_call_direction(),
++            
++            // 2D Grid actions
++            Action::Toggle2DView => self.toggle_2d_view(),
++            Action::PanLeft => self.handle_pan_left(),
++            Action::PanRight => self.handle_pan_right(),
++            Action::PanUp => self.handle_pan_up(),
++            Action::PanDown => self.handle_pan_down(),
++            Action::ZoomIn => self.handle_zoom_in(),
++            Action::ZoomOut => self.handle_zoom_out(),
++            Action::CenterView => self.center_viewport(),
++            Action::FocusOnSelected => self.handle_focus_on_selected(),
++            Action::SelectNodeAtCursor => self.handle_select_node_at_cursor(),
++            Action::ChangeLayoutAlgorithm => self.cycle_layout_algorithm(),
+         }
+     }
+ 
+@@ -1173,6 +1209,59 @@ impl App {
+         self.status_message = format!("Switched to {} calls view", direction_str);
+     }
+ 
++    // 2D Grid action handlers
++    fn handle_pan_left(&mut self) {
++        if self.current_tab == 1 && self.use_2d_view {
++            self.pan_viewport(-20.0, 0.0);
++        }
++    }
++
++    fn handle_pan_right(&mut self) {
++        if self.current_tab == 1 && self.use_2d_view {
++            self.pan_viewport(20.0, 0.0);
++        }
++    }
++
++    fn handle_pan_up(&mut self) {
++        if self.current_tab == 1 && self.use_2d_view {
++            self.pan_viewport(0.0, -20.0);
++        }
++    }
++
++    fn handle_pan_down(&mut self) {
++        if self.current_tab == 1 && self.use_2d_view {
++            self.pan_viewport(0.0, 20.0);
++        }
++    }
++
++    fn handle_zoom_in(&mut self) {
++        if self.current_tab == 1 && self.use_2d_view {
++            self.zoom_viewport(1.2);
++            self.status_message = "Zoomed in".to_string();
++        }
++    }
++
++    fn handle_zoom_out(&mut self) {
++        if self.current_tab == 1 && self.use_2d_view {
++            self.zoom_viewport(0.8);
++            self.status_message = "Zoomed out".to_string();
++        }
++    }
++
++    fn handle_focus_on_selected(&mut self) {
++        if self.current_tab == 1 && self.use_2d_view {
++            self.center_viewport();
++        }
++    }
++
++    fn handle_select_node_at_cursor(&mut self) {
++        // TODO: Implement mouse-based node selection in future iterations
++        // For now, this is a placeholder
++        if self.current_tab == 1 && self.use_2d_view {
++            self.status_message = "Mouse selection not yet implemented".to_string();
++        }
++    }
++
+     pub fn start_call_graph_with_function(&mut self, symbol_id: SymbolId) {
+         log::info!(
+             "Starting call graph exploration with function: {:?}",
+@@ -1205,12 +1294,87 @@ impl App {
+         self.request_call_hierarchy(&symbol_id);
+         self.status_message = "Loading call hierarchy...".to_string();
+ 
++        // Initialize 2D layout with the new data
++        self.initialize_2d_layout();
++
+         log::info!(
+             "Call graph started - nodes: {}, selected_index: {}",
+             self.tree_view_state.nodes.len(),
+             self.tree_view_state.selected_index
+         );
+     }
++
++    // 2D Grid methods
++    pub fn toggle_2d_view(&mut self) {
++        self.use_2d_view = !self.use_2d_view;
++        if self.use_2d_view {
++            self.initialize_2d_layout();
++            self.status_message = "Switched to 2D view".to_string();
++        } else {
++            self.status_message = "Switched to tree view".to_string();
++        }
++    }
++
++    pub fn initialize_2d_layout(&mut self) {
++        // Only recalculate if layout is empty or significantly different
++        if self.grid_layout_manager.current_layout.nodes.is_empty() 
++            || self.grid_layout_manager.current_layout.nodes.len() != self.call_graph.nodes.len() {
++            
++            self.grid_layout_manager.calculate_layout(&self.call_graph);
++            
++            // If we have a selected function, highlight it in the 2D view
++            if let Some(selected_id) = &self.selected_function {
++                self.grid_layout_manager.get_layout_mut().select_node(selected_id);
++            }
++        }
++    }
++
++    pub fn pan_viewport(&mut self, dx: f64, dy: f64) {
++        self.grid_layout_manager.get_layout_mut().viewport.pan(dx, dy);
++    }
++
++    pub fn zoom_viewport(&mut self, factor: f64) {
++        self.grid_layout_manager.get_layout_mut().viewport.zoom(factor);
++    }
++
++    pub fn center_viewport(&mut self) {
++        if let Some(selected_id) = &self.selected_function {
++            if let Some(node) = self.grid_layout_manager.current_layout.nodes.get(selected_id) {
++                let pos_x = node.position.x;
++                let pos_y = node.position.y;
++                self.grid_layout_manager.get_layout_mut().viewport.center_on(pos_x, pos_y);
++                self.status_message = "Centered on selected function".to_string();
++            }
++        } else {
++            self.grid_layout_manager.get_layout_mut().center_viewport_on_bounds();
++            self.status_message = "Centered on all functions".to_string();
++        }
++    }
++
++    pub fn cycle_layout_algorithm(&mut self) {
++        use crate::canvas::{LayoutAlgorithm, ForceDirectedConfig, GridConfig, HierarchicalConfig, LayoutDirection};
++        
++        let new_algorithm = match &self.grid_layout_manager.layout_algorithm {
++            LayoutAlgorithm::ForceDirected(_) => LayoutAlgorithm::Grid(GridConfig::default()),
++            LayoutAlgorithm::Grid(_) => LayoutAlgorithm::Hierarchical(HierarchicalConfig {
++                layer_spacing: 80.0,
++                node_spacing: 40.0,
++                direction: LayoutDirection::LeftRight,
++            }),
++            LayoutAlgorithm::Hierarchical(_) => LayoutAlgorithm::ForceDirected(ForceDirectedConfig::default()),
++        };
++        
++        self.grid_layout_manager.set_algorithm(new_algorithm);
++        self.grid_layout_manager.calculate_layout(&self.call_graph);
++        
++        let algorithm_name = match &self.grid_layout_manager.layout_algorithm {
++            LayoutAlgorithm::ForceDirected(_) => "Force-Directed",
++            LayoutAlgorithm::Grid(_) => "Grid",
++            LayoutAlgorithm::Hierarchical(_) => "Hierarchical (Left-to-Right)",
++        };
++        
++        self.status_message = format!("Layout: {}", algorithm_name);
++    }
+ }
+ 
+ /// Main TUI application runner
+@@ -1274,10 +1438,67 @@ impl TuiApp {
+                                 self.app.current_tab = 2;
+                                 None
+                             }
+-                            KeyCode::Up | KeyCode::Char('k') => Some(Action::MoveUp),
+-                            KeyCode::Down | KeyCode::Char('j') => Some(Action::MoveDown),
+-                            KeyCode::Right | KeyCode::Char('l') => Some(Action::ExpandNode),
+-                            KeyCode::Left | KeyCode::Char('h') => Some(Action::CollapseNode),
++                            KeyCode::Up | KeyCode::Char('k') => {
++                                if self.app.use_2d_view && self.app.current_tab == 1 {
++                                    Some(Action::PanUp)
++                                } else {
++                                    Some(Action::MoveUp)
++                                }
++                            }
++                            KeyCode::Down | KeyCode::Char('j') => {
++                                if self.app.use_2d_view && self.app.current_tab == 1 {
++                                    Some(Action::PanDown)
++                                } else {
++                                    Some(Action::MoveDown)
++                                }
++                            }
++                            KeyCode::Right | KeyCode::Char('l') => {
++                                if self.app.use_2d_view && self.app.current_tab == 1 {
++                                    Some(Action::PanRight)
++                                } else {
++                                    Some(Action::ExpandNode)
++                                }
++                            }
++                            KeyCode::Left | KeyCode::Char('h') => {
++                                if self.app.use_2d_view && self.app.current_tab == 1 {
++                                    Some(Action::PanLeft)
++                                } else {
++                                    Some(Action::CollapseNode)
++                                }
++                            }
++                            KeyCode::Char('w') => {
++                                if self.app.use_2d_view && self.app.current_tab == 1 {
++                                    Some(Action::PanUp)
++                                } else {
++                                    None
++                                }
++                            }
++                            KeyCode::Char('s') => {
++                                if self.app.use_2d_view && self.app.current_tab == 1 {
++                                    Some(Action::PanDown)
++                                } else {
++                                    None
++                                }
++                            }
++                            KeyCode::Char('a') => {
++                                if self.app.use_2d_view && self.app.current_tab == 1 {
++                                    Some(Action::PanLeft)
++                                } else {
++                                    None
++                                }
++                            }
++                            KeyCode::Char('d') => {
++                                if self.app.use_2d_view && self.app.current_tab == 1 {
++                                    Some(Action::PanRight)
++                                } else {
++                                    None
++                                }
++                            }
++                            KeyCode::Char('+') | KeyCode::Char('=') => Some(Action::ZoomIn),
++                            KeyCode::Char('-') => Some(Action::ZoomOut),
++                            KeyCode::Char(' ') => Some(Action::CenterView),
++                            KeyCode::Char('v') => Some(Action::Toggle2DView),
++                            KeyCode::Char('c') => Some(Action::ChangeLayoutAlgorithm),
+                             KeyCode::Enter => Some(Action::ExpandOrCollapse),
+                             KeyCode::Char('r') => Some(Action::Refresh),
+                             KeyCode::Char('f') => Some(Action::FindReferences),
+@@ -1346,7 +1567,13 @@ pub fn ui(f: &mut Frame, app: &App) {
+     // Render main content based on selected tab
+     match app.current_tab {
+         0 => render_function_list(f, chunks[1], app),
+-        1 => render_tree_call_graph(f, chunks[1], app),
++        1 => {
++            if app.use_2d_view {
++                render_2d_call_graph(f, chunks[1], app);
++            } else {
++                render_tree_call_graph(f, chunks[1], app);
++            }
++        }
+         2 => render_diagnostics(f, chunks[1], app),
+         _ => {}
+     }
+@@ -1362,10 +1589,19 @@ pub fn ui(f: &mut Frame, app: &App) {
+                 .map(|f| f.name.as_str())
+                 .unwrap_or("None")
+         ),
+-        1 => format!(
+-            "Status: {} | Use ↑↓/kj to navigate, →l to expand, ←h to collapse, Enter to toggle, ? for help | Press 'q' to quit",
+-            app.status_message
+-        ),
++        1 => {
++            if app.use_2d_view {
++                format!(
++                    "Status: {} | 2D View | WASD/hjkl to pan, +/- to zoom, Space to center, v to toggle view, c to change layout | Press 'q' to quit",
++                    app.status_message
++                )
++            } else {
++                format!(
++                    "Status: {} | Tree View | ↑↓/kj to navigate, →l to expand, ←h to collapse, v to toggle view | Press 'q' to quit",
++                    app.status_message
++                )
++            }
++        }
+         2 => format!(
+             "Status: {} | Diagnostics View | Press Tab to switch tabs, ? for help | Press 'q' to quit",
+             app.status_message
+@@ -1431,8 +1667,18 @@ fn render_help_overlay(f: &mut Frame, area: ratatui::layout::Rect) {
+         Line::from("  ← / h     - Collapse selected node"),
+         Line::from("  Enter     - Toggle expand/collapse"),
+         Line::from("  t         - Toggle between incoming/outgoing calls"),
++        Line::from("  v         - Toggle between Tree and 2D view"),
+         Line::from("  r         - Find references for selected function"),
+         Line::from(""),
++        Line::from("Call Graph (2D View):"),
++        Line::from("  w/a/s/d   - Pan up/left/down/right"),
++        Line::from("  ↑←↓→/hjkl - Pan in respective direction"),
++        Line::from("  +/=       - Zoom in"),
++        Line::from("  -         - Zoom out"),
++        Line::from("  Space     - Center view on selected/all"),
++        Line::from("  c         - Cycle layout algorithm"),
++        Line::from("  v         - Toggle back to Tree view"),
++        Line::from(""),
+         Line::from("Functions List:"),
+         Line::from("  Enter     - Start exploring from selected function"),
+         Line::from("  r         - Find references for selected function"),
+@@ -1449,6 +1695,12 @@ fn render_help_overlay(f: &mut Frame, area: ratatui::layout::Rect) {
+         Line::from("  • Children are loaded dynamically when expanded"),
+         Line::from("  • Navigate with arrow keys or vim-style keys"),
+         Line::from(""),
++        Line::from("🌐 2D View Behavior:"),
++        Line::from("  • Nodes positioned using layout algorithms"),
++        Line::from("  • Force-directed or Grid layout available"),
++        Line::from("  • Pan and zoom for large graphs"),
++        Line::from("  • Visual connections between related functions"),
++        Line::from(""),
+         Line::from("Press ? again to close this help"),
+     ];
+ 
+@@ -1580,6 +1832,46 @@ fn render_tree_call_graph(f: &mut Frame, area: ratatui::layout::Rect, app: &App)
+     f.render_widget(list, area);
+ }
+ 
++fn render_2d_call_graph(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
++    use crate::canvas::canvas_renderer::render_canvas_with_labels;
++    use crate::canvas::text_overlay::render_text_overlays;
++    
++    if app.grid_layout_manager.current_layout.nodes.is_empty() {
++        let content = "No functions loaded in 2D view.\n\n\
++                      Instructions:\n\
++                      1. Select a function from the Functions tab\n\
++                      2. Press 'v' to toggle to 2D view\n\
++                      3. Use WASD or hjkl to pan\n\
++                      4. Use +/- to zoom in/out\n\
++                      5. Press Space to center view\n\
++                      6. Press 'v' to toggle back to tree view\n\
++                      7. Use 'l' to switch layout algorithms\n\
++                      8. Use 'h' for hierarchical left-to-right layout";
++
++        let paragraph = Paragraph::new(content)
++            .block(
++                Block::default()
++                    .borders(Borders::ALL)
++                    .title("Call Graph - 2D View"),
++            )
++            .style(Style::default().fg(Color::DarkGray));
++        f.render_widget(paragraph, area);
++        return;
++    }
++    
++    // Render canvas with labels
++    let text_overlays = render_canvas_with_labels(
++        f,
++        area,
++        &app.grid_layout_manager.current_layout,
++        &app.call_graph,
++        app.selected_function.as_ref(),
++    );
++    
++    // Render text overlays on top
++    render_text_overlays(f, text_overlays);
++}
++
+ fn render_diagnostics(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+     // For diagnostics, we'll compute basic stats without the query engine to avoid initialization overhead
+     let total_functions = app.call_graph.nodes.len();
