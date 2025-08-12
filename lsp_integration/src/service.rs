@@ -1814,6 +1814,20 @@ impl LspService {
         Ok(())
     }
 
+    pub async fn request_incoming_calls(
+        &self,
+        request_id: String,
+        call_hierarchy_item: lsp_types::CallHierarchyItem,
+    ) -> Result<()> {
+        self.request_tx
+            .send(LspRequest::GetIncomingCalls {
+                request_id,
+                call_hierarchy_item,
+            })
+            .await?;
+        Ok(())
+    }
+
     /// Preload multiple documents to avoid "non-added document" errors
     pub async fn preload_documents(&self, document_uris: Vec<Url>) -> Result<String> {
         let request_id = Uuid::new_v4().to_string();

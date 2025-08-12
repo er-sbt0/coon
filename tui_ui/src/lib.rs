@@ -57,6 +57,13 @@ pub enum LspRequestType {
     Refresh,
 }
 
+/// Direction for call graph traversal
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallDirection {
+    Outgoing, // Show functions that THIS function calls (current behavior)
+    Incoming, // Show functions that call THIS function
+}
+
 /// Main application state
 pub struct App {
     pub call_graph: CallGraph,
@@ -69,6 +76,7 @@ pub struct App {
     pub functions: Vec<SymbolId>,
     pub tree_view_state: TreeViewState,
     pub show_help: bool,
+    pub call_direction: CallDirection,
 
     // Lazy loading fields
     pub loading_states: HashMap<SymbolId, LoadingState>,
@@ -106,6 +114,7 @@ impl App {
             functions,
             tree_view_state: TreeViewState::new(),
             show_help: false,
+            call_direction: CallDirection::Outgoing, // Default to outgoing calls (current behavior)
             loading_states: HashMap::new(),
             lsp_response_rx: None,
             lsp_request_tx: None,
@@ -455,48 +464,109 @@ impl App {
                             items.len()
                         );
 
-                        // If we got call hierarchy items, automatically request outgoing calls
+                        // If we got call hierarchy items, automatically request calls based on direction
                         if !items.is_empty() {
                             let first_item = items[0].clone();
-                            log::info!("Requesting outgoing calls for: {}", first_item.name);
 
-                            // Generate a new request ID for the outgoing calls request
-                            let outgoing_request_id = uuid::Uuid::new_v4().to_string();
-
-                            // Record pending request for outgoing calls
-                            self.pending_requests.insert(
-                                outgoing_request_id.clone(),
-                                PendingRequest {
-                                    request_type: LspRequestType::CallHierarchy,
-                                    timestamp: Instant::now(),
-                                    symbol_id: Some(symbol_id.clone()),
-                                },
-                            );
-
-                            // Send outgoing calls request
-                            if let Some(tx) = &self.lsp_request_tx {
-                                let request = LspRequest::GetOutgoingCalls {
-                                    request_id: outgoing_request_id,
-                                    call_hierarchy_item: first_item,
-                                };
-
-                                if let Err(e) = tx.send(request) {
-                                    log::error!("Failed to send outgoing calls request: {}", e);
-                                    self.update_loading_state(
-                                        &symbol_id,
-                                        LoadingState::Failed(
-                                            "Failed to request outgoing calls".to_string(),
-                                        ),
+                            match self.call_direction {
+                                CallDirection::Outgoing => {
+                                    log::info!(
+                                        "Requesting outgoing calls for: {}",
+                                        first_item.name
                                     );
-                                } else {
-                                    self.status_message = "Loading outgoing calls...".to_string();
+
+                                    // Generate a new request ID for the outgoing calls request
+                                    let outgoing_request_id = uuid::Uuid::new_v4().to_string();
+
+                                    // Record pending request for outgoing calls
+                                    self.pending_requests.insert(
+                                        outgoing_request_id.clone(),
+                                        PendingRequest {
+                                            request_type: LspRequestType::CallHierarchy,
+                                            timestamp: Instant::now(),
+                                            symbol_id: Some(symbol_id.clone()),
+                                        },
+                                    );
+
+                                    // Send outgoing calls request
+                                    if let Some(tx) = &self.lsp_request_tx {
+                                        let request = LspRequest::GetOutgoingCalls {
+                                            request_id: outgoing_request_id,
+                                            call_hierarchy_item: first_item,
+                                        };
+
+                                        if let Err(e) = tx.send(request) {
+                                            log::error!(
+                                                "Failed to send outgoing calls request: {}",
+                                                e
+                                            );
+                                            self.update_loading_state(
+                                                &symbol_id,
+                                                LoadingState::Failed(
+                                                    "Failed to request outgoing calls".to_string(),
+                                                ),
+                                            );
+                                        } else {
+                                            self.status_message =
+                                                "Loading outgoing calls...".to_string();
+                                        }
+                                    } else {
+                                        log::error!("No LSP request channel available");
+                                        self.update_loading_state(
+                                            &symbol_id,
+                                            LoadingState::Failed("No LSP channel".to_string()),
+                                        );
+                                    }
                                 }
-                            } else {
-                                log::error!("No LSP request channel available");
-                                self.update_loading_state(
-                                    &symbol_id,
-                                    LoadingState::Failed("No LSP channel".to_string()),
-                                );
+                                CallDirection::Incoming => {
+                                    log::info!(
+                                        "Requesting incoming calls for: {}",
+                                        first_item.name
+                                    );
+
+                                    // Generate a new request ID for the incoming calls request
+                                    let incoming_request_id = uuid::Uuid::new_v4().to_string();
+
+                                    // Record pending request for incoming calls
+                                    self.pending_requests.insert(
+                                        incoming_request_id.clone(),
+                                        PendingRequest {
+                                            request_type: LspRequestType::CallHierarchy,
+                                            timestamp: Instant::now(),
+                                            symbol_id: Some(symbol_id.clone()),
+                                        },
+                                    );
+
+                                    // Send incoming calls request
+                                    if let Some(tx) = &self.lsp_request_tx {
+                                        let request = LspRequest::GetIncomingCalls {
+                                            request_id: incoming_request_id,
+                                            call_hierarchy_item: first_item,
+                                        };
+
+                                        if let Err(e) = tx.send(request) {
+                                            log::error!(
+                                                "Failed to send incoming calls request: {}",
+                                                e
+                                            );
+                                            self.update_loading_state(
+                                                &symbol_id,
+                                                LoadingState::Failed(
+                                                    "Failed to request incoming calls".to_string(),
+                                                ),
+                                            );
+                                        } else {
+                                            self.status_message =
+                                                "Loading incoming calls...".to_string();
+                                        }
+                                    } else {
+                                        log::error!("No LSP request channel available");
+                                        self.update_loading_state(
+                                            &symbol_id,
+                                            LoadingState::Failed("No LSP channel".to_string()),
+                                        );
+                                    }
+                                }
                             }
                         } else {
                             // No call hierarchy items - this function has no callees
@@ -690,6 +760,15 @@ impl App {
 
                         // Update loading state to loaded
                         self.update_loading_state(&symbol_id, LoadingState::Loaded);
+
+                        // Load the callers into the tree view if the node is expanded
+                        if let Some(node_index) = self.tree_view_state.find_node_index(&symbol_id) {
+                            if let Some(node) = self.tree_view_state.nodes.get(node_index) {
+                                if node.is_expanded {
+                                    self.load_callees_for_node(symbol_id);
+                                }
+                            }
+                        }
 
                         self.status_message = "Incoming calls loaded".to_string();
                     }
@@ -897,6 +976,7 @@ impl App {
             Action::Refresh => self.handle_refresh(),
             Action::Quit => self.quit(),
             Action::Help => self.toggle_help(),
+            Action::ToggleCallDirection => self.handle_toggle_call_direction(),
         }
     }
 
@@ -997,13 +1077,29 @@ impl App {
     }
 
     fn load_callees_for_node(&mut self, symbol_id: SymbolId) {
-        // Get callees for the symbol
+        match self.call_direction {
+            CallDirection::Outgoing => self.load_outgoing_calls_for_node(symbol_id),
+            CallDirection::Incoming => self.load_incoming_calls_for_node(symbol_id),
+        }
+    }
+
+    fn load_outgoing_calls_for_node(&mut self, symbol_id: SymbolId) {
+        // Existing logic - get callees
         let callees = self.call_graph.get_callees(&symbol_id);
         let callee_ids: Vec<SymbolId> = callees.iter().map(|f| f.id.clone()).collect();
 
-        // Find the node index and insert children
         if let Some(node_index) = self.tree_view_state.find_node_index(&symbol_id) {
             self.tree_view_state.insert_children(node_index, callee_ids);
+        }
+    }
+
+    fn load_incoming_calls_for_node(&mut self, symbol_id: SymbolId) {
+        // New logic - get callers
+        let callers = self.call_graph.get_callers(&symbol_id);
+        let caller_ids: Vec<SymbolId> = callers.iter().map(|f| f.id.clone()).collect();
+
+        if let Some(node_index) = self.tree_view_state.find_node_index(&symbol_id) {
+            self.tree_view_state.insert_children(node_index, caller_ids);
         }
     }
 
@@ -1056,6 +1152,25 @@ impl App {
         }
 
         self.status_message = "Refreshing project data from LSP server...".to_string();
+    }
+
+    fn handle_toggle_call_direction(&mut self) {
+        self.call_direction = match self.call_direction {
+            CallDirection::Outgoing => CallDirection::Incoming,
+            CallDirection::Incoming => CallDirection::Outgoing,
+        };
+
+        // Clear tree view and force reload with new direction
+        self.tree_view_state = TreeViewState::new();
+        if let Some(root_id) = &self.selected_function.clone() {
+            self.start_call_graph_with_function(root_id.clone());
+        }
+
+        let direction_str = match self.call_direction {
+            CallDirection::Outgoing => "outgoing",
+            CallDirection::Incoming => "incoming",
+        };
+        self.status_message = format!("Switched to {} calls view", direction_str);
     }
 
     pub fn start_call_graph_with_function(&mut self, symbol_id: SymbolId) {
@@ -1166,6 +1281,7 @@ impl TuiApp {
                             KeyCode::Enter => Some(Action::ExpandOrCollapse),
                             KeyCode::Char('r') => Some(Action::Refresh),
                             KeyCode::Char('f') => Some(Action::FindReferences),
+                            KeyCode::Char('t') => Some(Action::ToggleCallDirection),
                             _ => None,
                         };
 
@@ -1314,6 +1430,7 @@ fn render_help_overlay(f: &mut Frame, area: ratatui::layout::Rect) {
         Line::from("  → / l     - Expand selected node"),
         Line::from("  ← / h     - Collapse selected node"),
         Line::from("  Enter     - Toggle expand/collapse"),
+        Line::from("  t         - Toggle between incoming/outgoing calls"),
         Line::from("  r         - Find references for selected function"),
         Line::from(""),
         Line::from("Functions List:"),
@@ -1446,8 +1563,13 @@ fn render_tree_call_graph(f: &mut Frame, area: ratatui::layout::Rect, app: &App)
         })
         .collect();
 
+    let direction_str = match app.call_direction {
+        CallDirection::Outgoing => "Outgoing Calls",
+        CallDirection::Incoming => "Incoming Calls",
+    };
     let title = format!(
-        "Call Graph - Call Hierarchy ({} nodes) - Use ↑↓/kj, →l/←h",
+        "Call Graph - {} ({} nodes) - Use ↑↓/kj, →l/←h, t to toggle",
+        direction_str,
         app.tree_view_state.nodes.len()
     );
 

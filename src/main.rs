@@ -331,6 +331,15 @@ async fn run_tui_with_lazy_lsp(
                                     });
                                 }
                             }
+                            LspRequest::GetIncomingCalls { request_id, call_hierarchy_item } => {
+                                if let Err(e) = lsp_service.request_incoming_calls(request_id.clone(), call_hierarchy_item).await {
+                                    log::error!("Failed to send incoming calls request: {}", e);
+                                    let _ = tui_response_tx.send(LspResponse::Error {
+                                        request_id,
+                                        error: format!("Request failed: {}", e),
+                                    });
+                                }
+                            }
                             LspRequest::FindReferences { request_id, document_uri, position } => {
                                 if let Err(e) = lsp_service.request_references(request_id.clone(), document_uri, position).await {
                                     log::error!("Failed to send references request: {}", e);

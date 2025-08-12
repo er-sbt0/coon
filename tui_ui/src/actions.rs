@@ -13,6 +13,7 @@ pub enum Action {
     Refresh,
     Quit,
     Help,
+    ToggleCallDirection,
 }
 
 /// Represents a node in the tree view with expand/collapse state
