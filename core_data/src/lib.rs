@@ -206,11 +206,19 @@ impl CallGraph {
     }
 
     pub fn add_call(&mut self, caller: SymbolId, callee: SymbolId, call_location: Location) {
-        self.edges.push(CallEdge {
-            caller,
-            callee,
-            call_location,
-        });
+        // Check if this exact edge already exists to prevent duplicates
+        let edge_exists = self
+            .edges
+            .iter()
+            .any(|e| e.caller == caller && e.callee == callee && e.call_location == call_location);
+
+        if !edge_exists {
+            self.edges.push(CallEdge {
+                caller,
+                callee,
+                call_location,
+            });
+        }
     }
 
     pub fn get_function(&self, id: &SymbolId) -> Option<&FunctionNode> {
@@ -223,6 +231,18 @@ impl CallGraph {
 
     pub fn find_function_by_name(&self, name: &str) -> Option<&FunctionNode> {
         self.nodes.values().find(|f| f.name == name)
+    }
+
+    pub fn find_function_by_qualified_name_and_location(
+        &self,
+        qualified_name: &str,
+        location: &Location,
+    ) -> Option<&FunctionNode> {
+        self.nodes.values().find(|f| {
+            f.qualified_name == qualified_name
+                && f.definition_location.file_path == location.file_path
+                && f.definition_location.line == location.line
+        })
     }
 
     pub fn get_callers(&self, callee_id: &SymbolId) -> Vec<&FunctionNode> {
@@ -520,6 +540,20 @@ impl LazyCallGraph {
                     call_graph.edges.push(CallEdge {
                         caller: node.symbol_id.clone(),
                         callee: call_ref.target_symbol_id.clone(),
+                        call_location: location.clone(),
+                    });
+                }
+            }
+        }
+
+        // Add call edges from incoming calls
+        for node in self.nodes.values() {
+            for call_ref in &node.incoming_calls {
+                // Add edges for each call location
+                for location in &call_ref.call_locations {
+                    call_graph.edges.push(CallEdge {
+                        caller: call_ref.target_symbol_id.clone(),
+                        callee: node.symbol_id.clone(),
                         call_location: location.clone(),
                     });
                 }

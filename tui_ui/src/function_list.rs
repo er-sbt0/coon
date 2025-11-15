@@ -100,43 +100,13 @@ impl<'a> FunctionList<'a> {
         f.render_widget(paragraph, area);
     }
 
-    fn get_function_style(&self, func: &FunctionNode) -> (Style, &'static str) {
-        if !func.diagnostics.is_empty() {
-            let has_errors = func
-                .diagnostics
-                .iter()
-                .any(|d| matches!(d.severity, core_data::DiagnosticSeverity::Error));
-
-            if has_errors {
-                (Style::default().fg(Color::Red), "⚠ ")
-            } else {
-                (Style::default().fg(Color::Yellow), "⚡ ")
-            }
-        } else {
-            (Style::default().fg(Color::Green), "✓ ")
-        }
+    fn get_function_style(&self, _func: &FunctionNode) -> (Style, &'static str) {
+        (Style::default().fg(Color::Green), "✓ ")
     }
 
     fn format_function_details(&self, func: &FunctionNode) -> String {
         let callers = self.graph.get_callers(&func.id);
         let callees = self.graph.get_callees(&func.id);
-
-        let diagnostics_summary = if func.diagnostics.is_empty() {
-            "No diagnostics".to_string()
-        } else {
-            let errors = func
-                .diagnostics
-                .iter()
-                .filter(|d| matches!(d.severity, core_data::DiagnosticSeverity::Error))
-                .count();
-            let warnings = func
-                .diagnostics
-                .iter()
-                .filter(|d| matches!(d.severity, core_data::DiagnosticSeverity::Warning))
-                .count();
-
-            format!("{} errors, {} warnings", errors, warnings)
-        };
 
         format!(
             "Name: {}\n\
@@ -144,23 +114,16 @@ impl<'a> FunctionList<'a> {
             Location: {}:{}\n\
             Callers: {}\n\
             Callees: {}\n\
-            References: {}\n\
-            Diagnostics: {}\n\n\
+            References: {}\n\n\
             Description:\n\
-            {}",
+            This is a function in the codebase.",
             func.name,
             func.qualified_name,
             func.definition_location.file_path,
             func.definition_location.line,
             callers.len(),
             callees.len(),
-            func.references.len(),
-            diagnostics_summary,
-            if func.diagnostics.is_empty() {
-                "This function has no known issues."
-            } else {
-                "This function has diagnostics that need attention."
-            }
+            func.references.len()
         )
     }
 

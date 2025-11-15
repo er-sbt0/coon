@@ -1,6 +1,7 @@
 /target
 **/logs
 /test_project/.cache/
+t/
 
 
 # Added by cargo

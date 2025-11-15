@@ -34,5 +34,5 @@ fern = "0.6"
 chrono = { version = "0.4", features = ["serde"] }
 lsp-types = "0.95"
 crossterm = "0.28"
-ratatui = "0.28"
+ratatui = "0.29"
 uuid = "1.0"

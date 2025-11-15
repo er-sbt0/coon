@@ -7,8 +7,8 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Tabs},
+    text::Line,
+    widgets::{Block, Borders, Paragraph, Tabs},
     Frame, Terminal,
 };
 use std::collections::HashMap;
@@ -22,13 +22,19 @@ use lsp_integration::{LspRequest, LspResponse};
 
 pub mod actions;
 pub mod call_graph_view;
-pub mod diagnostic_panel;
 pub mod function_list;
+pub mod graph_adapter;
+pub mod graph_view;
+pub mod graph_workspace;
+pub mod search_bar;
 
 pub use actions::{Action, TreeNode, TreeViewState};
 pub use call_graph_view::CallGraphView;
-pub use diagnostic_panel::DiagnosticPanel;
 pub use function_list::FunctionList;
+pub use graph_adapter::{CallDirection, CallGraphAdapter};
+pub use graph_view::{GraphView, GraphViewState};
+pub use graph_workspace::GraphWorkspace;
+pub use search_bar::{SearchBar, SearchBarState};
 
 /// Loading state for LSP operations
 #[derive(Debug, Clone, PartialEq)]
@@ -57,17 +63,9 @@ pub enum LspRequestType {
     Refresh,
 }
 
-/// Direction for call graph traversal
-#[derive(Debug, Clone, PartialEq)]
-pub enum CallDirection {
-    Outgoing, // Show functions that THIS function calls (current behavior)
-    Incoming, // Show functions that call THIS function
-}
-
 /// Main application state
 pub struct App {
     pub call_graph: CallGraph,
-    pub current_tab: usize,
     pub selected_function: Option<SymbolId>,
     pub search_query: String,
     pub should_quit: bool,
@@ -76,7 +74,21 @@ pub struct App {
     pub functions: Vec<SymbolId>,
     pub tree_view_state: TreeViewState,
     pub show_help: bool,
-    pub call_direction: CallDirection,
+
+    // Workspace management
+    pub workspaces: Vec<GraphWorkspace>,
+    pub current_workspace_index: usize,
+    pub next_workspace_id: usize,
+    pub show_workspace_manager: bool,
+    pub show_function_search: bool,
+    pub function_search_query: String,
+
+    // Search bar
+    pub search_bar_state: SearchBarState,
+    pub show_search_bar: bool,
+
+    // Last viewport size for recentering
+    pub last_viewport_size: (f32, f32),
 
     // Lazy loading fields
     pub loading_states: HashMap<SymbolId, LoadingState>,
@@ -103,9 +115,12 @@ impl App {
             function_list_state.select(Some(0));
         }
 
+        // Initialize with one default workspace
+        let default_workspace = GraphWorkspace::new(1, "Graph 1".to_string());
+        let workspaces = vec![default_workspace];
+
         Self {
             call_graph,
-            current_tab: 0,
             selected_function: None,
             search_query: String::new(),
             should_quit: false,
@@ -114,7 +129,15 @@ impl App {
             functions,
             tree_view_state: TreeViewState::new(),
             show_help: false,
-            call_direction: CallDirection::Outgoing, // Default to outgoing calls (current behavior)
+            workspaces,
+            current_workspace_index: 0,
+            next_workspace_id: 2,
+            show_workspace_manager: false,
+            show_function_search: false,
+            function_search_query: String::new(),
+            search_bar_state: SearchBarState::new(),
+            show_search_bar: false,
+            last_viewport_size: (100.0, 100.0), // Default size, will be updated on first render
             loading_states: HashMap::new(),
             lsp_response_rx: None,
             lsp_request_tx: None,
@@ -142,62 +165,8 @@ impl App {
         self.status_message = "Function selected".to_string();
     }
 
-    pub fn select_current_function(&mut self) {
-        if let Some(selected_idx) = self.function_list_state.selected() {
-            if let Some(function_id) = self.functions.get(selected_idx) {
-                self.start_call_graph_with_function(function_id.clone());
-            }
-        }
-    }
-
-    pub fn navigate_function_list_up(&mut self) {
-        if self.current_tab == 0 && !self.functions.is_empty() {
-            let i = match self.function_list_state.selected() {
-                Some(i) => {
-                    if i == 0 {
-                        self.functions.len() - 1
-                    } else {
-                        i - 1
-                    }
-                }
-                None => 0,
-            };
-            self.function_list_state.select(Some(i));
-            self.status_message = "Navigating function list".to_string();
-        }
-    }
-
-    pub fn navigate_function_list_down(&mut self) {
-        if self.current_tab == 0 && !self.functions.is_empty() {
-            let i = match self.function_list_state.selected() {
-                Some(i) => {
-                    if i >= self.functions.len() - 1 {
-                        0
-                    } else {
-                        i + 1
-                    }
-                }
-                None => 0,
-            };
-            self.function_list_state.select(Some(i));
-            self.status_message = "Navigating function list".to_string();
-        }
-    }
-
     pub fn set_search_query(&mut self, query: String) {
         self.search_query = query;
-    }
-
-    pub fn next_tab(&mut self) {
-        self.current_tab = (self.current_tab + 1) % 3;
-    }
-
-    pub fn previous_tab(&mut self) {
-        if self.current_tab == 0 {
-            self.current_tab = 2;
-        } else {
-            self.current_tab -= 1;
-        }
     }
 
     pub fn quit(&mut self) {
@@ -206,6 +175,174 @@ impl App {
 
     pub fn toggle_help(&mut self) {
         self.show_help = !self.show_help;
+    }
+
+    // Workspace management methods
+
+    /// Create a new workspace with an auto-generated name
+    pub fn create_workspace(&mut self, name: String) -> usize {
+        let id = self.next_workspace_id;
+        self.next_workspace_id += 1;
+
+        let workspace = GraphWorkspace::new(id, name);
+        self.workspaces.push(workspace);
+        self.current_workspace_index = self.workspaces.len() - 1;
+        self.status_message = format!("Created workspace #{}", id);
+        id
+    }
+
+    /// Create a new workspace with a specific root function
+    pub fn create_workspace_with_function(&mut self, name: String, symbol: SymbolId) -> usize {
+        let id = self.next_workspace_id;
+        self.next_workspace_id += 1;
+
+        let workspace = GraphWorkspace::new_with_root(id, name, symbol);
+        self.workspaces.push(workspace);
+        self.current_workspace_index = self.workspaces.len() - 1;
+        self.status_message = format!("Created workspace #{} with function", id);
+        id
+    }
+
+    /// Close a workspace by index (cannot close last workspace)
+    pub fn close_workspace(&mut self, index: usize) -> bool {
+        if self.workspaces.len() <= 1 {
+            self.status_message = "Cannot close the last workspace".to_string();
+            return false;
+        }
+
+        if index >= self.workspaces.len() {
+            return false;
+        }
+
+        self.workspaces.remove(index);
+
+        // Adjust current index if needed
+        if self.current_workspace_index >= self.workspaces.len() {
+            self.current_workspace_index = self.workspaces.len() - 1;
+        } else if self.current_workspace_index > index {
+            self.current_workspace_index -= 1;
+        }
+
+        self.status_message = "Workspace closed".to_string();
+        true
+    }
+
+    /// Switch to a specific workspace
+    pub fn switch_workspace(&mut self, index: usize) -> bool {
+        if index >= self.workspaces.len() {
+            return false;
+        }
+
+        self.current_workspace_index = index;
+        if let Some(workspace) = self.workspaces.get_mut(index) {
+            workspace.touch();
+            self.status_message = format!("Switched to workspace: {}", workspace.name);
+        }
+        true
+    }
+
+    /// Switch to next workspace
+    pub fn next_workspace(&mut self) {
+        if !self.workspaces.is_empty() {
+            self.current_workspace_index =
+                (self.current_workspace_index + 1) % self.workspaces.len();
+            if let Some(workspace) = self.workspaces.get_mut(self.current_workspace_index) {
+                workspace.touch();
+                self.status_message = format!("Switched to workspace: {}", workspace.name);
+            }
+        }
+    }
+
+    /// Switch to previous workspace
+    pub fn previous_workspace(&mut self) {
+        if !self.workspaces.is_empty() {
+            if self.current_workspace_index == 0 {
+                self.current_workspace_index = self.workspaces.len() - 1;
+            } else {
+                self.current_workspace_index -= 1;
+            }
+            if let Some(workspace) = self.workspaces.get_mut(self.current_workspace_index) {
+                workspace.touch();
+                self.status_message = format!("Switched to workspace: {}", workspace.name);
+            }
+        }
+    }
+
+    /// Rename a workspace
+    pub fn rename_workspace(&mut self, index: usize, new_name: String) {
+        if let Some(workspace) = self.workspaces.get_mut(index) {
+            workspace.name = new_name.clone();
+            self.status_message = format!("Renamed workspace to: {}", new_name);
+        }
+    }
+
+    /// Get current workspace reference
+    pub fn get_current_workspace(&self) -> Option<&GraphWorkspace> {
+        self.workspaces.get(self.current_workspace_index)
+    }
+
+    /// Get current workspace mutable reference
+    pub fn get_current_workspace_mut(&mut self) -> Option<&mut GraphWorkspace> {
+        self.workspaces.get_mut(self.current_workspace_index)
+    }
+
+    /// Toggle function search modal
+    pub fn toggle_function_search(&mut self) {
+        self.show_function_search = !self.show_function_search;
+        if self.show_function_search {
+            self.function_search_query.clear();
+        }
+    }
+
+    /// Toggle workspace manager modal
+    pub fn toggle_workspace_manager(&mut self) {
+        self.show_workspace_manager = !self.show_workspace_manager;
+    }
+
+    // Search bar methods
+
+    /// Toggle search bar visibility
+    pub fn toggle_search_bar(&mut self) {
+        if self.show_search_bar {
+            self.search_bar_state.deactivate();
+            self.show_search_bar = false;
+        } else {
+            self.search_bar_state.activate();
+            self.show_search_bar = true;
+            // Update results immediately
+            self.search_bar_state.update_results(&self.call_graph);
+        }
+    }
+
+    /// Handle search bar text input
+    pub fn handle_search_input(&mut self, c: char) {
+        if self.show_search_bar {
+            self.search_bar_state.insert_char(c);
+            self.search_bar_state.update_results(&self.call_graph);
+        }
+    }
+
+    /// Handle search bar backspace
+    pub fn handle_search_backspace(&mut self) {
+        if self.show_search_bar {
+            self.search_bar_state.delete_char();
+            self.search_bar_state.update_results(&self.call_graph);
+        }
+    }
+
+    /// Select from search bar and create workspace
+    pub fn select_from_search(&mut self) {
+        if let Some(result) = self.search_bar_state.get_selected() {
+            let symbol_id = result.symbol_id.clone();
+            let name = result.name.clone();
+
+            // Create new workspace with selected symbol
+            self.create_workspace_with_function(name, symbol_id);
+
+            // Close search bar
+            self.toggle_search_bar();
+            self.status_message = "Workspace created from search".to_string();
+        }
     }
 
     // Lazy loading methods for LSP integration
@@ -468,7 +605,13 @@ impl App {
                         if !items.is_empty() {
                             let first_item = items[0].clone();
 
-                            match self.call_direction {
+                            // Get the current workspace direction
+                            let current_direction = self
+                                .get_current_workspace()
+                                .map(|w| w.graph_view_state.direction)
+                                .unwrap_or(CallDirection::Incoming);
+
+                            match current_direction {
                                 CallDirection::Outgoing => {
                                     log::info!(
                                         "Requesting outgoing calls for: {}",
@@ -589,17 +732,13 @@ impl App {
                         // Process outgoing calls and update the call graph
                         self.update_function_outgoing_calls(symbol_id.clone(), calls);
 
+                        // Mark layout as dirty to force recomputation with new data
+                        if let Some(workspace) = self.get_current_workspace_mut() {
+                            workspace.graph_view_state.mark_layout_dirty();
+                        }
+
                         // Update loading state to loaded
                         self.update_loading_state(&symbol_id, LoadingState::Loaded);
-
-                        // Load the callees into the tree view if the node is expanded
-                        if let Some(node_index) = self.tree_view_state.find_node_index(&symbol_id) {
-                            if let Some(node) = self.tree_view_state.nodes.get(node_index) {
-                                if node.is_expanded {
-                                    self.load_callees_for_node(symbol_id);
-                                }
-                            }
-                        }
 
                         self.status_message = "Outgoing calls loaded".to_string();
                     }
@@ -758,17 +897,13 @@ impl App {
                         // Process incoming calls and update the call graph
                         self.update_function_incoming_calls(symbol_id.clone(), calls);
 
+                        // Mark layout as dirty to force recomputation with new data
+                        if let Some(workspace) = self.get_current_workspace_mut() {
+                            workspace.graph_view_state.mark_layout_dirty();
+                        }
+
                         // Update loading state to loaded
                         self.update_loading_state(&symbol_id, LoadingState::Loaded);
-
-                        // Load the callers into the tree view if the node is expanded
-                        if let Some(node_index) = self.tree_view_state.find_node_index(&symbol_id) {
-                            if let Some(node) = self.tree_view_state.nodes.get(node_index) {
-                                if node.is_expanded {
-                                    self.load_callees_for_node(symbol_id);
-                                }
-                            }
-                        }
 
                         self.status_message = "Incoming calls loaded".to_string();
                     }
@@ -814,15 +949,22 @@ impl App {
                 (call.to.range.start.character + 1) as u32,
             );
 
-            // Create or update the callee function
-            let callee_function = core_data::FunctionNode::new(
-                call.to.name.clone(),
-                format!("{}::{}", call.to.name, location.file_path),
-                location,
-            );
+            // Create or find existing callee function
+            let qualified_name = format!("{}::{}", call.to.name, location.file_path);
 
-            // Add the callee function to the call graph and get its ID
-            let callee_id = self.call_graph.add_function(callee_function);
+            // Check if function already exists
+            let callee_id = if let Some(existing_func) = self
+                .call_graph
+                .find_function_by_qualified_name_and_location(&qualified_name, &location)
+            {
+                // Use existing function's ID
+                existing_func.id.clone()
+            } else {
+                // Create new function
+                let callee_function =
+                    core_data::FunctionNode::new(call.to.name.clone(), qualified_name, location);
+                self.call_graph.add_function(callee_function)
+            };
 
             // Create the call edge from the original function to this callee
             // Use the call location from the LSP response
@@ -853,15 +995,22 @@ impl App {
                 (call.from.range.start.character + 1) as u32,
             );
 
-            // Create or update the caller function
-            let caller_function = core_data::FunctionNode::new(
-                call.from.name.clone(),
-                format!("{}::{}", call.from.name, location.file_path),
-                location,
-            );
+            // Create or find existing caller function
+            let qualified_name = format!("{}::{}", call.from.name, location.file_path);
 
-            // Add the caller function to the call graph and get its ID
-            let caller_id = self.call_graph.add_function(caller_function);
+            // Check if function already exists
+            let caller_id = if let Some(existing_func) = self
+                .call_graph
+                .find_function_by_qualified_name_and_location(&qualified_name, &location)
+            {
+                // Use existing function's ID
+                existing_func.id.clone()
+            } else {
+                // Create new function
+                let caller_function =
+                    core_data::FunctionNode::new(call.from.name.clone(), qualified_name, location);
+                self.call_graph.add_function(caller_function)
+            };
 
             // Create the call edge from the caller to the original function
             // Use the call location from the LSP response
@@ -968,161 +1117,85 @@ impl App {
         match action {
             Action::MoveUp => self.handle_move_up(),
             Action::MoveDown => self.handle_move_down(),
+            Action::MoveLeft => self.handle_move_left(),
+            Action::MoveRight => self.handle_move_right(),
             Action::ExpandNode => self.handle_expand_node(),
             Action::CollapseNode => self.handle_collapse_node(),
             Action::ExpandOrCollapse => self.handle_expand_or_collapse(),
-            Action::SwitchTab => self.next_tab(),
+            Action::SwitchTab => {} // Removed - tabs no longer exist
             Action::FindReferences => self.handle_find_references(),
             Action::Refresh => self.handle_refresh(),
             Action::Quit => self.quit(),
             Action::Help => self.toggle_help(),
             Action::ToggleCallDirection => self.handle_toggle_call_direction(),
+            Action::ResetView => self.handle_reset_view(),
+            Action::NavigateParent => self.handle_navigate_parent(),
+            Action::NavigateChild => self.handle_navigate_child(),
+            Action::NavigateNextSibling => self.handle_navigate_next_sibling(),
+            Action::NavigatePrevSibling => self.handle_navigate_prev_sibling(),
+            Action::NewWorkspace => self.handle_new_workspace(),
+            Action::CloseWorkspace => self.handle_close_workspace(),
+            Action::NextWorkspace => self.next_workspace(),
+            Action::PreviousWorkspace => self.previous_workspace(),
+            Action::RenameWorkspace => {} // TODO: Implement rename UI
         }
     }
 
     fn handle_move_up(&mut self) {
-        match self.current_tab {
-            0 => self.navigate_function_list_up(),
-            1 => {
-                self.tree_view_state.move_up();
-                self.status_message = "Moved up in call graph".to_string();
-            }
-            _ => {}
+        // Pan up in graph view
+        if let Some(workspace) = self.get_current_workspace_mut() {
+            workspace.graph_view_state.viewport.pan(0.0, -3.0);
+            self.status_message = "Panned up".to_string();
         }
     }
 
     fn handle_move_down(&mut self) {
-        match self.current_tab {
-            0 => self.navigate_function_list_down(),
-            1 => {
-                self.tree_view_state.move_down();
-                self.status_message = "Moved down in call graph".to_string();
-            }
-            _ => {}
+        // Pan down in graph view
+        if let Some(workspace) = self.get_current_workspace_mut() {
+            workspace.graph_view_state.viewport.pan(0.0, 3.0);
+            self.status_message = "Panned down".to_string();
         }
     }
 
     fn handle_expand_node(&mut self) {
-        if self.current_tab == 1 {
-            if let Some(node) = self.tree_view_state.get_selected_node_mut() {
-                if !node.is_expanded {
-                    let symbol_id = node.symbol_id.clone();
-
-                    // Update UI state immediately
-                    node.expand();
-
-                    // Only trigger LSP request if not already loaded
-                    if !self.is_function_loaded(&symbol_id) && !self.is_function_loading(&symbol_id)
-                    {
-                        self.loading_states
-                            .insert(symbol_id.clone(), LoadingState::Loading);
-                        self.request_call_hierarchy(&symbol_id);
-                        self.status_message = "Loading call hierarchy...".to_string();
-                    } else {
-                        // Use cached data if available
-                        self.load_callees_for_node(symbol_id);
-                        self.status_message = "Expanding node...".to_string();
-                    }
-                }
-            }
-        }
+        // Tree view removed - no-op
     }
 
     fn handle_collapse_node(&mut self) {
-        if self.current_tab == 1 {
-            let selected_index = self.tree_view_state.selected_index;
-            if let Some(node) = self.tree_view_state.get_selected_node_mut() {
-                if node.is_expanded {
-                    node.collapse();
-                    self.tree_view_state.remove_children(selected_index);
-                    self.status_message = "Collapsed node".to_string();
-                }
-            }
-        }
+        // Tree view removed - no-op
     }
 
     fn handle_expand_or_collapse(&mut self) {
-        if self.current_tab == 0 {
-            self.select_current_function();
-        } else if self.current_tab == 1 {
-            let selected_index = self.tree_view_state.selected_index;
-            if let Some(node) = self.tree_view_state.get_selected_node_mut() {
-                let was_expanded = node.is_expanded;
-                let symbol_id = node.symbol_id.clone();
+        // Request call hierarchy for the selected node without changing the root
+        let selected = self
+            .get_current_workspace()
+            .and_then(|w| w.graph_view_state.selected_node.clone());
 
-                if was_expanded {
-                    // Was expanded, now collapsed - remove children
-                    node.collapse();
-                    self.tree_view_state.remove_children(selected_index);
-                    self.status_message = "Collapsed node".to_string();
-                } else {
-                    // Was collapsed, now expanded - load children
-                    node.expand();
+        if let Some(selected) = selected {
+            // Request call hierarchy for this node to load its data
+            // This will populate the graph with children without changing the root
+            self.request_call_hierarchy(&selected);
 
-                    // Only trigger LSP request if not already loaded
-                    if !self.is_function_loaded(&symbol_id) && !self.is_function_loading(&symbol_id)
-                    {
-                        self.loading_states
-                            .insert(symbol_id.clone(), LoadingState::Loading);
-                        self.request_call_hierarchy(&symbol_id);
-                        self.status_message = "Loading call hierarchy...".to_string();
-                    } else {
-                        // Use cached data if available
-                        self.load_callees_for_node(symbol_id);
-                        self.status_message = "Expanding node...".to_string();
-                    }
-                }
+            // Mark layout dirty to refresh the view with updated data
+            if let Some(workspace) = self.get_current_workspace_mut() {
+                workspace.graph_view_state.mark_layout_dirty();
             }
-        }
-    }
 
-    fn load_callees_for_node(&mut self, symbol_id: SymbolId) {
-        match self.call_direction {
-            CallDirection::Outgoing => self.load_outgoing_calls_for_node(symbol_id),
-            CallDirection::Incoming => self.load_incoming_calls_for_node(symbol_id),
-        }
-    }
-
-    fn load_outgoing_calls_for_node(&mut self, symbol_id: SymbolId) {
-        // Existing logic - get callees
-        let callees = self.call_graph.get_callees(&symbol_id);
-        let callee_ids: Vec<SymbolId> = callees.iter().map(|f| f.id.clone()).collect();
-
-        if let Some(node_index) = self.tree_view_state.find_node_index(&symbol_id) {
-            self.tree_view_state.insert_children(node_index, callee_ids);
-        }
-    }
-
-    fn load_incoming_calls_for_node(&mut self, symbol_id: SymbolId) {
-        // New logic - get callers
-        let callers = self.call_graph.get_callers(&symbol_id);
-        let caller_ids: Vec<SymbolId> = callers.iter().map(|f| f.id.clone()).collect();
-
-        if let Some(node_index) = self.tree_view_state.find_node_index(&symbol_id) {
-            self.tree_view_state.insert_children(node_index, caller_ids);
+            let name = self
+                .call_graph
+                .get_function(&selected)
+                .map(|f| f.name.as_str())
+                .unwrap_or("unknown");
+            self.status_message = format!("Expanded node: {}", name);
+        } else {
+            self.status_message = "No node selected to expand".to_string();
         }
     }
 
     fn handle_find_references(&mut self) {
-        let symbol_id = match self.current_tab {
-            0 => {
-                // Function list tab - get selected function from list
-                if let Some(selected_idx) = self.function_list_state.selected() {
-                    self.functions.get(selected_idx).cloned()
-                } else {
-                    None
-                }
-            }
-            1 => {
-                // Call graph tab - get selected node from tree
-                if let Some(node) = self.tree_view_state.get_selected_node() {
-                    Some(node.symbol_id.clone())
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
+        let symbol_id = self
+            .get_current_workspace()
+            .and_then(|w| w.root_symbol.clone());
 
         if let Some(symbol_id) = symbol_id {
             self.request_references(&symbol_id);
@@ -1155,61 +1228,175 @@ impl App {
     }
 
     fn handle_toggle_call_direction(&mut self) {
-        self.call_direction = match self.call_direction {
-            CallDirection::Outgoing => CallDirection::Incoming,
-            CallDirection::Incoming => CallDirection::Outgoing,
+        // Toggle direction and get the new direction value
+        let new_direction = if let Some(workspace) = self.get_current_workspace_mut() {
+            workspace.graph_view_state.toggle_direction();
+            workspace.graph_view_state.mark_layout_dirty();
+            Some(workspace.graph_view_state.direction)
+        } else {
+            None
         };
 
-        // Clear tree view and force reload with new direction
-        self.tree_view_state = TreeViewState::new();
-        if let Some(root_id) = &self.selected_function.clone() {
-            self.start_call_graph_with_function(root_id.clone());
+        // Update status message after releasing the mutable borrow
+        if let Some(direction) = new_direction {
+            let direction_str = match direction {
+                CallDirection::Outgoing => "outgoing",
+                CallDirection::Incoming => "incoming",
+            };
+            self.status_message = format!("Switched to {} calls view", direction_str);
         }
+    }
 
-        let direction_str = match self.call_direction {
-            CallDirection::Outgoing => "outgoing",
-            CallDirection::Incoming => "incoming",
-        };
-        self.status_message = format!("Switched to {} calls view", direction_str);
+    fn handle_move_left(&mut self) {
+        // Pan left in graph view
+        if let Some(workspace) = self.get_current_workspace_mut() {
+            workspace.graph_view_state.viewport.pan(-5.0, 0.0);
+            self.status_message = "Panned left".to_string();
+        }
+    }
+
+    fn handle_move_right(&mut self) {
+        // Pan right in graph view
+        if let Some(workspace) = self.get_current_workspace_mut() {
+            workspace.graph_view_state.viewport.pan(5.0, 0.0);
+            self.status_message = "Panned right".to_string();
+        }
+    }
+
+    fn handle_reset_view(&mut self) {
+        // Capture viewport size before mutable borrow
+        let viewport_size = self.last_viewport_size;
+        if let Some(workspace) = self.get_current_workspace_mut() {
+            // Recenter the viewport on the root node
+            workspace.graph_view_state.recenter_viewport(viewport_size);
+            self.status_message = "Reset view - centered on root".to_string();
+        }
+    }
+
+    fn handle_navigate_parent(&mut self) {
+        let current_idx = self.current_workspace_index;
+        if let Some(workspace) = self.workspaces.get_mut(current_idx) {
+            if workspace
+                .graph_view_state
+                .navigate_to_parent(&self.call_graph)
+            {
+                if let Some(selected) = &workspace.graph_view_state.selected_node {
+                    let name = self
+                        .call_graph
+                        .get_function(selected)
+                        .map(|f| f.name.as_str())
+                        .unwrap_or("unknown");
+                    self.status_message = format!("Navigated to parent: {}", name);
+                } else {
+                    self.status_message = "Navigated to parent".to_string();
+                }
+            } else {
+                self.status_message = "No parent node (at root)".to_string();
+            }
+        }
+    }
+
+    fn handle_navigate_child(&mut self) {
+        let current_idx = self.current_workspace_index;
+        if let Some(workspace) = self.workspaces.get_mut(current_idx) {
+            if workspace
+                .graph_view_state
+                .navigate_to_child(&self.call_graph)
+            {
+                if let Some(selected) = &workspace.graph_view_state.selected_node {
+                    let name = self
+                        .call_graph
+                        .get_function(selected)
+                        .map(|f| f.name.as_str())
+                        .unwrap_or("unknown");
+                    self.status_message = format!("Navigated to child: {}", name);
+                } else {
+                    self.status_message = "Navigated to child".to_string();
+                }
+            } else {
+                self.status_message = "No child nodes".to_string();
+            }
+        }
+    }
+
+    fn handle_navigate_next_sibling(&mut self) {
+        let current_idx = self.current_workspace_index;
+        if let Some(workspace) = self.workspaces.get_mut(current_idx) {
+            if workspace
+                .graph_view_state
+                .navigate_next_sibling(&self.call_graph)
+            {
+                if let Some(selected) = &workspace.graph_view_state.selected_node {
+                    let name = self
+                        .call_graph
+                        .get_function(selected)
+                        .map(|f| f.name.as_str())
+                        .unwrap_or("unknown");
+                    self.status_message = format!("Navigated to next sibling: {}", name);
+                } else {
+                    self.status_message = "Navigated to next sibling".to_string();
+                }
+            } else {
+                self.status_message = "No sibling nodes".to_string();
+            }
+        }
+    }
+
+    fn handle_navigate_prev_sibling(&mut self) {
+        let current_idx = self.current_workspace_index;
+        if let Some(workspace) = self.workspaces.get_mut(current_idx) {
+            if workspace
+                .graph_view_state
+                .navigate_prev_sibling(&self.call_graph)
+            {
+                if let Some(selected) = &workspace.graph_view_state.selected_node {
+                    let name = self
+                        .call_graph
+                        .get_function(selected)
+                        .map(|f| f.name.as_str())
+                        .unwrap_or("unknown");
+                    self.status_message = format!("Navigated to previous sibling: {}", name);
+                } else {
+                    self.status_message = "Navigated to previous sibling".to_string();
+                }
+            } else {
+                self.status_message = "No sibling nodes".to_string();
+            }
+        }
+    }
+
+    fn handle_new_workspace(&mut self) {
+        let name = format!("Graph {}", self.next_workspace_id);
+        self.create_workspace(name);
+    }
+
+    fn handle_close_workspace(&mut self) {
+        self.close_workspace(self.current_workspace_index);
     }
 
     pub fn start_call_graph_with_function(&mut self, symbol_id: SymbolId) {
-        log::info!(
-            "Starting call graph exploration with function: {:?}",
-            symbol_id
-        );
+        log::info!("Starting graph view with function: {:?}", symbol_id);
 
-        // Check if we're already displaying the same function as root
-        if let Some(current_root) = self.tree_view_state.nodes.get(0) {
-            if current_root.symbol_id == symbol_id {
-                log::info!("Function {:?} is already the root of the call graph, switching to call graph tab", symbol_id);
-                self.selected_function = Some(symbol_id);
-                self.current_tab = 1; // Switch to call graph tab
-                return; // Don't create a new tree
-            }
-        }
+        // Get function name for workspace
+        let function_name = self
+            .call_graph
+            .get_function(&symbol_id)
+            .map(|f| {
+                let name = f.name.clone();
+                if name.len() > 20 {
+                    format!("{}...", &name[..17])
+                } else {
+                    name
+                }
+            })
+            .unwrap_or_else(|| format!("Graph {}", self.next_workspace_id));
 
-        self.tree_view_state = TreeViewState::new();
-        self.tree_view_state.add_root_node(symbol_id.clone());
+        // Create new workspace with this function as root
+        self.create_workspace_with_function(function_name, symbol_id.clone());
         self.selected_function = Some(symbol_id.clone());
-        self.current_tab = 1; // Switch to call graph tab
+        self.status_message = "Graph workspace created".to_string();
 
-        // Automatically expand the root node and load its call hierarchy
-        if let Some(root_node) = self.tree_view_state.nodes.get_mut(0) {
-            root_node.expand();
-        }
-
-        // Immediately request call hierarchy for the root function
-        self.loading_states
-            .insert(symbol_id.clone(), LoadingState::Loading);
-        self.request_call_hierarchy(&symbol_id);
-        self.status_message = "Loading call hierarchy...".to_string();
-
-        log::info!(
-            "Call graph started - nodes: {}, selected_index: {}",
-            self.tree_view_state.nodes.len(),
-            self.tree_view_state.selected_index
-        );
+        log::info!("Graph workspace started with root: {:?}", symbol_id);
     }
 }
 
@@ -1246,42 +1433,160 @@ impl TuiApp {
             // Check for LSP responses first
             self.app.check_lsp_responses();
 
-            // Create a reference to app for the UI drawing
-            let app_ref = &self.app;
-            self.terminal.draw(|f| ui(f, app_ref))?;
+            // Draw UI
+            self.terminal.draw(|f| ui(f, &mut self.app))?;
 
             // Handle input with timeout to allow checking for LSP responses
             if event::poll(std::time::Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
+                        // Handle search bar input separately
+                        if self.app.show_search_bar {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    self.app.toggle_search_bar();
+                                }
+                                KeyCode::Enter => {
+                                    self.app.select_from_search();
+                                }
+                                KeyCode::Up => {
+                                    self.app.search_bar_state.select_previous();
+                                }
+                                KeyCode::Down => {
+                                    self.app.search_bar_state.select_next();
+                                }
+                                KeyCode::Tab => {
+                                    self.app.search_bar_state.cycle_search_mode();
+                                    self.app
+                                        .search_bar_state
+                                        .update_results(&self.app.call_graph);
+                                }
+                                KeyCode::Backspace => {
+                                    self.app.handle_search_backspace();
+                                }
+                                KeyCode::Delete => {
+                                    self.app.search_bar_state.delete_char_forward();
+                                    self.app
+                                        .search_bar_state
+                                        .update_results(&self.app.call_graph);
+                                }
+                                KeyCode::Left => {
+                                    self.app.search_bar_state.move_cursor_right();
+                                }
+                                KeyCode::Right => {
+                                    self.app.search_bar_state.move_cursor_left();
+                                }
+                                KeyCode::Home => {
+                                    self.app.search_bar_state.move_cursor_start();
+                                }
+                                KeyCode::End => {
+                                    self.app.search_bar_state.move_cursor_end();
+                                }
+                                KeyCode::Char(c) => {
+                                    self.app.handle_search_input(c);
+                                }
+                                _ => {}
+                            }
+                            continue; // Don't process other actions when search is active
+                        }
+
                         let action = match key.code {
                             KeyCode::Char('q') | KeyCode::Esc => Some(Action::Quit),
                             KeyCode::Char('?') => Some(Action::Help),
-                            KeyCode::Tab => Some(Action::SwitchTab),
-                            KeyCode::BackTab => {
-                                self.app.previous_tab();
+                            KeyCode::Char('n')
+                                if key
+                                    .modifiers
+                                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                            {
+                                Some(Action::NewWorkspace)
+                            }
+                            KeyCode::Char('t')
+                                if key
+                                    .modifiers
+                                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                            {
+                                Some(Action::NewWorkspace)
+                            }
+                            KeyCode::Char('w')
+                                if key
+                                    .modifiers
+                                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                            {
+                                Some(Action::CloseWorkspace)
+                            }
+                            KeyCode::Char('s')
+                                if key
+                                    .modifiers
+                                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                            {
+                                self.app.toggle_search_bar();
                                 None
                             }
+                            KeyCode::Char(']') => Some(Action::NextWorkspace),
+                            KeyCode::Char('[') => Some(Action::PreviousWorkspace),
+                            KeyCode::Tab
+                                if key
+                                    .modifiers
+                                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                            {
+                                Some(Action::NextWorkspace)
+                            }
+                            KeyCode::BackTab
+                                if key
+                                    .modifiers
+                                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                            {
+                                Some(Action::PreviousWorkspace)
+                            }
                             KeyCode::Char('1') => {
-                                self.app.current_tab = 0;
+                                self.app.switch_workspace(0);
                                 None
                             }
                             KeyCode::Char('2') => {
-                                self.app.current_tab = 1;
+                                self.app.switch_workspace(1);
                                 None
                             }
                             KeyCode::Char('3') => {
-                                self.app.current_tab = 2;
+                                self.app.switch_workspace(2);
                                 None
                             }
-                            KeyCode::Up | KeyCode::Char('k') => Some(Action::MoveUp),
-                            KeyCode::Down | KeyCode::Char('j') => Some(Action::MoveDown),
-                            KeyCode::Right | KeyCode::Char('l') => Some(Action::ExpandNode),
-                            KeyCode::Left | KeyCode::Char('h') => Some(Action::CollapseNode),
+                            KeyCode::Char('4') => {
+                                self.app.switch_workspace(3);
+                                None
+                            }
+                            KeyCode::Char('5') => {
+                                self.app.switch_workspace(4);
+                                None
+                            }
+                            KeyCode::Char('6') => {
+                                self.app.switch_workspace(5);
+                                None
+                            }
+                            KeyCode::Char('7') => {
+                                self.app.switch_workspace(6);
+                                None
+                            }
+                            KeyCode::Char('8') => {
+                                self.app.switch_workspace(7);
+                                None
+                            }
+                            KeyCode::Char('9') => {
+                                self.app.switch_workspace(8);
+                                None
+                            }
+                            KeyCode::Up => Some(Action::MoveDown),
+                            KeyCode::Down => Some(Action::MoveUp),
+                            KeyCode::Right => Some(Action::MoveLeft),
+                            KeyCode::Left => Some(Action::MoveRight),
+                            KeyCode::Char('h') => Some(Action::NavigateParent),
+                            KeyCode::Char('l') => Some(Action::NavigateChild),
+                            KeyCode::Char('k') => Some(Action::NavigatePrevSibling),
+                            KeyCode::Char('j') => Some(Action::NavigateNextSibling),
                             KeyCode::Enter => Some(Action::ExpandOrCollapse),
-                            KeyCode::Char('r') => Some(Action::Refresh),
-                            KeyCode::Char('f') => Some(Action::FindReferences),
+                            KeyCode::Char('r') => Some(Action::ResetView),
+                            KeyCode::Char('F') => Some(Action::FindReferences),
                             KeyCode::Char('t') => Some(Action::ToggleCallDirection),
+                            KeyCode::Char('R') => Some(Action::Refresh),
                             _ => None,
                         };
 
@@ -1311,7 +1616,7 @@ impl TuiApp {
 }
 
 /// UI rendering function (separate from TuiApp to avoid borrowing issues)
-pub fn ui(f: &mut Frame, app: &App) {
+pub fn ui(f: &mut Frame, app: &mut App) {
     let size = f.area();
 
     // Show help overlay if requested
@@ -1320,100 +1625,61 @@ pub fn ui(f: &mut Frame, app: &App) {
         return;
     }
 
+    // Show search bar if active
+    if app.show_search_bar {
+        render_search_bar_overlay(f, size, app);
+        return;
+    }
+
+    // Show function search modal if requested
+    if app.show_function_search {
+        render_function_search_modal(f, size, app);
+        return;
+    }
+
+    // Show workspace manager if requested
+    if app.show_workspace_manager {
+        render_workspace_manager_modal(f, size, app);
+        return;
+    }
+
     // Create main layout
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Tab bar
-            Constraint::Min(0),    // Main content
+            Constraint::Length(3), // Workspace tabs
+            Constraint::Min(0),    // Main content (graph view)
             Constraint::Length(3), // Status bar
         ])
         .split(size);
 
-    // Render tab bar
-    let tab_titles = vec!["Functions", "Call Graph", "Diagnostics"];
-    let tabs = Tabs::new(tab_titles)
-        .block(Block::default().borders(Borders::ALL).title("Navigation"))
-        .style(Style::default().fg(Color::White))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
-        .select(app.current_tab);
-    f.render_widget(tabs, chunks[0]);
+    // Render workspace tabs
+    render_workspace_tabs(f, chunks[0], app);
 
-    // Render main content based on selected tab
-    match app.current_tab {
-        0 => render_function_list(f, chunks[1], app),
-        1 => render_tree_call_graph(f, chunks[1], app),
-        2 => render_diagnostics(f, chunks[1], app),
-        _ => {}
-    }
+    // Render graph view (current workspace)
+    render_graph_view(f, chunks[1], app);
 
     // Render status bar
-    let status_text = match app.current_tab {
-        0 => format!(
-            "Status: {} | Selected: {} | Use ↑↓/kj to navigate, Enter to explore, Tab to switch tabs, ? for help | Press 'q' to quit",
-            app.status_message,
-            app.selected_function
-                .as_ref()
-                .and_then(|id| app.call_graph.get_function(id))
-                .map(|f| f.name.as_str())
-                .unwrap_or("None")
-        ),
-        1 => format!(
-            "Status: {} | Use ↑↓/kj to navigate, →l to expand, ←h to collapse, Enter to toggle, ? for help | Press 'q' to quit",
-            app.status_message
-        ),
-        2 => format!(
-            "Status: {} | Diagnostics View | Press Tab to switch tabs, ? for help | Press 'q' to quit",
-            app.status_message
-        ),
-        _ => format!(
-            "Status: {} | Unknown View | Press 'q' to quit",
-            app.status_message
-        ),
+    let workspace_info = if let Some(workspace) = app.get_current_workspace() {
+        format!(
+            "{} ({}/{})",
+            workspace.name,
+            app.current_workspace_index + 1,
+            app.workspaces.len()
+        )
+    } else {
+        "No workspace".to_string()
     };
+
+    let status_text = format!(
+        "Status: {} | Workspace: {} | ↑↓←→/hjkl:pan r:reset t:direction Ctrl+N:new Ctrl+W:close ]:next [:prev ?:help | q:quit",
+        app.status_message,
+        workspace_info
+    );
 
     let status_paragraph =
         Paragraph::new(status_text).block(Block::default().borders(Borders::ALL).title("Status"));
     f.render_widget(status_paragraph, chunks[2]);
-}
-
-fn render_function_list(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    let query_engine = logic::query::GraphQueryEngine::new(&app.call_graph);
-    let mut function_list = FunctionList::new(&app.call_graph, &query_engine);
-
-    // Sync the state with the app's function list state
-    function_list.state = app.function_list_state.clone();
-
-    // Ensure the function list uses the same order as the app
-    function_list.functions = app
-        .functions
-        .iter()
-        .filter_map(|id| app.call_graph.get_function(id))
-        .collect();
-
-    // Debug logging
-    log::info!(
-        "Rendering function list with {} functions, selected: {:?}",
-        function_list.functions.len(),
-        function_list.state.selected()
-    );
-
-    // Log selected function for debugging
-    if let Some(selected_idx) = function_list.state.selected() {
-        if let Some(func) = function_list.functions.get(selected_idx) {
-            log::info!(
-                "Selected function: '{}' with {} references",
-                func.name,
-                func.references.len()
-            );
-        }
-    }
-
-    function_list.render(f, area);
 }
 
 fn render_help_overlay(f: &mut Frame, area: ratatui::layout::Rect) {
@@ -1422,32 +1688,30 @@ fn render_help_overlay(f: &mut Frame, area: ratatui::layout::Rect) {
         Line::from(""),
         Line::from("🎮 Key Bindings:"),
         Line::from(""),
-        Line::from("Navigation:"),
-        Line::from("  ↑ / k     - Move selection up"),
-        Line::from("  ↓ / j     - Move selection down"),
+        Line::from("Workspace Management:"),
+        Line::from("  Ctrl+N/T  - Create new workspace"),
+        Line::from("  Ctrl+W    - Close current workspace"),
+        Line::from("  Ctrl+Tab/]- Next workspace"),
+        Line::from("  [/Ctrl+⇧+Tab - Previous workspace"),
+        Line::from("  Ctrl+S    - Search symbols (create workspace"),
+        Line::from("  1-9       - Jump to workspace 1-9"),
         Line::from(""),
-        Line::from("Call Graph (Tree View):"),
-        Line::from("  → / l     - Expand selected node"),
-        Line::from("  ← / h     - Collapse selected node"),
-        Line::from("  Enter     - Toggle expand/collapse"),
-        Line::from("  t         - Toggle between incoming/outgoing calls"),
-        Line::from("  r         - Find references for selected function"),
-        Line::from(""),
-        Line::from("Functions List:"),
-        Line::from("  Enter     - Start exploring from selected function"),
-        Line::from("  r         - Find references for selected function"),
+        Line::from("Graph View Navigation:"),
+        Line::from("  ↑↓←→/hjkl - Pan the view"),
+        Line::from("  r         - Reset view"),
+        Line::from("  t         - Toggle call direction"),
+        Line::from("  Enter     - Select next node"),
         Line::from(""),
         Line::from("General:"),
-        Line::from("  Tab       - Switch between tabs"),
-        Line::from("  1, 2, 3   - Jump to specific tab"),
+        Line::from("  F         - Find references"),
+        Line::from("  R         - Refresh from LSP"),
         Line::from("  ?         - Show/hide this help"),
         Line::from("  q / Esc   - Quit application"),
         Line::from(""),
-        Line::from("🌲 Tree View Behavior:"),
-        Line::from("  • Nodes represent functions/symbols"),
-        Line::from("  • Indentation shows call hierarchy"),
-        Line::from("  • Children are loaded dynamically when expanded"),
-        Line::from("  • Navigate with arrow keys or vim-style keys"),
+        Line::from("🌲 Graph View Behavior:"),
+        Line::from("  • Each workspace shows an independent call graph"),
+        Line::from("  • Create multiple workspaces to compare graphs"),
+        Line::from("  • Panning is per-workspace"),
         Line::from(""),
         Line::from("Press ? again to close this help"),
     ];
@@ -1478,205 +1742,239 @@ fn render_help_overlay(f: &mut Frame, area: ratatui::layout::Rect) {
     f.render_widget(help_paragraph, popup_area);
 }
 
-fn render_tree_call_graph(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    if app.tree_view_state.nodes.is_empty() {
-        let content = "No function selected for call graph exploration.\n\n\
-                      Instructions:\n\
-                      1. Go to the Functions tab (press '1' or Tab)\n\
-                      2. Select a function (↑↓ to navigate)\n\
-                      3. Press Enter to start exploring\n\n\
-                      Then use:\n\
-                      • ↑↓ or kj to navigate\n\
-                      • →l to expand nodes\n\
-                      • ←h to collapse nodes\n\
-                      • Enter to toggle expand/collapse";
-
-        let paragraph = Paragraph::new(content)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Call Graph - Tree View"),
-            )
-            .style(Style::default().fg(Color::DarkGray));
-        f.render_widget(paragraph, area);
-        return;
-    }
-
-    let items: Vec<ListItem> = app
-        .tree_view_state
-        .nodes
-        .iter()
-        .enumerate()
-        .map(|(index, node)| {
-            if let Some(function) = app.call_graph.get_function(&node.symbol_id) {
-                let indent = "  ".repeat(node.depth);
-
-                let expand_indicator = if node.is_loading {
-                    "⏳"
-                } else if node.is_expanded {
-                    if node.has_children {
-                        "▼"
-                    } else {
-                        "○"
-                    }
-                } else if node.children_loaded && !node.has_children {
-                    "○"
-                } else {
-                    "▶"
-                };
-
-                let style = if function.diagnostics.is_empty() {
-                    Style::default().fg(Color::Green)
-                } else {
-                    let has_errors = function
-                        .diagnostics
-                        .iter()
-                        .any(|d| matches!(d.severity, core_data::DiagnosticSeverity::Error));
-                    if has_errors {
-                        Style::default().fg(Color::Red)
-                    } else {
-                        Style::default().fg(Color::Yellow)
-                    }
-                };
-
-                // Highlight selected node
-                let final_style = if index == app.tree_view_state.selected_index {
-                    style.add_modifier(Modifier::BOLD).bg(Color::DarkGray)
-                } else {
-                    style
-                };
-
-                ListItem::new(Line::from(vec![
-                    Span::raw(indent),
-                    Span::styled(expand_indicator, final_style),
-                    Span::raw(" "),
-                    Span::styled(&function.name, final_style),
-                    Span::raw(" "),
-                    Span::styled(
-                        format!("({})", function.definition_location.file_path),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]))
-            } else {
-                ListItem::new(Line::from("Invalid function"))
-            }
-        })
-        .collect();
-
-    let direction_str = match app.call_direction {
-        CallDirection::Outgoing => "Outgoing Calls",
-        CallDirection::Incoming => "Incoming Calls",
+fn render_search_bar_overlay(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
+    // Create centered overlay
+    let popup_width = area.width.min(100);
+    let popup_height = area.height.min(30);
+    let popup_area = ratatui::layout::Rect {
+        x: (area.width.saturating_sub(popup_width)) / 2,
+        y: (area.height.saturating_sub(popup_height)) / 2,
+        width: popup_width,
+        height: popup_height,
     };
-    let title = format!(
-        "Call Graph - {} ({} nodes) - Use ↑↓/kj, →l/←h, t to toggle",
-        direction_str,
-        app.tree_view_state.nodes.len()
-    );
 
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .style(Style::default());
+    // Dim background
+    let clear_block = Block::default()
+        .style(Style::default().bg(Color::Black))
+        .borders(Borders::NONE);
+    f.render_widget(clear_block, area);
 
-    f.render_widget(list, area);
+    // Render search bar
+    let search_bar = SearchBar::new();
+    search_bar.render(popup_area, f.buffer_mut(), &app.search_bar_state);
 }
 
-fn render_diagnostics(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    // For diagnostics, we'll compute basic stats without the query engine to avoid initialization overhead
-    let total_functions = app.call_graph.nodes.len();
-    let total_call_relationships = app.call_graph.edges.len();
+fn render_workspace_tabs(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let mut tab_titles = Vec::new();
 
-    let functions_with_diagnostics = app
-        .call_graph
-        .nodes
-        .values()
-        .filter(|f| !f.diagnostics.is_empty())
-        .count();
+    for (i, workspace) in app.workspaces.iter().enumerate() {
+        let mut name = workspace.name.clone();
 
-    let functions_with_errors = app
-        .call_graph
-        .nodes
-        .values()
-        .filter(|f| {
-            f.diagnostics
-                .iter()
-                .any(|d| matches!(d.severity, core_data::DiagnosticSeverity::Error))
-        })
-        .count();
+        // Truncate long names
+        if name.len() > 15 {
+            name = format!("{}...", &name[..12]);
+        }
 
-    let functions_with_warnings = app
-        .call_graph
-        .nodes
-        .values()
-        .filter(|f| {
-            f.diagnostics
-                .iter()
-                .any(|d| matches!(d.severity, core_data::DiagnosticSeverity::Warning))
-        })
-        .count();
+        // Add active indicator
+        if i == app.current_workspace_index {
+            name = format!("[{}*]", name);
+        } else {
+            name = format!("[{}]", name);
+        }
 
-    // Simple entry point detection (functions not called by others)
-    let called_functions: std::collections::HashSet<_> = app
-        .call_graph
-        .edges
-        .iter()
-        .map(|edge| &edge.callee)
-        .collect();
-    let entry_points = app
-        .call_graph
-        .nodes
-        .keys()
-        .filter(|id| !called_functions.contains(id))
-        .count();
+        tab_titles.push(name);
+    }
 
-    // Simple leaf function detection (functions that don't call others)
-    let calling_functions: std::collections::HashSet<_> = app
-        .call_graph
-        .edges
-        .iter()
-        .map(|edge| &edge.caller)
-        .collect();
-    let leaf_functions = app
-        .call_graph
-        .nodes
-        .keys()
-        .filter(|id| !calling_functions.contains(id))
-        .count();
+    // Add "new workspace" button
+    tab_titles.push("[+]".to_string());
+    tab_titles.push("[?]".to_string());
 
-    let average_calls = if total_functions > 0 {
-        total_call_relationships as f64 / total_functions as f64
+    let tabs = Tabs::new(tab_titles)
+        .block(Block::default().borders(Borders::ALL).title("Workspaces"))
+        .style(Style::default().fg(Color::White))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .select(app.current_workspace_index);
+    f.render_widget(tabs, area);
+}
+
+fn render_graph_view(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
+    // Get current workspace
+    let workspace_index = app.current_workspace_index;
+
+    if let Some(workspace) = app.workspaces.get_mut(workspace_index) {
+        // Store viewport size for potential recentering
+        let viewport_size = (area.width as f32, area.height as f32);
+        app.last_viewport_size = viewport_size;
+
+        // Update layout if dirty (efficient - only recomputes when needed)
+        if let Err(e) = workspace
+            .graph_view_state
+            .update_layout(&app.call_graph, viewport_size)
+        {
+            // If layout update fails, show error
+            let error_text = vec![
+                Line::from("Layout Error"),
+                Line::from(""),
+                Line::from(format!("Failed to compute layout: {}", e)),
+            ];
+
+            let paragraph = Paragraph::new(error_text)
+                .block(Block::default().borders(Borders::ALL).title("Graph View"))
+                .style(Style::default().fg(Color::Red));
+
+            f.render_widget(paragraph, area);
+            return;
+        }
+
+        // Create the graph view widget
+        let graph_view = GraphView::new(&app.call_graph).show_help(app.show_help);
+
+        // Render with workspace's graph view state
+        f.render_stateful_widget(graph_view, area, &mut workspace.graph_view_state);
     } else {
-        0.0
+        // No workspace available - render empty state
+        let empty_text = vec![
+            Line::from("No workspace available"),
+            Line::from(""),
+            Line::from("Press Ctrl+N to create a new workspace"),
+        ];
+
+        let paragraph = Paragraph::new(empty_text)
+            .block(Block::default().borders(Borders::ALL).title("Graph View"))
+            .style(Style::default().fg(Color::Gray));
+
+        f.render_widget(paragraph, area);
+    }
+}
+
+fn render_function_search_modal(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    // Create a centered popup
+    let popup_width = area.width.min(80);
+    let popup_height = area.height.min(30);
+    let popup_area = ratatui::layout::Rect {
+        x: (area.width - popup_width) / 2,
+        y: (area.height - popup_height) / 2,
+        width: popup_width,
+        height: popup_height,
     };
 
-    let content = format!(
-        "Graph Statistics:\n\
-        Total Functions: {}\n\
-        Total Call Relationships: {}\n\
-        Entry Points: {}\n\
-        Leaf Functions: {}\n\
-        Functions with Diagnostics: {}\n\
-        Average Calls per Function: {:.2}\n\n\
-        Problem Areas:\n\
-        Functions with Errors: {}\n\
-        Functions with Warnings: {}\n\
-        \n\
-        Note: Advanced analysis available when needed",
-        total_functions,
-        total_call_relationships,
-        entry_points,
-        leaf_functions,
-        functions_with_diagnostics,
-        average_calls,
-        functions_with_errors,
-        functions_with_warnings
-    );
+    // Clear the background with semi-transparent effect
+    let clear_block = Block::default()
+        .style(Style::default().bg(Color::Black))
+        .borders(Borders::NONE);
+    f.render_widget(clear_block, area);
 
-    let paragraph = Paragraph::new(content).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Diagnostics & Statistics"),
-    );
-    f.render_widget(paragraph, area);
+    // Filter functions based on search query
+    let filtered_functions: Vec<_> = app
+        .functions
+        .iter()
+        .filter_map(|id| app.call_graph.get_function(id))
+        .filter(|func| {
+            if app.function_search_query.is_empty() {
+                true
+            } else {
+                func.name
+                    .to_lowercase()
+                    .contains(&app.function_search_query.to_lowercase())
+            }
+        })
+        .take(popup_height as usize - 5)
+        .collect();
+
+    let mut text = vec![
+        Line::from("Search Functions"),
+        Line::from(""),
+        Line::from(format!("Query: {}_", app.function_search_query)),
+        Line::from(""),
+        Line::from(format!("Found {} function(s):", filtered_functions.len())),
+        Line::from(""),
+    ];
+
+    for (i, func) in filtered_functions.iter().enumerate() {
+        text.push(Line::from(format!("  {}. {}", i + 1, func.name)));
+    }
+
+    text.push(Line::from(""));
+    text.push(Line::from(
+        "Type to search, Enter to select first, Esc to cancel",
+    ));
+
+    let paragraph = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Function Search")
+                .style(Style::default().fg(Color::Cyan)),
+        )
+        .style(Style::default().fg(Color::White).bg(Color::Black));
+
+    f.render_widget(paragraph, popup_area);
+}
+
+fn render_workspace_manager_modal(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    // Create a centered popup
+    let popup_width = area.width.min(80);
+    let popup_height = area.height.min(30);
+    let popup_area = ratatui::layout::Rect {
+        x: (area.width - popup_width) / 2,
+        y: (area.height - popup_height) / 2,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    // Clear the background
+    let clear_block = Block::default()
+        .style(Style::default().bg(Color::Black))
+        .borders(Borders::NONE);
+    f.render_widget(clear_block, area);
+
+    let mut text = vec![
+        Line::from("Workspace Manager"),
+        Line::from(""),
+        Line::from(format!("Total Workspaces: {}", app.workspaces.len())),
+        Line::from(""),
+    ];
+
+    for (i, workspace) in app.workspaces.iter().enumerate() {
+        let marker = if i == app.current_workspace_index {
+            "→"
+        } else {
+            " "
+        };
+
+        let root_info = workspace
+            .root_symbol
+            .as_ref()
+            .and_then(|id| app.call_graph.get_function(id))
+            .map(|f| f.name.as_str())
+            .unwrap_or("(empty)");
+
+        text.push(Line::from(format!(
+            "{} {}. {} - Root: {}",
+            marker,
+            i + 1,
+            workspace.name,
+            root_info
+        )));
+    }
+
+    text.push(Line::from(""));
+    text.push(Line::from("Use 1-9 to switch, Esc to close"));
+
+    let paragraph = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Workspaces")
+                .style(Style::default().fg(Color::Green)),
+        )
+        .style(Style::default().fg(Color::White).bg(Color::Black));
+
+    f.render_widget(paragraph, popup_area);
 }
 
 #[cfg(test)]
@@ -1698,29 +1996,62 @@ mod tests {
     #[test]
     fn test_app_creation() {
         let app = create_test_app();
-        assert_eq!(app.current_tab, 0);
+        assert_eq!(app.workspaces.len(), 1);
+        assert_eq!(app.current_workspace_index, 0);
         assert!(app.selected_function.is_none());
         assert_eq!(app.search_query, "");
         assert!(!app.should_quit);
         assert!(!app.show_help);
-        assert_eq!(app.tree_view_state.nodes.len(), 0);
     }
 
     #[test]
-    fn test_tab_navigation() {
+    fn test_workspace_creation() {
         let mut app = create_test_app();
 
-        app.next_tab();
-        assert_eq!(app.current_tab, 1);
+        app.create_workspace("Test Workspace".to_string());
+        assert_eq!(app.workspaces.len(), 2);
+        assert_eq!(app.current_workspace_index, 1);
+        assert_eq!(app.workspaces[1].name, "Test Workspace");
+    }
 
-        app.next_tab();
-        assert_eq!(app.current_tab, 2);
+    #[test]
+    fn test_workspace_switching() {
+        let mut app = create_test_app();
+        app.create_workspace("Workspace 2".to_string());
 
-        app.next_tab();
-        assert_eq!(app.current_tab, 0);
+        app.next_workspace();
+        assert_eq!(app.current_workspace_index, 0);
 
-        app.previous_tab();
-        assert_eq!(app.current_tab, 2);
+        app.previous_workspace();
+        assert_eq!(app.current_workspace_index, 1);
+
+        app.switch_workspace(0);
+        assert_eq!(app.current_workspace_index, 0);
+    }
+
+    #[test]
+    fn test_workspace_closing() {
+        let mut app = create_test_app();
+
+        // Can't close last workspace
+        assert!(!app.close_workspace(0));
+        assert_eq!(app.workspaces.len(), 1);
+
+        // Add another workspace and close it
+        app.create_workspace("Workspace 2".to_string());
+        assert_eq!(app.workspaces.len(), 2);
+
+        assert!(app.close_workspace(1));
+        assert_eq!(app.workspaces.len(), 1);
+    }
+
+    #[test]
+    fn test_minimum_one_workspace() {
+        let mut app = create_test_app();
+
+        // Try to close the only workspace - should fail
+        assert!(!app.close_workspace(0));
+        assert_eq!(app.workspaces.len(), 1);
     }
 
     #[test]
@@ -1734,17 +2065,19 @@ mod tests {
     }
 
     #[test]
-    fn test_tree_view_initialization() {
+    fn test_graph_view_initialization() {
         let mut app = create_test_app();
         let func_id = app.call_graph.nodes.keys().next().unwrap().clone();
 
         app.start_call_graph_with_function(func_id.clone());
 
         assert_eq!(app.selected_function, Some(func_id.clone()));
-        assert_eq!(app.current_tab, 1);
-        assert_eq!(app.tree_view_state.nodes.len(), 1);
-        assert_eq!(app.tree_view_state.nodes[0].symbol_id, func_id);
-        assert_eq!(app.tree_view_state.selected_index, 0);
+        // Should have created a new workspace
+        assert_eq!(app.workspaces.len(), 2);
+        // New workspace should be current
+        assert_eq!(app.current_workspace_index, 1);
+        // New workspace should have the function as root
+        assert_eq!(app.workspaces[1].root_symbol, Some(func_id));
     }
 
     #[test]

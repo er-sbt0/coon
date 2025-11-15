@@ -7,7 +7,8 @@ edition = "2021"
 core_data = { path = "../core_data" }
 logic = { path = "../logic" }
 lsp_integration = { path = "../lsp_integration" }
-ratatui = "0.28"
+grid = { path = "../../grid", features = ["rendering"] }
+ratatui = "0.29"
 crossterm = "0.28"
 log = "0.4"
 tokio = { version = "1.0", features = ["sync"] }

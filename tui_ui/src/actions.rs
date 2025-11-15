@@ -5,6 +5,8 @@ use core_data::SymbolId;
 pub enum Action {
     MoveUp,
     MoveDown,
+    MoveLeft,
+    MoveRight,
     ExpandNode,
     CollapseNode,
     ExpandOrCollapse,
@@ -14,6 +16,20 @@ pub enum Action {
     Quit,
     Help,
     ToggleCallDirection,
+    ResetView,
+
+    // Graph navigation (hjkl)
+    NavigateParent,
+    NavigateChild,
+    NavigateNextSibling,
+    NavigatePrevSibling,
+
+    // Workspace management
+    NewWorkspace,
+    CloseWorkspace,
+    NextWorkspace,
+    PreviousWorkspace,
+    RenameWorkspace,
 }
 
 /// Represents a node in the tree view with expand/collapse state
