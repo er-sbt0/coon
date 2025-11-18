@@ -48,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn print_usage() {
     let program_name = env::args().next().unwrap_or_else(|| "coon".to_string());
-    
+
     println!("Usage:");
     println!("  {} [project_path]", program_name);
     println!();
@@ -58,7 +58,10 @@ fn print_usage() {
     println!();
     println!("Examples:");
     println!("  {}                    # Run with demo data", program_name);
-    println!("  {} /path/to/project   # Analyze a real project", program_name);
+    println!(
+        "  {} /path/to/project   # Analyze a real project",
+        program_name
+    );
 }
 
 async fn run_with_demo_data() -> Result<(), Box<dyn std::error::Error>> {
