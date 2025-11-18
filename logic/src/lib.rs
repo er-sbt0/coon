@@ -24,8 +24,11 @@ impl<'a> GraphTraversal<'a> {
         Self { graph }
     }
 
-    /// Find all functions reachable from a starting function (BFS)
-    pub fn find_reachable_from(&self, start_id: &SymbolId) -> Vec<SymbolId> {
+    /// Generic BFS traversal that can work with different neighbor functions
+    fn bfs_traverse<F>(&self, start_id: &SymbolId, get_neighbors: F) -> Vec<SymbolId>
+    where
+        F: Fn(&SymbolId) -> Vec<SymbolId>,
+    {
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
         let mut result = Vec::new();
@@ -36,11 +39,10 @@ impl<'a> GraphTraversal<'a> {
         while let Some(current_id) = queue.pop_front() {
             result.push(current_id.clone());
 
-            let callees = self.graph.get_callees(&current_id);
-            for callee in callees {
-                if !visited.contains(&callee.id) {
-                    visited.insert(callee.id.clone());
-                    queue.push_back(callee.id.clone());
+            for neighbor_id in get_neighbors(&current_id) {
+                if !visited.contains(&neighbor_id) {
+                    visited.insert(neighbor_id.clone());
+                    queue.push_back(neighbor_id.clone());
                 }
             }
         }
@@ -48,28 +50,26 @@ impl<'a> GraphTraversal<'a> {
         result
     }
 
+    /// Find all functions reachable from a starting function (BFS)
+    pub fn find_reachable_from(&self, start_id: &SymbolId) -> Vec<SymbolId> {
+        self.bfs_traverse(start_id, |id| {
+            self.graph
+                .get_callees(id)
+                .iter()
+                .map(|callee| callee.id.clone())
+                .collect()
+        })
+    }
+
     /// Find all functions that can reach a target function (reverse BFS)
     pub fn find_can_reach(&self, target_id: &SymbolId) -> Vec<SymbolId> {
-        let mut visited = HashSet::new();
-        let mut queue = VecDeque::new();
-        let mut result = Vec::new();
-
-        queue.push_back(target_id.clone());
-        visited.insert(target_id.clone());
-
-        while let Some(current_id) = queue.pop_front() {
-            result.push(current_id.clone());
-
-            let callers = self.graph.get_callers(&current_id);
-            for caller in callers {
-                if !visited.contains(&caller.id) {
-                    visited.insert(caller.id.clone());
-                    queue.push_back(caller.id.clone());
-                }
-            }
-        }
-
-        result
+        self.bfs_traverse(target_id, |id| {
+            self.graph
+                .get_callers(id)
+                .iter()
+                .map(|caller| caller.id.clone())
+                .collect()
+        })
     }
 
     /// Find the shortest path between two functions

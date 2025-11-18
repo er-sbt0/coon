@@ -17,7 +17,6 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 
 use core_data::{CallGraph, SymbolId};
-use logic::query::GraphQueryEngine;
 use lsp_integration::{LspRequest, LspResponse};
 
 pub mod actions;

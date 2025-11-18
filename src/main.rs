@@ -47,25 +47,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_usage() {
+    let program_name = env::args().next().unwrap_or_else(|| "coon".to_string());
+    
     println!("Usage:");
-    println!(
-        "  {} [project_path]",
-        env::args().next().unwrap_or("coon".to_string())
-    );
+    println!("  {} [project_path]", program_name);
     println!();
     println!("Options:");
     println!("  project_path    Path to the project directory for LSP analysis");
     println!("                  If not provided, runs with demo data");
     println!();
     println!("Examples:");
-    println!(
-        "  {}                    # Run with demo data",
-        env::args().next().unwrap_or("coon".to_string())
-    );
-    println!(
-        "  {} /path/to/project   # Analyze a real project",
-        env::args().next().unwrap_or("coon".to_string())
-    );
+    println!("  {}                    # Run with demo data", program_name);
+    println!("  {} /path/to/project   # Analyze a real project", program_name);
 }
 
 async fn run_with_demo_data() -> Result<(), Box<dyn std::error::Error>> {
