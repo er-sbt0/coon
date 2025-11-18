@@ -52,18 +52,19 @@ impl CallGraphAdapter {
         // Create tree structure with SymbolId as data
         let mut tree = Tree::new(root.clone());
 
-        // Add root to mappings
+        // Add root to mappings (note: only first occurrence is in symbol_to_node map)
         self.symbol_to_node.insert(root.clone(), 0);
         self.node_to_symbol.insert(0, root.clone());
 
-        // Build tree using BFS
+        // Build tree using BFS - track path to detect direct cycles only
         let mut queue = VecDeque::new();
-        let mut visited = HashSet::new();
 
-        queue.push_back((root.clone(), 0, 0)); // (symbol_id, parent_idx, depth)
-        visited.insert(root.clone());
+        // Queue contains: (symbol_id, parent_idx, depth, path_from_root)
+        let mut initial_path = HashSet::new();
+        initial_path.insert(root.clone());
+        queue.push_back((root.clone(), 0, 0, initial_path));
 
-        while let Some((symbol, parent_idx, depth)) = queue.pop_front() {
+        while let Some((symbol, parent_idx, depth, path)) = queue.pop_front() {
             // Check depth limit
             if let Some(max) = max_depth {
                 if depth >= max {
@@ -75,21 +76,28 @@ impl CallGraphAdapter {
             let children = self.get_children(graph, &symbol, direction);
 
             for child_func in children {
-                // Cycle detection - if already visited, skip
-                if visited.contains(&child_func.id) {
+                // Only prevent direct cycles in current path (not all previously seen nodes)
+                if path.contains(&child_func.id) {
                     continue;
                 }
 
                 // Add child to tree
                 let child_idx = tree.add_child(parent_idx, child_func.id.clone())?;
 
-                // Update mappings
-                self.symbol_to_node.insert(child_func.id.clone(), child_idx);
+                // Update node_to_symbol mapping (all nodes)
                 self.node_to_symbol.insert(child_idx, child_func.id.clone());
 
-                // Mark as visited and enqueue
-                visited.insert(child_func.id.clone());
-                queue.push_back((child_func.id.clone(), child_idx, depth + 1));
+                // Only update symbol_to_node for first occurrence (for backward compatibility)
+                self.symbol_to_node
+                    .entry(child_func.id.clone())
+                    .or_insert(child_idx);
+
+                // Create new path including this child
+                let mut new_path = path.clone();
+                new_path.insert(child_func.id.clone());
+
+                // Enqueue with new path
+                queue.push_back((child_func.id.clone(), child_idx, depth + 1, new_path));
             }
         }
 
