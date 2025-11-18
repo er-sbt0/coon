@@ -27,8 +27,8 @@ pub struct GraphViewState {
 impl GraphViewState {
     pub fn new() -> Self {
         let config = LayoutConfig::new()
-            .with_node_size(2.0, 2.0)
-            .with_spacing(2.0, 6.0, 1.0); // Reduced node_separation from 4.0 to 2.0, subtree_separation from 2.0 to 1.0
+            .with_node_size(2.0, 3.0)
+            .with_spacing(2.0, 8.0, 1.0); // node_separation=2.0, level_separation=8.0 (ensures visible edges), subtree_separation=1.0
 
         Self {
             adapter: CallGraphAdapter::new(),
