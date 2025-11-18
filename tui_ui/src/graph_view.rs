@@ -416,7 +416,7 @@ impl<'a> StatefulWidget for GraphView<'a> {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::White))
             .title(format!(
-                "Call Graph - {} (depth: {})",
+                " Call Graph - {} (depth: {}) ",
                 match state.direction {
                     CallDirection::Incoming => "Callers",
                     CallDirection::Outgoing => "Callees",
@@ -495,11 +495,16 @@ impl<'a> StatefulWidget for GraphView<'a> {
         // Render status bar
         let status_y = area.y + area.height.saturating_sub(1);
         let offset = state.viewport.offset();
+        let direction_str = match state.direction {
+            CallDirection::Incoming => "Incoming",
+            CallDirection::Outgoing => "Outgoing",
+        };
         let status_text = format!(
-            "Offset: ({:.0}, {:.0}) | Nodes: {}",
+            " Offset: ({:.0}, {:.0}) | Nodes: {} | Direction: {} ",
             offset.x,
             offset.y,
-            state.adapter.node_to_symbol.len()
+            state.adapter.node_to_symbol.len(),
+            direction_str
         );
         buf.set_string(
             area.x + 1,
