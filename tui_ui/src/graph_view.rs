@@ -496,7 +496,7 @@ impl<'a> StatefulWidget for GraphView<'a> {
         let status_y = area.y + area.height.saturating_sub(1);
         let offset = state.viewport.offset();
         let status_text = format!(
-            "Offset: ({:.0}, {:.0}) | Nodes: {} | Press ? for help",
+            "Offset: ({:.0}, {:.0}) | Nodes: {}",
             offset.x,
             offset.y,
             state.adapter.node_to_symbol.len()
