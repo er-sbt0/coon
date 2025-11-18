@@ -1507,18 +1507,8 @@ impl TuiApp {
                             {
                                 Some(Action::NewWorkspace)
                             }
-                            KeyCode::Char('w')
-                                if key
-                                    .modifiers
-                                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
-                            {
-                                Some(Action::CloseWorkspace)
-                            }
-                            KeyCode::Char('s')
-                                if key
-                                    .modifiers
-                                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
-                            {
+                            KeyCode::Char('W') => Some(Action::CloseWorkspace),
+                            KeyCode::Char('f') => {
                                 self.app.toggle_search_bar();
                                 None
                             }
@@ -1672,7 +1662,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     };
 
     let status_text = format!(
-        "Status: {} | Workspace: {} | ↑↓←→/hjkl:pan r:reset t:direction Ctrl+N:new Ctrl+W:close ]:next [:prev ?:help | q:quit",
+        "Status: {} | Workspace: {} | ↑↓←→/hjkl:pan r:reset t:direction CtrlN:new W:close ]:next [:prev f:search ?:help | q/Esc:quit",
         app.status_message,
         workspace_info
     );
@@ -1689,11 +1679,11 @@ fn render_help_overlay(f: &mut Frame, area: ratatui::layout::Rect) {
         Line::from("🎮 Key Bindings:"),
         Line::from(""),
         Line::from("Workspace Management:"),
-        Line::from("  Ctrl+N/T  - Create new workspace"),
-        Line::from("  Ctrl+W    - Close current workspace"),
-        Line::from("  Ctrl+Tab/]- Next workspace"),
-        Line::from("  [/Ctrl+⇧+Tab - Previous workspace"),
-        Line::from("  Ctrl+S    - Search symbols (create workspace"),
+        Line::from("  CtrlN/T   - Create new workspace"),
+        Line::from("  W         - Close current workspace"),
+        Line::from("  CtrlTab/] - Next workspace"),
+        Line::from("  [/Ctrl⇧Tab - Previous workspace"),
+        Line::from("  f         - Search symbols (create workspace"),
         Line::from("  1-9       - Jump to workspace 1-9"),
         Line::from(""),
         Line::from("Graph View Navigation:"),
@@ -1712,6 +1702,11 @@ fn render_help_overlay(f: &mut Frame, area: ratatui::layout::Rect) {
         Line::from("  • Each workspace shows an independent call graph"),
         Line::from("  • Create multiple workspaces to compare graphs"),
         Line::from("  • Panning is per-workspace"),
+        Line::from(""),
+        Line::from("💡 Key Changes:"),
+        Line::from("  • 'W' (Shift+w) closes the current workspace"),
+        Line::from("  • 'q' or 'Esc' exits the entire application"),
+        Line::from("  • 'f' opens search/symbol finder"),
         Line::from(""),
         Line::from("Press ? again to close this help"),
     ];
@@ -1785,8 +1780,7 @@ fn render_workspace_tabs(f: &mut Frame, area: ratatui::layout::Rect, app: &App) 
         tab_titles.push(name);
     }
 
-    // Add "new workspace" button
-    tab_titles.push("[+]".to_string());
+    // Add help button
     tab_titles.push("[?]".to_string());
 
     let tabs = Tabs::new(tab_titles)
@@ -1840,7 +1834,7 @@ fn render_graph_view(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) 
         let empty_text = vec![
             Line::from("No workspace available"),
             Line::from(""),
-            Line::from("Press Ctrl+N to create a new workspace"),
+            Line::from("Press CtrlN to create a new workspace"),
         ];
 
         let paragraph = Paragraph::new(empty_text)
