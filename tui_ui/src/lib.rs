@@ -1639,7 +1639,6 @@ pub fn ui(f: &mut Frame, app: &mut App) {
         .constraints([
             Constraint::Length(3), // Workspace tabs
             Constraint::Min(0),    // Main content (graph view)
-            Constraint::Length(3), // Status bar
         ])
         .split(size);
 
@@ -1648,28 +1647,6 @@ pub fn ui(f: &mut Frame, app: &mut App) {
 
     // Render graph view (current workspace)
     render_graph_view(f, chunks[1], app);
-
-    // Render status bar
-    let workspace_info = if let Some(workspace) = app.get_current_workspace() {
-        format!(
-            "{} ({}/{})",
-            workspace.name,
-            app.current_workspace_index + 1,
-            app.workspaces.len()
-        )
-    } else {
-        "No workspace".to_string()
-    };
-
-    let status_text = format!(
-        "Status: {} | Workspace: {} | ↑↓←→/hjkl:pan r:reset t:direction CtrlN:new W:close ]:next [:prev f:search ?:help | q/Esc:quit",
-        app.status_message,
-        workspace_info
-    );
-
-    let status_paragraph =
-        Paragraph::new(status_text).block(Block::default().borders(Borders::ALL).title("Status"));
-    f.render_widget(status_paragraph, chunks[2]);
 }
 
 fn render_help_overlay(f: &mut Frame, area: ratatui::layout::Rect) {
