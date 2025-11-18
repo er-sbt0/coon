@@ -1757,9 +1757,6 @@ fn render_workspace_tabs(f: &mut Frame, area: ratatui::layout::Rect, app: &App) 
         tab_titles.push(name);
     }
 
-    // Add help button
-    tab_titles.push("[?]".to_string());
-
     let tabs = Tabs::new(tab_titles)
         .block(Block::default().borders(Borders::ALL).title("Workspaces"))
         .style(Style::default().fg(Color::White))
