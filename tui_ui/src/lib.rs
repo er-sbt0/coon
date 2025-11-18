@@ -96,12 +96,6 @@ pub struct App {
     pub lsp_request_tx: Option<mpsc::UnboundedSender<LspRequest>>,
     pub pending_requests: HashMap<String, PendingRequest>,
     pub opened_documents: std::collections::HashSet<lsp_types::Url>,
-
-    // These fields and related methods are currently not used but kept for future expansion
-    #[allow(dead_code)]
-    query_engine: Option<GraphQueryEngine<'static>>,
-    #[allow(dead_code)]
-    leaked_graph: Option<&'static CallGraph>,
 }
 
 impl App {
@@ -143,21 +137,7 @@ impl App {
             lsp_request_tx: None,
             pending_requests: HashMap::new(),
             opened_documents: std::collections::HashSet::new(),
-            query_engine: None,
-            leaked_graph: None,
         }
-    }
-
-    // Lazy initialization of query engine - only create when needed
-    #[allow(dead_code)]
-    fn get_query_engine(&mut self) -> &GraphQueryEngine<'static> {
-        if self.query_engine.is_none() {
-            // Only create the leaked reference when actually needed
-            let leaked_graph = Box::leak(Box::new(self.call_graph.clone()));
-            self.leaked_graph = Some(leaked_graph);
-            self.query_engine = Some(GraphQueryEngine::new(leaked_graph));
-        }
-        self.query_engine.as_ref().unwrap()
     }
 
     pub fn select_function(&mut self, id: SymbolId) {
