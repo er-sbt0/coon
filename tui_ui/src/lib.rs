@@ -16,7 +16,7 @@ use std::io;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
-use core_data::{CallGraph, SymbolId};
+use core_data::{lsp_status::LspLoadPhase, lsp_status::LspUiMessage, CallGraph, SymbolId};
 use lsp_integration::{LspRequest, LspResponse};
 
 pub mod actions;
@@ -95,6 +95,16 @@ pub struct App {
     pub lsp_request_tx: Option<mpsc::UnboundedSender<LspRequest>>,
     pub pending_requests: HashMap<String, PendingRequest>,
     pub opened_documents: std::collections::HashSet<lsp_types::Url>,
+
+    // Async LSP loading state
+    pub lsp_status: LspLoadPhase,
+    pub lsp_rx: Option<mpsc::UnboundedReceiver<LspUiMessage>>,
+    pub lsp_channels_rx: Option<
+        mpsc::UnboundedReceiver<(
+            mpsc::UnboundedReceiver<LspResponse>,
+            mpsc::UnboundedSender<LspRequest>,
+        )>,
+    >,
 }
 
 impl App {
@@ -136,6 +146,59 @@ impl App {
             lsp_request_tx: None,
             pending_requests: HashMap::new(),
             opened_documents: std::collections::HashSet::new(),
+            lsp_status: LspLoadPhase::NotStarted,
+            lsp_rx: None,
+            lsp_channels_rx: None,
+        }
+    }
+
+    pub fn new_with_lsp_async(
+        call_graph: CallGraph,
+        lsp_rx: mpsc::UnboundedReceiver<LspUiMessage>,
+        lsp_channels_rx: mpsc::UnboundedReceiver<(
+            mpsc::UnboundedReceiver<LspResponse>,
+            mpsc::UnboundedSender<LspRequest>,
+        )>,
+    ) -> Self {
+        let mut app = Self::new(call_graph);
+        app.lsp_status = LspLoadPhase::NotStarted;
+        app.lsp_rx = Some(lsp_rx);
+        app.lsp_channels_rx = Some(lsp_channels_rx);
+        app
+    }
+
+    /// Poll and handle any messages from the background LSP loader
+    pub fn poll_lsp_loader_messages(&mut self) {
+        if let Some(rx) = &mut self.lsp_rx {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    LspUiMessage::Progress(phase) => {
+                        self.lsp_status = phase;
+                    }
+                    LspUiMessage::AddFunction(symbol) => {
+                        // Mirror into the call graph for now
+                        let function = core_data::FunctionNode::new(
+                            symbol.name.clone(),
+                            symbol.qualified_name.clone(),
+                            symbol.location.clone(),
+                        );
+                        let id = self.call_graph.add_function(function);
+                        self.functions.push(id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Poll for LSP channels and wire them up when they arrive
+    pub fn poll_lsp_channels(&mut self) {
+        if let Some(rx) = &mut self.lsp_channels_rx {
+            if let Ok((response_rx, request_tx)) = rx.try_recv() {
+                log::info!("Received LSP channels from loader - wiring up for lazy loading");
+                self.set_lsp_channels(response_rx, request_tx);
+                // Clear the receiver since we only need to do this once
+                self.lsp_channels_rx = None;
+            }
         }
     }
 
@@ -1399,6 +1462,26 @@ impl TuiApp {
         Ok(Self { app, terminal })
     }
 
+    pub fn new_with_lsp_async(
+        call_graph: CallGraph,
+        lsp_rx: mpsc::UnboundedReceiver<LspUiMessage>,
+        lsp_channels_rx: mpsc::UnboundedReceiver<(
+            mpsc::UnboundedReceiver<LspResponse>,
+            mpsc::UnboundedSender<LspRequest>,
+        )>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Setup terminal (same as new)
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        let backend = CrosstermBackend::new(stdout);
+        let terminal = Terminal::new(backend)?;
+
+        let app = App::new_with_lsp_async(call_graph, lsp_rx, lsp_channels_rx);
+
+        Ok(Self { app, terminal })
+    }
+
     pub fn set_lsp_channels(
         &mut self,
         response_rx: mpsc::UnboundedReceiver<LspResponse>,
@@ -1409,6 +1492,12 @@ impl TuiApp {
 
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         loop {
+            // Drain any async LSP loader messages
+            self.app.poll_lsp_loader_messages();
+
+            // Poll for LSP channels and wire them up when they arrive
+            self.app.poll_lsp_channels();
+
             // Check for LSP responses first
             self.app.check_lsp_responses();
 
@@ -1612,20 +1701,68 @@ pub fn ui(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    // Create main layout
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Workspace tabs
-            Constraint::Min(0),    // Main content (graph view)
-        ])
-        .split(size);
+    // Create main layout with conditional LSP status bar above graph view
+    let show_lsp_status = !matches!(app.lsp_status, LspLoadPhase::Completed);
+
+    let chunks = if show_lsp_status {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // Workspace tabs
+                Constraint::Length(1), // LSP Status bar
+                Constraint::Length(1), // Blank line separator
+                Constraint::Min(0),    // Main content (graph view)
+            ])
+            .split(size)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // Workspace tabs
+                Constraint::Min(0),    // Main content (graph view)
+            ])
+            .split(size)
+    };
 
     // Render workspace tabs
     render_workspace_tabs(f, chunks[0], app);
 
-    // Render graph view (current workspace)
-    render_graph_view(f, chunks[1], app);
+    if show_lsp_status {
+        // Render LSP loading status bar above graph view
+        render_lsp_status_bar(f, chunks[1], app);
+        // chunks[2] is blank separator
+        // Render graph view (current workspace)
+        render_graph_view(f, chunks[3], app);
+    } else {
+        // Render graph view (current workspace)
+        render_graph_view(f, chunks[1], app);
+    }
+}
+
+fn render_lsp_status_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let status_text = match &app.lsp_status {
+        LspLoadPhase::NotStarted => "LSP: not started".to_string(),
+        LspLoadPhase::SpawningServer => "LSP: starting clangd…".to_string(),
+        LspLoadPhase::Initializing => "LSP: initializing…".to_string(),
+        LspLoadPhase::Initialized => "LSP: initialized".to_string(),
+        LspLoadPhase::DiscoveringFiles => "LSP: discovering project files…".to_string(),
+        LspLoadPhase::PreloadingDocuments { done, total } => {
+            format!("LSP: preloading documents… {}/{}", done, total)
+        }
+        LspLoadPhase::LoadingWorkspaceSymbols { loaded } => {
+            format!("LSP: loading workspace symbols… {}", loaded)
+        }
+        LspLoadPhase::Completed => "LSP: ready".to_string(),
+        LspLoadPhase::Failed(err) => format!("LSP: failed ({})", err),
+    };
+
+    let paragraph = Paragraph::new(Line::from(status_text)).block(
+        Block::default()
+            .borders(Borders::NONE)
+            .style(Style::default().fg(Color::Gray)),
+    );
+
+    f.render_widget(paragraph, area);
 }
 
 fn render_help_overlay(f: &mut Frame, area: ratatui::layout::Rect) {

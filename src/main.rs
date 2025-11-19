@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use core_data::logging;
+use core_data::lsp_status::{LspLoadPhase, LspUiMessage};
 use core_data::{CallGraph, Diagnostic, DiagnosticSeverity, FunctionNode, Location};
 use lsp_integration::{LspClient, LspRequest, LspResponse, LspService};
 use tui_ui::TuiApp;
@@ -78,24 +79,53 @@ async fn run_with_demo_data() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_with_lsp(project_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    info!("Starting LSP client for lazy loading...");
+    info!("Starting LSP loader and TUI asynchronously...");
 
-    // Create channel for LSP communication
+    // Channel for LSP loader -> TUI messages (progress + data)
+    let (ui_msg_tx, ui_msg_rx) = mpsc::unbounded_channel::<LspUiMessage>();
+
+    // Channel for LSP lazy loading channels to be sent back from loader
+    let (lsp_channels_tx, lsp_channels_rx) = mpsc::unbounded_channel::<(
+        mpsc::UnboundedReceiver<LspResponse>,
+        mpsc::UnboundedSender<LspRequest>,
+    )>();
+
+    // Spawn background LSP loader task
+    let project_path_string = project_path.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = lsp_loader_task(&project_path_string, ui_msg_tx, lsp_channels_tx).await {
+            error!("LSP loader task failed: {}", e);
+        }
+    });
+
+    // Start TUI immediately - it will poll for LSP channels when they become available
+    run_tui_async_lsp(ui_msg_rx, lsp_channels_rx).await
+}
+
+async fn lsp_loader_task(
+    project_path: &str,
+    ui_tx: mpsc::UnboundedSender<LspUiMessage>,
+    lsp_channels_tx: mpsc::UnboundedSender<(
+        mpsc::UnboundedReceiver<LspResponse>,
+        mpsc::UnboundedSender<LspRequest>,
+    )>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!("LSP loader: starting background initialization");
+    ui_tx.send(LspUiMessage::Progress(LspLoadPhase::SpawningServer))?;
+
+    // Create channel for raw LSP JSON messages
     let (tx, rx) = mpsc::channel::<Value>(100);
-
-    // Start LSP client
     let mut lsp_client = LspClient::new(tx).await?;
 
-    info!("LSP client started. Initializing LSP...");
+    ui_tx.send(LspUiMessage::Progress(LspLoadPhase::Initializing))?;
 
-    // Initialize LSP
     let root_path = std::path::Path::new(project_path).canonicalize()?;
     let root_uri = lsp_types::Url::from_file_path(&root_path)
         .map_err(|_| "Failed to create URI from project path")?;
 
     let init_id = lsp_client.initialize(root_uri.clone()).await?;
 
-    // Wait for initialization response
+    // Wait for initialization response with timeout
     let mut init_response = None;
     let timeout = tokio::time::Duration::from_secs(10);
     let start_time = std::time::Instant::now();
@@ -112,10 +142,14 @@ async fn run_with_lsp(project_path: &str) -> Result<(), Box<dyn std::error::Erro
                 if let Some(id) = message.get("id").and_then(|i| i.as_i64()) {
                     if id == init_id {
                         if let Some(error) = message.get("error") {
-                            return Err(format!("LSP initialization failed: {:?}", error).into());
+                            let msg = format!("LSP initialization failed: {:?}", error);
+                            ui_tx
+                                .send(LspUiMessage::Progress(LspLoadPhase::Failed(msg.clone())))?;
+                            return Err(msg.into());
                         }
                         init_response = Some(message);
                         info!("LSP initialization complete");
+                        ui_tx.send(LspUiMessage::Progress(LspLoadPhase::Initialized))?;
                     }
                 }
             }
@@ -124,24 +158,25 @@ async fn run_with_lsp(project_path: &str) -> Result<(), Box<dyn std::error::Erro
         }
     }
 
-    let _init_result = init_response.ok_or("LSP initialization timed out")?;
+    if init_response.is_none() {
+        let msg = "LSP initialization timed out".to_string();
+        ui_tx.send(LspUiMessage::Progress(LspLoadPhase::Failed(msg.clone())))?;
+        return Err(msg.into());
+    }
 
-    // Send initialized notification
     info!("Sending initialized notification...");
     lsp_client.send_initialized().await?;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    // Discover source files from compile_commands.json or fallback to directory walking
+    // Discover source files
+    ui_tx.send(LspUiMessage::Progress(LspLoadPhase::DiscoveringFiles))?;
     let source_files = compile_commands::parse_compile_commands(&root_path)?;
     info!("Found {} source files", source_files.len());
 
-    // Create a lazy call graph that will load relationships on demand
-    let mut lazy_call_graph = core_data::LazyCallGraph::new();
-
-    // Create LSP service for all LSP operations
+    // Create LSP service
     let mut lsp_service = LspService::new(lsp_client, rx_for_init).await?;
 
-    // Set project files for symbol filtering
+    // Set project files
     let project_file_paths: Vec<String> = source_files
         .iter()
         .map(|path| path.to_string_lossy().to_string())
@@ -154,36 +189,44 @@ async fn run_with_lsp(project_path: &str) -> Result<(), Box<dyn std::error::Erro
         project_file_paths.len()
     );
 
-    // Preload documents from compile_commands.json to avoid "non-added document" errors
+    // Preload documents
     let document_uris: Vec<lsp_types::Url> = source_files
         .iter()
         .filter_map(|path| lsp_types::Url::from_file_path(path).ok())
         .collect();
 
     if !document_uris.is_empty() {
-        info!(
-            "Preloading {} documents to avoid LSP errors...",
-            document_uris.len()
-        );
+        let total = document_uris.len();
+        ui_tx.send(LspUiMessage::Progress(LspLoadPhase::PreloadingDocuments {
+            done: 0,
+            total,
+        }))?;
+
         let _preload_request_id = lsp_service.preload_documents(document_uris.clone()).await?;
 
-        // Give some time for preloading to complete
+        // Coarse-grained wait; in future we could stream progress
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        ui_tx.send(LspUiMessage::Progress(LspLoadPhase::PreloadingDocuments {
+            done: total,
+            total,
+        }))?;
     }
 
-    // Use only workspace symbols for fast startup (lazy loading approach)
+    // Request initial workspace symbols
     let initial_request_id = Uuid::new_v4().to_string();
     lsp_service
         .request_workspace_symbols(initial_request_id.clone(), "".to_string())
         .await?;
     info!("Requested initial workspace symbols for overview");
+    ui_tx.send(LspUiMessage::Progress(
+        LspLoadPhase::LoadingWorkspaceSymbols { loaded: 0 },
+    ))?;
 
-    // Give time for initial symbols loading
-    let symbol_timeout = tokio::time::Duration::from_millis(2000); // Increased timeout for workspace symbols
+    let symbol_timeout = tokio::time::Duration::from_millis(2000);
     let symbol_start = std::time::Instant::now();
-    let mut initial_symbols_loaded = false;
+    let mut loaded_count: usize = 0;
 
-    while symbol_start.elapsed() < symbol_timeout && !initial_symbols_loaded {
+    while symbol_start.elapsed() < symbol_timeout {
         match lsp_service.try_recv_response() {
             Some(lsp_response) => {
                 if let LspResponse::WorkspaceSymbols {
@@ -194,19 +237,7 @@ async fn run_with_lsp(project_path: &str) -> Result<(), Box<dyn std::error::Erro
                     if request_id == initial_request_id {
                         info!("Received {} initial workspace symbols", symbols.len());
 
-                        // Add function symbols to lazy call graph
-                        let mut function_count = 0;
-                        for function_node in symbols.into_iter().take(100) {
-                            // Increased limit since lazy loading is faster
-                            info!(
-                                "Adding function to lazy call graph: '{}' from {}:{}:{}",
-                                function_node.qualified_name,
-                                function_node.definition_location.file_path,
-                                function_node.definition_location.line,
-                                function_node.definition_location.column
-                            );
-
-                            // Convert to workspace symbol info
+                        for function_node in symbols.into_iter().take(200) {
                             let workspace_symbol = core_data::WorkspaceSymbolInfo {
                                 name: function_node.name.clone(),
                                 qualified_name: function_node.qualified_name.clone(),
@@ -214,94 +245,43 @@ async fn run_with_lsp(project_path: &str) -> Result<(), Box<dyn std::error::Erro
                                 location: function_node.definition_location.clone(),
                                 container_name: None,
                             };
-
-                            lazy_call_graph.add_function_from_workspace_symbol(workspace_symbol);
-                            function_count += 1;
+                            loaded_count += 1;
+                            // Best-effort send; ignore if receiver is closed
+                            let _ = ui_tx.send(LspUiMessage::AddFunction(workspace_symbol));
                         }
 
-                        info!(
-                            "Added {} functions to lazy call graph from workspace symbols",
-                            function_count
-                        );
-                        initial_symbols_loaded = true;
+                        ui_tx.send(LspUiMessage::Progress(
+                            LspLoadPhase::LoadingWorkspaceSymbols {
+                                loaded: loaded_count,
+                            },
+                        ))?;
                         break;
                     }
                 }
             }
             None => {
-                // No response yet, continue waiting
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
     }
 
-    if !initial_symbols_loaded {
-        info!("Initial workspace symbols loading timed out - proceeding with document symbols we found");
+    ui_tx.send(LspUiMessage::Progress(LspLoadPhase::Completed))?;
+
+    // After initial load, hand LSP service over to the TUI for lazy requests
+    // by starting the existing lazy TUI bridge.
+    info!("LSP loader: starting lazy-loading TUI bridge");
+
+    // Spawn the LSP bridge task that forwards requests from TUI to LSP service
+    let (tui_request_tx, mut tui_request_rx) = mpsc::unbounded_channel::<LspRequest>();
+    let (tui_response_tx, tui_response_rx) = mpsc::unbounded_channel::<LspResponse>();
+
+    // Send the LSP channels back to the main task so they can be wired to the TUI
+    if let Err(e) = lsp_channels_tx.send((tui_response_rx, tui_request_tx)) {
+        error!("Failed to send LSP channels: {}", e);
     }
 
-    // If no functions were found, add a placeholder
-    if lazy_call_graph.nodes.is_empty() {
-        let project_name = std::path::Path::new(project_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("Unknown");
-
-        let message = if source_files.is_empty() {
-            format!("Project: {} (no source files found)", project_name)
-        } else {
-            format!(
-                "Project: {} (click to explore {} source files)",
-                project_name,
-                source_files.len()
-            )
-        };
-
-        let project_symbol = core_data::WorkspaceSymbolInfo {
-            name: message.clone(),
-            qualified_name: format!("project::{}", project_path),
-            kind: core_data::lsp_types::SymbolKind::MODULE,
-            location: core_data::Location::new(project_path.to_string(), 1, 0),
-            container_name: None,
-        };
-        lazy_call_graph.add_function_from_workspace_symbol(project_symbol);
-    }
-
-    info!(
-        "Starting TUI with {} initial functions. Additional data will load on demand...",
-        lazy_call_graph.nodes.len()
-    );
-
-    // Convert to old CallGraph format for backward compatibility during migration
-    let call_graph = lazy_call_graph.to_call_graph();
-
-    // Start TUI with lazy loading
-    run_tui_with_lazy_lsp(call_graph, lsp_service).await
-}
-
-async fn run_tui(call_graph: CallGraph) -> Result<(), Box<dyn std::error::Error>> {
-    info!("Starting TUI interface...");
-
-    let mut tui_app = TuiApp::new(call_graph)?;
-    tui_app.run()?;
-
-    info!("TUI exited. Goodbye!");
-    Ok(())
-}
-
-async fn run_tui_with_lazy_lsp(
-    call_graph: CallGraph,
-    mut lsp_service: LspService,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use tokio::sync::mpsc;
-
-    info!("Starting lazy-loading TUI interface...");
-
-    // Create channels for TUI communication
-    let (tui_request_tx, mut tui_request_rx) = mpsc::unbounded_channel();
-    let (tui_response_tx, tui_response_rx) = mpsc::unbounded_channel();
-
-    // Spawn a task to handle the communication between TUI and LSP service
     tokio::spawn(async move {
+        let mut lsp_service = lsp_service;
         loop {
             tokio::select! {
                 // Forward TUI requests to LSP service
@@ -369,13 +349,12 @@ async fn run_tui_with_lazy_lsp(
                         }
                     } else {
                         log::info!("TUI request channel closed, stopping forwarder");
-                        break; // TUI channel closed
+                        break;
                     }
                 }
 
                 // Poll for LSP responses and forward them to TUI
                 _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)) => {
-                    // Collect all available responses
                     let mut response_count = 0;
                     while let Some(response) = lsp_service.try_recv_response() {
                         log::info!("Forwarding LSP response to TUI: {:?}", response);
@@ -394,16 +373,45 @@ async fn run_tui_with_lazy_lsp(
         log::info!("LSP-TUI forwarder task ended");
     });
 
-    // Create TUI app with channels
-    let mut tui_app = TuiApp::new(call_graph)?;
-    tui_app.set_lsp_channels(tui_response_rx, tui_request_tx);
+    // Inform TUI about LSP channels using existing lazy LSP wiring
+    // by sending a special progress message is overkill; instead, the TUI
+    // will establish the channels itself when starting. So we simply
+    // keep the bridge running here.
 
-    // Use the full TUI implementation with all features
-    tui_app.run()?;
-
-    info!("Lazy-loading TUI exited. Goodbye!");
     Ok(())
 }
+
+async fn run_tui(call_graph: CallGraph) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Starting TUI interface...");
+
+    let mut tui_app = TuiApp::new(call_graph)?;
+    tui_app.run()?;
+
+    info!("TUI exited. Goodbye!");
+    Ok(())
+}
+
+async fn run_tui_async_lsp(
+    lsp_rx: mpsc::UnboundedReceiver<LspUiMessage>,
+    lsp_channels_rx: mpsc::UnboundedReceiver<(
+        mpsc::UnboundedReceiver<LspResponse>,
+        mpsc::UnboundedSender<LspRequest>,
+    )>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Starting TUI interface with async LSP loading...");
+
+    // Start with an empty call graph; functions will stream in via messages
+    let call_graph = CallGraph::new();
+    let mut tui_app = TuiApp::new_with_lsp_async(call_graph, lsp_rx, lsp_channels_rx)?;
+
+    tui_app.run()?;
+
+    info!("TUI exited. Goodbye!");
+    Ok(())
+}
+
+// Note: run_tui_with_lazy_lsp has been replaced by the async LSP loader architecture.
+// Its logic now lives in lsp_loader_task (which spawns the LSP bridge) and run_tui_async_lsp.
 
 fn create_demo_call_graph() -> CallGraph {
     let mut graph = CallGraph::new();

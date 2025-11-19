@@ -28,7 +28,7 @@ impl GraphViewState {
     pub fn new() -> Self {
         let config = LayoutConfig::new()
             .with_node_size(2.0, 3.0)
-            .with_spacing(3.0, 16.0, 1.0); // node_separation=2.0, level_separation=8.0 (ensures visible edges), subtree_separation=1.0
+            .with_spacing(3.0, 20.0, 1.0); // node_separation, level_separation (ensures visible edges), subtree_separation
 
         Self {
             adapter: CallGraphAdapter::new(),
@@ -341,16 +341,16 @@ impl<'a> GraphView<'a> {
             return;
         }
 
-        // Simple selection-based styling
+        // Simple styling: cyan for selected, yellow for others
         let (border_style, text_style) = if is_selected {
             (
                 Style::default().fg(Color::Cyan),
-                Style::default().fg(Color::White),
+                Style::default().fg(Color::Cyan),
             )
         } else {
             (
-                Style::default().fg(Color::White),
-                Style::default().fg(Color::White),
+                Style::default().fg(Color::Yellow),
+                Style::default().fg(Color::Yellow),
             )
         };
 
@@ -468,7 +468,7 @@ impl<'a> StatefulWidget for GraphView<'a> {
             layout,
             &state.viewport,
             inner_area,
-            Style::default().fg(Color::White),
+            Style::default().fg(Color::DarkGray),
         );
 
         // Render only visible nodes (performance optimization)
@@ -479,6 +479,7 @@ impl<'a> StatefulWidget for GraphView<'a> {
                     // Dynamic width based on label length
                     let node_width = (func.name.len() + 2) as u16;
                     let node_height = 3u16;
+                    
                     self.render_node(
                         buf,
                         func,

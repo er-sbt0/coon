@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 pub mod logging;
+pub mod lsp_status;
 
 // Re-export for convenience
 pub use lsp_types;
