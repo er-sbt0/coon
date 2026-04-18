@@ -86,7 +86,7 @@ pub async fn lsp_loader_task(
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     ui_tx.send(LspUiMessage::Progress(LspLoadPhase::DiscoveringFiles))?;
-    let source_files = compile_commands::parse_compile_commands(&root_path)?;
+    let source_files = compile_commands::parse_compile_commands(&root_path).await?;
     info!("Found {} source files", source_files.len());
 
     let mut lsp_service = LspService::new(lsp_client, rx_for_init).await?;

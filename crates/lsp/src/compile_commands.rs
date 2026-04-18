@@ -15,13 +15,15 @@ pub struct CompileCommand {
 }
 
 /// Parse compile_commands.json to extract source file paths
-pub fn parse_compile_commands(project_path: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
+pub async fn parse_compile_commands(project_path: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
     let compile_commands_path = project_path.join("compile_commands.json");
 
-    if !compile_commands_path.exists() {
+    if !tokio::fs::try_exists(&compile_commands_path).await.unwrap_or(false) {
         // Fallback to directory walking if no compile_commands.json exists
         log::info!("No compile_commands.json found, falling back to directory discovery");
-        return discover_source_files_fallback(project_path);
+        let project_path = project_path.to_owned();
+        return tokio::task::spawn_blocking(move || discover_source_files_fallback(&project_path))
+            .await?;
     }
 
     log::info!(
@@ -29,7 +31,7 @@ pub fn parse_compile_commands(project_path: &std::path::Path) -> anyhow::Result<
         compile_commands_path.display()
     );
 
-    let content = std::fs::read_to_string(&compile_commands_path)?;
+    let content = tokio::fs::read_to_string(&compile_commands_path).await?;
     log::debug!("compile_commands.json content: {}", content);
 
     let compile_commands: Vec<CompileCommand> = serde_json::from_str(&content)
@@ -46,8 +48,8 @@ pub fn parse_compile_commands(project_path: &std::path::Path) -> anyhow::Result<
         };
 
         // Canonicalize the path if it exists
-        if file_path.exists() {
-            match file_path.canonicalize() {
+        if tokio::fs::try_exists(&file_path).await.unwrap_or(false) {
+            match tokio::fs::canonicalize(&file_path).await {
                 Ok(canonical_path) => source_files.push(canonical_path),
                 Err(e) => log::warn!("Failed to canonicalize path {}: {}", file_path.display(), e),
             }

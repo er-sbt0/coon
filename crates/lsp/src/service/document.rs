@@ -17,7 +17,8 @@ pub(super) async fn ensure_document_opened(
         .to_file_path()
         .map_err(|_| anyhow::anyhow!("Invalid file URI: {}", document_uri))?;
 
-    let content = std::fs::read_to_string(&file_path)
+    let content = tokio::fs::read_to_string(&file_path)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to read file {}: {}", file_path.display(), e))?;
 
     log::debug!(

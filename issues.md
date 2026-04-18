@@ -7,9 +7,6 @@ Here's the consolidated ranking, re-evaluated by real-world impact:
 **1. Hardcoded developer path** — mod.rs, utils.rs
 Binary fails on any machine except the original developer's. Absolute `/home/eransa/...` path baked in. Use `CLANGD_PATH` env var or `which clangd`.
 
-**3. Blocking I/O on async executor thread** — document.rs, compile_commands.rs
-`std::fs::read_to_string` / `std::fs::read_dir` block the Tokio thread. Stalls all concurrent async tasks. Use `tokio::fs`.
-
 ### High — Correctness or scalability problems
 
 **8. Silent channel send failures** — throughout loader.rs
