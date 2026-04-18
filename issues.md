@@ -52,16 +52,6 @@ Every `add_call` clones the file path string into the `edge_set`. For large grap
 
 ---
 
-### 7. `convert_lsp_location` can produce incorrect `length` for multi-line ranges
-
-In types.rs:
-```rust
-length: Some(lsp_location.range.end.character - lsp_location.range.start.character),
-```
-If the range spans multiple lines, `end.character` may be less than `start.character`, causing underflow (u32 wrapping). Use `.checked_sub()` or compute length only for single-line ranges.
-
----
-
 ### 8. `process_call_entry` produces nonsensical qualified names
 
 In update.rs:

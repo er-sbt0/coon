@@ -76,11 +76,7 @@ fn discover_source_files_fallback(
 ) -> anyhow::Result<Vec<std::path::PathBuf>> {
     let mut source_files = Vec::new();
 
-    // Common source file extensions
-    let extensions = [
-        "rs", "c", "cpp", "cxx", "cc", "h", "hpp", "hxx", "py", "js", "ts", "java", "go", "php",
-        "rb", "cs", "swift", "kt", "scala", "clj", "hs", "ml", "elm",
-    ];
+    let extensions = ["c", "cpp", "cxx", "cc", "h", "hpp", "hxx"];
 
     // Walk the directory tree
     fn walk_dir(
