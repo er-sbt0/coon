@@ -145,11 +145,12 @@ impl GraphViewState {
     pub fn select_next_sibling(&mut self, _graph: &CallGraph) {
         if let Some(selected) = &self.selected_node {
             if let Some(_root) = &self.root_symbol {
-                // For now, just cycle through all nodes
-                let all_symbols: Vec<_> = self.adapter.symbol_to_node.keys().collect();
-                if let Some(current_idx) = all_symbols.iter().position(|s| *s == selected) {
+                // For now, just cycle through all nodes (sorted by node index for determinism)
+                let mut all_symbols: Vec<_> = self.adapter.symbol_to_node.iter().collect();
+                all_symbols.sort_by_key(|(_, &idx)| idx);
+                if let Some(current_idx) = all_symbols.iter().position(|(s, _)| *s == selected) {
                     let next_idx = (current_idx + 1) % all_symbols.len();
-                    self.selected_node = Some(all_symbols[next_idx].clone());
+                    self.selected_node = Some(all_symbols[next_idx].0.clone());
                 }
             }
         }
@@ -159,14 +160,15 @@ impl GraphViewState {
     pub fn select_prev_sibling(&mut self, _graph: &CallGraph) {
         if let Some(selected) = &self.selected_node {
             if let Some(_root) = &self.root_symbol {
-                let all_symbols: Vec<_> = self.adapter.symbol_to_node.keys().collect();
-                if let Some(current_idx) = all_symbols.iter().position(|s| *s == selected) {
+                let mut all_symbols: Vec<_> = self.adapter.symbol_to_node.iter().collect();
+                all_symbols.sort_by_key(|(_, &idx)| idx);
+                if let Some(current_idx) = all_symbols.iter().position(|(s, _)| *s == selected) {
                     let prev_idx = if current_idx == 0 {
                         all_symbols.len() - 1
                     } else {
                         current_idx - 1
                     };
-                    self.selected_node = Some(all_symbols[prev_idx].clone());
+                    self.selected_node = Some(all_symbols[prev_idx].0.clone());
                 }
             }
         }
