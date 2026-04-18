@@ -1,5 +1,5 @@
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -13,8 +13,8 @@ const EVENT_POLL_INTERVAL_MS: u64 = 100;
 use lsp::{LspRequest, LspResponse};
 use model::{lsp_status::LspUiMessage, CallGraph};
 
-use crate::actions::Action;
 use crate::app::App;
+use crate::key_map;
 use crate::rendering::ui;
 
 /// Main TUI application runner
@@ -83,147 +83,9 @@ impl TuiApp {
             if event::poll(std::time::Duration::from_millis(EVENT_POLL_INTERVAL_MS))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
-                        // Handle search bar input separately
-                        if self.app.show_search_bar {
-                            match key.code {
-                                KeyCode::Esc => {
-                                    self.app.toggle_search_bar();
-                                }
-                                KeyCode::Enter => {
-                                    self.app.select_from_search();
-                                }
-                                KeyCode::Up => {
-                                    self.app.search_bar_state.select_previous();
-                                }
-                                KeyCode::Down => {
-                                    self.app.search_bar_state.select_next();
-                                }
-                                KeyCode::Tab => {
-                                    self.app.search_bar_state.cycle_search_mode();
-                                    self.app
-                                        .search_bar_state
-                                        .update_results(&self.app.call_graph);
-                                }
-                                KeyCode::Backspace => {
-                                    self.app.handle_search_backspace();
-                                }
-                                KeyCode::Delete => {
-                                    self.app.search_bar_state.delete_char_forward();
-                                    self.app
-                                        .search_bar_state
-                                        .update_results(&self.app.call_graph);
-                                }
-                                KeyCode::Left => {
-                                    self.app.search_bar_state.move_cursor_left();
-                                }
-                                KeyCode::Right => {
-                                    self.app.search_bar_state.move_cursor_right();
-                                }
-                                KeyCode::Home => {
-                                    self.app.search_bar_state.move_cursor_start();
-                                }
-                                KeyCode::End => {
-                                    self.app.search_bar_state.move_cursor_end();
-                                }
-                                KeyCode::Char(c) => {
-                                    self.app.handle_search_input(c);
-                                }
-                                _ => {}
-                            }
-                            continue; // Don't process other actions when search is active
-                        }
-
-                        let action = match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => Some(Action::Quit),
-                            KeyCode::Char('?') => Some(Action::Help),
-                            KeyCode::Char('n')
-                                if key
-                                    .modifiers
-                                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
-                            {
-                                Some(Action::NewWorkspace)
-                            }
-                            KeyCode::Char('t')
-                                if key
-                                    .modifiers
-                                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
-                            {
-                                Some(Action::NewWorkspace)
-                            }
-                            KeyCode::Char('W') => Some(Action::CloseWorkspace),
-                            KeyCode::Char('f') => {
-                                self.app.toggle_search_bar();
-                                None
-                            }
-                            KeyCode::Char(']') => Some(Action::NextWorkspace),
-                            KeyCode::Char('[') => Some(Action::PreviousWorkspace),
-                            KeyCode::Tab
-                                if key
-                                    .modifiers
-                                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
-                            {
-                                Some(Action::NextWorkspace)
-                            }
-                            KeyCode::BackTab
-                                if key
-                                    .modifiers
-                                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
-                            {
-                                Some(Action::PreviousWorkspace)
-                            }
-                            KeyCode::Char('1') => {
-                                self.app.switch_workspace(0);
-                                None
-                            }
-                            KeyCode::Char('2') => {
-                                self.app.switch_workspace(1);
-                                None
-                            }
-                            KeyCode::Char('3') => {
-                                self.app.switch_workspace(2);
-                                None
-                            }
-                            KeyCode::Char('4') => {
-                                self.app.switch_workspace(3);
-                                None
-                            }
-                            KeyCode::Char('5') => {
-                                self.app.switch_workspace(4);
-                                None
-                            }
-                            KeyCode::Char('6') => {
-                                self.app.switch_workspace(5);
-                                None
-                            }
-                            KeyCode::Char('7') => {
-                                self.app.switch_workspace(6);
-                                None
-                            }
-                            KeyCode::Char('8') => {
-                                self.app.switch_workspace(7);
-                                None
-                            }
-                            KeyCode::Char('9') => {
-                                self.app.switch_workspace(8);
-                                None
-                            }
-                            KeyCode::Up => Some(Action::MoveUp),
-                            KeyCode::Down => Some(Action::MoveDown),
-                            KeyCode::Right => Some(Action::MoveRight),
-                            KeyCode::Left => Some(Action::MoveLeft),
-                            KeyCode::Char('h') => Some(Action::NavigateParent),
-                            KeyCode::Char('l') => Some(Action::NavigateChild),
-                            KeyCode::Char('k') => Some(Action::NavigatePrevSibling),
-                            KeyCode::Char('j') => Some(Action::NavigateNextSibling),
-                            KeyCode::Enter => Some(Action::ExpandOrCollapse),
-                            KeyCode::Char('r') => Some(Action::ResetView),
-                            KeyCode::Char('F') => Some(Action::FindReferences),
-                            KeyCode::Char('t') => Some(Action::ToggleCallDirection),
-                            KeyCode::Char('R') => Some(Action::Refresh),
-                            _ => None,
-                        };
-
-                        if let Some(action) = action {
+                        if let Some(action) =
+                            key_map::map_key_event(key, self.app.show_search_bar)
+                        {
                             self.app.handle_action(action);
                         }
                     }

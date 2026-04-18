@@ -10,10 +10,13 @@ impl App {
     pub fn handle_action(&mut self, action: Action) {
         log::info!("Handling action: {:?}", action);
         match action {
+            // Viewport panning
             Action::MoveUp => self.handle_move_up(),
             Action::MoveDown => self.handle_move_down(),
             Action::MoveLeft => self.handle_move_left(),
             Action::MoveRight => self.handle_move_right(),
+
+            // Tree interaction
             Action::ExpandOrCollapse => self.handle_expand_or_collapse(),
             Action::FindReferences => self.handle_find_references(),
             Action::Refresh => self.handle_refresh(),
@@ -21,15 +24,42 @@ impl App {
             Action::Help => self.toggle_help(),
             Action::ToggleCallDirection => self.handle_toggle_call_direction(),
             Action::ResetView => self.handle_reset_view(),
+
+            // Graph navigation (hjkl)
             Action::NavigateParent => self.handle_navigate_parent(),
             Action::NavigateChild => self.handle_navigate_child(),
             Action::NavigateNextSibling => self.handle_navigate_next_sibling(),
             Action::NavigatePrevSibling => self.handle_navigate_prev_sibling(),
+
+            // Workspace management
             Action::NewWorkspace => self.handle_new_workspace(),
             Action::CloseWorkspace => self.handle_close_workspace(),
             Action::NextWorkspace => self.next_workspace(),
             Action::PreviousWorkspace => self.previous_workspace(),
             Action::RenameWorkspace => {} // TODO: Implement rename UI
+            Action::SwitchWorkspace(index) => {
+                self.switch_workspace(index);
+            }
+
+            // Search bar
+            Action::ToggleSearch => self.toggle_search_bar(),
+            Action::SearchConfirm => self.select_from_search(),
+            Action::SearchPrevResult => self.search_bar_state.select_previous(),
+            Action::SearchNextResult => self.search_bar_state.select_next(),
+            Action::SearchCycleMode => {
+                self.search_bar_state.cycle_search_mode();
+                self.search_bar_state.update_results(&self.call_graph);
+            }
+            Action::SearchBackspace => self.handle_search_backspace(),
+            Action::SearchDeleteForward => {
+                self.search_bar_state.delete_char_forward();
+                self.search_bar_state.update_results(&self.call_graph);
+            }
+            Action::SearchCursorLeft => self.search_bar_state.move_cursor_left(),
+            Action::SearchCursorRight => self.search_bar_state.move_cursor_right(),
+            Action::SearchCursorHome => self.search_bar_state.move_cursor_start(),
+            Action::SearchCursorEnd => self.search_bar_state.move_cursor_end(),
+            Action::SearchInput(c) => self.handle_search_input(c),
         }
     }
 

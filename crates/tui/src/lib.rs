@@ -3,6 +3,7 @@ pub mod app;
 pub mod graph_adapter;
 pub mod graph_view;
 pub mod graph_workspace;
+pub mod key_map;
 pub mod rendering;
 pub mod search_bar;
 pub mod tui;
