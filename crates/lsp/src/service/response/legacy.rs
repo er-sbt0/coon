@@ -17,7 +17,7 @@ pub(super) async fn handle_legacy_response_detection(
     }
 
     if let Ok(Some(_)) = state.client.parse_prepare_call_hierarchy_response(&message) {
-        call_hierarchy::handle_call_hierarchy_response(message, request_id, state, response_tx)
+        call_hierarchy::handle_prepare_call_hierarchy_response(message, request_id, state, response_tx)
             .await;
     } else if let Ok(Some(_)) = state.client.parse_outgoing_calls_response(&message) {
         call_hierarchy::handle_outgoing_calls_response(message, request_id, state, response_tx)

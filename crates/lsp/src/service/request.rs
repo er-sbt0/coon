@@ -35,56 +35,6 @@ pub(super) async fn handle_preload_documents(
         .await;
 }
 
-pub(super) async fn handle_call_hierarchy_request(
-    state: &mut LspWorkerState,
-    response_tx: &mpsc::Sender<LspResponse>,
-    request_id: String,
-    document_uri: Url,
-    position: Position,
-) {
-    log::info!(
-        "Handling call hierarchy request: uri={}, position={}:{}, request_id={}",
-        document_uri,
-        position.line,
-        position.character,
-        request_id
-    );
-
-    if let Err(e) = document::ensure_document_opened(state, &document_uri).await {
-        log::error!("Failed to open document for call hierarchy: {}", e);
-        let _ = response_tx
-            .send(LspResponse::Error {
-                request_id,
-                error: format!("Failed to open document: {}", e),
-            })
-            .await;
-        return;
-    }
-
-    match state
-        .client
-        .prepare_call_hierarchy(document_uri, position)
-        .await
-    {
-        Ok(lsp_request_id) => {
-            log::info!(
-                "Sent call hierarchy request to LSP server: lsp_request_id={}",
-                lsp_request_id
-            );
-            state.track_request(lsp_request_id, request_id, RequestType::CallHierarchy);
-        }
-        Err(e) => {
-            log::error!("Failed to send call hierarchy request: {}", e);
-            let _ = response_tx
-                .send(LspResponse::Error {
-                    request_id,
-                    error: format!("Failed to request call hierarchy: {}", e),
-                })
-                .await;
-        }
-    }
-}
-
 pub(super) async fn handle_outgoing_calls_request(
     state: &mut LspWorkerState,
     response_tx: &mpsc::Sender<LspResponse>,

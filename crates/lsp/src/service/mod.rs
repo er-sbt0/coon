@@ -21,7 +21,7 @@ pub struct LspService {
 /// Request types for LSP operations
 #[derive(Debug, Clone)]
 pub enum LspRequest {
-    GetCallHierarchy {
+    PrepareCallHierarchy {
         request_id: String,
         document_uri: Url,
         position: Position,
@@ -33,11 +33,6 @@ pub enum LspRequest {
     GetIncomingCalls {
         request_id: String,
         call_hierarchy_item: lsp_types::CallHierarchyItem,
-    },
-    PrepareCallHierarchy {
-        request_id: String,
-        document_uri: Url,
-        position: Position,
     },
     FindReferences {
         request_id: String,
@@ -70,7 +65,7 @@ pub enum LspRequest {
 /// Response types for LSP operations
 #[derive(Debug, Clone)]
 pub enum LspResponse {
-    CallHierarchy {
+    CallHierarchyPrepared {
         request_id: String,
         items: Vec<CallHierarchyItem>,
     },
@@ -81,10 +76,6 @@ pub enum LspResponse {
     IncomingCalls {
         request_id: String,
         calls: Vec<lsp_types::CallHierarchyIncomingCall>,
-    },
-    CallHierarchyPrepared {
-        request_id: String,
-        items: Vec<lsp_types::CallHierarchyItem>,
     },
     References {
         request_id: String,
@@ -128,23 +119,6 @@ impl LspService {
             response_rx,
             worker_handle: Some(worker_handle),
         })
-    }
-
-    /// Request call hierarchy for a symbol
-    pub async fn request_call_hierarchy(
-        &self,
-        request_id: String,
-        document_uri: Url,
-        position: Position,
-    ) -> Result<()> {
-        self.request_tx
-            .send(LspRequest::GetCallHierarchy {
-                request_id,
-                document_uri,
-                position,
-            })
-            .await?;
-        Ok(())
     }
 
     /// Request references for a symbol

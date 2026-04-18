@@ -117,8 +117,8 @@ pub(super) async fn handle_lsp_message(
             let request_type = state.request_types.remove(&id);
 
             match request_type {
-                Some(RequestType::CallHierarchy) => {
-                    call_hierarchy::handle_call_hierarchy_response(
+                Some(RequestType::PrepareCallHierarchy) => {
+                    call_hierarchy::handle_prepare_call_hierarchy_response(
                         message,
                         request_id,
                         state,
@@ -137,15 +137,6 @@ pub(super) async fn handle_lsp_message(
                 }
                 Some(RequestType::IncomingCalls) => {
                     call_hierarchy::handle_incoming_calls_response(
-                        message,
-                        request_id,
-                        state,
-                        response_tx,
-                    )
-                    .await;
-                }
-                Some(RequestType::PrepareCallHierarchy) => {
-                    call_hierarchy::handle_prepare_call_hierarchy_response(
                         message,
                         request_id,
                         state,

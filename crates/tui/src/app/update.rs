@@ -11,39 +11,7 @@ impl App {
     pub(super) fn handle_lsp_response(&mut self, response: LspResponse) {
         log::info!("TUI handling LSP response: {:?}", response);
         match response {
-            LspResponse::CallHierarchy { request_id, items } => {
-                if let Some(pending) = self.lsp.take_pending(&request_id) {
-                    if let Some(symbol_id) = pending.symbol_id {
-                        log::info!(
-                            "Received call hierarchy prepare response for symbol: {:?}, {} items",
-                            symbol_id,
-                            items.len()
-                        );
 
-                        if !items.is_empty() {
-                            let first_item = items[0].clone();
-
-                            let current_direction = self
-                                .get_current_workspace()
-                                .map(|w| w.graph_view_state.direction)
-                                .unwrap_or(CallDirection::Incoming);
-
-                            let outgoing = matches!(current_direction, CallDirection::Outgoing);
-
-                            if let Some(msg) = self
-                                .lsp
-                                .send_follow_up_call(&symbol_id, first_item, outgoing)
-                            {
-                                self.status_message = msg;
-                            }
-                        } else {
-                            log::info!("No call hierarchy items found for symbol: {:?}", symbol_id);
-                            self.update_loading_state(&symbol_id, LoadingState::Loaded);
-                            self.status_message = "Function has no callees".to_string();
-                        }
-                    }
-                }
-            }
             LspResponse::OutgoingCalls { request_id, calls } => {
                 if let Some(pending) = self.lsp.take_pending(&request_id) {
                     if let Some(symbol_id) = pending.symbol_id {
@@ -237,21 +205,32 @@ impl App {
                 if let Some(pending) = self.lsp.take_pending(&request_id) {
                     if let Some(symbol_id) = pending.symbol_id {
                         log::info!(
-                            "Call hierarchy prepared for symbol: {:?}, {} items",
+                            "Received call hierarchy prepare response for symbol: {:?}, {} items",
                             symbol_id,
                             items.len()
                         );
 
-                        // Mark the call hierarchy as prepared and cache the first item
                         if !items.is_empty() {
-                            // We'll implement lazy call graph integration here later
-                            self.status_message = "Call hierarchy prepared for function".to_string();
-                        } else {
-                            self.status_message =
-                                "No call hierarchy available for this function".to_string();
-                        }
+                            let first_item = items[0].clone();
 
-                        self.update_loading_state(&symbol_id, LoadingState::Loaded);
+                            let current_direction = self
+                                .get_current_workspace()
+                                .map(|w| w.graph_view_state.direction)
+                                .unwrap_or(CallDirection::Incoming);
+
+                            let outgoing = matches!(current_direction, CallDirection::Outgoing);
+
+                            if let Some(msg) = self
+                                .lsp
+                                .send_follow_up_call(&symbol_id, first_item, outgoing)
+                            {
+                                self.status_message = msg;
+                            }
+                        } else {
+                            log::info!("No call hierarchy items found for symbol: {:?}", symbol_id);
+                            self.update_loading_state(&symbol_id, LoadingState::Loaded);
+                            self.status_message = "Function has no callees".to_string();
+                        }
                     }
                 }
             }
@@ -304,8 +283,8 @@ impl App {
         let file_path = other_uri.path().to_string();
         let location = model::Location::new(
             file_path.clone(),
-            ((other_range.start.line + 1)),
-            ((other_range.start.character + 1)),
+            (other_range.start.line + 1) as u32,
+            (other_range.start.character + 1) as u32,
         );
         let qualified_name = format!("{}::{}", other_name, file_path);
         let other_id = self.call_graph.add_function(model::FunctionNode::new(
@@ -316,8 +295,8 @@ impl App {
         for from_range in from_ranges {
             let call_location = model::Location::new(
                 file_path.clone(),
-                ((from_range.start.line + 1)),
-                ((from_range.start.character + 1)),
+                (from_range.start.line + 1) as u32,
+                (from_range.start.character + 1) as u32,
             );
             let (caller, callee) = if is_outgoing {
                 (symbol_id.clone(), other_id.clone())

@@ -221,7 +221,7 @@ impl LspBridge {
             },
         );
 
-        let request = LspRequest::GetCallHierarchy {
+        let request = LspRequest::PrepareCallHierarchy {
             request_id,
             document_uri,
             position,

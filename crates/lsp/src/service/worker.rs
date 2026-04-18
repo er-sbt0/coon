@@ -7,10 +7,9 @@ use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum RequestType {
-    CallHierarchy,
+    PrepareCallHierarchy,
     OutgoingCalls,
     IncomingCalls,
-    PrepareCallHierarchy,
     References,
     ReferencesWithSymbols,
     DocumentSymbols,
@@ -75,17 +74,14 @@ pub(super) async fn run_loop(
         tokio::select! {
             request = request_rx.recv() => {
                 match request {
-                    Some(LspRequest::GetCallHierarchy { request_id, document_uri, position }) => {
-                        super::request::handle_call_hierarchy_request(&mut state, &response_tx, request_id, document_uri, position).await;
+                    Some(LspRequest::PrepareCallHierarchy { request_id, document_uri, position }) => {
+                        super::request::handle_prepare_call_hierarchy_request(&mut state, &response_tx, request_id, document_uri, position).await;
                     }
                     Some(LspRequest::GetOutgoingCalls { request_id, call_hierarchy_item }) => {
                         super::request::handle_outgoing_calls_request(&mut state, &response_tx, request_id, call_hierarchy_item).await;
                     }
                     Some(LspRequest::GetIncomingCalls { request_id, call_hierarchy_item }) => {
                         super::request::handle_incoming_calls_request(&mut state, &response_tx, request_id, call_hierarchy_item).await;
-                    }
-                    Some(LspRequest::PrepareCallHierarchy { request_id, document_uri, position }) => {
-                        super::request::handle_prepare_call_hierarchy_request(&mut state, &response_tx, request_id, document_uri, position).await;
                     }
                     Some(LspRequest::FindReferences { request_id, document_uri, position }) => {
                         super::request::handle_references_request(&mut state, &response_tx, request_id, document_uri, position).await;

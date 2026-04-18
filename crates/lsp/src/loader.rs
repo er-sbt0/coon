@@ -185,15 +185,6 @@ pub async fn lsp_loader_task(
                     if let Some(request) = tui_request {
                         log::debug!("Forwarding TUI request to LSP service: {:?}", request);
                         match request {
-                            LspRequest::GetCallHierarchy { request_id, document_uri, position } => {
-                                if let Err(e) = lsp_service.request_call_hierarchy(request_id.clone(), document_uri, position).await {
-                                    log::error!("Failed to send call hierarchy request: {}", e);
-                                    let _ = tui_response_tx.send(LspResponse::Error {
-                                        request_id,
-                                        error: format!("Request failed: {}", e),
-                                    });
-                                }
-                            }
                             LspRequest::GetOutgoingCalls { request_id, call_hierarchy_item } => {
                                 if let Err(e) = lsp_service.request_outgoing_calls(request_id.clone(), call_hierarchy_item).await {
                                     log::error!("Failed to send outgoing calls request: {}", e);
