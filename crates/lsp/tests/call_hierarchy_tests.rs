@@ -1,4 +1,4 @@
-use lsp_integration::LspClient;
+use lsp::LspClient;
 use lsp_types::{self as lsp, Position, Url};
 use serde_json::Value;
 use tempfile::tempdir;

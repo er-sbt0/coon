@@ -1,6 +1,6 @@
-# Testing the `lsp_integration` Crate
+# Testing the `lsp` Crate
 
-This guide outlines the strategy for writing and running tests for the `lsp_integration` crate. The goal is to ensure our Language Server Protocol (LSP) client communicates correctly with `clangd` and accurately translates LSP responses into our internal `core_data` types.
+This guide outlines the strategy for writing and running tests for the `lsp` crate. The goal is to ensure our Language Server Protocol (LSP) client communicates correctly with `clangd` and accurately translates LSP responses into our internal `core_data` types.
 
 ## Testing Philosophy
 
@@ -75,7 +75,7 @@ std::fs::write(project_root.join("compile_commands.json"), compile_commands)
 
 You'll need a helper function to spawn the `clangd` process and create an `LspClient` instance to communicate with it.
 
-*(This functionality should be part of the `lsp_integration` crate's test helpers).*
+*(This functionality should be part of the `lsp` crate's test helpers).*
 
 ### 5. Perform LSP Communication
 
@@ -107,7 +107,7 @@ assert!(calls.iter().any(|item| item.to.name == "callee2"));
 
 ### Full Example
 
-Here is a complete example of what a test function could look like. It's recommended to place this inside the `lsp_integration` crate's tests module.
+Here is a complete example of what a test function could look like. It's recommended to place this inside the `lsp` crate's tests module.
 
 ```rust
 #[cfg(test)]

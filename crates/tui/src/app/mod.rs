@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
-use lsp_integration::{LspRequest, LspResponse};
+use lsp::{LspRequest, LspResponse};
 use model::{lsp_status::LspLoadPhase, lsp_status::LspUiMessage, CallGraph, SymbolId};
 
 use crate::actions::TreeViewState;

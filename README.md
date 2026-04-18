@@ -30,7 +30,7 @@ cargo build --release
 
 ```bash
 cargo test                      # all tests
-cargo test -p lsp_integration   # LSP tests (requires clangd)
+cargo test -p lsp               # LSP tests (requires clangd)
 ```
 
-See [`lsp_integration/TESTING.md`](lsp_integration/TESTING.md) for writing integration tests.
+See [`lsp/TESTING.md`](lsp/TESTING.md) for writing integration tests.

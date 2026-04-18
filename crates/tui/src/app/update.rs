@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use lsp_integration::LspResponse;
+use lsp::LspResponse;
 use model::SymbolId;
 
 use crate::graph_adapter::CallDirection;
@@ -54,7 +54,7 @@ impl App {
                                     // Send outgoing calls request
                                     if let Some(tx) = &self.lsp_request_tx {
                                         let request =
-                                            lsp_integration::LspRequest::GetOutgoingCalls {
+                                            lsp::LspRequest::GetOutgoingCalls {
                                                 request_id: outgoing_request_id,
                                                 call_hierarchy_item: first_item,
                                             };
@@ -104,7 +104,7 @@ impl App {
                                     // Send incoming calls request
                                     if let Some(tx) = &self.lsp_request_tx {
                                         let request =
-                                            lsp_integration::LspRequest::GetIncomingCalls {
+                                            lsp::LspRequest::GetIncomingCalls {
                                                 request_id: incoming_request_id,
                                                 call_hierarchy_item: first_item,
                                             };

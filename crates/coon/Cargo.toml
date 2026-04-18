@@ -6,8 +6,8 @@ edition = "2021"
 [dependencies]
 model.workspace = true
 logic.workspace = true
-lsp_integration.workspace = true
-tui_ui.workspace = true
+lsp.workspace = true
+tui.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -15,12 +15,12 @@ cargo run -- /path/to/project   # LSP mode (analyzes a real C/C++ project via cl
 
 # Test
 cargo test                       # All tests
-cargo test -p lsp_integration    # LSP crate only (requires clangd in PATH)
+cargo test -p lsp              # LSP crate only (requires clangd in PATH)
 cargo test -p logic              # Graph logic only
 cargo test <test_name>           # Single test by name pattern
 ```
 
-LSP integration tests require `clangd` to be installed and in `PATH`. See `lsp_integration/TESTING.md` for details on writing integration tests.
+LSP integration tests require `clangd` to be installed and in `PATH`. See `lsp/TESTING.md` for details on writing integration tests.
 
 Logs are written to `logs/` directory.
 
@@ -31,9 +31,9 @@ COON is a Rust workspace (4 crates) that visualizes C/C++ call graphs in a TUI, 
 ### Crates
 
 - **`model`** — Shared types: `CallGraph`, `FunctionNode`, `CallEdge`, `SymbolId`, LSP progress/status enums.
-- **`lsp_integration`** — All clangd communication: `LspClient` (raw protocol), `LspService` (higher-level async service with request/response handling, document caching, symbol resolution).
+- **`lsp`** — All clangd communication: `LspClient` (raw protocol), `LspService` (higher-level async service with request/response handling, document caching, symbol resolution).
 - **`logic`** — Pure graph algorithms (BFS traversal, path-finding, reachability) operating on `CallGraph`.
-- **`tui_ui`** — Ratatui TUI: `TuiApp` (main state/event loop), `GraphView`/`GraphViewState` (tree rendering via the external `grid` crate), search bar, workspace management.
+- **`tui`** — Ratatui TUI: `TuiApp` (main state/event loop), `GraphView`/`GraphViewState` (tree rendering via the external `grid` crate), search bar, workspace management.
 
 ### Data Flow
 

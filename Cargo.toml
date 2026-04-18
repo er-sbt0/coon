@@ -3,9 +3,9 @@ resolver = "2"
 members = [
     "crates/coon",
     "crates/model",
-    "crates/lsp_integration",
+    "crates/lsp",
     "crates/logic",
-    "crates/tui_ui"
+    "crates/tui"
 ]
 
 [workspace.dependencies]
@@ -26,5 +26,5 @@ tempfile = "3.0"
 # Internal crates
 model = { path = "crates/model" }
 logic = { path = "crates/logic" }
-lsp_integration = { path = "crates/lsp_integration" }
-tui_ui = { path = "crates/tui_ui" }
+lsp = { path = "crates/lsp" }
+tui = { path = "crates/tui" }

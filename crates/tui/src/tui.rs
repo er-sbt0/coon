@@ -7,7 +7,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
 use tokio::sync::mpsc;
 
-use lsp_integration::{LspRequest, LspResponse};
+use lsp::{LspRequest, LspResponse};
 use model::{lsp_status::LspUiMessage, CallGraph};
 
 use crate::actions::Action;

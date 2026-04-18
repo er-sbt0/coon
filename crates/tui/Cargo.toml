@@ -1,12 +1,12 @@
 [package]
-name = "tui_ui"
+name = "tui"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 model.workspace = true
 logic.workspace = true
-lsp_integration.workspace = true
+lsp.workspace = true
 grid = { path = "../../../grid", features = ["rendering"] }
 ratatui.workspace = true
 crossterm.workspace = true

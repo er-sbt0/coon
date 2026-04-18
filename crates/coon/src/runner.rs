@@ -1,10 +1,10 @@
 use log::{error, info};
 use tokio::sync::mpsc;
 
-use lsp_integration::{LspRequest, LspResponse};
+use lsp::{LspRequest, LspResponse};
 use model::lsp_status::LspUiMessage;
 use model::CallGraph;
-use tui_ui::TuiApp;
+use tui::TuiApp;
 
 pub async fn run_with_demo_data() -> Result<(), Box<dyn std::error::Error>> {
     info!("Creating demo call graph...");
@@ -30,7 +30,7 @@ pub async fn run_with_lsp(project_path: &str) -> Result<(), Box<dyn std::error::
 
     let project_path_string = project_path.to_string();
     tokio::spawn(async move {
-        if let Err(e) = lsp_integration::loader::lsp_loader_task(
+        if let Err(e) = lsp::loader::lsp_loader_task(
             &project_path_string,
             ui_msg_tx,
             lsp_channels_tx,
