@@ -26,19 +26,8 @@ pub enum LoadingState {
 /// Pending LSP request information
 #[derive(Debug, Clone)]
 pub struct PendingRequest {
-    #[allow(dead_code)]
-    pub(super) request_type: LspRequestType,
     pub(super) symbol_id: Option<SymbolId>,
     pub(super) timestamp: Instant,
-}
-
-/// Types of LSP requests
-#[derive(Debug, Clone)]
-pub enum LspRequestType {
-    CallHierarchy,
-    References,
-    Symbols,
-    Refresh,
 }
 
 /// Main application state
@@ -73,7 +62,6 @@ pub struct App {
     pub lsp_response_rx: Option<mpsc::UnboundedReceiver<LspResponse>>,
     pub lsp_request_tx: Option<mpsc::UnboundedSender<LspRequest>>,
     pub pending_requests: HashMap<String, PendingRequest>,
-    pub opened_documents: std::collections::HashSet<lsp_types::Url>,
 
     // Async LSP loading state
     pub lsp_status: LspLoadPhase,
@@ -124,7 +112,6 @@ impl App {
             lsp_response_rx: None,
             lsp_request_tx: None,
             pending_requests: HashMap::new(),
-            opened_documents: std::collections::HashSet::new(),
             lsp_status: LspLoadPhase::NotStarted,
             lsp_rx: None,
             lsp_channels_rx: None,

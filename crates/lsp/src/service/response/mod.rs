@@ -184,10 +184,6 @@ pub(super) async fn handle_lsp_message(
                     )
                     .await;
                 }
-                Some(RequestType::Hover) => {
-                    references::handle_hover_response(message, request_id, state, response_tx)
-                        .await;
-                }
                 None => {
                     log::warn!("No request type tracked for LSP request {}, falling back to content detection", id);
                     legacy::handle_legacy_response_detection(

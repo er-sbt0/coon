@@ -365,7 +365,6 @@ async fn parse_enhanced_references_response(
     state.pending_enhanced_requests.insert(
         service_request_id.to_string(),
         EnhancedRequestInfo {
-            request_id: service_request_id.to_string(),
             locations: locations.clone(),
             pending_symbol_requests: locations
                 .iter()

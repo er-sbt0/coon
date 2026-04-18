@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 use lsp::{LspRequest, LspResponse};
 use model::SymbolId;
 
-use super::{App, LoadingState, LspRequestType, PendingRequest};
+use super::{App, LoadingState, PendingRequest};
 
 impl App {
     // Lazy loading methods for LSP integration
@@ -67,7 +67,6 @@ impl App {
         self.pending_requests.insert(
             request_id.clone(),
             PendingRequest {
-                request_type: LspRequestType::CallHierarchy,
                 symbol_id: Some(function_id.clone()),
                 timestamp: Instant::now(),
             },
@@ -136,7 +135,6 @@ impl App {
         self.pending_requests.insert(
             request_id.clone(),
             PendingRequest {
-                request_type: LspRequestType::References,
                 symbol_id: Some(function_id.clone()),
                 timestamp: Instant::now(),
             },
@@ -173,7 +171,6 @@ impl App {
         self.pending_requests.insert(
             request_id.clone(),
             PendingRequest {
-                request_type: LspRequestType::Symbols,
                 symbol_id: None,
                 timestamp: Instant::now(),
             },
@@ -314,25 +311,6 @@ impl App {
         if let Some(node_index) = self.tree_view_state.find_node_index(symbol_id) {
             if let Some(node) = self.tree_view_state.nodes.get_mut(node_index) {
                 node.is_loading = is_loading;
-            }
-        }
-    }
-
-    /// Preload documents that will likely be needed
-    #[allow(dead_code)]
-    fn preload_documents(&mut self, function_id: &SymbolId) {
-        if let Some(function) = self.call_graph.nodes.get(function_id) {
-            let file_path = &function.definition_location.file_path;
-
-            // Create document URI from file path
-            if let Ok(uri) = lsp_types::Url::from_file_path(file_path) {
-                // Check if we've already opened this document
-                if !self.opened_documents.contains(&uri) {
-                    // Track that we've marked it for opening
-                    // The actual document opening will be handled by the LSP service
-                    // when it processes the request
-                    self.opened_documents.insert(uri);
-                }
             }
         }
     }

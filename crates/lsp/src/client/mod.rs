@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -11,8 +10,10 @@ mod parsing_impl;
 mod requests;
 
 pub struct LspClient {
+    #[allow(dead_code)] // held for process lifetime
     process: Child,
     writer: ChildStdin,
+    #[allow(dead_code)] // held for task lifetime
     reader_handle: tokio::task::JoinHandle<()>,
     next_id: i64,
     pub(crate) pending_requests: HashMap<i64, String>,

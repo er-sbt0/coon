@@ -5,7 +5,7 @@ use model::SymbolId;
 
 use crate::graph_adapter::CallDirection;
 
-use super::{App, LoadingState, LspRequestType, PendingRequest};
+use super::{App, LoadingState, PendingRequest};
 
 impl App {
     /// Handle an LSP response
@@ -45,7 +45,6 @@ impl App {
                                     self.pending_requests.insert(
                                         outgoing_request_id.clone(),
                                         PendingRequest {
-                                            request_type: LspRequestType::CallHierarchy,
                                             timestamp: Instant::now(),
                                             symbol_id: Some(symbol_id.clone()),
                                         },
@@ -94,7 +93,6 @@ impl App {
                                     self.pending_requests.insert(
                                         incoming_request_id.clone(),
                                         PendingRequest {
-                                            request_type: LspRequestType::CallHierarchy,
                                             timestamp: Instant::now(),
                                             symbol_id: Some(symbol_id.clone()),
                                         },

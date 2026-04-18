@@ -1,7 +1,6 @@
 use chrono::Utc;
 use fern::Dispatch;
 use log::LevelFilter;
-use std::path::Path;
 
 /// Initialize file-based logging for the application
 ///
@@ -55,34 +54,6 @@ pub fn init_logging() -> Result<(), fern::InitError> {
     init_file_logging(log_level)
 }
 
-/// Initialize debug-level logging for development
-#[allow(dead_code)]
-pub fn init_debug_logging() -> Result<(), fern::InitError> {
-    init_file_logging(LevelFilter::Debug)
-}
-
-/// Get the latest log file path
-#[allow(dead_code)]
-pub fn get_latest_log_file() -> Option<String> {
-    let logs_dir = Path::new("logs");
-    if !logs_dir.exists() {
-        return None;
-    }
-
-    std::fs::read_dir(logs_dir)
-        .ok()?
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let path = entry.path();
-            if path.is_file() && path.extension()? == "log" {
-                Some(path.to_string_lossy().to_string())
-            } else {
-                None
-            }
-        })
-        .max() // This will get the latest file alphabetically (which works with our timestamp format)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,10 +74,6 @@ mod tests {
         log::info!("Test log message");
 
         // Check that logs directory exists
-        assert!(Path::new("logs").exists());
-
-        // Check that we can get the latest log file
-        let latest_log = get_latest_log_file();
-        assert!(latest_log.is_some());
+        assert!(std::path::Path::new("logs").exists());
     }
 }

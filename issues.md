@@ -35,8 +35,6 @@ Rediscovering the same function creates a new ID → duplicates in graph. Need c
 **9. Non-deterministic sibling navigation** — graph_view.rs
 `HashMap::keys()` iteration order changes between runs. Next/previous sibling is random.
 
----
-
 ### Medium — Architectural debt and maintainability
 
 **10. God object: `App` (23 fields)** — mod.rs
@@ -46,9 +44,6 @@ Mixes graph, workspace, search, LSP channels, loading, and UI state. Untestable.
 `event::poll` + `event::read` block the main thread inside an `async fn`. Works only because LSP is spawned separately. Fragile.
 
 ### Low-Medium — Hygiene, testing, performance
-
-**17. Dead code behind `#[allow(dead_code)]`** — lib.rs, lazy_graph.rs (~280 lines), large parts of `logic` crate
-Whole modules suppressed. `LazyCallGraph` never used. `logic` crate mostly unused by TUI.
 
 **18. Zero unit tests for LSP service layer** — `service/worker.rs`, `service/request.rs`, all `service/response/*.rs`
 The complex enhanced-references state machine with pending hovers is entirely untested.

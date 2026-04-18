@@ -8,7 +8,7 @@ pub use lsp_types;
 
 // Re-export public types explicitly
 pub use graph::{CallEdge, CallGraph, FunctionNode};
-pub use lazy_graph::{CallGraphNode, CallReference, LazyCallGraph, WorkspaceSymbolInfo};
+pub use lazy_graph::WorkspaceSymbolInfo;
 pub use lsp_status::{LspLoadPhase, LspUiMessage};
 pub use symbols::{
     Diagnostic, DiagnosticSeverity, Location, Reference, ReferenceSymbolKind, ReferencingSymbol,

@@ -10,7 +10,7 @@ pub mod search_bar;
 pub mod tui;
 
 pub use actions::{Action, TreeNode, TreeViewState};
-pub use app::{App, LoadingState, LspRequestType, PendingRequest};
+pub use app::{App, LoadingState, PendingRequest};
 pub use call_graph_view::CallGraphView;
 pub use function_list::FunctionList;
 pub use graph_adapter::{CallDirection, CallGraphAdapter};
