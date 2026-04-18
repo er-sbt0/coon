@@ -8,13 +8,8 @@ impl App {
 
     /// Request call hierarchy for a function
     pub fn request_call_hierarchy(&mut self, function_id: &SymbolId) {
-        // Update UI to show loading state
-        self.update_node_loading_state(function_id, true);
-
         if let Some(msg) = self.lsp.send_call_hierarchy(&self.call_graph, function_id) {
             self.status_message = msg;
-            // If there was an error, reset the loading indicator
-            self.update_node_loading_state(function_id, false);
         }
     }
 
@@ -66,42 +61,17 @@ impl App {
     pub(super) fn update_loading_state(&mut self, symbol_id: &SymbolId, state: LoadingState) {
         self.lsp.set_loading_state(symbol_id.clone(), state.clone());
 
-        // Update UI elements
         match state {
             LoadingState::Loading => {
-                self.update_node_loading_state(symbol_id, true);
                 self.status_message = "Loading data for function...".to_string();
             }
             LoadingState::Loaded => {
-                self.update_node_loading_state(symbol_id, false);
-                if let Some(node_index) = self.tree_view_state.find_node_index(symbol_id) {
-                    if let Some(node) = self.tree_view_state.nodes.get_mut(node_index) {
-                        node.children_loaded = true;
-                    }
-                }
                 self.status_message = String::new();
             }
             LoadingState::Failed(error) => {
-                self.update_node_loading_state(symbol_id, false);
                 self.status_message = format!("Error: {}", error);
             }
-            LoadingState::NotLoaded => {
-                self.update_node_loading_state(symbol_id, false);
-                if let Some(node_index) = self.tree_view_state.find_node_index(symbol_id) {
-                    if let Some(node) = self.tree_view_state.nodes.get_mut(node_index) {
-                        node.children_loaded = false;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Update the loading state of a tree node
-    pub(super) fn update_node_loading_state(&mut self, symbol_id: &SymbolId, is_loading: bool) {
-        if let Some(node_index) = self.tree_view_state.find_node_index(symbol_id) {
-            if let Some(node) = self.tree_view_state.nodes.get_mut(node_index) {
-                node.is_loading = is_loading;
-            }
+            LoadingState::NotLoaded => {}
         }
     }
 }

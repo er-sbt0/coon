@@ -6,7 +6,6 @@ use model::{lsp_status::LspUiMessage, CallGraph, SymbolId};
 /// Default viewport size used before the actual terminal size is known.
 const DEFAULT_VIEWPORT_SIZE: (f32, f32) = (100.0, 100.0);
 
-use crate::actions::TreeViewState;
 use crate::search_bar::SearchBarState;
 
 mod events;
@@ -26,7 +25,6 @@ pub struct App {
     pub selected_function: Option<SymbolId>,
     pub functions: Vec<SymbolId>,
     pub function_list_state: ratatui::widgets::ListState,
-    pub tree_view_state: TreeViewState,
 
     // UI chrome
     pub should_quit: bool,
@@ -60,7 +58,6 @@ impl App {
             selected_function: None,
             functions,
             function_list_state,
-            tree_view_state: TreeViewState::new(),
             should_quit: false,
             show_help: false,
             status_message: "Ready".to_string(),

@@ -14,10 +14,7 @@ impl App {
             Action::MoveDown => self.handle_move_down(),
             Action::MoveLeft => self.handle_move_left(),
             Action::MoveRight => self.handle_move_right(),
-            Action::ExpandNode => self.handle_expand_node(),
-            Action::CollapseNode => self.handle_collapse_node(),
             Action::ExpandOrCollapse => self.handle_expand_or_collapse(),
-            Action::SwitchTab => {} // Removed - tabs no longer exist
             Action::FindReferences => self.handle_find_references(),
             Action::Refresh => self.handle_refresh(),
             Action::Quit => self.quit(),
@@ -50,14 +47,6 @@ impl App {
             workspace.graph_view_state.viewport.pan(0.0, 3.0);
             self.status_message = "Panned down".to_string();
         }
-    }
-
-    fn handle_expand_node(&mut self) {
-        // Tree view removed - no-op
-    }
-
-    fn handle_collapse_node(&mut self) {
-        // Tree view removed - no-op
     }
 
     fn handle_expand_or_collapse(&mut self) {
@@ -110,12 +99,6 @@ impl App {
         // If there's a selected function, refresh its call hierarchy
         if let Some(selected_id) = &self.selected_function.clone() {
             self.request_call_hierarchy(selected_id);
-        }
-
-        // Reset tree view expanded states to force reload when re-expanded
-        for node in &mut self.tree_view_state.nodes {
-            node.children_loaded = false;
-            node.is_loading = false;
         }
 
         self.status_message = "Refreshing project data from LSP server...".to_string();

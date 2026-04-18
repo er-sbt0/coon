@@ -1,7 +1,5 @@
 pub mod actions;
 pub mod app;
-pub mod call_graph_view;
-pub mod function_list;
 pub mod graph_adapter;
 pub mod graph_view;
 pub mod graph_workspace;
@@ -9,10 +7,8 @@ pub mod rendering;
 pub mod search_bar;
 pub mod tui;
 
-pub use actions::{Action, TreeNode, TreeViewState};
+pub use actions::Action;
 pub use app::{App, LoadingState, PendingRequest};
-pub use call_graph_view::CallGraphView;
-pub use function_list::FunctionList;
 pub use graph_adapter::{CallDirection, CallGraphAdapter};
 pub use graph_view::{GraphView, GraphViewState};
 pub use graph_workspace::GraphWorkspace;

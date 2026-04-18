@@ -14,36 +14,6 @@ tui.rs contains a ~150-line monolithic `match` on every key code — search-bar 
 
 ---
 
-### 3. **Swapped arrow-key semantics — silent correctness bug**
-
-tui.rs:
-```rust
-KeyCode::Up => Some(Action::MoveDown),
-KeyCode::Down => Some(Action::MoveUp),
-KeyCode::Right => Some(Action::MoveLeft),
-KeyCode::Left => Some(Action::MoveRight),
-```
-And in the search bar at tui.rs:
-```rust
-KeyCode::Left => { self.app.search_bar_state.move_cursor_right(); }
-KeyCode::Right => { self.app.search_bar_state.move_cursor_left(); }
-```
-All four arrow keys are mapped to the *opposite* action. If intentional (inverted viewport panning), this is extremely confusing and undocumented. In the search bar case it's almost certainly a bug.
-
----
-
-### 4. **Dead code: `TreeViewState`, `TreeNode`, `SwitchTab`, `ExpandNode`, `CollapseNode`**
-
-Several `Action` variants and the entire `TreeViewState` / `TreeNode` system in actions.rs are vestigial — their handlers are no-ops:
-- events.rs: `Action::SwitchTab => {} // Removed - tabs no longer exist`
-- events.rs: `handle_expand_node` and `handle_collapse_node` are empty.
-- `TreeViewState` is still mutated in lsp.rs and events.rs despite the tree view being removed.
-- `CallGraphView` and `FunctionList` in call_graph_view.rs and function_list.rs appear completely unused by the rendering pipeline.
-
-This dead code is confusing and adds maintenance burden.
-
----
-
 ### 7. **`CallGraphAdapter.build_tree` clones `HashSet<SymbolId>` on every BFS step**
 
 graph_adapter.rs: Each node enqueued gets `let mut new_path = path.clone()`. For graphs with branching factor *b* and depth *d*, this creates *O(b^d)* cloned hash sets, each growing in size. This is a potential performance bomb on large call graphs.
@@ -51,10 +21,6 @@ graph_adapter.rs: Each node enqueued gets `let mut new_path = path.clone()`. For
 **Fix:** Use a global `visited` set with backtracking, or use `Rc<HashSet>` with persistent data structures.
 
 ---
-
-### 8. **`select_next_sibling` / `select_prev_sibling` cycle through ALL nodes, not actual siblings**
-
-graph_view.rs: The comment says "sibling" navigation, but the implementation sorts `symbol_to_node` by node index and cycles through *every* node in the tree. Contrast with `navigate_next_sibling` (line 275) which correctly uses `get_siblings()`. This is inconsistent and misleading.
 
 ---
 
