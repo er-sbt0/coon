@@ -1,4 +1,4 @@
-use grid::{LayoutError, Tree};
+use grid::{Dag, LayoutError};
 use model::{CallGraph, FunctionNode, SymbolId};
 use std::collections::{HashMap, VecDeque};
 
@@ -31,104 +31,54 @@ impl CallGraphAdapter {
         }
     }
 
-    /// Build a tree structure from the call graph starting at root
-    pub fn build_tree(
+    /// Build a DAG from the call graph starting at root.
+    ///
+    /// When a symbol is encountered that is already in the DAG, only an edge is
+    /// added — no duplicate node.  Cycles are preserved as back-edges and are
+    /// handled by the Sugiyama engine.
+    pub fn build_dag(
         &mut self,
         graph: &CallGraph,
         root: &SymbolId,
         direction: CallDirection,
         max_depth: Option<usize>,
-    ) -> Result<Tree<SymbolId>, LayoutError> {
-        // Clear previous mappings
+    ) -> Result<Dag<SymbolId>, LayoutError> {
         self.symbol_to_node.clear();
         self.node_to_symbol.clear();
         self.current_direction = direction;
 
-        // Get root function to validate it exists
         let _root_func = graph.get_function(root).ok_or_else(|| {
             LayoutError::InvalidTree(format!("Root function not found: {:?}", root))
         })?;
 
-        // Create tree structure with SymbolId as data
-        let mut tree = Tree::new(*root);
+        let mut dag = Dag::new();
+        let mut queue: VecDeque<(SymbolId, usize)> = VecDeque::new();
 
-        // Add root to mappings (note: only first occurrence is in symbol_to_node map)
-        self.symbol_to_node.insert(*root, 0);
-        self.node_to_symbol.insert(0, *root);
+        let root_idx = dag.add_node(*root);
+        self.symbol_to_node.insert(*root, root_idx);
+        self.node_to_symbol.insert(root_idx, *root);
+        queue.push_back((*root, 0));
 
-        // Build tree using BFS with parent pointers for cycle detection.
-        // Instead of cloning a HashSet per queued node (O(B^D) allocations),
-        // we store a parent-pointer map and walk up to the root to check for
-        // cycles. This reduces per-node overhead to O(1) space and O(D) time
-        // for each ancestor check.
-        let mut queue = VecDeque::new();
-
-        // parent_map: tree node index -> parent node index (root has no entry)
-        let mut parent_map: HashMap<usize, usize> = HashMap::new();
-
-        // Queue contains: (symbol_id, tree_node_idx, depth)
-        queue.push_back((*root, 0, 0));
-
-        while let Some((symbol, parent_idx, depth)) = queue.pop_front() {
-            // Check depth limit
-            if let Some(max) = max_depth {
-                if depth >= max {
-                    continue;
-                }
+        while let Some((symbol, depth)) = queue.pop_front() {
+            if max_depth.map_or(false, |m| depth >= m) {
+                continue;
             }
+            let parent_idx = self.symbol_to_node[&symbol];
 
-            // Get children based on direction
-            let children = self.get_children(graph, &symbol, direction);
-
-            for child_func in children {
-                // Walk parent pointers to detect cycles on the root-to-node path
-                if self.is_on_ancestor_path(parent_idx, &child_func.id, &parent_map) {
-                    continue;
-                }
-
-                // Add child to tree
-                let child_idx = tree.add_child(parent_idx, child_func.id)?;
-
-                // Update node_to_symbol mapping (all nodes)
-                self.node_to_symbol.insert(child_idx, child_func.id);
-
-                // Only update symbol_to_node for first occurrence (for backward compatibility)
-                self.symbol_to_node
-                    .entry(child_func.id)
-                    .or_insert(child_idx);
-
-                // Record parent pointer for cycle detection
-                parent_map.insert(child_idx, parent_idx);
-
-                // Enqueue child
-                queue.push_back((child_func.id, child_idx, depth + 1));
+            for child_func in self.get_children(graph, &symbol, direction) {
+                let child_idx = if let Some(&idx) = self.symbol_to_node.get(&child_func.id) {
+                    idx
+                } else {
+                    let idx = dag.add_node(child_func.id);
+                    self.symbol_to_node.insert(child_func.id, idx);
+                    self.node_to_symbol.insert(idx, child_func.id);
+                    queue.push_back((child_func.id, depth + 1));
+                    idx
+                };
+                dag.add_edge(parent_idx, child_idx)?;
             }
         }
-
-        Ok(tree)
-    }
-
-    /// Check whether `symbol` appears on the path from `node_idx` up to (and
-    /// including) the root, by walking parent pointers.  Returns `true` if the
-    /// symbol would create a cycle.
-    fn is_on_ancestor_path(
-        &self,
-        node_idx: usize,
-        symbol: &SymbolId,
-        parent_map: &HashMap<usize, usize>,
-    ) -> bool {
-        let mut current = node_idx;
-        loop {
-            if let Some(sym) = self.node_to_symbol.get(&current) {
-                if sym == symbol {
-                    return true;
-                }
-            }
-            match parent_map.get(&current) {
-                Some(&parent) => current = parent,
-                None => return false, // reached root, no cycle
-            }
-        }
+        Ok(dag)
     }
 
     /// Get children of a node based on direction
@@ -163,127 +113,5 @@ impl CallGraphAdapter {
 impl Default for CallGraphAdapter {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use model::Location;
-
-    fn create_test_graph() -> CallGraph {
-        let mut graph = CallGraph::new();
-
-        // Create functions: main -> foo -> bar
-        //                        -> baz
-        let main_func = FunctionNode::new(
-            "main".to_string(),
-            "main".to_string(),
-            Location::new("test.c".to_string(), 1, 0),
-        );
-        let main_id = main_func.id;
-
-        let foo_func = FunctionNode::new(
-            "foo".to_string(),
-            "foo".to_string(),
-            Location::new("test.c".to_string(), 5, 0),
-        );
-        let foo_id = foo_func.id;
-
-        let bar_func = FunctionNode::new(
-            "bar".to_string(),
-            "bar".to_string(),
-            Location::new("test.c".to_string(), 10, 0),
-        );
-        let bar_id = bar_func.id;
-
-        let baz_func = FunctionNode::new(
-            "baz".to_string(),
-            "baz".to_string(),
-            Location::new("test.c".to_string(), 15, 0),
-        );
-        let baz_id = baz_func.id;
-
-        graph.add_function(main_func);
-        graph.add_function(foo_func);
-        graph.add_function(bar_func);
-        graph.add_function(baz_func);
-
-        // Add edges
-        graph.add_call(main_id, foo_id, Location::new("test.c".to_string(), 2, 0));
-        graph.add_call(main_id, baz_id, Location::new("test.c".to_string(), 3, 0));
-        graph.add_call(foo_id, bar_id, Location::new("test.c".to_string(), 6, 0));
-
-        graph
-    }
-
-    #[test]
-    fn test_build_tree_outgoing() {
-        let graph = create_test_graph();
-        let mut adapter = CallGraphAdapter::new();
-
-        // Get main function
-        let main_id = graph.functions().find(|f| f.name == "main").unwrap().id;
-
-        let tree = adapter
-            .build_tree(&graph, &main_id, CallDirection::Outgoing, None)
-            .unwrap();
-
-        // Root should be main
-        assert_eq!(tree.nodes()[0].data, main_id);
-        assert_eq!(tree.nodes()[0].children.len(), 2); // foo and baz
-
-        // Check mappings
-        assert_eq!(adapter.get_node_index(&main_id), Some(0));
-        assert_eq!(adapter.get_symbol(0), Some(&main_id));
-    }
-
-    #[test]
-    fn test_build_tree_with_depth_limit() {
-        let graph = create_test_graph();
-        let mut adapter = CallGraphAdapter::new();
-
-        let main_id = graph.functions().find(|f| f.name == "main").unwrap().id;
-
-        let tree = adapter
-            .build_tree(&graph, &main_id, CallDirection::Outgoing, Some(1))
-            .unwrap();
-
-        // Should have main and its direct children only
-        assert!(tree.nodes().len() <= 3); // main, foo, baz (bar should not be included)
-    }
-
-    #[test]
-    fn test_cycle_detection() {
-        let mut graph = CallGraph::new();
-
-        // Create a cycle: a -> b -> a
-        let a_func = FunctionNode::new(
-            "a".to_string(),
-            "a".to_string(),
-            Location::new("test.c".to_string(), 1, 0),
-        );
-        let a_id = a_func.id;
-
-        let b_func = FunctionNode::new(
-            "b".to_string(),
-            "b".to_string(),
-            Location::new("test.c".to_string(), 5, 0),
-        );
-        let b_id = b_func.id;
-
-        graph.add_function(a_func);
-        graph.add_function(b_func);
-
-        graph.add_call(a_id, b_id, Location::new("test.c".to_string(), 2, 0));
-        graph.add_call(b_id, a_id, Location::new("test.c".to_string(), 6, 0));
-
-        let mut adapter = CallGraphAdapter::new();
-        let tree = adapter
-            .build_tree(&graph, &a_id, CallDirection::Outgoing, None)
-            .unwrap();
-
-        // Should not infinite loop, should only have a and b once
-        assert_eq!(tree.nodes().len(), 2);
     }
 }

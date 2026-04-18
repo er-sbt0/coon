@@ -1,5 +1,5 @@
 use crate::graph_adapter::{CallDirection, CallGraphAdapter};
-use grid::{LayoutConfig, LayoutEngine, LayoutResult, Position, Tree, Viewport};
+use grid::{Dag, LayoutConfig, LayoutEngine, LayoutResult, Position, Viewport};
 use model::{CallGraph, FunctionNode, SymbolId};
 use ratatui::{
     buffer::Buffer,
@@ -13,7 +13,7 @@ use ratatui::{
 pub struct GraphViewState {
     pub adapter: CallGraphAdapter,
     pub engine: LayoutEngine,
-    pub tree: Option<Tree<SymbolId>>,
+    pub dag: Option<Dag<SymbolId>>,
     pub layout: Option<LayoutResult>,
     pub root_symbol: Option<SymbolId>,
     pub selected_node: Option<SymbolId>,
@@ -27,13 +27,13 @@ pub struct GraphViewState {
 impl GraphViewState {
     pub fn new() -> Self {
         let config = LayoutConfig::new()
-            .with_node_size(2.0, 3.0)
-            .with_spacing(3.0, 20.0, 1.0); // node_separation, level_separation (ensures visible edges), subtree_separation
+            .with_node_size(24.0, 3.0) // 24-char fixed width, 3-row height
+            .with_spacing(5.0, 28.0, 1.0); // node_separation (height+gap), level_separation (width+gap), subtree_separation
 
         Self {
             adapter: CallGraphAdapter::new(),
             engine: LayoutEngine::with_config(config).unwrap(),
-            tree: None,
+            dag: None,
             layout: None,
             root_symbol: None,
             selected_node: None,
@@ -92,38 +92,32 @@ impl GraphViewState {
             None => return Err("No root symbol set".to_string()),
         };
 
-        // Check if this is the first layout (tree doesn't exist yet)
-        let is_first_layout = self.tree.is_none();
+        // Check if this is the first layout (dag doesn't exist yet)
+        let is_first_layout = self.dag.is_none();
 
-        // Build tree structure
-        let tree = self
+        // Build DAG structure
+        let dag = self
             .adapter
-            .build_tree(graph, root, self.direction, self.max_depth)
+            .build_dag(graph, root, self.direction, self.max_depth)
             .map_err(|e| e.to_string())?;
 
-        // Track tree version for future change detection
-        self.tree_version = tree.version();
+        // Track dag version for future change detection
+        self.tree_version = dag.version();
 
-        // Compute layout using cached method
-        let layout = self
-            .engine
-            .compute_cached(&tree)
-            .map_err(|e| e.to_string())?;
+        // Compute layout using Sugiyama algorithm
+        let layout = self.engine.compute_dag(&dag).map_err(|e| e.to_string())?;
 
         // On first layout, center the viewport vertically (put root in middle of screen on y-axis)
         if is_first_layout {
             if let Some(root_pos) = layout.position(0) {
-                // The viewport_size includes borders, but rendering uses inner area (viewport_size - 2 for borders)
-                // Formula: screen_y = (world_y - offset_y) * scale
-                // To center: screen_middle = (root_y - offset_y) => offset_y = root_y - screen_middle
-                let inner_height = viewport_size.1 - 2.0; // Subtract 2 for top and bottom borders
+                let inner_height = viewport_size.1 - 2.0;
                 let screen_middle = inner_height / 2.0;
                 let offset_y = root_pos.y - screen_middle;
                 self.viewport = Viewport::with_offset(Position::new(0.0, offset_y));
             }
         }
 
-        self.tree = Some(tree);
+        self.dag = Some(dag);
         self.layout = Some(layout);
         self.layout_dirty = false;
 
@@ -144,13 +138,10 @@ impl GraphViewState {
     /// Navigate to the parent of the currently selected node
     pub fn navigate_to_parent(&mut self) -> bool {
         if let Some(selected) = &self.selected_node {
-            if let Some(tree) = &self.tree {
-                // Find the selected node's index
+            if let Some(dag) = &self.dag {
                 if let Some(&selected_idx) = self.adapter.symbol_to_node.get(selected) {
-                    // Search for parent by finding which node has this as a child
-                    for (parent_idx, node) in tree.nodes().iter().enumerate() {
-                        if node.children.contains(&selected_idx) {
-                            // Found parent, select it
+                    if let Ok(node) = dag.node(selected_idx) {
+                        if let Some(&parent_idx) = node.predecessors.first() {
                             if let Some(parent_symbol) =
                                 self.adapter.node_to_symbol.get(&parent_idx)
                             {
@@ -168,16 +159,14 @@ impl GraphViewState {
     /// Navigate to the first child of the currently selected node
     pub fn navigate_to_child(&mut self) -> bool {
         if let Some(selected) = &self.selected_node {
-            if let Some(tree) = &self.tree {
-                // Find the selected node's index
+            if let Some(dag) = &self.dag {
                 if let Some(&selected_idx) = self.adapter.symbol_to_node.get(selected) {
-                    // Get middle child if any
-                    if let Ok(node) = tree.node(selected_idx) {
-                        if !node.children.is_empty() {
-                            let middle_idx = (node.children.len() - 1) / 2;
-                            if let Some(&middle_child_idx) = node.children.get(middle_idx) {
+                    if let Ok(node) = dag.node(selected_idx) {
+                        if !node.successors.is_empty() {
+                            let middle_idx = (node.successors.len() - 1) / 2;
+                            if let Some(&child_dag_idx) = node.successors.get(middle_idx) {
                                 if let Some(child_symbol) =
-                                    self.adapter.node_to_symbol.get(&middle_child_idx)
+                                    self.adapter.node_to_symbol.get(&child_dag_idx)
                                 {
                                     self.selected_node = Some(*child_symbol);
                                     return true;
@@ -191,20 +180,19 @@ impl GraphViewState {
         false
     }
 
-    /// Get siblings of the currently selected node
+    /// Get siblings of the currently selected node (nodes sharing the same first predecessor)
     fn get_siblings(&self) -> Option<Vec<usize>> {
         if let Some(selected) = &self.selected_node {
-            if let Some(tree) = &self.tree {
+            if let Some(dag) = &self.dag {
                 if let Some(&selected_idx) = self.adapter.symbol_to_node.get(selected) {
-                    // Find parent
-                    for node in tree.nodes() {
-                        if node.children.contains(&selected_idx) {
-                            return Some(node.children.clone());
+                    if let Ok(node) = dag.node(selected_idx) {
+                        if let Some(&parent_idx) = node.predecessors.first() {
+                            if let Ok(parent) = dag.node(parent_idx) {
+                                return Some(parent.successors.clone());
+                            }
                         }
-                    }
-                    // If no parent found, it's the root - return single element vec
-                    if selected_idx == tree.root() {
-                        return Some(vec![tree.root()]);
+                        // No predecessor: this is a root node
+                        return Some(vec![selected_idx]);
                     }
                 }
             }
@@ -317,8 +305,13 @@ impl<'a> GraphView<'a> {
             )
         };
 
-        // Use full label without truncation
-        let label = &func.name;
+        // Truncate label to fit fixed node width (leave 2 chars for borders)
+        let max_label = (node_width.saturating_sub(2)) as usize;
+        let label: std::borrow::Cow<str> = if func.name.len() > max_label && max_label >= 1 {
+            std::borrow::Cow::Owned(format!("{}…", &func.name[..max_label.saturating_sub(1)]))
+        } else {
+            std::borrow::Cow::Borrowed(&func.name)
+        };
 
         // Calculate node area
         let node_area = Rect {
@@ -332,7 +325,7 @@ impl<'a> GraphView<'a> {
 
         // Widget-based rendering
         let block = Block::bordered().border_style(border_style);
-        let paragraph = Paragraph::new(label.as_str())
+        let paragraph = Paragraph::new(label.as_ref())
             .block(block)
             .style(text_style);
         paragraph.render(node_area, buf);
@@ -408,30 +401,27 @@ impl<'a> StatefulWidget for GraphView<'a> {
             return;
         };
 
-        let Some(tree) = &state.tree else {
-            let msg = "No tree available. Press 'r' to refresh.";
-            buf.set_string(
-                inner_area.x,
-                inner_area.y,
-                msg,
-                Style::default().fg(Color::Yellow),
-            );
-            return;
-        };
-
         let viewport_layout = layout.with_viewport(&state.viewport);
 
         let screen_bounds =
             grid::LayoutBounds::new(0.0, inner_area.width as f32, 0.0, inner_area.height as f32);
 
-        // Render edges using grid's rendering module
-        grid::render_tree_edges(
+        // Render forward edges
+        grid::render_dag_edges(
             buf,
-            tree,
             layout,
             &state.viewport,
             inner_area,
             Style::default().fg(Color::DarkGray),
+        );
+
+        // Render back-edges (cycles) in red
+        grid::render_cross_edges(
+            buf,
+            layout,
+            &state.viewport,
+            inner_area,
+            Style::default().fg(Color::Red),
         );
 
         // Render only visible nodes (performance optimization)
@@ -439,9 +429,9 @@ impl<'a> StatefulWidget for GraphView<'a> {
             if let Some(symbol_id) = state.adapter.get_symbol(node_id) {
                 if let Some(func) = self.graph.get_function(symbol_id) {
                     let is_selected = state.selected_node.as_ref() == Some(symbol_id);
-                    // Dynamic width based on label length
-                    let node_width = (func.name.len() + 2) as u16;
-                    let node_height = 3u16;
+                    // Fixed node dimensions matching LayoutConfig
+                    let node_width = state.engine.config().node_width as u16;
+                    let node_height = state.engine.config().node_height as u16;
 
                     self.render_node(
                         buf,
