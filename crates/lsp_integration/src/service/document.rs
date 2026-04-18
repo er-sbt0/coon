@@ -63,6 +63,7 @@ pub(super) async fn ensure_document_opened(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub(super) fn enhance_references_with_cached_symbols(
     _locations: &[model::Location],
     locations_by_file: &std::collections::HashMap<String, Vec<model::Location>>,

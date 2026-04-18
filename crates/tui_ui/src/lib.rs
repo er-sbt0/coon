@@ -19,4 +19,3 @@ pub use graph_workspace::GraphWorkspace;
 pub use rendering::ui;
 pub use search_bar::{SearchBar, SearchBarState};
 pub use tui::TuiApp;
-

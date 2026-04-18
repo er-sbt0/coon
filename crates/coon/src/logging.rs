@@ -56,11 +56,13 @@ pub fn init_logging() -> Result<(), fern::InitError> {
 }
 
 /// Initialize debug-level logging for development
+#[allow(dead_code)]
 pub fn init_debug_logging() -> Result<(), fern::InitError> {
     init_file_logging(LevelFilter::Debug)
 }
 
 /// Get the latest log file path
+#[allow(dead_code)]
 pub fn get_latest_log_file() -> Option<String> {
     let logs_dir = Path::new("logs");
     if !logs_dir.exists() {

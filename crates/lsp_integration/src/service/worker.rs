@@ -15,6 +15,7 @@ pub(super) enum RequestType {
     ReferencesWithSymbols,
     DocumentSymbols,
     WorkspaceSymbols,
+    #[allow(dead_code)]
     Hover,
 }
 
@@ -24,6 +25,7 @@ pub(super) struct LspWorkerState {
     pub(super) request_types: HashMap<i64, RequestType>,
     pub(super) opened_documents: HashSet<Url>,
     pub(super) project_files: HashSet<String>,
+    #[allow(dead_code)]
     pub(super) document_symbols_cache: HashMap<String, Vec<lsp_types::DocumentSymbol>>,
     pub(super) pending_enhanced_requests: HashMap<String, EnhancedRequestInfo>,
     pub(super) enhanced_lsp_requests: HashSet<i64>,
@@ -49,6 +51,7 @@ impl LspWorkerState {
 
 #[derive(Debug, Clone)]
 pub(super) struct EnhancedRequestInfo {
+    #[allow(dead_code)]
     pub(super) request_id: String,
     pub(super) locations: Vec<model::Location>,
     pub(super) pending_symbol_requests: HashSet<String>,

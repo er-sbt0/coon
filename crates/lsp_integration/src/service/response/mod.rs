@@ -55,13 +55,8 @@ pub(super) async fn handle_lsp_message(
                     .await;
                 }
                 Some(RequestType::References) => {
-                    references::handle_references_response(
-                        message,
-                        request_id,
-                        state,
-                        response_tx,
-                    )
-                    .await;
+                    references::handle_references_response(message, request_id, state, response_tx)
+                        .await;
                 }
                 Some(RequestType::ReferencesWithSymbols) => {
                     references::handle_references_with_symbols_response(

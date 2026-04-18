@@ -1,5 +1,5 @@
-use log::debug;
 use crate::{CallGraph, Diagnostic, DiagnosticSeverity, FunctionNode, Location};
+use log::debug;
 
 pub fn create_demo_call_graph() -> CallGraph {
     let mut graph = CallGraph::new();
