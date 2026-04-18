@@ -14,8 +14,7 @@ impl<'a> FunctionFilter<'a> {
     /// Filter functions by name pattern (simple substring match)
     pub fn filter_by_name(&self, pattern: &str) -> Vec<&FunctionNode> {
         self.graph
-            .nodes
-            .values()
+            .functions()
             .filter(|func| func.name.contains(pattern) || func.qualified_name.contains(pattern))
             .collect()
     }
@@ -23,8 +22,7 @@ impl<'a> FunctionFilter<'a> {
     /// Filter functions by file path pattern
     pub fn filter_by_file(&self, pattern: &str) -> Vec<&FunctionNode> {
         self.graph
-            .nodes
-            .values()
+            .functions()
             .filter(|func| func.definition_location.file_path.contains(pattern))
             .collect()
     }
@@ -35,8 +33,7 @@ impl<'a> FunctionFilter<'a> {
         severity: DiagnosticSeverity,
     ) -> Vec<&FunctionNode> {
         self.graph
-            .nodes
-            .values()
+            .functions()
             .filter(|func| {
                 func.diagnostics
                     .iter()
@@ -48,8 +45,7 @@ impl<'a> FunctionFilter<'a> {
     /// Filter functions that have any diagnostics
     pub fn filter_with_diagnostics(&self) -> Vec<&FunctionNode> {
         self.graph
-            .nodes
-            .values()
+            .functions()
             .filter(|func| !func.diagnostics.is_empty())
             .collect()
     }
@@ -67,8 +63,7 @@ impl<'a> FunctionFilter<'a> {
     /// Filter functions that have no callers (entry points)
     pub fn filter_entry_points(&self) -> Vec<&FunctionNode> {
         self.graph
-            .nodes
-            .values()
+            .functions()
             .filter(|func| self.graph.get_callers(&func.id).is_empty())
             .collect()
     }
@@ -76,8 +71,7 @@ impl<'a> FunctionFilter<'a> {
     /// Filter functions that have no callees (leaf functions)
     pub fn filter_leaf_functions(&self) -> Vec<&FunctionNode> {
         self.graph
-            .nodes
-            .values()
+            .functions()
             .filter(|func| self.graph.get_callees(&func.id).is_empty())
             .collect()
     }
@@ -85,8 +79,7 @@ impl<'a> FunctionFilter<'a> {
     /// Filter functions by minimum number of references
     pub fn filter_by_reference_count(&self, min_refs: usize) -> Vec<&FunctionNode> {
         self.graph
-            .nodes
-            .values()
+            .functions()
             .filter(|func| func.references.len() >= min_refs)
             .collect()
     }
@@ -97,8 +90,7 @@ impl<'a> FunctionFilter<'a> {
         F: Fn(&FunctionNode) -> bool,
     {
         self.graph
-            .nodes
-            .values()
+            .functions()
             .filter(|func| filters.iter().all(|filter| filter(func)))
             .collect()
     }

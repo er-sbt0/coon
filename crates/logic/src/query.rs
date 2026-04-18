@@ -133,8 +133,7 @@ impl<'a> GraphQueryEngine<'a> {
     /// Find functions with high connectivity (many callers + callees)
     fn find_highly_connected_functions(&self, min_connections: usize) -> Vec<&FunctionNode> {
         self.graph
-            .nodes
-            .values()
+            .functions()
             .filter(|func| {
                 let caller_count = self.graph.get_callers(&func.id).len();
                 let callee_count = self.graph.get_callees(&func.id).len();
@@ -145,8 +144,8 @@ impl<'a> GraphQueryEngine<'a> {
 
     /// Get graph statistics
     pub fn get_graph_stats(&self) -> GraphStatistics {
-        let total_functions = self.graph.nodes.len();
-        let total_edges = self.graph.edges.len();
+        let total_functions = self.graph.node_count();
+        let total_edges = self.graph.edge_count();
         let entry_points = self.filter.filter_entry_points().len();
         let leaf_functions = self.filter.filter_leaf_functions().len();
         let functions_with_diagnostics = self.filter.filter_with_diagnostics().len();

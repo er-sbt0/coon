@@ -45,7 +45,7 @@ impl App {
                         log::info!("Processing references for symbol_id: {:?}", symbol_id);
 
                         // Process references and update the function
-                        if let Some(function) = self.call_graph.nodes.get_mut(&symbol_id) {
+                        if let Some(function) = self.call_graph.get_function_mut(&symbol_id) {
                             log::info!("Found function '{}' in call graph, clearing existing {} references", function.name, function.references.len());
 
                             // Clear existing references first to avoid duplicates
@@ -122,7 +122,7 @@ impl App {
                     );
 
                     // Update the functions list to reflect the new call graph state
-                    self.functions = self.call_graph.nodes.keys().cloned().collect();
+                    self.functions = self.call_graph.function_ids().cloned().collect();
                     log::info!(
                         "Updated function list, now contains {} functions",
                         self.functions.len()

@@ -209,8 +209,7 @@ mod tests {
 
         // Get main function
         let main_id = graph
-            .nodes
-            .values()
+            .functions()
             .find(|f| f.name == "main")
             .unwrap()
             .id
@@ -235,8 +234,7 @@ mod tests {
         let mut adapter = CallGraphAdapter::new();
 
         let main_id = graph
-            .nodes
-            .values()
+            .functions()
             .find(|f| f.name == "main")
             .unwrap()
             .id

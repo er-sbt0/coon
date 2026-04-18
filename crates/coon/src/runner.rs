@@ -12,8 +12,8 @@ pub async fn run_with_demo_data() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(
         "Demo call graph created with {} functions and {} call relationships",
-        call_graph.nodes.len(),
-        call_graph.edges.len()
+        call_graph.node_count(),
+        call_graph.edge_count()
     );
 
     run_tui(call_graph).await

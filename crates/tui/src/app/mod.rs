@@ -46,7 +46,7 @@ pub struct App {
 
 impl App {
     pub fn new(call_graph: CallGraph) -> Self {
-        let functions: Vec<SymbolId> = call_graph.nodes.keys().cloned().collect();
+        let functions: Vec<SymbolId> = call_graph.function_ids().cloned().collect();
 
         let mut function_list_state = ratatui::widgets::ListState::default();
         if !functions.is_empty() {
@@ -272,7 +272,7 @@ mod tests {
     #[test]
     fn test_function_selection() {
         let mut app = create_test_app();
-        let func_id = app.call_graph.nodes.keys().next().unwrap().clone();
+        let func_id = app.call_graph.function_ids().next().unwrap().clone();
 
         app.select_function(func_id.clone());
         assert_eq!(app.selected_function, Some(func_id));
@@ -282,7 +282,7 @@ mod tests {
     #[test]
     fn test_graph_view_initialization() {
         let mut app = create_test_app();
-        let func_id = app.call_graph.nodes.keys().next().unwrap().clone();
+        let func_id = app.call_graph.function_ids().next().unwrap().clone();
 
         app.start_call_graph_with_function(func_id.clone());
 

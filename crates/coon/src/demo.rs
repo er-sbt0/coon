@@ -153,8 +153,8 @@ mod tests {
     fn test_demo_graph_creation() {
         let graph = create_demo_call_graph();
 
-        assert_eq!(graph.nodes.len(), 7);
-        assert!(graph.edges.len() > 5);
+        assert_eq!(graph.node_count(), 7);
+        assert!(graph.edge_count() > 5);
         assert!(graph.find_function_by_name("main").is_some());
 
         let error_func = graph.find_function_by_name("risky_operation").unwrap();

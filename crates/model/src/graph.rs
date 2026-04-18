@@ -109,8 +109,8 @@ struct CallGraphData {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(from = "CallGraphData")]
 pub struct CallGraph {
-    pub nodes: HashMap<SymbolId, FunctionNode>,
-    pub edges: Vec<CallEdge>,
+    nodes: HashMap<SymbolId, FunctionNode>,
+    edges: Vec<CallEdge>,
     #[serde(skip)]
     edge_set: HashSet<(SymbolId, SymbolId, String, u32, u32)>,
     #[serde(skip)]
@@ -179,6 +179,22 @@ impl CallGraph {
                 call_location,
             });
         }
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn edge_count(&self) -> usize {
+        self.edges.len()
+    }
+
+    pub fn functions(&self) -> impl Iterator<Item = &FunctionNode> {
+        self.nodes.values()
+    }
+
+    pub fn function_ids(&self) -> impl Iterator<Item = &SymbolId> {
+        self.nodes.keys()
     }
 
     pub fn get_function(&self, id: &SymbolId) -> Option<&FunctionNode> {

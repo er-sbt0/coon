@@ -181,7 +181,7 @@ impl LspBridge {
         function_id: &SymbolId,
     ) -> Option<String> {
         let (file_path, line, column, _name) = {
-            if let Some(function) = call_graph.nodes.get(function_id) {
+            if let Some(function) = call_graph.get_function(function_id) {
                 (
                     function.definition_location.file_path.clone(),
                     function.definition_location.line,
@@ -247,7 +247,7 @@ impl LspBridge {
         function_id: &SymbolId,
     ) -> Option<String> {
         let (file_path, line, column, name) = {
-            if let Some(function) = call_graph.nodes.get(function_id) {
+            if let Some(function) = call_graph.get_function(function_id) {
                 (
                     function.definition_location.file_path.clone(),
                     function.definition_location.line,

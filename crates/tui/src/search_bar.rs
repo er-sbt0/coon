@@ -170,8 +170,7 @@ impl SearchBarState {
         if self.query.is_empty() {
             // Show all functions (limited by max_results)
             self.filtered_results = graph
-                .nodes
-                .values()
+                .functions()
                 .take(self.max_results)
                 .map(|func| SearchResult {
                     symbol_id: func.id.clone(),
@@ -196,8 +195,7 @@ impl SearchBarState {
         let query_lower = self.query.to_lowercase();
 
         let mut results: Vec<SearchResult> = graph
-            .nodes
-            .values()
+            .functions()
             .filter_map(|func| {
                 let score = match self.search_mode {
                     SearchMode::Fuzzy => self.fuzzy_match(&func.name, &query_lower),
