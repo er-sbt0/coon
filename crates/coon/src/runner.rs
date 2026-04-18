@@ -29,7 +29,7 @@ pub async fn run_with_lsp(project_path: &str) -> Result<(), Box<dyn std::error::
     )>();
 
     let project_path_string = project_path.to_string();
-    tokio::spawn(async move {
+    let loader_handle = tokio::spawn(async move {
         if let Err(e) =
             lsp::loader::lsp_loader_task(&project_path_string, ui_msg_tx, lsp_channels_tx).await
         {
@@ -37,7 +37,19 @@ pub async fn run_with_lsp(project_path: &str) -> Result<(), Box<dyn std::error::
         }
     });
 
-    run_tui_async_lsp(ui_msg_rx, lsp_channels_rx).await
+    let tui_result = run_tui_async_lsp(ui_msg_rx, lsp_channels_rx).await;
+
+    // Wait for the LSP loader task to finish its graceful shutdown.
+    // The forwarder loop will exit once TUI channels are dropped,
+    // then it sends shutdown/exit to clangd.
+    info!("TUI exited, waiting for LSP shutdown...");
+    match tokio::time::timeout(std::time::Duration::from_secs(5), loader_handle).await {
+        Ok(Ok(())) => info!("LSP loader task completed cleanly"),
+        Ok(Err(e)) => error!("LSP loader task panicked: {}", e),
+        Err(_) => error!("LSP loader task did not finish within 5s timeout"),
+    }
+
+    tui_result
 }
 
 async fn run_tui(call_graph: CallGraph) -> Result<(), Box<dyn std::error::Error>> {

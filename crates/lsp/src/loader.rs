@@ -194,73 +194,77 @@ pub async fn lsp_loader_task(
         }};
     }
 
-    tokio::spawn(async move {
-        let mut lsp_service = lsp_service;
-        loop {
-            tokio::select! {
-                tui_request = tui_request_rx.recv() => {
-                    if let Some(request) = tui_request {
-                        log::debug!("Forwarding TUI request to LSP service: {:?}", request);
-                        match request {
-                            LspRequest::GetOutgoingCalls { request_id, call_hierarchy_item } =>
-                                forward_lsp!(tui_response_tx, request_id.clone(),
-                                    lsp_service.request_outgoing_calls(request_id, call_hierarchy_item).await),
-                            LspRequest::GetIncomingCalls { request_id, call_hierarchy_item } =>
-                                forward_lsp!(tui_response_tx, request_id.clone(),
-                                    lsp_service.request_incoming_calls(request_id, call_hierarchy_item).await),
-                            LspRequest::FindReferences { request_id, document_uri, position } =>
-                                forward_lsp!(tui_response_tx, request_id.clone(),
-                                    lsp_service.request_references(request_id, document_uri, position).await),
-                            LspRequest::GetWorkspaceSymbols { request_id, query } =>
-                                forward_lsp!(tui_response_tx, request_id.clone(),
-                                    lsp_service.request_workspace_symbols(request_id, query).await),
-                            LspRequest::FindReferencesWithSymbols { request_id, document_uri, position } =>
-                                forward_lsp!(tui_response_tx, request_id.clone(),
-                                    lsp_service.request_references_with_symbols(request_id, document_uri, position).await),
-                            LspRequest::PrepareCallHierarchy { request_id, document_uri, position } =>
-                                forward_lsp!(tui_response_tx, request_id.clone(),
-                                    lsp_service.request_prepare_call_hierarchy(request_id, document_uri, position).await),
-                            LspRequest::GetDocumentSymbols { request_id, document_uri } =>
-                                forward_lsp!(tui_response_tx, request_id.clone(),
-                                    lsp_service.request_document_symbols(request_id, document_uri).await),
-                            LspRequest::PreloadDocuments { request_id, document_uris } =>
-                                forward_lsp!(tui_response_tx, request_id.clone(),
-                                    lsp_service.request_preload_documents(request_id, document_uris).await),
-                            LspRequest::SetProjectFiles { project_files } => {
-                                if let Err(e) = lsp_service.set_project_files(project_files).await {
-                                    log::error!("Failed to forward set project files: {}", e);
-                                }
-                            }
-                            LspRequest::Shutdown => {
-                                log::debug!("Received Shutdown from TUI, stopping forwarder");
-                                break;
+    let mut lsp_service = lsp_service;
+    loop {
+        tokio::select! {
+            tui_request = tui_request_rx.recv() => {
+                if let Some(request) = tui_request {
+                    log::debug!("Forwarding TUI request to LSP service: {:?}", request);
+                    match request {
+                        LspRequest::GetOutgoingCalls { request_id, call_hierarchy_item } =>
+                            forward_lsp!(tui_response_tx, request_id.clone(),
+                                lsp_service.request_outgoing_calls(request_id, call_hierarchy_item).await),
+                        LspRequest::GetIncomingCalls { request_id, call_hierarchy_item } =>
+                            forward_lsp!(tui_response_tx, request_id.clone(),
+                                lsp_service.request_incoming_calls(request_id, call_hierarchy_item).await),
+                        LspRequest::FindReferences { request_id, document_uri, position } =>
+                            forward_lsp!(tui_response_tx, request_id.clone(),
+                                lsp_service.request_references(request_id, document_uri, position).await),
+                        LspRequest::GetWorkspaceSymbols { request_id, query } =>
+                            forward_lsp!(tui_response_tx, request_id.clone(),
+                                lsp_service.request_workspace_symbols(request_id, query).await),
+                        LspRequest::FindReferencesWithSymbols { request_id, document_uri, position } =>
+                            forward_lsp!(tui_response_tx, request_id.clone(),
+                                lsp_service.request_references_with_symbols(request_id, document_uri, position).await),
+                        LspRequest::PrepareCallHierarchy { request_id, document_uri, position } =>
+                            forward_lsp!(tui_response_tx, request_id.clone(),
+                                lsp_service.request_prepare_call_hierarchy(request_id, document_uri, position).await),
+                        LspRequest::GetDocumentSymbols { request_id, document_uri } =>
+                            forward_lsp!(tui_response_tx, request_id.clone(),
+                                lsp_service.request_document_symbols(request_id, document_uri).await),
+                        LspRequest::PreloadDocuments { request_id, document_uris } =>
+                            forward_lsp!(tui_response_tx, request_id.clone(),
+                                lsp_service.request_preload_documents(request_id, document_uris).await),
+                        LspRequest::SetProjectFiles { project_files } => {
+                            if let Err(e) = lsp_service.set_project_files(project_files).await {
+                                log::error!("Failed to forward set project files: {}", e);
                             }
                         }
-                    } else {
-                        log::debug!("TUI request channel closed, stopping forwarder");
-                        break;
-                    }
-                }
-
-                response = lsp_service.recv_response() => {
-                    match response {
-                        Some(r) => {
-                            log::trace!("Forwarding LSP response to TUI: {:?}", r);
-                            if let Err(e) = tui_response_tx.send(r) {
-                                log::error!("Failed to forward LSP response to TUI: {}", e);
-                                break;
-                            }
-                        }
-                        None => {
-                            log::debug!("LSP service response channel closed, stopping forwarder");
+                        LspRequest::Shutdown => {
+                            log::debug!("Received Shutdown from TUI, stopping forwarder");
                             break;
                         }
+                    }
+                } else {
+                    log::debug!("TUI request channel closed, stopping forwarder");
+                    break;
+                }
+            }
+
+            response = lsp_service.recv_response() => {
+                match response {
+                    Some(r) => {
+                        log::trace!("Forwarding LSP response to TUI: {:?}", r);
+                        if let Err(e) = tui_response_tx.send(r) {
+                            log::error!("Failed to forward LSP response to TUI: {}", e);
+                            break;
+                        }
+                    }
+                    None => {
+                        log::debug!("LSP service response channel closed, stopping forwarder");
+                        break;
                     }
                 }
             }
         }
-        log::debug!("LSP-TUI forwarder task ended");
-    });
+    }
+    log::debug!("LSP-TUI forwarder loop ended, shutting down LSP service");
+
+    // Gracefully shut down the LSP service (sends shutdown + exit to clangd)
+    if let Err(e) = lsp_service.shutdown().await {
+        log::error!("Error during LSP service shutdown: {}", e);
+    }
+    info!("LSP loader: graceful shutdown complete");
 
     Ok(())
 }
