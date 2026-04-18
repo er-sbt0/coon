@@ -233,6 +233,7 @@ impl App {
             self.process_call_entry(
                 symbol_id.clone(),
                 call.to.name,
+                call.to.detail.as_deref(),
                 &call.to.uri,
                 call.to.range,
                 &call.from_ranges,
@@ -250,6 +251,7 @@ impl App {
             self.process_call_entry(
                 symbol_id.clone(),
                 call.from.name,
+                call.from.detail.as_deref(),
                 &call.from.uri,
                 call.from.range,
                 &call.from_ranges,
@@ -262,6 +264,7 @@ impl App {
         &mut self,
         symbol_id: SymbolId,
         other_name: String,
+        other_detail: Option<&str>,
         other_uri: &lsp_types::Url,
         other_range: lsp_types::Range,
         from_ranges: &[lsp_types::Range],
@@ -273,7 +276,10 @@ impl App {
             other_range.start.line + 1,
             other_range.start.character + 1,
         );
-        let qualified_name = format!("{}::{}", other_name, file_path);
+        let qualified_name = match other_detail {
+            Some(detail) if !detail.is_empty() => format!("{}::{}", detail, other_name),
+            _ => other_name.clone(),
+        };
         let other_id = self.call_graph.add_function(model::FunctionNode::new(
             other_name,
             qualified_name,
