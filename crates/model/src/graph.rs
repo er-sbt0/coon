@@ -16,8 +16,13 @@ pub struct FunctionNode {
 
 impl FunctionNode {
     pub fn new(name: String, qualified_name: String, definition_location: Location) -> Self {
+        let id = SymbolId::from_content(
+            &qualified_name,
+            &definition_location.file_path,
+            definition_location.line,
+        );
         Self {
-            id: SymbolId::new(),
+            id,
             name,
             qualified_name,
             definition_location,
@@ -119,7 +124,7 @@ impl CallGraph {
 
     pub fn add_function(&mut self, function: FunctionNode) -> SymbolId {
         let id = function.id.clone();
-        self.nodes.insert(id.clone(), function);
+        self.nodes.entry(id.clone()).or_insert(function);
         id
     }
 
@@ -158,18 +163,6 @@ impl CallGraph {
 
     pub fn find_function_by_name(&self, name: &str) -> Option<&FunctionNode> {
         self.nodes.values().find(|f| f.name == name)
-    }
-
-    pub fn find_function_by_qualified_name_and_location(
-        &self,
-        qualified_name: &str,
-        location: &Location,
-    ) -> Option<&FunctionNode> {
-        self.nodes.values().find(|f| {
-            f.qualified_name == qualified_name
-                && f.definition_location.file_path == location.file_path
-                && f.definition_location.line == location.line
-        })
     }
 
     pub fn get_callers(&self, callee_id: &SymbolId) -> Vec<&FunctionNode> {

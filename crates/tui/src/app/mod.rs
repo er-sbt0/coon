@@ -149,7 +149,9 @@ impl App {
                             symbol.location.clone(),
                         );
                         let id = self.call_graph.add_function(function);
-                        self.functions.push(id);
+                        if !self.functions.contains(&id) {
+                            self.functions.push(id);
+                        }
                     }
                 }
             }

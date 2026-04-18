@@ -6,6 +6,11 @@ use uuid::Uuid;
 pub struct SymbolId(pub Uuid);
 
 impl SymbolId {
+    pub fn from_content(qualified_name: &str, file_path: &str, line: u32) -> Self {
+        let content = format!("{qualified_name}@{file_path}:{line}");
+        Self(Uuid::new_v5(&Uuid::NAMESPACE_OID, content.as_bytes()))
+    }
+
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -93,9 +98,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_symbol_id_creation() {
+    fn test_symbol_id_random() {
         let id1 = SymbolId::new();
         let id2 = SymbolId::new();
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_symbol_id_content_addressable() {
+        let id1 = SymbolId::from_content("ns::foo", "src/lib.rs", 10);
+        let id2 = SymbolId::from_content("ns::foo", "src/lib.rs", 10);
+        assert_eq!(id1, id2);
+
+        let id3 = SymbolId::from_content("ns::bar", "src/lib.rs", 10);
+        assert_ne!(id1, id3);
+
+        let id4 = SymbolId::from_content("ns::foo", "src/lib.rs", 11);
+        assert_ne!(id1, id4);
     }
 }

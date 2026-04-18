@@ -10,21 +10,12 @@ Binary fails on any machine except the original developer's. Absolute `/home/era
 **3. Blocking I/O on async executor thread** — document.rs, compile_commands.rs
 `std::fs::read_to_string` / `std::fs::read_dir` block the Tokio thread. Stalls all concurrent async tasks. Use `tokio::fs`.
 
-**4. Unbounded channels — no backpressure** — runner.rs, loader.rs
-All MPSC channels are unbounded. Large workspace symbol results can grow memory without limit → OOM.
-
 ### High — Correctness or scalability problems
-
-**7. Random UUID `SymbolId` — no deduplication** — symbols.rs
-Rediscovering the same function creates a new ID → duplicates in graph. Need content-addressable ID.
 
 **8. Silent channel send failures** — throughout loader.rs
 `let _ = tx.send(...)` silently discards errors. When receiver drops, sender loops indefinitely burning CPU.
 
 ### Medium — Architectural debt and maintainability
-
-**10. God object: `App` (23 fields)** — mod.rs
-Mixes graph, workspace, search, LSP channels, loading, and UI state. Untestable. Extract `LspBridge`, `WorkspaceManager`.
 
 **11. Sync TUI loop masquerading as async** — tui.rs
 `event::poll` + `event::read` block the main thread inside an `async fn`. Works only because LSP is spawned separately. Fragile.

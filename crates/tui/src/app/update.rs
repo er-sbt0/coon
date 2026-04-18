@@ -367,22 +367,12 @@ impl App {
                 (call.to.range.start.character + 1) as u32,
             );
 
-            // Create or find existing callee function
             let qualified_name = format!("{}::{}", call.to.name, location.file_path);
-
-            // Check if function already exists
-            let callee_id = if let Some(existing_func) = self
-                .call_graph
-                .find_function_by_qualified_name_and_location(&qualified_name, &location)
-            {
-                // Use existing function's ID
-                existing_func.id.clone()
-            } else {
-                // Create new function
-                let callee_function =
-                    model::FunctionNode::new(call.to.name.clone(), qualified_name, location);
-                self.call_graph.add_function(callee_function)
-            };
+            let callee_id = self.call_graph.add_function(model::FunctionNode::new(
+                call.to.name.clone(),
+                qualified_name,
+                location,
+            ));
 
             // Create the call edge from the original function to this callee
             // Use the call location from the LSP response
@@ -413,22 +403,12 @@ impl App {
                 (call.from.range.start.character + 1) as u32,
             );
 
-            // Create or find existing caller function
             let qualified_name = format!("{}::{}", call.from.name, location.file_path);
-
-            // Check if function already exists
-            let caller_id = if let Some(existing_func) = self
-                .call_graph
-                .find_function_by_qualified_name_and_location(&qualified_name, &location)
-            {
-                // Use existing function's ID
-                existing_func.id.clone()
-            } else {
-                // Create new function
-                let caller_function =
-                    model::FunctionNode::new(call.from.name.clone(), qualified_name, location);
-                self.call_graph.add_function(caller_function)
-            };
+            let caller_id = self.call_graph.add_function(model::FunctionNode::new(
+                call.from.name.clone(),
+                qualified_name,
+                location,
+            ));
 
             // Create the call edge from the caller to the original function
             // Use the call location from the LSP response
