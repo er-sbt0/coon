@@ -6,9 +6,6 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Widget},
 };
 
-/// Default assumed number of visible search results for scroll adjustment.
-const DEFAULT_VISIBLE_RESULTS: usize = 20;
-
 /// Search mode for filtering symbols
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {
@@ -50,6 +47,7 @@ pub struct SearchBarState {
     pub is_active: bool,
     pub filtered_results: Vec<SearchResult>,
     pub max_results: usize,
+    pub visible_height: usize,
 }
 
 impl SearchBarState {
@@ -63,6 +61,7 @@ impl SearchBarState {
             is_active: false,
             filtered_results: Vec::new(),
             max_results: 50,
+            visible_height: 20,
         }
     }
 
@@ -130,7 +129,7 @@ impl SearchBarState {
     pub fn select_next(&mut self) {
         if !self.filtered_results.is_empty() {
             self.selected_index = (self.selected_index + 1).min(self.filtered_results.len() - 1);
-            self.adjust_scroll(DEFAULT_VISIBLE_RESULTS);
+            self.adjust_scroll(self.visible_height);
         }
     }
 
@@ -138,7 +137,7 @@ impl SearchBarState {
     pub fn select_previous(&mut self) {
         if self.selected_index > 0 {
             self.selected_index -= 1;
-            self.adjust_scroll(DEFAULT_VISIBLE_RESULTS);
+            self.adjust_scroll(self.visible_height);
         }
     }
 
@@ -301,7 +300,7 @@ impl SearchBar {
         Self
     }
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer, state: &SearchBarState) {
+    pub fn render(&self, area: Rect, buf: &mut Buffer, state: &mut SearchBarState) {
         use ratatui::layout::{Constraint, Direction, Layout};
 
         // Split area into input, results, and status
@@ -317,7 +316,7 @@ impl SearchBar {
         // Render input bar
         self.render_input_bar(chunks[0], buf, state);
 
-        // Render results list
+        // Render results list (also updates state.visible_height from actual area)
         self.render_results_list(chunks[1], buf, state);
 
         // Render status line
@@ -347,8 +346,9 @@ impl SearchBar {
         input_widget.render(area, buf);
     }
 
-    fn render_results_list(&self, area: Rect, buf: &mut Buffer, state: &SearchBarState) {
+    fn render_results_list(&self, area: Rect, buf: &mut Buffer, state: &mut SearchBarState) {
         let visible_height = area.height.saturating_sub(2) as usize; // Account for borders
+        state.visible_height = visible_height;
         let start_idx = state.scroll_offset;
         let end_idx = (start_idx + visible_height).min(state.filtered_results.len());
 

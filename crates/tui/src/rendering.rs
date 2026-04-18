@@ -182,7 +182,7 @@ fn render_search_bar_overlay(f: &mut Frame, area: ratatui::layout::Rect, app: &m
 
     // Render search bar
     let search_bar = SearchBar::new();
-    search_bar.render(popup_area, f.buffer_mut(), &app.search_bar_state);
+    search_bar.render(popup_area, f.buffer_mut(), &mut app.search_bar_state);
 }
 
 fn render_workspace_tabs(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
