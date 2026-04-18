@@ -60,15 +60,17 @@ mod tests {
 
     #[test]
     fn test_logging_initialization() {
-        // Test that logging can be initialized without errors
+        // Test that logging can be initialized without errors.
+        // Note: fern's apply() sets the global logger, which can only succeed once.
+        // If another test already set it, we expect a SetLoggerError, which is fine.
         let result = init_file_logging(LevelFilter::Debug);
-        assert!(result.is_ok());
+        assert!(result.is_ok() || result.unwrap_err().to_string().contains("logger"));
     }
 
     #[test]
     fn test_log_file_creation() {
-        // Initialize logging
-        init_file_logging(LevelFilter::Info).unwrap();
+        // Initialize logging (may fail if global logger already set by another test)
+        let _ = init_file_logging(LevelFilter::Info);
 
         // Log a test message
         log::info!("Test log message");

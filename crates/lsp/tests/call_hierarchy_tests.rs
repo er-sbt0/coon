@@ -1,4 +1,3 @@
-use lsp::LspClient;
 use lsp_types::{self as lsp, Position, Url};
 use serde_json::Value;
 use tempfile::tempdir;
@@ -39,8 +38,8 @@ void entry_point() {
         .expect("Failed to write compile_commands.json");
 
     // Create LSP client and channels
-    let (tx, mut rx) = mpsc::channel(100);
-    let mut client = LspClient::new(tx).await.unwrap();
+    let (tx, mut rx) = mpsc::channel::<Value>(100);
+    let mut client = ::lsp::LspClient::new(tx).await.unwrap();
 
     let file_uri = Url::from_file_path(&file_path).unwrap();
     let root_uri = Url::from_file_path(project_root).unwrap();

@@ -239,8 +239,41 @@ pub async fn lsp_loader_task(
                                     });
                                 }
                             }
-                            _ => {
-                                log::warn!("Unhandled LSP request type");
+                            LspRequest::PrepareCallHierarchy { request_id, document_uri, position } => {
+                                if let Err(e) = lsp_service.request_prepare_call_hierarchy(request_id.clone(), document_uri, position).await {
+                                    log::error!("Failed to send prepare call hierarchy request: {}", e);
+                                    let _ = tui_response_tx.send(LspResponse::Error {
+                                        request_id,
+                                        error: format!("Request failed: {}", e),
+                                    });
+                                }
+                            }
+                            LspRequest::GetDocumentSymbols { request_id, document_uri } => {
+                                if let Err(e) = lsp_service.request_document_symbols(request_id.clone(), document_uri).await {
+                                    log::error!("Failed to send document symbols request: {}", e);
+                                    let _ = tui_response_tx.send(LspResponse::Error {
+                                        request_id,
+                                        error: format!("Request failed: {}", e),
+                                    });
+                                }
+                            }
+                            LspRequest::PreloadDocuments { request_id, document_uris } => {
+                                if let Err(e) = lsp_service.request_preload_documents(request_id.clone(), document_uris).await {
+                                    log::error!("Failed to send preload documents request: {}", e);
+                                    let _ = tui_response_tx.send(LspResponse::Error {
+                                        request_id,
+                                        error: format!("Request failed: {}", e),
+                                    });
+                                }
+                            }
+                            LspRequest::SetProjectFiles { project_files } => {
+                                if let Err(e) = lsp_service.set_project_files(project_files).await {
+                                    log::error!("Failed to forward set project files: {}", e);
+                                }
+                            }
+                            LspRequest::Shutdown => {
+                                log::debug!("Received Shutdown from TUI, stopping forwarder");
+                                break;
                             }
                         }
                     } else {

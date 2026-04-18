@@ -245,6 +245,36 @@ impl LspService {
         Ok(request_id)
     }
 
+    pub async fn request_prepare_call_hierarchy(
+        &self,
+        request_id: String,
+        document_uri: Url,
+        position: Position,
+    ) -> Result<()> {
+        self.request_tx
+            .send(LspRequest::PrepareCallHierarchy {
+                request_id,
+                document_uri,
+                position,
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn request_preload_documents(
+        &self,
+        request_id: String,
+        document_uris: Vec<Url>,
+    ) -> Result<()> {
+        self.request_tx
+            .send(LspRequest::PreloadDocuments {
+                request_id,
+                document_uris,
+            })
+            .await?;
+        Ok(())
+    }
+
     /// Set project files for symbol filtering
     pub async fn set_project_files(&self, project_files: Vec<String>) -> Result<()> {
         self.request_tx

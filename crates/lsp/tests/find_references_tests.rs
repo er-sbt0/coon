@@ -1,5 +1,5 @@
-use lsp::LspClient;
 use lsp_types::{self as lsp, Position, Url};
+use serde_json::Value;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 
@@ -13,8 +13,8 @@ async fn test_find_references_integration() {
     let file_content = "void my_func() {}\nint main() { my_func(); return 0; }";
     std::fs::write(&test_file_path, file_content).unwrap();
 
-    let (tx, mut rx) = mpsc::channel(100);
-    let mut client = LspClient::new(tx).await.unwrap();
+    let (tx, mut rx) = mpsc::channel::<Value>(100);
+    let mut client = ::lsp::LspClient::new(tx).await.unwrap();
 
     let root_uri = Url::from_file_path(temp_dir.path()).unwrap();
     let test_file_uri = Url::from_file_path(&test_file_path).unwrap();
@@ -126,8 +126,8 @@ async fn test_find_references_no_results() {
     let file_content = "// Empty file with just a comment";
     std::fs::write(&test_file_path, file_content).unwrap();
 
-    let (tx, mut rx) = mpsc::channel(100);
-    let mut client = LspClient::new(tx).await.unwrap();
+    let (tx, mut rx) = mpsc::channel::<Value>(100);
+    let mut client = ::lsp::LspClient::new(tx).await.unwrap();
 
     let root_uri = Url::from_file_path(temp_dir.path()).unwrap();
     let test_file_uri = Url::from_file_path(&test_file_path).unwrap();
