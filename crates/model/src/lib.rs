@@ -1,4 +1,3 @@
-pub mod demo;
 pub mod graph;
 pub mod lazy_graph;
 pub mod lsp_status;

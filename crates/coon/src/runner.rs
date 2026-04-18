@@ -8,7 +8,7 @@ use tui_ui::TuiApp;
 
 pub async fn run_with_demo_data() -> Result<(), Box<dyn std::error::Error>> {
     info!("Creating demo call graph...");
-    let call_graph = model::demo::create_demo_call_graph();
+    let call_graph = crate::demo::create_demo_call_graph();
 
     info!(
         "Demo call graph created with {} functions and {} call relationships",
