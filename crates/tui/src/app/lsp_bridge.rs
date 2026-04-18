@@ -52,6 +52,12 @@ pub struct LspBridge {
     >,
 }
 
+impl Default for LspBridge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LspBridge {
     /// Create an LspBridge with no active channels (demo / offline mode)
     pub fn new() -> Self {

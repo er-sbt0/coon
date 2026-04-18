@@ -162,7 +162,7 @@ impl App {
     }
 
     pub fn next_workspace(&mut self) {
-        if let Some(msg) = self.workspaces.next() {
+        if let Some(msg) = self.workspaces.next_workspace() {
             self.status_message = msg;
         }
     }

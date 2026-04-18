@@ -10,6 +10,14 @@ pub struct PathAnalysisResult {
     pub avg_depth: f64,
 }
 
+/// Mutable state threaded through recursive path search.
+struct PathSearchState {
+    current_path: Vec<SymbolId>,
+    visited: HashSet<SymbolId>,
+    all_paths: Vec<Vec<SymbolId>>,
+    max_depth: usize,
+}
+
 /// Advanced path analysis operations
 #[derive(Debug)]
 pub struct PathAnalyzer<'a> {
@@ -28,62 +36,51 @@ impl<'a> PathAnalyzer<'a> {
         to: &SymbolId,
         max_depth: usize,
     ) -> Vec<Vec<SymbolId>> {
-        let mut all_paths = Vec::new();
-        let mut current_path = vec![from.clone()];
-        let mut visited = HashSet::new();
-
-        self.find_all_paths_recursive(
-            from,
-            to,
-            &mut current_path,
-            &mut visited,
-            &mut all_paths,
+        let mut state = PathSearchState {
+            current_path: vec![from.clone()],
+            visited: HashSet::new(),
+            all_paths: Vec::new(),
             max_depth,
-            0,
-        );
+        };
 
-        all_paths
+        self.find_all_paths_recursive(from, to, &mut state, 0);
+
+        state.all_paths
     }
 
     fn find_all_paths_recursive(
         &self,
         current: &SymbolId,
         target: &SymbolId,
-        current_path: &mut Vec<SymbolId>,
-        visited: &mut HashSet<SymbolId>,
-        all_paths: &mut Vec<Vec<SymbolId>>,
-        max_depth: usize,
+        state: &mut PathSearchState,
         current_depth: usize,
     ) {
-        if current_depth >= max_depth {
+        if current_depth >= state.max_depth {
             return;
         }
 
         if current == target {
-            all_paths.push(current_path.clone());
+            state.all_paths.push(state.current_path.clone());
             return;
         }
 
-        visited.insert(current.clone());
+        state.visited.insert(current.clone());
 
         let callees = self.graph.get_callees(current);
         for callee in callees {
-            if !visited.contains(&callee.id) {
-                current_path.push(callee.id.clone());
+            if !state.visited.contains(&callee.id) {
+                state.current_path.push(callee.id.clone());
                 self.find_all_paths_recursive(
                     &callee.id,
                     target,
-                    current_path,
-                    visited,
-                    all_paths,
-                    max_depth,
+                    state,
                     current_depth + 1,
                 );
-                current_path.pop();
+                state.current_path.pop();
             }
         }
 
-        visited.remove(current);
+        state.visited.remove(current);
     }
 
     /// Find the shortest paths from source to all reachable nodes

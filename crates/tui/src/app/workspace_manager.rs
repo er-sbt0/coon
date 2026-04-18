@@ -13,6 +13,12 @@ pub struct WorkspaceManager {
     pub show_manager: bool,
 }
 
+impl Default for WorkspaceManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WorkspaceManager {
     /// Create a manager pre-populated with one default workspace.
     pub fn new() -> Self {
@@ -83,7 +89,7 @@ impl WorkspaceManager {
     }
 
     /// Switch to the next workspace (wrapping). Returns a status message.
-    pub fn next(&mut self) -> Option<String> {
+    pub fn next_workspace(&mut self) -> Option<String> {
         if self.workspaces.is_empty() {
             return None;
         }
@@ -184,7 +190,7 @@ mod tests {
         wm.create("W2".to_string());
 
         // Currently at index 1 (just created)
-        wm.next();
+        wm.next_workspace();
         assert_eq!(wm.current_index, 0); // Wraps
 
         wm.previous();

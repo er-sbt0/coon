@@ -335,9 +335,9 @@ impl<'a> GraphView<'a> {
         pos: (i32, i32),
         area: Rect,
         is_selected: bool,
-        node_width: u16,
-        node_height: u16,
+        node_size: (u16, u16),
     ) {
+        let (node_width, node_height) = node_size;
         let screen_x = pos.0 as i16;
         let screen_y = pos.1 as i16;
 
@@ -495,8 +495,7 @@ impl<'a> StatefulWidget for GraphView<'a> {
                         (screen_pos.x as i32, screen_pos.y as i32),
                         inner_area,
                         is_selected,
-                        node_width,
-                        node_height,
+                        (node_width, node_height),
                     );
                 }
             }
