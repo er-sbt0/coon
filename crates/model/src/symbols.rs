@@ -10,7 +10,6 @@ impl SymbolId {
         let content = format!("{qualified_name}@{file_path}:{line}");
         Self(Uuid::new_v5(&Uuid::NAMESPACE_OID, content.as_bytes()))
     }
-
 }
 
 /// Location information for symbols

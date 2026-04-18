@@ -238,7 +238,9 @@ impl CallGraph {
         self.callees_map.clear();
         self.name_index.clear();
         for (id, node) in &self.nodes {
-            self.name_index.entry(node.name.clone()).or_insert_with(|| id.clone());
+            self.name_index
+                .entry(node.name.clone())
+                .or_insert_with(|| id.clone());
         }
         for edge in &self.edges {
             let key = (

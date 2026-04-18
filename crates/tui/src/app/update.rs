@@ -11,7 +11,6 @@ impl App {
     pub(super) fn handle_lsp_response(&mut self, response: LspResponse) {
         log::info!("TUI handling LSP response: {:?}", response);
         match response {
-
             LspResponse::OutgoingCalls { request_id, calls } => {
                 if let Some(pending) = self.lsp.take_pending(&request_id) {
                     if let Some(symbol_id) = pending.symbol_id {
