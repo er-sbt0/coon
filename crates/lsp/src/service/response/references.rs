@@ -169,7 +169,7 @@ pub(crate) fn is_references_response(response: &Value) -> bool {
             return true;
         }
     }
-    response.get("result").map_or(false, |r| r.is_null())
+    response.get("result").is_some_and(|r| r.is_null())
 }
 
 pub(super) fn parse_references_response_content(response: &Value) -> Vec<model::Location> {

@@ -250,9 +250,9 @@ impl SearchBarState {
         let mut matched_chars = 0;
         let mut first_match_idx = None;
 
-        while let Some(pattern_char) = pattern_chars.next() {
+        for pattern_char in pattern_chars {
             let mut found = false;
-            while let Some((idx, text_char)) = text_chars.next() {
+            for (idx, text_char) in text_chars.by_ref() {
                 if text_char == pattern_char {
                     matched_chars += 1;
                     last_match_idx = idx;
@@ -291,6 +291,12 @@ impl Default for SearchBarState {
 
 /// Widget for rendering the search bar
 pub struct SearchBar;
+
+impl Default for SearchBar {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl SearchBar {
     pub fn new() -> Self {
@@ -363,7 +369,7 @@ impl SearchBar {
                 let filename = result
                     .file_path
                     .split('/')
-                    .last()
+                    .next_back()
                     .unwrap_or(&result.file_path);
 
                 let content = format!("{}{:<40} {}:{}", marker, result.name, filename, result.line);

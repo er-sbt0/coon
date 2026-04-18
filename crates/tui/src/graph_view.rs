@@ -373,7 +373,7 @@ impl<'a> GraphView<'a> {
             width: node_width.min(area.width.saturating_sub(screen_x as u16)),
             height: node_height
                 .min(area.height.saturating_sub(screen_y as u16))
-                .max(1) as u16,
+                .max(1),
         };
 
         // Widget-based rendering
