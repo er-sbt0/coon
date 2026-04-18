@@ -16,24 +16,6 @@ if !self.functions.contains(&id) {
 
 ---
 
-### 5. Inconsistent error handling: `Box<dyn Error>` vs `anyhow::Result`
-
-The codebase mixes `Box<dyn std::error::Error>` (in loader.rs, runner.rs, tui.rs) with `anyhow::Result` (in parsing, client, service). Pick one consistently — `anyhow` is already a dependency and more ergonomic.
-
----
-
-### 6. Expensive edge deduplication key clones a `String` per check
-
-In graph.rs:
-```rust
-let key = (
-    caller.clone(), callee.clone(),
-    call_location.file_path.clone(), // heap allocation
-    call_location.line, call_location.column,
-);
-```
-Every `add_call` clones the file path string into the `edge_set`. For large graphs this wastes memory. Consider hashing the location into a compact key or interning file paths.
-
 ---
 
 ### 10. No LSP shutdown on application exit

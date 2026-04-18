@@ -4,10 +4,11 @@ use std::fmt;
 ///
 /// Replaces ad-hoc string literals scattered across the codebase,
 /// making it easy to audit, test, and evolve the set of user-visible messages.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum StatusMessage {
     // ── General ───────────────────────────────────────────────
     /// Initial idle state.
+    #[default]
     Ready,
     /// Cleared / nothing to show.
     Empty,
@@ -222,11 +223,7 @@ impl fmt::Display for StatusMessage {
     }
 }
 
-impl Default for StatusMessage {
-    fn default() -> Self {
-        Self::Ready
-    }
-}
+
 
 #[cfg(test)]
 mod tests {

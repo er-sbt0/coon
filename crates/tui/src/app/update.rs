@@ -235,10 +235,7 @@ impl App {
         for call in calls {
             self.process_call_entry(
                 symbol_id,
-                call.to.name,
-                call.to.detail.as_deref(),
-                &call.to.uri,
-                call.to.range,
+                &call.to,
                 &call.from_ranges,
                 true,
             );
@@ -253,10 +250,7 @@ impl App {
         for call in calls {
             self.process_call_entry(
                 symbol_id,
-                call.from.name,
-                call.from.detail.as_deref(),
-                &call.from.uri,
-                call.from.range,
+                &call.from,
                 &call.from_ranges,
                 false,
             );
@@ -266,13 +260,14 @@ impl App {
     fn process_call_entry(
         &mut self,
         symbol_id: SymbolId,
-        other_name: String,
-        other_detail: Option<&str>,
-        other_uri: &lsp_types::Url,
-        other_range: lsp_types::Range,
+        item: &lsp_types::CallHierarchyItem,
         from_ranges: &[lsp_types::Range],
         is_outgoing: bool,
     ) {
+        let other_name = item.name.clone();
+        let other_detail = item.detail.as_deref();
+        let other_uri = &item.uri;
+        let other_range = item.range;
         let file_path = other_uri.path().to_string();
         let location = model::Location::new(
             file_path.clone(),
