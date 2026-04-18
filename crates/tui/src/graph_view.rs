@@ -141,46 +141,6 @@ impl GraphViewState {
         }
     }
 
-    /// Select the next sibling node
-    pub fn select_next_sibling(&mut self) {
-        if let Some(siblings) = self.get_siblings() {
-            if let Some(selected) = &self.selected_node {
-                if let Some(&selected_idx) = self.adapter.symbol_to_node.get(selected) {
-                    if let Some(current_pos) = siblings.iter().position(|&idx| idx == selected_idx)
-                    {
-                        let next_pos = (current_pos + 1) % siblings.len();
-                        let next_idx = siblings[next_pos];
-                        if let Some(next_symbol) = self.adapter.node_to_symbol.get(&next_idx) {
-                            self.selected_node = Some(next_symbol.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Select the previous sibling node
-    pub fn select_prev_sibling(&mut self) {
-        if let Some(siblings) = self.get_siblings() {
-            if let Some(selected) = &self.selected_node {
-                if let Some(&selected_idx) = self.adapter.symbol_to_node.get(selected) {
-                    if let Some(current_pos) = siblings.iter().position(|&idx| idx == selected_idx)
-                    {
-                        let prev_pos = if current_pos == 0 {
-                            siblings.len() - 1
-                        } else {
-                            current_pos - 1
-                        };
-                        let prev_idx = siblings[prev_pos];
-                        if let Some(prev_symbol) = self.adapter.node_to_symbol.get(&prev_idx) {
-                            self.selected_node = Some(prev_symbol.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     /// Navigate to the parent of the currently selected node
     pub fn navigate_to_parent(&mut self) -> bool {
         if let Some(selected) = &self.selected_node {

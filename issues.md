@@ -143,6 +143,3 @@ graph.rs hands out `&mut FunctionNode`, but if the caller changes `node.name`, t
 ### 19. Magic numbers for pan distances and viewport defaults
 
 Hard-coded constants like `3.0` / `5.0` for pan delta (events.rs), `(100.0, 100.0)` for default viewport (mod.rs), and `200` for max symbols (loader.rs) should be named constants.
-
----
-
