@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
-use crate::symbols::*;
+use crate::symbols::{Diagnostic, Location, Reference, ReferenceSymbolKind, ReferencingSymbol, SymbolId};
 
 /// Compute a compact `u64` hash of an edge's identity so we can deduplicate
 /// without cloning the file-path `String` into the set.
