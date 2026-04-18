@@ -207,7 +207,7 @@ impl LspBridge {
             Ok(uri) => uri,
             Err(_) => {
                 self.loading_states.insert(
-                    function_id.clone(),
+                    *function_id,
                     LoadingState::Failed("Invalid file path".to_string()),
                 );
                 return Some(StatusMessage::InvalidFilePath);
@@ -224,7 +224,7 @@ impl LspBridge {
         self.pending_requests.insert(
             request_id.clone(),
             PendingRequest {
-                symbol_id: Some(function_id.clone()),
+                symbol_id: Some(*function_id),
                 timestamp: Instant::now(),
             },
         );
@@ -238,7 +238,7 @@ impl LspBridge {
         if let Err(e) = request_tx.send(request) {
             log::error!("Failed to send LSP request: {}", e);
             self.loading_states.insert(
-                function_id.clone(),
+                *function_id,
                 LoadingState::Failed("Failed to send request".to_string()),
             );
             return Some(StatusMessage::FailedToSendLspRequest);
@@ -289,7 +289,7 @@ impl LspBridge {
         self.pending_requests.insert(
             request_id.clone(),
             PendingRequest {
-                symbol_id: Some(function_id.clone()),
+                symbol_id: Some(*function_id),
                 timestamp: Instant::now(),
             },
         );
@@ -353,7 +353,7 @@ impl LspBridge {
         self.pending_requests.insert(
             request_id.clone(),
             PendingRequest {
-                symbol_id: Some(symbol_id.clone()),
+                symbol_id: Some(*symbol_id),
                 timestamp: Instant::now(),
             },
         );
@@ -363,7 +363,7 @@ impl LspBridge {
             None => {
                 log::error!("No LSP request channel available");
                 self.loading_states.insert(
-                    symbol_id.clone(),
+                    *symbol_id,
                     LoadingState::Failed("No LSP channel".to_string()),
                 );
                 return Some(StatusMessage::NoLspChannel);
@@ -387,7 +387,7 @@ impl LspBridge {
         if let Err(e) = request_tx.send(request) {
             log::error!("Failed to send calls request: {}", e);
             self.loading_states.insert(
-                symbol_id.clone(),
+                *symbol_id,
                 LoadingState::Failed(format!(
                     "Failed to request {} calls",
                     if outgoing { "outgoing" } else { "incoming" }

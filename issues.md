@@ -48,12 +48,6 @@ In graph.rs, this obscures type origins. Use explicit imports (`use crate::symbo
 
 ---
 
-### 13. `parse_document_symbol_response_impl` and `parse_hover_response_impl` don't use the generic helper
-
-parsing.rs manually replicates the exact id-extraction → method-match → remove-pending → parse-result pattern that `parse_lsp_response` already implements generically. These should delegate to the generic helper.
-
----
-
 ### 14. `is_references_response` clones the entire JSON result for a type-probe
 
 In references.rs:

@@ -1,6 +1,5 @@
 use anyhow::Result;
 use lsp_types as lsp;
-use tokio::io::AsyncWriteExt;
 
 use super::LspClient;
 

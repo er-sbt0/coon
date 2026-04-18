@@ -71,7 +71,15 @@ pub(super) async fn handle_outgoing_calls_request(
     );
 
     let result = state.client.get_outgoing_calls(call_hierarchy_item).await;
-    track_or_error(state, response_tx, result, request_id, RequestType::OutgoingCalls, "outgoing calls").await;
+    track_or_error(
+        state,
+        response_tx,
+        result,
+        request_id,
+        RequestType::OutgoingCalls,
+        "outgoing calls",
+    )
+    .await;
 }
 
 pub(super) async fn handle_incoming_calls_request(
@@ -87,7 +95,15 @@ pub(super) async fn handle_incoming_calls_request(
     );
 
     let result = state.client.get_incoming_calls(call_hierarchy_item).await;
-    track_or_error(state, response_tx, result, request_id, RequestType::IncomingCalls, "incoming calls").await;
+    track_or_error(
+        state,
+        response_tx,
+        result,
+        request_id,
+        RequestType::IncomingCalls,
+        "incoming calls",
+    )
+    .await;
 }
 
 pub(super) async fn handle_prepare_call_hierarchy_request(
@@ -119,8 +135,19 @@ pub(super) async fn handle_prepare_call_hierarchy_request(
         return;
     }
 
-    let result = state.client.prepare_call_hierarchy(document_uri, position).await;
-    track_or_error(state, response_tx, result, request_id, RequestType::PrepareCallHierarchy, "prepare call hierarchy").await;
+    let result = state
+        .client
+        .prepare_call_hierarchy(document_uri, position)
+        .await;
+    track_or_error(
+        state,
+        response_tx,
+        result,
+        request_id,
+        RequestType::PrepareCallHierarchy,
+        "prepare call hierarchy",
+    )
+    .await;
 }
 
 pub(super) async fn handle_references_request(
@@ -151,7 +178,15 @@ pub(super) async fn handle_references_request(
 
     let text_document = lsp_types::TextDocumentIdentifier { uri: document_uri };
     let result = state.client.find_references(text_document, position).await;
-    track_or_error(state, response_tx, result, request_id, RequestType::References, "references").await;
+    track_or_error(
+        state,
+        response_tx,
+        result,
+        request_id,
+        RequestType::References,
+        "references",
+    )
+    .await;
 }
 
 pub(super) async fn handle_references_with_symbols_request(
@@ -181,7 +216,10 @@ pub(super) async fn handle_references_with_symbols_request(
     }
 
     let text_document = lsp_types::TextDocumentIdentifier { uri: document_uri };
-    let result = state.client.find_references_with_symbols(text_document, position).await;
+    let result = state
+        .client
+        .find_references_with_symbols(text_document, position)
+        .await;
     match result {
         Ok(lsp_id) => {
             state.track_request(lsp_id, request_id, RequestType::ReferencesWithSymbols);
@@ -224,7 +262,15 @@ pub(super) async fn handle_document_symbols_request(
 
     let text_document = lsp_types::TextDocumentIdentifier { uri: document_uri };
     let result = state.client.document_symbol(text_document).await;
-    track_or_error(state, response_tx, result, request_id, RequestType::DocumentSymbols, "document symbols").await;
+    track_or_error(
+        state,
+        response_tx,
+        result,
+        request_id,
+        RequestType::DocumentSymbols,
+        "document symbols",
+    )
+    .await;
 }
 
 pub(super) async fn handle_workspace_symbols_request(
@@ -240,5 +286,13 @@ pub(super) async fn handle_workspace_symbols_request(
     );
 
     let result = state.client.workspace_symbol(&query).await;
-    track_or_error(state, response_tx, result, request_id, RequestType::WorkspaceSymbols, "workspace symbols").await;
+    track_or_error(
+        state,
+        response_tx,
+        result,
+        request_id,
+        RequestType::WorkspaceSymbols,
+        "workspace symbols",
+    )
+    .await;
 }
