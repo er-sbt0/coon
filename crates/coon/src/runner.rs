@@ -43,7 +43,7 @@ pub async fn run_with_lsp(project_path: &str) -> Result<(), Box<dyn std::error::
 async fn run_tui(call_graph: CallGraph) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting TUI interface...");
     let mut tui_app = TuiApp::new(call_graph)?;
-    tui_app.run()?;
+    tokio::task::block_in_place(|| tui_app.run())?;
     info!("TUI exited. Goodbye!");
     Ok(())
 }
@@ -58,7 +58,7 @@ async fn run_tui_async_lsp(
     info!("Starting TUI interface with async LSP loading...");
     let call_graph = CallGraph::new();
     let mut tui_app = TuiApp::new_with_lsp_async(call_graph, lsp_rx, lsp_channels_rx)?;
-    tui_app.run()?;
+    tokio::task::block_in_place(|| tui_app.run())?;
     info!("TUI exited. Goodbye!");
     Ok(())
 }
