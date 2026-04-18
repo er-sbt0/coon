@@ -1272,8 +1272,8 @@ mod tests {
         let core_location = convert_lsp_location(&lsp_location);
 
         assert_eq!(core_location.file_path, "/home/user/test.rs");
-        assert_eq!(core_location.line, 10);
-        assert_eq!(core_location.column, 5);
+        assert_eq!(core_location.line, 11);
+        assert_eq!(core_location.column, 6);
         assert_eq!(core_location.length, Some(10));
     }
 
@@ -1288,8 +1288,8 @@ mod tests {
         let core_location = convert_lsp_position(&uri, &position);
 
         assert_eq!(core_location.file_path, "/home/user/test.rs");
-        assert_eq!(core_location.line, 20);
-        assert_eq!(core_location.column, 8);
+        assert_eq!(core_location.line, 21);
+        assert_eq!(core_location.column, 9);
         assert_eq!(core_location.length, None);
     }
 
@@ -1343,13 +1343,13 @@ mod tests {
         assert_eq!(response.locations.len(), 2);
 
         assert_eq!(response.locations[0].file_path, "/home/user/test.rs");
-        assert_eq!(response.locations[0].line, 0);
-        assert_eq!(response.locations[0].column, 3);
+        assert_eq!(response.locations[0].line, 1);
+        assert_eq!(response.locations[0].column, 4);
         assert_eq!(response.locations[0].length, Some(8));
 
         assert_eq!(response.locations[1].file_path, "/home/user/test.rs");
-        assert_eq!(response.locations[1].line, 5);
-        assert_eq!(response.locations[1].column, 10);
+        assert_eq!(response.locations[1].line, 6);
+        assert_eq!(response.locations[1].column, 11);
         assert_eq!(response.locations[1].length, Some(8));
     }
 

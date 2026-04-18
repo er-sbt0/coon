@@ -88,12 +88,7 @@ void entry_point() {
             character: 5,
         }; // Position of "entry_point"
         let prep_id = client
-            .prepare_call_hierarchy(
-                lsp::TextDocumentIdentifier {
-                    uri: file_uri.clone(),
-                },
-                position,
-            )
+            .prepare_call_hierarchy(file_uri.clone(), position)
             .await
             .unwrap();
 
