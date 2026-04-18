@@ -23,7 +23,6 @@ pub struct App {
     // Core data
     pub call_graph: CallGraph,
     pub selected_function: Option<SymbolId>,
-    pub functions: Vec<SymbolId>,
 
     // UI chrome
     pub should_quit: bool,
@@ -42,12 +41,9 @@ pub struct App {
 
 impl App {
     pub fn new(call_graph: CallGraph) -> Self {
-        let functions: Vec<SymbolId> = call_graph.function_ids().cloned().collect();
-
         Self {
             call_graph,
             selected_function: None,
-            functions,
             should_quit: false,
             show_help: false,
             status_message: "Ready".to_string(),
@@ -81,10 +77,7 @@ impl App {
                 symbol.qualified_name.clone(),
                 symbol.location.clone(),
             );
-            let id = self.call_graph.add_function(function);
-            if !self.functions.contains(&id) {
-                self.functions.push(id);
-            }
+            self.call_graph.add_function(function);
         }
     }
 
