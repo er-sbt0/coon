@@ -87,3 +87,15 @@ pub enum DiagnosticSeverity {
     Information,
     Hint,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_symbol_id_creation() {
+        let id1 = SymbolId::new();
+        let id2 = SymbolId::new();
+        assert_ne!(id1, id2);
+    }
+}
