@@ -75,7 +75,11 @@ pub fn convert_lsp_location(lsp_location: &lsp::Location) -> model::Location {
             .unwrap_or_else(|_| lsp_location.uri.to_string()),
         line: lsp_location.range.start.line + 1, // Convert from 0-indexed LSP to 1-indexed
         column: lsp_location.range.start.character + 1, // Convert from 0-indexed LSP to 1-indexed
-        length: Some(lsp_location.range.end.character - lsp_location.range.start.character),
+        length: if lsp_location.range.start.line == lsp_location.range.end.line {
+            Some(lsp_location.range.end.character - lsp_location.range.start.character)
+        } else {
+            None // Length is not meaningful for multi-line ranges
+        },
     }
 }
 
@@ -120,6 +124,31 @@ mod tests {
         assert_eq!(core_location.line, 11);
         assert_eq!(core_location.column, 6);
         assert_eq!(core_location.length, Some(10));
+    }
+
+    #[test]
+    fn test_convert_lsp_location_multi_line_range() {
+        let uri = Url::parse("file:///home/user/test.rs").unwrap();
+        let lsp_location = lsp::Location {
+            uri: uri.clone(),
+            range: Range {
+                start: Position {
+                    line: 10,
+                    character: 20,
+                },
+                end: Position {
+                    line: 12,
+                    character: 5,
+                },
+            },
+        };
+
+        let core_location = convert_lsp_location(&lsp_location);
+
+        assert_eq!(core_location.file_path, "/home/user/test.rs");
+        assert_eq!(core_location.line, 11);
+        assert_eq!(core_location.column, 21);
+        assert_eq!(core_location.length, None); // Multi-line range: no meaningful length
     }
 
     #[test]

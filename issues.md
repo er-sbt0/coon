@@ -52,35 +52,9 @@ Every `add_call` clones the file path string into the `edge_set`. For large grap
 
 ---
 
-### 8. `process_call_entry` produces nonsensical qualified names
-
-In update.rs:
-```rust
-let qualified_name = format!("{}::{}", other_name, file_path);
-```
-This produces strings like `"foo::/home/user/src/main.cpp"`, which aren't valid qualified names. The file path should not be part of the qualified name — use container info from the `CallHierarchyItem` detail field instead.
-
----
-
-### 9. Duplicate sibling navigation code
-
-`GraphViewState` has two nearly identical pairs of methods:
-- `select_next_sibling` / `select_prev_sibling` (graph_view.rs)
-- `navigate_next_sibling` / `navigate_prev_sibling` (graph_view.rs)
-
-They do the same thing. The `select_*` variants appear unused and should be removed.
-
----
-
 ### 10. No LSP shutdown on application exit
 
 In runner.rs, the `lsp_loader_task` is spawned with `tokio::spawn` but never joined. When the TUI exits, the Tokio runtime is dropped, aborting the task without sending LSP `shutdown`/`exit`. The `Drop` impl on `LspClient` tries `start_kill()` but the child process might not receive it reliably.
-
----
-
-### 11. `send_initialized` bypasses existing `send_notification`
-
-In requests.rs, `send_initialized` manually builds and sends JSON instead of calling `self.send_notification("initialized", json!({}))` which already exists on `LspClient`. Redundant code that could diverge.
 
 ---
 
