@@ -48,14 +48,6 @@ Mixes graph, workspace, search, LSP channels, loading, and UI state. Untestable.
 **12. Massive code duplication** — call_hierarchy.rs, utils.rs / symbol_resolution.rs / document.rs
 Triple-duplicated utility functions. Four near-identical response handlers. Bugs fixed in one copy missed in others.
 
-**13. `WorkspaceSymbolInfo` defined twice with different fields** — types.rs vs lazy_graph.rs
-Same name, different structs, different crates. Causes confusion and unnecessary conversions.
-
-**14. Swapped arrow key semantics** — tui.rs
-`Up → MoveDown`, `Down → MoveUp`. Contradicts cursor bindings elsewhere. Confusing even if intentional for panning.
-
----
-
 ### Low-Medium — Hygiene, testing, performance
 
 **17. Dead code behind `#[allow(dead_code)]`** — lib.rs, lazy_graph.rs (~280 lines), large parts of `logic` crate

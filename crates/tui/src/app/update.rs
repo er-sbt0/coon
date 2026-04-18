@@ -53,11 +53,10 @@ impl App {
 
                                     // Send outgoing calls request
                                     if let Some(tx) = &self.lsp_request_tx {
-                                        let request =
-                                            lsp::LspRequest::GetOutgoingCalls {
-                                                request_id: outgoing_request_id,
-                                                call_hierarchy_item: first_item,
-                                            };
+                                        let request = lsp::LspRequest::GetOutgoingCalls {
+                                            request_id: outgoing_request_id,
+                                            call_hierarchy_item: first_item,
+                                        };
 
                                         if let Err(e) = tx.send(request) {
                                             log::error!(
@@ -103,11 +102,10 @@ impl App {
 
                                     // Send incoming calls request
                                     if let Some(tx) = &self.lsp_request_tx {
-                                        let request =
-                                            lsp::LspRequest::GetIncomingCalls {
-                                                request_id: incoming_request_id,
-                                                call_hierarchy_item: first_item,
-                                            };
+                                        let request = lsp::LspRequest::GetIncomingCalls {
+                                            request_id: incoming_request_id,
+                                            call_hierarchy_item: first_item,
+                                        };
 
                                         if let Err(e) = tx.send(request) {
                                             log::error!(

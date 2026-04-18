@@ -30,12 +30,8 @@ pub async fn run_with_lsp(project_path: &str) -> Result<(), Box<dyn std::error::
 
     let project_path_string = project_path.to_string();
     tokio::spawn(async move {
-        if let Err(e) = lsp::loader::lsp_loader_task(
-            &project_path_string,
-            ui_msg_tx,
-            lsp_channels_tx,
-        )
-        .await
+        if let Err(e) =
+            lsp::loader::lsp_loader_task(&project_path_string, ui_msg_tx, lsp_channels_tx).await
         {
             error!("LSP loader task failed: {}", e);
         }

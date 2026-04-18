@@ -5,8 +5,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::types::{
-    convert_lsp_location, DocumentSymbolResponse, FindReferencesResponse, HoverResponse,
-    WorkspaceSymbolInfo, WorkspaceSymbolResponse,
+    convert_lsp_location, make_qualified_name, DocumentSymbolResponse, FindReferencesResponse,
+    HoverResponse, WorkspaceSymbolResponse,
 };
 
 // Helper function to test the parsing logic without LspClient
@@ -167,8 +167,12 @@ pub(crate) fn parse_workspace_symbol_response_impl(
                                     length: None,
                                 },
                             };
-                            WorkspaceSymbolInfo {
+                            model::WorkspaceSymbolInfo {
                                 name: symbol.name.clone(),
+                                qualified_name: make_qualified_name(
+                                    &symbol.container_name,
+                                    &symbol.name,
+                                ),
                                 kind: symbol.kind,
                                 location,
                                 container_name: symbol.container_name.clone(),
@@ -229,8 +233,12 @@ pub(crate) fn parse_document_symbol_response_impl(
                         // Convert SymbolInformation to our format
                         symbol_infos
                             .iter()
-                            .map(|symbol| WorkspaceSymbolInfo {
+                            .map(|symbol| model::WorkspaceSymbolInfo {
                                 name: symbol.name.clone(),
+                                qualified_name: make_qualified_name(
+                                    &symbol.container_name,
+                                    &symbol.name,
+                                ),
                                 kind: symbol.kind,
                                 location: convert_lsp_location(&symbol.location),
                                 container_name: symbol.container_name.clone(),
@@ -386,16 +394,18 @@ pub(crate) fn extract_function_name_from_signature(signature: &str) -> Option<St
     None
 }
 
-// Helper to recursively convert DocumentSymbol to our WorkspaceSymbolInfo
+// Helper to recursively convert DocumentSymbol to model::WorkspaceSymbolInfo
 pub(crate) fn convert_document_symbol_recursive(
     doc_symbol: &lsp::DocumentSymbol,
     container: Option<&str>,
-) -> Vec<WorkspaceSymbolInfo> {
+) -> Vec<model::WorkspaceSymbolInfo> {
     let mut results = Vec::new();
 
+    let container_name = container.map(|s| s.to_string());
     // Convert the current symbol
-    let symbol_info = WorkspaceSymbolInfo {
+    let symbol_info = model::WorkspaceSymbolInfo {
         name: doc_symbol.name.clone(),
+        qualified_name: make_qualified_name(&container_name, &doc_symbol.name),
         kind: doc_symbol.kind,
         location: model::Location {
             file_path: "".to_string(), // Will be filled in by caller
@@ -406,7 +416,7 @@ pub(crate) fn convert_document_symbol_recursive(
                     - doc_symbol.selection_range.start.character,
             ),
         },
-        container_name: container.map(|s| s.to_string()),
+        container_name,
     };
     results.push(symbol_info);
 

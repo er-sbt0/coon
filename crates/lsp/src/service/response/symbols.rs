@@ -134,7 +134,7 @@ pub(super) async fn handle_workspace_symbols_response(
                     request_id
                 );
 
-                let symbols: Vec<crate::WorkspaceSymbolInfo> = workspace_symbols
+                let symbols: Vec<model::WorkspaceSymbolInfo> = workspace_symbols
                     .iter()
                     .map(|symbol| {
                         let location = match &symbol.location {
@@ -152,8 +152,12 @@ pub(super) async fn handle_workspace_symbols_response(
                                 length: None,
                             },
                         };
-                        crate::WorkspaceSymbolInfo {
+                        model::WorkspaceSymbolInfo {
                             name: symbol.name.clone(),
+                            qualified_name: crate::make_qualified_name(
+                                &symbol.container_name,
+                                &symbol.name,
+                            ),
                             kind: symbol.kind,
                             location,
                             container_name: symbol.container_name.clone(),
@@ -193,14 +197,7 @@ pub(super) async fn handle_workspace_symbols_response(
                         };
                         is_function && is_project_file
                     })
-                    .map(|sym| {
-                        let qualified_name = if let Some(container) = &sym.container_name {
-                            format!("{}::{}", container, sym.name)
-                        } else {
-                            sym.name.clone()
-                        };
-                        model::FunctionNode::new(sym.name, qualified_name, sym.location)
-                    })
+                    .map(|sym| model::FunctionNode::new(sym.name, sym.qualified_name, sym.location))
                     .collect();
 
                 log::info!("Filtered to {} function symbols", function_symbols.len());

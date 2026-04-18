@@ -18,14 +18,14 @@ pub struct EnhancedReferencesResponse {
 #[derive(Debug, Clone)]
 pub struct WorkspaceSymbolResponse {
     pub request_id: i64,
-    pub symbols: Vec<WorkspaceSymbolInfo>,
+    pub symbols: Vec<model::WorkspaceSymbolInfo>,
 }
 
 /// Response from LSP textDocument/documentSymbol request
 #[derive(Debug, Clone)]
 pub struct DocumentSymbolResponse {
     pub request_id: i64,
-    pub symbols: Vec<WorkspaceSymbolInfo>,
+    pub symbols: Vec<model::WorkspaceSymbolInfo>,
 }
 
 /// Response from LSP textDocument/hover request
@@ -56,13 +56,13 @@ pub struct IncomingCallsResponse {
     pub calls: Vec<lsp::CallHierarchyIncomingCall>,
 }
 
-/// Simplified symbol information from LSP
-#[derive(Debug, Clone)]
-pub struct WorkspaceSymbolInfo {
-    pub name: String,
-    pub kind: lsp::SymbolKind,
-    pub location: model::Location,
-    pub container_name: Option<String>,
+/// Compute a qualified name from an optional container and a symbol name.
+pub fn make_qualified_name(container_name: &Option<String>, name: &str) -> String {
+    if let Some(container) = container_name {
+        format!("{}::{}", container, name)
+    } else {
+        name.to_string()
+    }
 }
 
 /// Convert LSP Location to our model Location
