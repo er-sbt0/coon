@@ -1,6 +1,6 @@
 use grid::{LayoutError, Tree};
 use model::{CallGraph, FunctionNode, SymbolId};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 /// Direction for building call hierarchy tree
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,15 +56,20 @@ impl CallGraphAdapter {
         self.symbol_to_node.insert(root.clone(), 0);
         self.node_to_symbol.insert(0, root.clone());
 
-        // Build tree using BFS - track path to detect direct cycles only
+        // Build tree using BFS with parent pointers for cycle detection.
+        // Instead of cloning a HashSet per queued node (O(B^D) allocations),
+        // we store a parent-pointer map and walk up to the root to check for
+        // cycles. This reduces per-node overhead to O(1) space and O(D) time
+        // for each ancestor check.
         let mut queue = VecDeque::new();
 
-        // Queue contains: (symbol_id, parent_idx, depth, path_from_root)
-        let mut initial_path = HashSet::new();
-        initial_path.insert(root.clone());
-        queue.push_back((root.clone(), 0, 0, initial_path));
+        // parent_map: tree node index -> parent node index (root has no entry)
+        let mut parent_map: HashMap<usize, usize> = HashMap::new();
 
-        while let Some((symbol, parent_idx, depth, path)) = queue.pop_front() {
+        // Queue contains: (symbol_id, tree_node_idx, depth)
+        queue.push_back((root.clone(), 0, 0));
+
+        while let Some((symbol, parent_idx, depth)) = queue.pop_front() {
             // Check depth limit
             if let Some(max) = max_depth {
                 if depth >= max {
@@ -76,8 +81,8 @@ impl CallGraphAdapter {
             let children = self.get_children(graph, &symbol, direction);
 
             for child_func in children {
-                // Only prevent direct cycles in current path (not all previously seen nodes)
-                if path.contains(&child_func.id) {
+                // Walk parent pointers to detect cycles on the root-to-node path
+                if self.is_on_ancestor_path(parent_idx, &child_func.id, &parent_map) {
                     continue;
                 }
 
@@ -92,16 +97,38 @@ impl CallGraphAdapter {
                     .entry(child_func.id.clone())
                     .or_insert(child_idx);
 
-                // Create new path including this child
-                let mut new_path = path.clone();
-                new_path.insert(child_func.id.clone());
+                // Record parent pointer for cycle detection
+                parent_map.insert(child_idx, parent_idx);
 
-                // Enqueue with new path
-                queue.push_back((child_func.id.clone(), child_idx, depth + 1, new_path));
+                // Enqueue child
+                queue.push_back((child_func.id.clone(), child_idx, depth + 1));
             }
         }
 
         Ok(tree)
+    }
+
+    /// Check whether `symbol` appears on the path from `node_idx` up to (and
+    /// including) the root, by walking parent pointers.  Returns `true` if the
+    /// symbol would create a cycle.
+    fn is_on_ancestor_path(
+        &self,
+        node_idx: usize,
+        symbol: &SymbolId,
+        parent_map: &HashMap<usize, usize>,
+    ) -> bool {
+        let mut current = node_idx;
+        loop {
+            if let Some(sym) = self.node_to_symbol.get(&current) {
+                if sym == symbol {
+                    return true;
+                }
+            }
+            match parent_map.get(&current) {
+                Some(&parent) => current = parent,
+                None => return false, // reached root, no cycle
+            }
+        }
     }
 
     /// Get children of a node based on direction

@@ -197,7 +197,7 @@ mod tests {
         assert_eq!(app.workspaces.workspaces.len(), 1);
         assert_eq!(app.workspaces.current_index, 0);
         assert!(app.selected_function.is_none());
-        assert_eq!(app.search_query, "");
+        assert_eq!(app.search_bar_state.query, "");
         assert!(!app.should_quit);
         assert!(!app.show_help);
     }

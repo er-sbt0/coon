@@ -270,8 +270,8 @@ impl App {
         let file_path = other_uri.path().to_string();
         let location = model::Location::new(
             file_path.clone(),
-            ((other_range.start.line + 1)),
-            ((other_range.start.character + 1)),
+            other_range.start.line + 1,
+            other_range.start.character + 1,
         );
         let qualified_name = format!("{}::{}", other_name, file_path);
         let other_id = self.call_graph.add_function(model::FunctionNode::new(
@@ -282,8 +282,8 @@ impl App {
         for from_range in from_ranges {
             let call_location = model::Location::new(
                 file_path.clone(),
-                ((from_range.start.line + 1)),
-                ((from_range.start.character + 1)),
+                from_range.start.line + 1,
+                from_range.start.character + 1,
             );
             let (caller, callee) = if is_outgoing {
                 (symbol_id.clone(), other_id.clone())
