@@ -12,24 +12,7 @@ pub(super) async fn handle_legacy_response_detection(
 ) {
     log::warn!("Using legacy response detection for request {}", request_id);
 
-    if message.get("error").is_some() {
-        let error_msg = message
-            .get("error")
-            .and_then(|e| e.get("message"))
-            .and_then(|m| m.as_str())
-            .unwrap_or("Unknown LSP error");
-        log::error!(
-            "LSP Error Response for request {}: {}",
-            request_id,
-            error_msg
-        );
-        log::debug!("Full LSP error message: {}", message);
-        let _ = response_tx
-            .send(LspResponse::Error {
-                request_id,
-                error: error_msg.to_string(),
-            })
-            .await;
+    if super::check_and_send_lsp_error(&message, &request_id, "legacy", response_tx).await {
         return;
     }
 

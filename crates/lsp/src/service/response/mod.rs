@@ -1,5 +1,6 @@
 use super::worker::{LspWorkerState, RequestType};
 use super::LspResponse;
+use crate::LspClient;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -7,6 +8,104 @@ mod call_hierarchy;
 mod legacy;
 mod references;
 mod symbols;
+
+// ---------------------------------------------------------------------------
+// Shared response-handling helpers
+// ---------------------------------------------------------------------------
+
+/// Extract the error message from an LSP response, if present.
+fn extract_lsp_error(message: &Value) -> Option<String> {
+    message.get("error").map(|error| {
+        error
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("Unknown LSP error")
+            .to_string()
+    })
+}
+
+/// Check for an LSP error in `message` and send `LspResponse::Error` when
+/// found.  Returns `true` if an error was sent (caller should return early).
+async fn check_and_send_lsp_error(
+    message: &Value,
+    request_id: &str,
+    context: &str,
+    response_tx: &mpsc::Sender<LspResponse>,
+) -> bool {
+    if let Some(error_msg) = extract_lsp_error(message) {
+        log::error!(
+            "LSP Error Response for {} request {}: {}",
+            context,
+            request_id,
+            error_msg
+        );
+        let _ = response_tx
+            .send(LspResponse::Error {
+                request_id: request_id.to_string(),
+                error: error_msg,
+            })
+            .await;
+        true
+    } else {
+        false
+    }
+}
+
+/// Generic handler for responses that are parsed via an `LspClient` method.
+///
+/// 1. Checks for an LSP error and sends `LspResponse::Error` if found.
+/// 2. Calls `parse` to parse the response via the client.
+/// 3. On success, converts to `LspResponse` via `to_response` and sends it.
+/// 4. On failure, sends a parse-error `LspResponse::Error`.
+async fn parse_client_response<T>(
+    message: Value,
+    request_id: String,
+    context: &str,
+    client: &mut LspClient,
+    response_tx: &mpsc::Sender<LspResponse>,
+    parse: impl FnOnce(&mut LspClient, &Value) -> anyhow::Result<Option<T>>,
+    to_response: impl FnOnce(String, T) -> LspResponse,
+) {
+    if check_and_send_lsp_error(&message, &request_id, context, response_tx).await {
+        return;
+    }
+
+    match parse(client, &message) {
+        Ok(Some(parsed)) => {
+            log::debug!("Parsed {} response for request {}", context, request_id);
+            let _ = response_tx.send(to_response(request_id, parsed)).await;
+        }
+        Ok(None) => {
+            log::error!(
+                "No parsed result for {} response for request {}",
+                context,
+                request_id
+            );
+            log::debug!("Raw response: {}", message);
+            let _ = response_tx
+                .send(LspResponse::Error {
+                    request_id,
+                    error: format!("Failed to parse {} response", context),
+                })
+                .await;
+        }
+        Err(e) => {
+            log::error!(
+                "Error parsing {} response for request {}: {}",
+                context,
+                request_id,
+                e
+            );
+            log::debug!("Raw response: {}", message);
+            let _ = response_tx
+                .send(LspResponse::Error {
+                    request_id,
+                    error: format!("Failed to parse {} response", context),
+                })
+                .await;
+        }
+    }
+}
 
 pub(super) async fn handle_lsp_message(
     message: Value,

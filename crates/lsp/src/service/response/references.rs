@@ -10,22 +10,7 @@ pub(super) async fn handle_references_response(
     _state: &mut LspWorkerState,
     response_tx: &mpsc::Sender<LspResponse>,
 ) {
-    if let Some(error) = message.get("error") {
-        let error_msg = error
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("Unknown LSP error");
-        log::error!(
-            "LSP Error Response for references request {}: {}",
-            request_id,
-            error_msg
-        );
-        let _ = response_tx
-            .send(LspResponse::Error {
-                request_id,
-                error: error_msg.to_string(),
-            })
-            .await;
+    if super::check_and_send_lsp_error(&message, &request_id, "references", response_tx).await {
         return;
     }
 
@@ -58,22 +43,9 @@ pub(super) async fn handle_references_with_symbols_response(
     state: &mut LspWorkerState,
     response_tx: &mpsc::Sender<LspResponse>,
 ) {
-    if let Some(error) = message.get("error") {
-        let error_msg = error
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("Unknown LSP error");
-        log::error!(
-            "LSP Error Response for enhanced references request {}: {}",
-            request_id,
-            error_msg
-        );
-        let _ = response_tx
-            .send(LspResponse::Error {
-                request_id,
-                error: error_msg.to_string(),
-            })
-            .await;
+    if super::check_and_send_lsp_error(&message, &request_id, "enhanced references", response_tx)
+        .await
+    {
         return;
     }
 
@@ -122,22 +94,7 @@ pub(super) async fn handle_hover_response(
     state: &mut LspWorkerState,
     response_tx: &mpsc::Sender<LspResponse>,
 ) {
-    if let Some(error) = message.get("error") {
-        let error_msg = error
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("Unknown LSP error");
-        log::error!(
-            "LSP Error Response for hover request {}: {}",
-            request_id,
-            error_msg
-        );
-        let _ = response_tx
-            .send(LspResponse::Error {
-                request_id,
-                error: error_msg.to_string(),
-            })
-            .await;
+    if super::check_and_send_lsp_error(&message, &request_id, "hover", response_tx).await {
         return;
     }
 

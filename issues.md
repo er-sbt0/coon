@@ -45,9 +45,6 @@ Mixes graph, workspace, search, LSP channels, loading, and UI state. Untestable.
 **11. Sync TUI loop masquerading as async** — tui.rs
 `event::poll` + `event::read` block the main thread inside an `async fn`. Works only because LSP is spawned separately. Fragile.
 
-**12. Massive code duplication** — call_hierarchy.rs, utils.rs / symbol_resolution.rs / document.rs
-Triple-duplicated utility functions. Four near-identical response handlers. Bugs fixed in one copy missed in others.
-
 ### Low-Medium — Hygiene, testing, performance
 
 **17. Dead code behind `#[allow(dead_code)]`** — lib.rs, lazy_graph.rs (~280 lines), large parts of `logic` crate

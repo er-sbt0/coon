@@ -9,322 +9,300 @@ use crate::types::{
     HoverResponse, WorkspaceSymbolResponse,
 };
 
-// Helper function to test the parsing logic without LspClient
+// ---------------------------------------------------------------------------
+// Generic LSP response parsing helpers
+// ---------------------------------------------------------------------------
+
+/// Core of LSP response parsing after ID extraction and method matching.
+///
+/// Handles the common pattern: check for error → check for null result →
+/// deserialize → build typed response.  Callers that need multi-method
+/// matching or custom deserialization can call this directly after doing
+/// their own ID / method checks.
+pub(crate) fn parse_lsp_result<T, R>(
+    id: i64,
+    response: &Value,
+    method_label: &str,
+    build_result: impl FnOnce(i64, T) -> R,
+    build_empty: impl FnOnce(i64) -> R,
+) -> Result<Option<R>>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    if let Some(error) = response.get("error") {
+        log::warn!("LSP error for {}: {:?}", method_label, error);
+        return Ok(Some(build_empty(id)));
+    }
+
+    match response.get("result") {
+        Some(result) if !result.is_null() => match T::deserialize(result) {
+            Ok(parsed) => Ok(Some(build_result(id, parsed))),
+            Err(e) => {
+                let msg = format!(
+                    "Failed to parse {} result: {}. Raw result: {:?}",
+                    method_label, e, result
+                );
+                log::error!("{}", msg);
+                Err(anyhow::anyhow!(msg))
+            }
+        },
+        _ => {
+            log::warn!("No result in {} response", method_label);
+            Ok(Some(build_empty(id)))
+        }
+    }
+}
+
+/// Full LSP response parser: extract ID, match a single method name,
+/// remove from pending requests, then delegate to [`parse_lsp_result`].
+///
+/// Only removes the pending request entry when the method actually matches,
+/// so other parsers can still try the same response in the legacy
+/// detection path.
+pub(crate) fn parse_lsp_response<T, R>(
+    pending_requests: &mut HashMap<i64, String>,
+    response: &Value,
+    method_name: &str,
+    build_result: impl FnOnce(i64, T) -> R,
+    build_empty: impl FnOnce(i64) -> R,
+) -> Result<Option<R>>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let id = match response.get("id").and_then(|v| v.as_i64()) {
+        Some(id) => id,
+        None => return Ok(None),
+    };
+
+    // Only remove from pending when the method matches (fixes legacy
+    // detection path where multiple parsers try the same response).
+    match pending_requests.get(&id) {
+        Some(method) if method == method_name => {
+            pending_requests.remove(&id);
+        }
+        _ => return Ok(None),
+    }
+
+    parse_lsp_result(id, response, method_name, build_result, build_empty)
+}
+
+// ---------------------------------------------------------------------------
+// Concrete response parsers
+// ---------------------------------------------------------------------------
+
 pub(crate) fn parse_find_references_response_impl(
     pending_requests: &mut HashMap<i64, String>,
     response: &Value,
 ) -> Result<Option<FindReferencesResponse>> {
-    if let Some(id) = response.get("id").and_then(|v| v.as_i64()) {
-        log::debug!("parse_find_references_response_impl: checking ID {}", id);
-        if let Some(method) = pending_requests.get(&id) {
-            log::debug!(
-                "parse_find_references_response_impl: found method '{}' for ID {}",
-                method,
-                id
-            );
-        } else {
-            log::debug!(
-                "parse_find_references_response_impl: no pending request found for ID {}",
-                id
-            );
+    let id = match response.get("id").and_then(|v| v.as_i64()) {
+        Some(id) => id,
+        None => return Ok(None),
+    };
+
+    // Matches both normal and enhanced reference requests.
+    match pending_requests.get(&id).map(|s| s.as_str()) {
+        Some("textDocument/references") | Some("textDocument/references_enhanced") => {
+            pending_requests.remove(&id);
         }
-
-        if let Some(method) = pending_requests.remove(&id) {
-            log::debug!(
-                "parse_find_references_response_impl: removed method '{}' for ID {}",
-                method,
-                id
-            );
-            if method == "textDocument/references" {
-                log::debug!(
-                    "parse_find_references_response_impl: method matches textDocument/references"
-                );
-                // Check if this is an error response
-                if let Some(error) = response.get("error") {
-                    log::warn!("LSP error for find_references: {:?}", error);
-                    // Return empty results for errors (like "no symbol found")
-                    return Ok(Some(FindReferencesResponse {
-                        request_id: id,
-                        locations: Vec::new(),
-                    }));
-                }
-
-                if let Some(result) = response.get("result") {
-                    if result.is_null() {
-                        log::debug!("parse_find_references_response_impl: result is null, returning empty response");
-                        return Ok(Some(FindReferencesResponse {
-                            request_id: id,
-                            locations: Vec::new(),
-                        }));
-                    }
-
-                    log::debug!(
-                        "parse_find_references_response_impl: parsing result: {}",
-                        result
-                    );
-                    let lsp_locations = Vec::<lsp::Location>::deserialize(result)?;
-                    let locations: Vec<_> =
-                        lsp_locations.iter().map(convert_lsp_location).collect();
-
-                    log::debug!(
-                        "parse_find_references_response_impl: successfully parsed {} locations",
-                        locations.len()
-                    );
-                    return Ok(Some(FindReferencesResponse {
-                        request_id: id,
-                        locations,
-                    }));
-                }
-            } else if method == "textDocument/references_enhanced" {
-                log::debug!(
-                    "parse_find_references_response_impl: method matches enhanced references"
-                );
-                // This is an enhanced reference request, but we process the base response here
-                // The enhancement will be done separately
-                if let Some(error) = response.get("error") {
-                    log::warn!("LSP error for enhanced find_references: {:?}", error);
-                    return Ok(Some(FindReferencesResponse {
-                        request_id: id,
-                        locations: Vec::new(),
-                    }));
-                }
-
-                if let Some(result) = response.get("result") {
-                    if result.is_null() {
-                        log::debug!("parse_find_references_response_impl: enhanced result is null, returning empty response");
-                        return Ok(Some(FindReferencesResponse {
-                            request_id: id,
-                            locations: Vec::new(),
-                        }));
-                    }
-
-                    log::debug!(
-                        "parse_find_references_response_impl: parsing enhanced result: {}",
-                        result
-                    );
-                    let lsp_locations = Vec::<lsp::Location>::deserialize(result)?;
-                    let locations: Vec<_> =
-                        lsp_locations.iter().map(convert_lsp_location).collect();
-
-                    log::debug!(
-                        "parse_find_references_response_impl: successfully parsed {} enhanced locations",
-                        locations.len()
-                    );
-                    return Ok(Some(FindReferencesResponse {
-                        request_id: id,
-                        locations,
-                    }));
-                }
-            } else {
-                log::debug!("parse_find_references_response_impl: method '{}' does not match 'textDocument/references'", method);
-            }
-        }
-    } else {
-        log::debug!("parse_find_references_response_impl: no ID found in response");
+        _ => return Ok(None),
     }
-    Ok(None)
+
+    parse_lsp_result(
+        id,
+        response,
+        "textDocument/references",
+        |id, lsp_locations: Vec<lsp::Location>| FindReferencesResponse {
+            request_id: id,
+            locations: lsp_locations.iter().map(convert_lsp_location).collect(),
+        },
+        |id| FindReferencesResponse {
+            request_id: id,
+            locations: Vec::new(),
+        },
+    )
 }
 
-// Helper function to parse workspace symbol responses
 pub(crate) fn parse_workspace_symbol_response_impl(
     pending_requests: &mut HashMap<i64, String>,
     response: &Value,
 ) -> Result<Option<WorkspaceSymbolResponse>> {
-    if let Some(id) = response.get("id").and_then(|v| v.as_i64()) {
-        if let Some(method) = pending_requests.remove(&id) {
-            if method == "workspace/symbol" {
-                // Check if this is an error response
-                if let Some(error) = response.get("error") {
-                    log::warn!("LSP error for workspace/symbol: {:?}", error);
-                    return Ok(Some(WorkspaceSymbolResponse {
-                        request_id: id,
-                        symbols: Vec::new(),
-                    }));
-                }
-
-                if let Some(result) = response.get("result") {
-                    if result.is_null() {
-                        return Ok(Some(WorkspaceSymbolResponse {
-                            request_id: id,
-                            symbols: Vec::new(),
-                        }));
+    parse_lsp_response(
+        pending_requests,
+        response,
+        "workspace/symbol",
+        |id, workspace_symbols: Vec<lsp::WorkspaceSymbol>| {
+            let symbols = workspace_symbols
+                .iter()
+                .map(|symbol| {
+                    let location = match &symbol.location {
+                        lsp::OneOf::Left(location) => convert_lsp_location(location),
+                        lsp::OneOf::Right(workspace_location) => model::Location {
+                            file_path: workspace_location
+                                .uri
+                                .to_file_path()
+                                .map(|p| p.to_string_lossy().to_string())
+                                .unwrap_or_else(|_| workspace_location.uri.to_string()),
+                            line: 0,
+                            column: 0,
+                            length: None,
+                        },
+                    };
+                    model::WorkspaceSymbolInfo {
+                        name: symbol.name.clone(),
+                        qualified_name: make_qualified_name(
+                            &symbol.container_name,
+                            &symbol.name,
+                        ),
+                        kind: symbol.kind,
+                        location,
+                        container_name: symbol.container_name.clone(),
                     }
-
-                    let workspace_symbols = Vec::<lsp::WorkspaceSymbol>::deserialize(result)?;
-                    let symbols = workspace_symbols
-                        .iter()
-                        .map(|symbol| {
-                            let location = match &symbol.location {
-                                lsp::OneOf::Left(location) => convert_lsp_location(location),
-                                lsp::OneOf::Right(workspace_location) => model::Location {
-                                    file_path: workspace_location
-                                        .uri
-                                        .to_file_path()
-                                        .map(|p| p.to_string_lossy().to_string())
-                                        .unwrap_or_else(|_| workspace_location.uri.to_string()),
-                                    line: 0, // WorkspaceLocation doesn't have range info
-                                    column: 0,
-                                    length: None,
-                                },
-                            };
-                            model::WorkspaceSymbolInfo {
-                                name: symbol.name.clone(),
-                                qualified_name: make_qualified_name(
-                                    &symbol.container_name,
-                                    &symbol.name,
-                                ),
-                                kind: symbol.kind,
-                                location,
-                                container_name: symbol.container_name.clone(),
-                            }
-                        })
-                        .collect();
-
-                    return Ok(Some(WorkspaceSymbolResponse {
-                        request_id: id,
-                        symbols,
-                    }));
-                }
+                })
+                .collect();
+            WorkspaceSymbolResponse {
+                request_id: id,
+                symbols,
             }
-        }
-    }
-    Ok(None)
+        },
+        |id| WorkspaceSymbolResponse {
+            request_id: id,
+            symbols: Vec::new(),
+        },
+    )
 }
 
-// Helper function to parse document symbol responses
 pub(crate) fn parse_document_symbol_response_impl(
     pending_requests: &mut HashMap<i64, String>,
     response: &Value,
 ) -> Result<Option<DocumentSymbolResponse>> {
-    if let Some(id) = response.get("id").and_then(|v| v.as_i64()) {
-        if let Some(method) = pending_requests.remove(&id) {
-            if method == "textDocument/documentSymbol" {
-                // Check if this is an error response
-                if let Some(error) = response.get("error") {
-                    log::warn!("LSP error for textDocument/documentSymbol: {:?}", error);
-                    return Ok(Some(DocumentSymbolResponse {
-                        request_id: id,
-                        symbols: Vec::new(),
-                    }));
-                }
+    let id = match response.get("id").and_then(|v| v.as_i64()) {
+        Some(id) => id,
+        None => return Ok(None),
+    };
 
-                if let Some(result) = response.get("result") {
-                    if result.is_null() {
-                        return Ok(Some(DocumentSymbolResponse {
-                            request_id: id,
-                            symbols: Vec::new(),
-                        }));
-                    }
-
-                    // DocumentSymbol can return either DocumentSymbol[] or SymbolInformation[]
-                    let symbols = if let Ok(doc_symbols) =
-                        Vec::<lsp::DocumentSymbol>::deserialize(result)
-                    {
-                        // Convert DocumentSymbol to our format
-                        doc_symbols
-                            .into_iter()
-                            .flat_map(|doc_symbol| {
-                                convert_document_symbol_recursive(&doc_symbol, None)
-                            })
-                            .collect()
-                    } else if let Ok(symbol_infos) =
-                        Vec::<lsp::SymbolInformation>::deserialize(result)
-                    {
-                        // Convert SymbolInformation to our format
-                        symbol_infos
-                            .iter()
-                            .map(|symbol| model::WorkspaceSymbolInfo {
-                                name: symbol.name.clone(),
-                                qualified_name: make_qualified_name(
-                                    &symbol.container_name,
-                                    &symbol.name,
-                                ),
-                                kind: symbol.kind,
-                                location: convert_lsp_location(&symbol.location),
-                                container_name: symbol.container_name.clone(),
-                            })
-                            .collect()
-                    } else {
-                        let error_msg = format!(
-                            "Failed to parse documentSymbol result as either DocumentSymbol[] or SymbolInformation[]. Raw result: {:?}",
-                            result
-                        );
-                        log::error!("{}", error_msg);
-                        return Err(anyhow::anyhow!(error_msg));
-                    };
-
-                    return Ok(Some(DocumentSymbolResponse {
-                        request_id: id,
-                        symbols,
-                    }));
-                }
-            }
+    match pending_requests.get(&id) {
+        Some(method) if method == "textDocument/documentSymbol" => {
+            pending_requests.remove(&id);
         }
+        _ => return Ok(None),
     }
-    Ok(None)
+
+    if let Some(error) = response.get("error") {
+        log::warn!("LSP error for textDocument/documentSymbol: {:?}", error);
+        return Ok(Some(DocumentSymbolResponse {
+            request_id: id,
+            symbols: Vec::new(),
+        }));
+    }
+
+    let result = match response.get("result") {
+        Some(r) if !r.is_null() => r,
+        _ => {
+            return Ok(Some(DocumentSymbolResponse {
+                request_id: id,
+                symbols: Vec::new(),
+            }))
+        }
+    };
+
+    // DocumentSymbol can return either DocumentSymbol[] or SymbolInformation[]
+    let symbols = if let Ok(doc_symbols) = Vec::<lsp::DocumentSymbol>::deserialize(result) {
+        doc_symbols
+            .into_iter()
+            .flat_map(|doc_symbol| convert_document_symbol_recursive(&doc_symbol, None))
+            .collect()
+    } else if let Ok(symbol_infos) = Vec::<lsp::SymbolInformation>::deserialize(result) {
+        symbol_infos
+            .iter()
+            .map(|symbol| model::WorkspaceSymbolInfo {
+                name: symbol.name.clone(),
+                qualified_name: make_qualified_name(&symbol.container_name, &symbol.name),
+                kind: symbol.kind,
+                location: convert_lsp_location(&symbol.location),
+                container_name: symbol.container_name.clone(),
+            })
+            .collect()
+    } else {
+        let msg = format!(
+            "Failed to parse documentSymbol result as either DocumentSymbol[] or SymbolInformation[]. Raw result: {:?}",
+            result
+        );
+        log::error!("{}", msg);
+        return Err(anyhow::anyhow!(msg));
+    };
+
+    Ok(Some(DocumentSymbolResponse {
+        request_id: id,
+        symbols,
+    }))
 }
 
 pub(crate) fn parse_hover_response_impl(
     pending_requests: &mut HashMap<i64, String>,
     response: &Value,
 ) -> Result<Option<HoverResponse>> {
-    if let Some(id) = response.get("id").and_then(|v| v.as_i64()) {
-        if let Some(method) = pending_requests.remove(&id) {
-            if method == "textDocument/hover" {
-                // Check if this is an error response
-                if let Some(error) = response.get("error") {
-                    log::warn!("LSP error for textDocument/hover: {:?}", error);
-                    return Ok(Some(HoverResponse {
-                        request_id: id,
-                        hover_info: None,
-                    }));
-                }
+    let id = match response.get("id").and_then(|v| v.as_i64()) {
+        Some(id) => id,
+        None => return Ok(None),
+    };
 
-                if let Some(result) = response.get("result") {
-                    if result.is_null() {
-                        return Ok(Some(HoverResponse {
-                            request_id: id,
-                            hover_info: None,
-                        }));
-                    }
-
-                    // Parse hover response
-                    if let Ok(hover) = lsp_types::Hover::deserialize(result) {
-                        // Extract text content from hover
-                        let hover_text = match &hover.contents {
-                            lsp_types::HoverContents::Scalar(marked_string) => {
-                                extract_text_from_marked_string(marked_string)
-                            }
-                            lsp_types::HoverContents::Array(marked_strings) => marked_strings
-                                .iter()
-                                .map(extract_text_from_marked_string)
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                            lsp_types::HoverContents::Markup(markup) => {
-                                extract_text_from_markup(markup)
-                            }
-                        };
-
-                        return Ok(Some(HoverResponse {
-                            request_id: id,
-                            hover_info: if hover_text.is_empty() {
-                                None
-                            } else {
-                                Some(hover_text)
-                            },
-                        }));
-                    } else {
-                        log::warn!("Failed to parse hover response: {:?}", result);
-                        return Ok(Some(HoverResponse {
-                            request_id: id,
-                            hover_info: None,
-                        }));
-                    }
-                }
-            }
+    match pending_requests.get(&id) {
+        Some(method) if method == "textDocument/hover" => {
+            pending_requests.remove(&id);
         }
+        _ => return Ok(None),
     }
-    Ok(None)
+
+    if let Some(error) = response.get("error") {
+        log::warn!("LSP error for textDocument/hover: {:?}", error);
+        return Ok(Some(HoverResponse {
+            request_id: id,
+            hover_info: None,
+        }));
+    }
+
+    let result = match response.get("result") {
+        Some(r) if !r.is_null() => r,
+        _ => {
+            return Ok(Some(HoverResponse {
+                request_id: id,
+                hover_info: None,
+            }))
+        }
+    };
+
+    // Hover deserialization failures are soft errors (return None, not Err)
+    let hover = match lsp_types::Hover::deserialize(result) {
+        Ok(h) => h,
+        Err(_) => {
+            log::warn!("Failed to parse hover response: {:?}", result);
+            return Ok(Some(HoverResponse {
+                request_id: id,
+                hover_info: None,
+            }));
+        }
+    };
+
+    let hover_text = match &hover.contents {
+        lsp_types::HoverContents::Scalar(marked_string) => {
+            extract_text_from_marked_string(marked_string)
+        }
+        lsp_types::HoverContents::Array(marked_strings) => marked_strings
+            .iter()
+            .map(extract_text_from_marked_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        lsp_types::HoverContents::Markup(markup) => extract_text_from_markup(markup),
+    };
+
+    Ok(Some(HoverResponse {
+        request_id: id,
+        hover_info: if hover_text.is_empty() {
+            None
+        } else {
+            Some(hover_text)
+        },
+    }))
 }
 
 // Helper to extract text from MarkedString

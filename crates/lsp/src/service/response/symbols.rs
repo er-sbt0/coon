@@ -12,22 +12,9 @@ pub(super) async fn handle_document_symbols_response(
     state: &mut LspWorkerState,
     response_tx: &mpsc::Sender<LspResponse>,
 ) {
-    if let Some(error) = message.get("error") {
-        let error_msg = error
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("Unknown LSP error");
-        log::error!(
-            "LSP Error Response for document symbols request {}: {}",
-            request_id,
-            error_msg
-        );
-        let _ = response_tx
-            .send(LspResponse::Error {
-                request_id,
-                error: error_msg.to_string(),
-            })
-            .await;
+    if super::check_and_send_lsp_error(&message, &request_id, "document symbols", response_tx)
+        .await
+    {
         return;
     }
 
@@ -104,22 +91,9 @@ pub(super) async fn handle_workspace_symbols_response(
     state: &mut LspWorkerState,
     response_tx: &mpsc::Sender<LspResponse>,
 ) {
-    if let Some(error) = message.get("error") {
-        let error_msg = error
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("Unknown LSP error");
-        log::error!(
-            "LSP Error Response for workspace symbols request {}: {}",
-            request_id,
-            error_msg
-        );
-        let _ = response_tx
-            .send(LspResponse::Error {
-                request_id,
-                error: error_msg.to_string(),
-            })
-            .await;
+    if super::check_and_send_lsp_error(&message, &request_id, "workspace symbols", response_tx)
+        .await
+    {
         return;
     }
 
