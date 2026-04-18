@@ -7,6 +7,7 @@ use model::{lsp_status::LspUiMessage, CallGraph, SymbolId};
 const DEFAULT_VIEWPORT_SIZE: (f32, f32) = (100.0, 100.0);
 
 use crate::search_bar::SearchBarState;
+use crate::status_message::StatusMessage;
 
 mod events;
 mod lsp;
@@ -27,7 +28,7 @@ pub struct App {
     // UI chrome
     pub should_quit: bool,
     pub show_help: bool,
-    pub status_message: String,
+    pub status_message: StatusMessage,
     pub last_viewport_size: (f32, f32),
 
     // Search
@@ -46,7 +47,7 @@ impl App {
             selected_function: None,
             should_quit: false,
             show_help: false,
-            status_message: "Ready".to_string(),
+            status_message: StatusMessage::Ready,
             last_viewport_size: DEFAULT_VIEWPORT_SIZE,
             search_bar_state: SearchBarState::new(),
             show_search_bar: false,
@@ -97,7 +98,7 @@ impl App {
 
     pub fn select_function(&mut self, id: SymbolId) {
         self.selected_function = Some(id);
-        self.status_message = "Function selected".to_string();
+        self.status_message = StatusMessage::FunctionSelected;
     }
 
     pub fn quit(&mut self) {
@@ -171,6 +172,7 @@ impl App {
 mod tests {
     use super::*;
     use crate::actions::Action;
+    use crate::status_message::StatusMessage;
     use model::{FunctionNode, Location};
 
     fn create_test_app() -> App {
@@ -252,7 +254,7 @@ mod tests {
 
         app.select_function(func_id.clone());
         assert_eq!(app.selected_function, Some(func_id));
-        assert_eq!(app.status_message, "Function selected");
+        assert_eq!(app.status_message, StatusMessage::FunctionSelected);
     }
 
     #[test]

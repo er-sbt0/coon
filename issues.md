@@ -128,12 +128,6 @@ update.rs logs `{:?}` of the entire `LspResponse` at `log::info!` for every resp
 
 ---
 
-### 17. Fallback file discovery includes non-C/C++ extensions
-
-In compile_commands.rs, the fallback walker scans for `.rs`, `.py`, `.js`, `.ts`, `.java`, `.go`, etc. — but this tool is specifically for C/C++ via clangd, which won't analyze those files. The extension list should be limited to C/C++ headers and sources.
-
----
-
 ### 18. `get_function_mut` can invalidate `name_index`
 
 graph.rs hands out `&mut FunctionNode`, but if the caller changes `node.name`, the `name_index` becomes stale. Either make the index lazy/rebuild-on-access or don't expose `&mut FunctionNode` and provide specific mutation methods instead.

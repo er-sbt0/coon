@@ -6,6 +6,8 @@ use tokio::sync::mpsc;
 use ::lsp::{LspRequest, LspResponse};
 use model::{lsp_status::LspLoadPhase, lsp_status::LspUiMessage, CallGraph, SymbolId};
 
+use crate::status_message::StatusMessage;
+
 /// Timeout duration for pending LSP requests before they are considered failed.
 const LSP_REQUEST_TIMEOUT_SECS: u64 = 30;
 
@@ -135,7 +137,7 @@ impl LspBridge {
     /// Drain all available responses from the LSP response channel.
     ///
     /// Also checks for timed-out requests. Returns responses for the caller to dispatch.
-    pub fn drain_responses(&mut self) -> (Vec<LspResponse>, Vec<String>) {
+    pub fn drain_responses(&mut self) -> (Vec<LspResponse>, Vec<StatusMessage>) {
         // Check for timed-out requests first
         let status_messages = self.check_timed_out_requests();
 
@@ -153,7 +155,7 @@ impl LspBridge {
     }
 
     /// Check for timed-out requests and return status messages for each.
-    fn check_timed_out_requests(&mut self) -> Vec<String> {
+    fn check_timed_out_requests(&mut self) -> Vec<StatusMessage> {
         let timeout_duration = std::time::Duration::from_secs(LSP_REQUEST_TIMEOUT_SECS);
         let now = Instant::now();
         let mut messages = Vec::new();
@@ -173,7 +175,7 @@ impl LspBridge {
                     LoadingState::Failed("Request timed out".to_string()),
                 );
             }
-            messages.push("LSP request timed out".to_string());
+            messages.push(StatusMessage::LspRequestTimedOut);
         }
         messages
     }
@@ -185,7 +187,7 @@ impl LspBridge {
         &mut self,
         call_graph: &CallGraph,
         function_id: &SymbolId,
-    ) -> Option<String> {
+    ) -> Option<StatusMessage> {
         let (file_path, line, column, _name) = {
             if let Some(function) = call_graph.get_function(function_id) {
                 (
@@ -208,7 +210,7 @@ impl LspBridge {
                     function_id.clone(),
                     LoadingState::Failed("Invalid file path".to_string()),
                 );
-                return Some("Invalid file path".to_string());
+                return Some(StatusMessage::InvalidFilePath);
             }
         };
 
@@ -239,7 +241,7 @@ impl LspBridge {
                 function_id.clone(),
                 LoadingState::Failed("Failed to send request".to_string()),
             );
-            return Some("Failed to send LSP request".to_string());
+            return Some(StatusMessage::FailedToSendLspRequest);
         }
         None
     }
@@ -251,7 +253,7 @@ impl LspBridge {
         &mut self,
         call_graph: &CallGraph,
         function_id: &SymbolId,
-    ) -> Option<String> {
+    ) -> Option<StatusMessage> {
         let (file_path, line, column, name) = {
             if let Some(function) = call_graph.get_function(function_id) {
                 (
@@ -273,7 +275,7 @@ impl LspBridge {
         let document_uri = match lsp_types::Url::from_file_path(&file_path) {
             Ok(uri) => uri,
             Err(_) => {
-                return Some("Failed to create URI from file path".to_string());
+                return Some(StatusMessage::FailedToCreateUri);
             }
         };
 
@@ -300,13 +302,13 @@ impl LspBridge {
 
         if let Err(e) = request_tx.send(request) {
             log::error!("Failed to send LSP request: {}", e);
-            return Some("Failed to send request".to_string());
+            return Some(StatusMessage::FailedToSendRequest);
         }
-        Some(format!("Finding references for '{}'...", name))
+        Some(StatusMessage::FindingReferences { name })
     }
 
     /// Send a workspace symbols request. Returns an optional status message.
-    pub fn send_workspace_symbols(&mut self) -> Option<String> {
+    pub fn send_workspace_symbols(&mut self) -> Option<StatusMessage> {
         let request_tx = match self.request_tx.as_ref() {
             Some(tx) => tx.clone(),
             None => return None,
@@ -330,10 +332,10 @@ impl LspBridge {
         log::info!("TUI sending workspace symbols request: {}", request_id);
         if let Err(e) = request_tx.send(request) {
             log::error!("Failed to send LSP request: {}", e);
-            Some("Failed to send request".to_string())
+            Some(StatusMessage::FailedToSendRequest)
         } else {
             log::info!("Successfully sent workspace symbols request to channel");
-            Some("Refreshing workspace symbols...".to_string())
+            Some(StatusMessage::RefreshingWorkspaceSymbols)
         }
     }
 
@@ -345,7 +347,7 @@ impl LspBridge {
         symbol_id: &SymbolId,
         item: lsp_types::CallHierarchyItem,
         outgoing: bool,
-    ) -> Option<String> {
+    ) -> Option<StatusMessage> {
         let request_id = uuid::Uuid::new_v4().to_string();
 
         self.pending_requests.insert(
@@ -364,7 +366,7 @@ impl LspBridge {
                     symbol_id.clone(),
                     LoadingState::Failed("No LSP channel".to_string()),
                 );
-                return Some("No LSP channel available".to_string());
+                return Some(StatusMessage::NoLspChannel);
             }
         };
 
@@ -393,10 +395,9 @@ impl LspBridge {
             );
             None
         } else {
-            Some(format!(
-                "Loading {} calls...",
-                if outgoing { "outgoing" } else { "incoming" }
-            ))
+            Some(StatusMessage::LoadingCalls {
+                direction: if outgoing { "outgoing" } else { "incoming" }.to_string(),
+            })
         }
     }
 

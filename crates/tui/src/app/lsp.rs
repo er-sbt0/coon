@@ -1,5 +1,7 @@
 use model::SymbolId;
 
+use crate::status_message::StatusMessage;
+
 use super::lsp_bridge::LoadingState;
 use super::App;
 
@@ -63,13 +65,13 @@ impl App {
 
         match state {
             LoadingState::Loading => {
-                self.status_message = "Loading data for function...".to_string();
+                self.status_message = StatusMessage::LoadingFunctionData;
             }
             LoadingState::Loaded => {
-                self.status_message = String::new();
+                self.status_message = StatusMessage::Empty;
             }
             LoadingState::Failed(error) => {
-                self.status_message = format!("Error: {}", error);
+                self.status_message = StatusMessage::Error { error };
             }
             LoadingState::NotLoaded => {}
         }

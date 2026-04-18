@@ -2,6 +2,7 @@ use lsp::LspResponse;
 use model::SymbolId;
 
 use crate::graph_adapter::CallDirection;
+use crate::status_message::StatusMessage;
 
 use super::lsp_bridge::LoadingState;
 use super::App;
@@ -31,7 +32,7 @@ impl App {
                         // Update loading state to loaded
                         self.update_loading_state(&symbol_id, LoadingState::Loaded);
 
-                        self.status_message = "Outgoing calls loaded".to_string();
+                        self.status_message = StatusMessage::OutgoingCallsLoaded;
                     }
                 }
             }
@@ -55,13 +56,12 @@ impl App {
                             }
 
                             self.status_message = if locations.is_empty() {
-                                format!("No references found for '{}'", function.name)
+                                StatusMessage::NoReferencesFound { name: function.name.clone() }
                             } else {
-                                format!(
-                                    "Found {} reference(s) for '{}'",
-                                    locations.len(),
-                                    function.name
-                                )
+                                StatusMessage::ReferencesFound {
+                                    count: locations.len(),
+                                    name: Some(function.name.clone()),
+                                }
                             };
 
                             log::info!(
@@ -74,7 +74,7 @@ impl App {
                                 "Could not find function with symbol_id {:?} in call graph",
                                 symbol_id
                             );
-                            self.status_message = format!("Found {} reference(s)", locations.len());
+                            self.status_message = StatusMessage::ReferencesFound { count: locations.len(), name: None };
                         }
                     } else {
                         log::warn!("Pending request had no symbol_id");
@@ -88,7 +88,7 @@ impl App {
                 symbols: _,
             } => {
                 if let Some(_pending) = self.lsp.take_pending(&request_id) {
-                    self.status_message = "Document symbols loaded".to_string();
+                    self.status_message = StatusMessage::DocumentSymbolsLoaded;
                 }
             }
             LspResponse::WorkspaceSymbols {
@@ -96,7 +96,7 @@ impl App {
                 symbols,
             } => {
                 if let Some(_pending) = self.lsp.take_pending(&request_id) {
-                    self.status_message = format!("Loaded {} workspace symbols", symbols.len());
+                    self.status_message = StatusMessage::WorkspaceSymbolsLoaded { count: symbols.len() };
                     log::info!("Successfully loaded {} workspace symbols", symbols.len());
 
                     // Add the function symbols to the call graph
@@ -121,7 +121,7 @@ impl App {
                     );
 
                     self.status_message =
-                        format!("Loaded {} functions from workspace", function_count);
+                        StatusMessage::FunctionsLoadedFromWorkspace { count: function_count };
                 }
             }
             LspResponse::Error { request_id, error } => {
@@ -129,7 +129,7 @@ impl App {
                     if let Some(symbol_id) = pending.symbol_id {
                         self.update_loading_state(&symbol_id, LoadingState::Failed(error.clone()));
                     }
-                    self.status_message = format!("LSP error: {}", error);
+                    self.status_message = StatusMessage::LspError { error };
                 }
             }
             LspResponse::PreloadComplete {
@@ -137,15 +137,10 @@ impl App {
                 loaded_count,
                 failed_count,
             } => {
-                if failed_count > 0 {
-                    self.status_message = format!(
-                        "Preloaded {} documents ({} failed)",
-                        loaded_count, failed_count
-                    );
-                } else {
-                    self.status_message =
-                        format!("Preloaded {} documents successfully", loaded_count);
-                }
+                self.status_message = StatusMessage::PreloadComplete {
+                    loaded: loaded_count,
+                    failed: failed_count,
+                };
             }
             LspResponse::ReferencesWithSymbols {
                 request_id,
@@ -184,7 +179,7 @@ impl App {
                         // Update loading state to loaded
                         self.update_loading_state(&symbol_id, LoadingState::Loaded);
 
-                        self.status_message = "Incoming calls loaded".to_string();
+                        self.status_message = StatusMessage::IncomingCallsLoaded;
                     }
                 }
             }
@@ -216,7 +211,7 @@ impl App {
                         } else {
                             log::info!("No call hierarchy items found for symbol: {:?}", symbol_id);
                             self.update_loading_state(&symbol_id, LoadingState::Loaded);
-                            self.status_message = "Function has no callees".to_string();
+                            self.status_message = StatusMessage::FunctionHasNoCallees;
                         }
                     }
                 }

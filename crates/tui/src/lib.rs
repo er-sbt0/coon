@@ -6,10 +6,12 @@ pub mod graph_workspace;
 pub mod key_map;
 pub mod rendering;
 pub mod search_bar;
+pub mod status_message;
 pub mod tui;
 
 pub use actions::Action;
 pub use app::{App, LoadingState, PendingRequest};
+pub use status_message::StatusMessage;
 pub use graph_adapter::{CallDirection, CallGraphAdapter};
 pub use graph_view::{GraphView, GraphViewState};
 pub use graph_workspace::GraphWorkspace;

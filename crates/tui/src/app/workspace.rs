@@ -1,3 +1,5 @@
+use crate::status_message::StatusMessage;
+
 use super::App;
 
 impl App {
@@ -48,7 +50,7 @@ impl App {
 
             // Close search bar
             self.toggle_search_bar();
-            self.status_message = "Workspace created from search".to_string();
+            self.status_message = StatusMessage::WorkspaceCreatedFromSearch;
         }
     }
 }

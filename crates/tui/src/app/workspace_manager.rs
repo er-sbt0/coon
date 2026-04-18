@@ -1,6 +1,7 @@
 use model::SymbolId;
 
 use crate::graph_workspace::GraphWorkspace;
+use crate::status_message::StatusMessage;
 
 /// Manages the collection of graph workspaces (tabs).
 ///
@@ -32,35 +33,35 @@ impl WorkspaceManager {
     }
 
     /// Create a new workspace with the given name. Returns `(id, status_message)`.
-    pub fn create(&mut self, name: String) -> (usize, String) {
+    pub fn create(&mut self, name: String) -> (usize, StatusMessage) {
         let id = self.next_id;
         self.next_id += 1;
 
         let workspace = GraphWorkspace::new(id, name);
         self.workspaces.push(workspace);
         self.current_index = self.workspaces.len() - 1;
-        (id, format!("Created workspace #{}", id))
+        (id, StatusMessage::CreatedWorkspace { id })
     }
 
     /// Create a new workspace rooted at `symbol`. Returns `(id, status_message)`.
-    pub fn create_with_function(&mut self, name: String, symbol: SymbolId) -> (usize, String) {
+    pub fn create_with_function(&mut self, name: String, symbol: SymbolId) -> (usize, StatusMessage) {
         let id = self.next_id;
         self.next_id += 1;
 
         let workspace = GraphWorkspace::new_with_root(id, name, symbol);
         self.workspaces.push(workspace);
         self.current_index = self.workspaces.len() - 1;
-        (id, format!("Created workspace #{} with function", id))
+        (id, StatusMessage::CreatedWorkspaceWithFunction { id })
     }
 
     /// Close a workspace by index (cannot close the last one).
     /// Returns `Ok(status_message)` or `Err(status_message)`.
-    pub fn close(&mut self, index: usize) -> Result<String, String> {
+    pub fn close(&mut self, index: usize) -> Result<StatusMessage, StatusMessage> {
         if self.workspaces.len() <= 1 {
-            return Err("Cannot close the last workspace".to_string());
+            return Err(StatusMessage::CannotCloseLastWorkspace);
         }
         if index >= self.workspaces.len() {
-            return Err("Invalid workspace index".to_string());
+            return Err(StatusMessage::InvalidWorkspaceIndex);
         }
 
         self.workspaces.remove(index);
@@ -71,39 +72,39 @@ impl WorkspaceManager {
             self.current_index -= 1;
         }
 
-        Ok("Workspace closed".to_string())
+        Ok(StatusMessage::WorkspaceClosed)
     }
 
     /// Switch to a specific workspace. Returns an optional status message.
-    pub fn switch_to(&mut self, index: usize) -> Option<String> {
+    pub fn switch_to(&mut self, index: usize) -> Option<StatusMessage> {
         if index >= self.workspaces.len() {
             return None;
         }
         self.current_index = index;
         if let Some(workspace) = self.workspaces.get_mut(index) {
             workspace.touch();
-            Some(format!("Switched to workspace: {}", workspace.name))
+            Some(StatusMessage::SwitchedToWorkspace { name: workspace.name.clone() })
         } else {
             None
         }
     }
 
     /// Switch to the next workspace (wrapping). Returns a status message.
-    pub fn next_workspace(&mut self) -> Option<String> {
+    pub fn next_workspace(&mut self) -> Option<StatusMessage> {
         if self.workspaces.is_empty() {
             return None;
         }
         self.current_index = (self.current_index + 1) % self.workspaces.len();
         if let Some(workspace) = self.workspaces.get_mut(self.current_index) {
             workspace.touch();
-            Some(format!("Switched to workspace: {}", workspace.name))
+            Some(StatusMessage::SwitchedToWorkspace { name: workspace.name.clone() })
         } else {
             None
         }
     }
 
     /// Switch to the previous workspace (wrapping). Returns a status message.
-    pub fn previous(&mut self) -> Option<String> {
+    pub fn previous(&mut self) -> Option<StatusMessage> {
         if self.workspaces.is_empty() {
             return None;
         }
@@ -114,17 +115,17 @@ impl WorkspaceManager {
         }
         if let Some(workspace) = self.workspaces.get_mut(self.current_index) {
             workspace.touch();
-            Some(format!("Switched to workspace: {}", workspace.name))
+            Some(StatusMessage::SwitchedToWorkspace { name: workspace.name.clone() })
         } else {
             None
         }
     }
 
     /// Rename a workspace. Returns a status message.
-    pub fn rename(&mut self, index: usize, new_name: String) -> Option<String> {
+    pub fn rename(&mut self, index: usize, new_name: String) -> Option<StatusMessage> {
         if let Some(workspace) = self.workspaces.get_mut(index) {
             workspace.name = new_name.clone();
-            Some(format!("Renamed workspace to: {}", new_name))
+            Some(StatusMessage::SwitchedToWorkspace { name: new_name })
         } else {
             None
         }

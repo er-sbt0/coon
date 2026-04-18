@@ -3,6 +3,7 @@ use model::SymbolId;
 use crate::actions::Action;
 use crate::graph_adapter::CallDirection;
 use crate::graph_view::GraphViewState;
+use crate::status_message::StatusMessage;
 
 use super::App;
 
@@ -67,7 +68,7 @@ impl App {
         // Pan up in graph view
         if let Some(workspace) = self.get_current_workspace_mut() {
             workspace.graph_view_state.viewport.pan(0.0, -3.0);
-            self.status_message = "Panned up".to_string();
+            self.status_message = StatusMessage::PannedUp;
         }
     }
 
@@ -75,7 +76,7 @@ impl App {
         // Pan down in graph view
         if let Some(workspace) = self.get_current_workspace_mut() {
             workspace.graph_view_state.viewport.pan(0.0, 3.0);
-            self.status_message = "Panned down".to_string();
+            self.status_message = StatusMessage::PannedDown;
         }
     }
 
@@ -100,9 +101,9 @@ impl App {
                 .get_function(&selected)
                 .map(|f| f.name.as_str())
                 .unwrap_or("unknown");
-            self.status_message = format!("Expanded node: {}", name);
+            self.status_message = StatusMessage::ExpandedNode { name: name.to_string() };
         } else {
-            self.status_message = "No node selected to expand".to_string();
+            self.status_message = StatusMessage::NoNodeSelected;
         }
     }
 
@@ -114,7 +115,7 @@ impl App {
         if let Some(symbol_id) = symbol_id {
             self.request_references(&symbol_id);
         } else {
-            self.status_message = "No function selected for finding references".to_string();
+            self.status_message = StatusMessage::NoFunctionSelectedForReferences;
         }
     }
 
@@ -131,7 +132,7 @@ impl App {
             self.request_call_hierarchy(selected_id);
         }
 
-        self.status_message = "Refreshing project data from LSP server...".to_string();
+        self.status_message = StatusMessage::RefreshingProject;
     }
 
     fn handle_toggle_call_direction(&mut self) {
@@ -150,7 +151,9 @@ impl App {
                 CallDirection::Outgoing => "outgoing",
                 CallDirection::Incoming => "incoming",
             };
-            self.status_message = format!("Switched to {} calls view", direction_str);
+            self.status_message = StatusMessage::SwitchedCallDirection {
+                direction: direction_str.to_string(),
+            };
         }
     }
 
@@ -158,7 +161,7 @@ impl App {
         // Pan left in graph view
         if let Some(workspace) = self.get_current_workspace_mut() {
             workspace.graph_view_state.viewport.pan(-5.0, 0.0);
-            self.status_message = "Panned left".to_string();
+            self.status_message = StatusMessage::PannedLeft;
         }
     }
 
@@ -166,7 +169,7 @@ impl App {
         // Pan right in graph view
         if let Some(workspace) = self.get_current_workspace_mut() {
             workspace.graph_view_state.viewport.pan(5.0, 0.0);
-            self.status_message = "Panned right".to_string();
+            self.status_message = StatusMessage::PannedRight;
         }
     }
 
@@ -176,7 +179,7 @@ impl App {
         if let Some(workspace) = self.get_current_workspace_mut() {
             // Recenter the viewport on the root node
             workspace.graph_view_state.recenter_viewport(viewport_size);
-            self.status_message = "Reset view - centered on root".to_string();
+            self.status_message = StatusMessage::ResetView;
         }
     }
 
@@ -195,12 +198,20 @@ impl App {
                         .get_function(selected)
                         .map(|f| f.name.as_str())
                         .unwrap_or("unknown");
-                    self.status_message = format!("{}: {}", success_prefix, name);
+                    self.status_message = StatusMessage::Navigated {
+                        description: success_prefix.to_string(),
+                        name: Some(name.to_string()),
+                    };
                 } else {
-                    self.status_message = success_prefix.to_string();
+                    self.status_message = StatusMessage::Navigated {
+                        description: success_prefix.to_string(),
+                        name: None,
+                    };
                 }
             } else {
-                self.status_message = fail_msg.to_string();
+                self.status_message = StatusMessage::NavigationFailed {
+                    reason: fail_msg.to_string(),
+                };
             }
         }
     }
@@ -267,7 +278,7 @@ impl App {
         // Create new workspace with this function as root
         self.create_workspace_with_function(function_name, symbol_id.clone());
         self.selected_function = Some(symbol_id.clone());
-        self.status_message = "Graph workspace created".to_string();
+        self.status_message = StatusMessage::GraphWorkspaceCreated;
 
         log::info!("Graph workspace started with root: {:?}", symbol_id);
     }
