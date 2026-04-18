@@ -114,10 +114,10 @@ impl TuiApp {
                                         .update_results(&self.app.call_graph);
                                 }
                                 KeyCode::Left => {
-                                    self.app.search_bar_state.move_cursor_right();
+                                    self.app.search_bar_state.move_cursor_left();
                                 }
                                 KeyCode::Right => {
-                                    self.app.search_bar_state.move_cursor_left();
+                                    self.app.search_bar_state.move_cursor_right();
                                 }
                                 KeyCode::Home => {
                                     self.app.search_bar_state.move_cursor_start();
@@ -207,10 +207,10 @@ impl TuiApp {
                                 self.app.switch_workspace(8);
                                 None
                             }
-                            KeyCode::Up => Some(Action::MoveDown),
-                            KeyCode::Down => Some(Action::MoveUp),
-                            KeyCode::Right => Some(Action::MoveLeft),
-                            KeyCode::Left => Some(Action::MoveRight),
+                            KeyCode::Up => Some(Action::MoveUp),
+                            KeyCode::Down => Some(Action::MoveDown),
+                            KeyCode::Right => Some(Action::MoveRight),
+                            KeyCode::Left => Some(Action::MoveLeft),
                             KeyCode::Char('h') => Some(Action::NavigateParent),
                             KeyCode::Char('l') => Some(Action::NavigateChild),
                             KeyCode::Char('k') => Some(Action::NavigatePrevSibling),
