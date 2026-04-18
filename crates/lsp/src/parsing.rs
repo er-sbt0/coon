@@ -87,6 +87,34 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Newtype wrappers for custom deserialization
+// ---------------------------------------------------------------------------
+
+/// Handles both `DocumentSymbol[]` and legacy `SymbolInformation[]` response
+/// shapes so the generic [`parse_lsp_response`] can be used directly.
+struct RawDocumentSymbols(Vec<lsp::DocumentSymbol>);
+
+impl<'de> Deserialize<'de> for RawDocumentSymbols {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        if let Ok(doc_symbols) = Vec::<lsp::DocumentSymbol>::deserialize(&value) {
+            Ok(RawDocumentSymbols(doc_symbols))
+        } else if let Ok(symbol_infos) = Vec::<lsp::SymbolInformation>::deserialize(&value) {
+            Ok(RawDocumentSymbols(convert_symbol_info_to_document_symbols(
+                &symbol_infos,
+            )))
+        } else {
+            Err(serde::de::Error::custom(
+                "Failed to parse as either DocumentSymbol[] or SymbolInformation[]",
+            ))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Concrete response parsers
 // ---------------------------------------------------------------------------
 
@@ -145,115 +173,61 @@ pub(crate) fn parse_document_symbol_response_impl(
     pending_requests: &mut HashMap<i64, String>,
     response: &Value,
 ) -> Result<Option<DocumentSymbolResponse>> {
-    let id = match response.get("id").and_then(|v| v.as_i64()) {
-        Some(id) => id,
-        None => return Ok(None),
-    };
-
-    match pending_requests.get(&id) {
-        Some(method) if method == "textDocument/documentSymbol" => {
-            pending_requests.remove(&id);
-        }
-        _ => return Ok(None),
-    }
-
-    if let Some(error) = response.get("error") {
-        log::warn!("LSP error for textDocument/documentSymbol: {:?}", error);
-        return Ok(Some(DocumentSymbolResponse {
+    parse_lsp_response(
+        pending_requests,
+        response,
+        "textDocument/documentSymbol",
+        |id, RawDocumentSymbols(doc_symbols)| {
+            let symbols = doc_symbols
+                .into_iter()
+                .flat_map(|doc_symbol| convert_document_symbol_recursive(&doc_symbol, None))
+                .collect();
+            DocumentSymbolResponse {
+                request_id: id,
+                symbols,
+            }
+        },
+        |id| DocumentSymbolResponse {
             request_id: id,
             symbols: Vec::new(),
-        }));
-    }
-
-    let result = match response.get("result") {
-        Some(r) if !r.is_null() => r,
-        _ => {
-            return Ok(Some(DocumentSymbolResponse {
-                request_id: id,
-                symbols: Vec::new(),
-            }))
-        }
-    };
-
-    // DocumentSymbol can return either DocumentSymbol[] or SymbolInformation[]
-    let doc_symbols = parse_document_symbols_from_result(result)?;
-    let symbols = doc_symbols
-        .into_iter()
-        .flat_map(|doc_symbol| convert_document_symbol_recursive(&doc_symbol, None))
-        .collect();
-
-    Ok(Some(DocumentSymbolResponse {
-        request_id: id,
-        symbols,
-    }))
+        },
+    )
 }
 
 pub(crate) fn parse_hover_response_impl(
     pending_requests: &mut HashMap<i64, String>,
     response: &Value,
 ) -> Result<Option<HoverResponse>> {
-    let id = match response.get("id").and_then(|v| v.as_i64()) {
-        Some(id) => id,
-        None => return Ok(None),
-    };
-
-    match pending_requests.get(&id) {
-        Some(method) if method == "textDocument/hover" => {
-            pending_requests.remove(&id);
-        }
-        _ => return Ok(None),
-    }
-
-    if let Some(error) = response.get("error") {
-        log::warn!("LSP error for textDocument/hover: {:?}", error);
-        return Ok(Some(HoverResponse {
+    parse_lsp_response(
+        pending_requests,
+        response,
+        "textDocument/hover",
+        |id, hover: lsp_types::Hover| {
+            let hover_text = match &hover.contents {
+                lsp_types::HoverContents::Scalar(marked_string) => {
+                    extract_text_from_marked_string(marked_string)
+                }
+                lsp_types::HoverContents::Array(marked_strings) => marked_strings
+                    .iter()
+                    .map(extract_text_from_marked_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                lsp_types::HoverContents::Markup(markup) => extract_text_from_markup(markup),
+            };
+            HoverResponse {
+                request_id: id,
+                hover_info: if hover_text.is_empty() {
+                    None
+                } else {
+                    Some(hover_text)
+                },
+            }
+        },
+        |id| HoverResponse {
             request_id: id,
             hover_info: None,
-        }));
-    }
-
-    let result = match response.get("result") {
-        Some(r) if !r.is_null() => r,
-        _ => {
-            return Ok(Some(HoverResponse {
-                request_id: id,
-                hover_info: None,
-            }))
-        }
-    };
-
-    // Hover deserialization failures are soft errors (return None, not Err)
-    let hover = match lsp_types::Hover::deserialize(result) {
-        Ok(h) => h,
-        Err(_) => {
-            log::warn!("Failed to parse hover response: {:?}", result);
-            return Ok(Some(HoverResponse {
-                request_id: id,
-                hover_info: None,
-            }));
-        }
-    };
-
-    let hover_text = match &hover.contents {
-        lsp_types::HoverContents::Scalar(marked_string) => {
-            extract_text_from_marked_string(marked_string)
-        }
-        lsp_types::HoverContents::Array(marked_strings) => marked_strings
-            .iter()
-            .map(extract_text_from_marked_string)
-            .collect::<Vec<_>>()
-            .join("\n"),
-        lsp_types::HoverContents::Markup(markup) => extract_text_from_markup(markup),
-    };
-
-    Ok(Some(HoverResponse {
-        request_id: id,
-        hover_info: if hover_text.is_empty() {
-            None
-        } else {
-            Some(hover_text)
         },
-    }))
+    )
 }
 
 // Helper to extract text from MarkedString
