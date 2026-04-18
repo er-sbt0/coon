@@ -98,8 +98,16 @@ pub struct CallEdge {
     pub call_location: Location,
 }
 
+/// Serde-only intermediate for deserializing CallGraph (holds only persisted fields).
+#[derive(Deserialize)]
+struct CallGraphData {
+    nodes: HashMap<SymbolId, FunctionNode>,
+    edges: Vec<CallEdge>,
+}
+
 /// The main call graph structure
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(from = "CallGraphData")]
 pub struct CallGraph {
     pub nodes: HashMap<SymbolId, FunctionNode>,
     pub edges: Vec<CallEdge>,
@@ -109,6 +117,26 @@ pub struct CallGraph {
     callers_map: HashMap<SymbolId, Vec<SymbolId>>,
     #[serde(skip)]
     callees_map: HashMap<SymbolId, Vec<SymbolId>>,
+}
+
+impl<'de> serde::Deserialize<'de> for CallGraph {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        CallGraphData::deserialize(d).map(CallGraph::from)
+    }
+}
+
+impl From<CallGraphData> for CallGraph {
+    fn from(data: CallGraphData) -> Self {
+        let mut g = CallGraph {
+            nodes: data.nodes,
+            edges: data.edges,
+            edge_set: HashSet::new(),
+            callers_map: HashMap::new(),
+            callees_map: HashMap::new(),
+        };
+        g.rebuild_indexes();
+        g
+    }
 }
 
 impl CallGraph {
@@ -178,6 +206,30 @@ impl CallGraph {
             .map(|ids| ids.iter().filter_map(|id| self.nodes.get(id)).collect())
             .unwrap_or_default()
     }
+
+    fn rebuild_indexes(&mut self) {
+        self.edge_set.clear();
+        self.callers_map.clear();
+        self.callees_map.clear();
+        for edge in &self.edges {
+            let key = (
+                edge.caller.clone(),
+                edge.callee.clone(),
+                edge.call_location.file_path.clone(),
+                edge.call_location.line,
+                edge.call_location.column,
+            );
+            self.edge_set.insert(key);
+            self.callees_map
+                .entry(edge.caller.clone())
+                .or_default()
+                .push(edge.callee.clone());
+            self.callers_map
+                .entry(edge.callee.clone())
+                .or_default()
+                .push(edge.caller.clone());
+        }
+    }
 }
 
 impl Default for CallGraph {
@@ -232,6 +284,36 @@ mod tests {
         assert_eq!(function.get_referencing_function_names().len(), 1);
         assert_eq!(function.get_referencing_function_names()[0], "caller_func");
         assert_eq!(function.get_reference_locations().len(), 2);
+    }
+
+    #[test]
+    fn test_serde_round_trip_rebuilds_indexes() {
+        let mut graph = CallGraph::new();
+        let f1 = FunctionNode::new(
+            "a".to_string(),
+            "a".to_string(),
+            Location::new("x.rs".to_string(), 1, 0),
+        );
+        let f2 = FunctionNode::new(
+            "b".to_string(),
+            "b".to_string(),
+            Location::new("x.rs".to_string(), 5, 0),
+        );
+        let id1 = graph.add_function(f1);
+        let id2 = graph.add_function(f2);
+        let loc = Location::new("x.rs".to_string(), 2, 4);
+        graph.add_call(id1.clone(), id2.clone(), loc.clone());
+
+        let json = serde_json::to_string(&graph).unwrap();
+        let restored: CallGraph = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.get_callees(&id1).len(), 1);
+        assert_eq!(restored.get_callers(&id2).len(), 1);
+
+        // deduplication must still work after round-trip
+        let mut restored = restored;
+        restored.add_call(id1.clone(), id2.clone(), loc);
+        assert_eq!(restored.edges.len(), 1, "duplicate edge was not deduplicated");
     }
 
     #[test]

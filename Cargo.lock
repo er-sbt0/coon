@@ -703,6 +703,7 @@ dependencies = [
  "log",
  "lsp-types",
  "serde",
+ "serde_json",
  "uuid",
 ]
 
