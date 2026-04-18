@@ -117,6 +117,8 @@ pub struct CallGraph {
     callers_map: HashMap<SymbolId, Vec<SymbolId>>,
     #[serde(skip)]
     callees_map: HashMap<SymbolId, Vec<SymbolId>>,
+    #[serde(skip)]
+    name_index: HashMap<String, SymbolId>,
 }
 
 impl<'de> serde::Deserialize<'de> for CallGraph {
@@ -133,6 +135,7 @@ impl From<CallGraphData> for CallGraph {
             edge_set: HashSet::new(),
             callers_map: HashMap::new(),
             callees_map: HashMap::new(),
+            name_index: HashMap::new(),
         };
         g.rebuild_indexes();
         g
@@ -147,12 +150,18 @@ impl CallGraph {
             edge_set: HashSet::new(),
             callers_map: HashMap::new(),
             callees_map: HashMap::new(),
+            name_index: HashMap::new(),
         }
     }
 
     pub fn add_function(&mut self, function: FunctionNode) -> SymbolId {
         let id = function.id.clone();
+        let name = function.name.clone();
+        let is_new = !self.nodes.contains_key(&id);
         self.nodes.entry(id.clone()).or_insert(function);
+        if is_new {
+            self.name_index.entry(name).or_insert(id.clone());
+        }
         id
     }
 
@@ -206,7 +215,7 @@ impl CallGraph {
     }
 
     pub fn find_function_by_name(&self, name: &str) -> Option<&FunctionNode> {
-        self.nodes.values().find(|f| f.name == name)
+        self.name_index.get(name).and_then(|id| self.nodes.get(id))
     }
 
     pub fn get_callers(&self, callee_id: &SymbolId) -> Vec<&FunctionNode> {
@@ -227,6 +236,10 @@ impl CallGraph {
         self.edge_set.clear();
         self.callers_map.clear();
         self.callees_map.clear();
+        self.name_index.clear();
+        for (id, node) in &self.nodes {
+            self.name_index.entry(node.name.clone()).or_insert_with(|| id.clone());
+        }
         for edge in &self.edges {
             let key = (
                 edge.caller.clone(),
