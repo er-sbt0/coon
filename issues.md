@@ -13,8 +13,6 @@ Binary fails on any machine except the original developer's. Absolute `/home/era
 **4. Unbounded channels — no backpressure** — runner.rs, loader.rs
 All MPSC channels are unbounded. Large workspace symbol results can grow memory without limit → OOM.
 
----
-
 ### High — Correctness or scalability problems
 
 **7. Random UUID `SymbolId` — no deduplication** — symbols.rs

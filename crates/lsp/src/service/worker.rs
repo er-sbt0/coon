@@ -115,4 +115,9 @@ pub(super) async fn run_loop(
             }
         }
     }
+
+    // Gracefully shut down the LSP server (sends shutdown + exit, kills process)
+    if let Err(e) = state.client.shutdown().await {
+        log::error!("Error during LSP client shutdown: {}", e);
+    }
 }

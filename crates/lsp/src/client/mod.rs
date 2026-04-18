@@ -10,11 +10,10 @@ mod parsing_impl;
 mod requests;
 
 pub struct LspClient {
-    #[allow(dead_code)] // held for process lifetime
-    process: Child,
+    process: Option<Child>,
     writer: ChildStdin,
-    #[allow(dead_code)] // held for task lifetime
-    reader_handle: tokio::task::JoinHandle<()>,
+    reader_handle: Option<tokio::task::JoinHandle<()>>,
+    stderr_handle: Option<tokio::task::JoinHandle<()>>,
     next_id: i64,
     pub(crate) pending_requests: HashMap<i64, String>,
 }
@@ -63,7 +62,7 @@ impl LspClient {
         let stdout = process.stdout.take().unwrap();
         let stderr = process.stderr.take().unwrap();
 
-        tokio::spawn(async move {
+        let stderr_handle = tokio::spawn(async move {
             let mut stderr_reader = BufReader::new(stderr);
             let mut line = String::new();
             loop {
@@ -114,9 +113,10 @@ impl LspClient {
         });
 
         Ok(Self {
-            process,
+            process: Some(process),
             writer,
-            reader_handle,
+            reader_handle: Some(reader_handle),
+            stderr_handle: Some(stderr_handle),
             next_id: 0,
             pending_requests: HashMap::new(),
         })
@@ -160,5 +160,74 @@ impl LspClient {
         self.writer.flush().await?;
 
         Ok(())
+    }
+
+    /// Gracefully shut down the LSP server by sending `shutdown` then `exit`,
+    /// then kill the child process and abort background tasks.
+    pub async fn shutdown(&mut self) -> Result<()> {
+        // 1. Send the LSP "shutdown" request
+        if let Err(e) = self.send_request("shutdown", serde_json::json!(null)).await {
+            log::warn!("Failed to send LSP shutdown request: {}", e);
+        }
+
+        // Give clangd a moment to process the shutdown request
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // 2. Send the LSP "exit" notification
+        if let Err(e) = self.send_notification("exit", serde_json::json!(null)).await {
+            log::warn!("Failed to send LSP exit notification: {}", e);
+        }
+
+        // 3. Wait briefly for the process to exit on its own
+        if let Some(ref mut child) = self.process {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                child.wait(),
+            )
+            .await
+            {
+                Ok(Ok(status)) => {
+                    log::info!("clangd exited with status: {}", status);
+                }
+                Ok(Err(e)) => {
+                    log::warn!("Error waiting for clangd to exit: {}", e);
+                }
+                Err(_) => {
+                    // Timed out — force kill
+                    log::warn!("clangd did not exit in time, killing");
+                    if let Err(e) = child.kill().await {
+                        log::error!("Failed to kill clangd: {}", e);
+                    }
+                }
+            }
+        }
+        self.process = None;
+
+        // 4. Abort background reader tasks
+        if let Some(handle) = self.reader_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.stderr_handle.take() {
+            handle.abort();
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for LspClient {
+    fn drop(&mut self) {
+        // Safety net: if shutdown() was not called, forcibly clean up.
+        if let Some(mut child) = self.process.take() {
+            // We can't do async in Drop, so use start_kill (non-blocking).
+            let _ = child.start_kill();
+            log::warn!("LspClient dropped without shutdown — killed clangd");
+        }
+        if let Some(handle) = self.reader_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.stderr_handle.take() {
+            handle.abort();
+        }
     }
 }
