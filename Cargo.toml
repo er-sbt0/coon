@@ -1,7 +1,9 @@
 [workspace]
+resolver = "2"
 members = [
+    "coon",
     "core_data",
-    "lsp_integration", 
+    "lsp_integration",
     "logic",
     "tui_ui"
 ]
@@ -14,25 +16,3 @@ anyhow = "1.0"
 log = "0.4"
 fern = "0.6"
 chrono = { version = "0.4", features = ["serde"] }
-
-[package]
-name = "coon"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-core_data = { path = "core_data" }
-logic = { path = "logic" }
-lsp_integration = { path = "lsp_integration" }
-tui_ui = { path = "tui_ui"}
-tokio = { version = "1.0", features = ["full"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-anyhow = "1.0"
-log = "0.4"
-fern = "0.6"
-chrono = { version = "0.4", features = ["serde"] }
-lsp-types = "0.95"
-crossterm = "0.28"
-ratatui = "0.29"
-uuid = "1.0"
