@@ -5,7 +5,21 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
+use std::sync::Once;
 use tokio::sync::mpsc;
+
+static PANIC_HOOK: Once = Once::new();
+
+fn install_panic_hook() {
+    PANIC_HOOK.call_once(|| {
+        let original = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+            original(info);
+        }));
+    });
+}
 
 /// Interval in milliseconds for polling terminal events between UI redraws.
 const EVENT_POLL_INTERVAL_MS: u64 = 100;
@@ -25,7 +39,7 @@ pub struct TuiApp {
 
 impl TuiApp {
     pub fn new(call_graph: CallGraph) -> Result<Self, Box<dyn std::error::Error>> {
-        // Setup terminal
+        install_panic_hook();
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -45,7 +59,7 @@ impl TuiApp {
             mpsc::UnboundedSender<LspRequest>,
         )>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Setup terminal (same as new)
+        install_panic_hook();
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -97,15 +111,18 @@ impl TuiApp {
             }
         }
 
-        // Restore terminal
-        disable_raw_mode()?;
-        execute!(
+        Ok(())
+    }
+}
+
+impl Drop for TuiApp {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(
             self.terminal.backend_mut(),
             LeaveAlternateScreen,
             DisableMouseCapture
-        )?;
-        self.terminal.show_cursor()?;
-
-        Ok(())
+        );
+        let _ = self.terminal.show_cursor();
     }
 }
