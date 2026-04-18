@@ -700,8 +700,6 @@ dependencies = [
 name = "model"
 version = "0.1.0"
 dependencies = [
- "chrono",
- "fern",
  "log",
  "lsp-types",
  "serde",
