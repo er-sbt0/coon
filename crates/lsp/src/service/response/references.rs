@@ -30,13 +30,13 @@ pub(super) async fn handle_references_response(
     }
 
     let locations = parse_references_response_content(&message);
-    log::info!(
+    log::debug!(
         "LSP References Response: found {} references for request {}",
         locations.len(),
         request_id
     );
     for (i, loc) in locations.iter().enumerate() {
-        log::info!(
+        log::trace!(
             "  Reference {}: {}:{}:{}",
             i,
             loc.file_path,
@@ -81,14 +81,14 @@ pub(super) async fn handle_references_with_symbols_response(
         parse_enhanced_references_response(&message, &request_id, state, response_tx).await;
 
     if !enhanced_references.is_empty() {
-        log::info!(
+        log::debug!(
             "LSP Enhanced References Response: found {} references for request {}",
             enhanced_references.len(),
             request_id
         );
         for (i, ref_info) in enhanced_references.iter().enumerate() {
             if let Some(symbol) = &ref_info.referencing_symbol {
-                log::info!(
+                log::trace!(
                     "  Enhanced Reference {}: {}:{}:{} (from {}::{})",
                     i,
                     ref_info.location.file_path,
@@ -98,7 +98,7 @@ pub(super) async fn handle_references_with_symbols_response(
                     symbol.name
                 );
             } else {
-                log::info!(
+                log::trace!(
                     "  Enhanced Reference {}: {}:{}:{} (no symbol info)",
                     i,
                     ref_info.location.file_path,
@@ -216,7 +216,7 @@ async fn handle_hover_for_enhanced_references(
                             });
                         }
 
-                        log::info!(
+                        log::debug!(
                             "Completed enhanced references for {}: {} references with symbol info",
                             service_request_id,
                             enhanced_refs.len()
@@ -320,7 +320,7 @@ pub(super) async fn handle_document_symbols_for_enhanced_references(
         if let Err(e) = response_tx.send(response).await {
             log::error!("Failed to send enhanced references response: {:?}", e);
         } else {
-            log::info!(
+            log::debug!(
                 "Sent enhanced references response for request {}",
                 base_request_id
             );
@@ -393,7 +393,7 @@ async fn parse_enhanced_references_response(
     let locations = parse_references_response_content(message);
     let _lsp_request_id = message.get("id").and_then(|i| i.as_i64());
 
-    log::info!(
+    log::debug!(
         "Enhancing {} reference locations with symbol information using hover requests",
         locations.len()
     );
@@ -423,7 +423,7 @@ async fn parse_enhanced_references_response(
         files_to_analyze.insert(location.file_path.clone());
     }
 
-    log::info!(
+    log::debug!(
         "Need to analyze {} unique files for symbol information",
         files_to_analyze.len()
     );

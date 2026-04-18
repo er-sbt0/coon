@@ -192,7 +192,7 @@ pub async fn lsp_loader_task(
             tokio::select! {
                 tui_request = tui_request_rx.recv() => {
                     if let Some(request) = tui_request {
-                        log::info!("Forwarding TUI request to LSP service: {:?}", request);
+                        log::debug!("Forwarding TUI request to LSP service: {:?}", request);
                         match request {
                             LspRequest::GetCallHierarchy { request_id, document_uri, position } => {
                                 if let Err(e) = lsp_service.request_call_hierarchy(request_id.clone(), document_uri, position).await {
@@ -253,7 +253,7 @@ pub async fn lsp_loader_task(
                             }
                         }
                     } else {
-                        log::info!("TUI request channel closed, stopping forwarder");
+                        log::debug!("TUI request channel closed, stopping forwarder");
                         break;
                     }
                 }
@@ -261,7 +261,7 @@ pub async fn lsp_loader_task(
                 _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)) => {
                     let mut response_count = 0;
                     while let Some(response) = lsp_service.try_recv_response() {
-                        log::info!("Forwarding LSP response to TUI: {:?}", response);
+                        log::trace!("Forwarding LSP response to TUI: {:?}", response);
                         if let Err(e) = tui_response_tx.send(response) {
                             log::error!("Failed to forward LSP response to TUI: {}", e);
                             break;
@@ -269,12 +269,12 @@ pub async fn lsp_loader_task(
                         response_count += 1;
                     }
                     if response_count > 0 {
-                        log::info!("Forwarded {} LSP responses to TUI", response_count);
+                        log::debug!("Forwarded {} LSP responses to TUI", response_count);
                     }
                 }
             }
         }
-        log::info!("LSP-TUI forwarder task ended");
+        log::debug!("LSP-TUI forwarder task ended");
     });
 
     Ok(())
