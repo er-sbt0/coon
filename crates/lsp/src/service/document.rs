@@ -58,8 +58,6 @@ pub(super) async fn ensure_document_opened(
         state.opened_documents.len()
     );
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
     Ok(())
 }
 
