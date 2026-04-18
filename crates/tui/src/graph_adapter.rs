@@ -50,11 +50,11 @@ impl CallGraphAdapter {
         })?;
 
         // Create tree structure with SymbolId as data
-        let mut tree = Tree::new(root.clone());
+        let mut tree = Tree::new(*root);
 
         // Add root to mappings (note: only first occurrence is in symbol_to_node map)
-        self.symbol_to_node.insert(root.clone(), 0);
-        self.node_to_symbol.insert(0, root.clone());
+        self.symbol_to_node.insert(*root, 0);
+        self.node_to_symbol.insert(0, *root);
 
         // Build tree using BFS with parent pointers for cycle detection.
         // Instead of cloning a HashSet per queued node (O(B^D) allocations),
@@ -67,7 +67,7 @@ impl CallGraphAdapter {
         let mut parent_map: HashMap<usize, usize> = HashMap::new();
 
         // Queue contains: (symbol_id, tree_node_idx, depth)
-        queue.push_back((root.clone(), 0, 0));
+        queue.push_back((*root, 0, 0));
 
         while let Some((symbol, parent_idx, depth)) = queue.pop_front() {
             // Check depth limit
@@ -87,21 +87,21 @@ impl CallGraphAdapter {
                 }
 
                 // Add child to tree
-                let child_idx = tree.add_child(parent_idx, child_func.id.clone())?;
+                let child_idx = tree.add_child(parent_idx, child_func.id)?;
 
                 // Update node_to_symbol mapping (all nodes)
-                self.node_to_symbol.insert(child_idx, child_func.id.clone());
+                self.node_to_symbol.insert(child_idx, child_func.id);
 
                 // Only update symbol_to_node for first occurrence (for backward compatibility)
                 self.symbol_to_node
-                    .entry(child_func.id.clone())
+                    .entry(child_func.id)
                     .or_insert(child_idx);
 
                 // Record parent pointer for cycle detection
                 parent_map.insert(child_idx, parent_idx);
 
                 // Enqueue child
-                queue.push_back((child_func.id.clone(), child_idx, depth + 1));
+                queue.push_back((child_func.id, child_idx, depth + 1));
             }
         }
 
@@ -181,28 +181,28 @@ mod tests {
             "main".to_string(),
             Location::new("test.c".to_string(), 1, 0),
         );
-        let main_id = main_func.id.clone();
+        let main_id = main_func.id;
 
         let foo_func = FunctionNode::new(
             "foo".to_string(),
             "foo".to_string(),
             Location::new("test.c".to_string(), 5, 0),
         );
-        let foo_id = foo_func.id.clone();
+        let foo_id = foo_func.id;
 
         let bar_func = FunctionNode::new(
             "bar".to_string(),
             "bar".to_string(),
             Location::new("test.c".to_string(), 10, 0),
         );
-        let bar_id = bar_func.id.clone();
+        let bar_id = bar_func.id;
 
         let baz_func = FunctionNode::new(
             "baz".to_string(),
             "baz".to_string(),
             Location::new("test.c".to_string(), 15, 0),
         );
-        let baz_id = baz_func.id.clone();
+        let baz_id = baz_func.id;
 
         graph.add_function(main_func);
         graph.add_function(foo_func);
@@ -210,21 +210,9 @@ mod tests {
         graph.add_function(baz_func);
 
         // Add edges
-        graph.add_call(
-            main_id.clone(),
-            foo_id.clone(),
-            Location::new("test.c".to_string(), 2, 0),
-        );
-        graph.add_call(
-            main_id.clone(),
-            baz_id.clone(),
-            Location::new("test.c".to_string(), 3, 0),
-        );
-        graph.add_call(
-            foo_id.clone(),
-            bar_id.clone(),
-            Location::new("test.c".to_string(), 6, 0),
-        );
+        graph.add_call(main_id, foo_id, Location::new("test.c".to_string(), 2, 0));
+        graph.add_call(main_id, baz_id, Location::new("test.c".to_string(), 3, 0));
+        graph.add_call(foo_id, bar_id, Location::new("test.c".to_string(), 6, 0));
 
         graph
     }
@@ -235,12 +223,7 @@ mod tests {
         let mut adapter = CallGraphAdapter::new();
 
         // Get main function
-        let main_id = graph
-            .functions()
-            .find(|f| f.name == "main")
-            .unwrap()
-            .id
-            .clone();
+        let main_id = graph.functions().find(|f| f.name == "main").unwrap().id;
 
         let tree = adapter
             .build_tree(&graph, &main_id, CallDirection::Outgoing, None)
@@ -260,12 +243,7 @@ mod tests {
         let graph = create_test_graph();
         let mut adapter = CallGraphAdapter::new();
 
-        let main_id = graph
-            .functions()
-            .find(|f| f.name == "main")
-            .unwrap()
-            .id
-            .clone();
+        let main_id = graph.functions().find(|f| f.name == "main").unwrap().id;
 
         let tree = adapter
             .build_tree(&graph, &main_id, CallDirection::Outgoing, Some(1))
@@ -285,28 +263,20 @@ mod tests {
             "a".to_string(),
             Location::new("test.c".to_string(), 1, 0),
         );
-        let a_id = a_func.id.clone();
+        let a_id = a_func.id;
 
         let b_func = FunctionNode::new(
             "b".to_string(),
             "b".to_string(),
             Location::new("test.c".to_string(), 5, 0),
         );
-        let b_id = b_func.id.clone();
+        let b_id = b_func.id;
 
         graph.add_function(a_func);
         graph.add_function(b_func);
 
-        graph.add_call(
-            a_id.clone(),
-            b_id.clone(),
-            Location::new("test.c".to_string(), 2, 0),
-        );
-        graph.add_call(
-            b_id.clone(),
-            a_id.clone(),
-            Location::new("test.c".to_string(), 6, 0),
-        );
+        graph.add_call(a_id, b_id, Location::new("test.c".to_string(), 2, 0));
+        graph.add_call(b_id, a_id, Location::new("test.c".to_string(), 6, 0));
 
         let mut adapter = CallGraphAdapter::new();
         let tree = adapter

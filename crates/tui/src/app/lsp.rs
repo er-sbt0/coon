@@ -61,7 +61,7 @@ impl App {
 
     /// Update loading state for a symbol and corresponding UI elements
     pub(super) fn update_loading_state(&mut self, symbol_id: &SymbolId, state: LoadingState) {
-        self.lsp.set_loading_state(symbol_id.clone(), state.clone());
+        self.lsp.set_loading_state(*symbol_id, state.clone());
 
         match state {
             LoadingState::Loading => {

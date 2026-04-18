@@ -11,10 +11,10 @@ pub mod tui;
 
 pub use actions::Action;
 pub use app::{App, LoadingState, PendingRequest};
-pub use status_message::StatusMessage;
 pub use graph_adapter::{CallDirection, CallGraphAdapter};
 pub use graph_view::{GraphView, GraphViewState};
 pub use graph_workspace::GraphWorkspace;
 pub use rendering::ui;
 pub use search_bar::{SearchBar, SearchBarState};
+pub use status_message::StatusMessage;
 pub use tui::TuiApp;

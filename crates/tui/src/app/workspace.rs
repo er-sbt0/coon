@@ -42,7 +42,7 @@ impl App {
     /// Select from search bar and create workspace
     pub fn select_from_search(&mut self) {
         if let Some(result) = self.search_bar_state.get_selected() {
-            let symbol_id = result.symbol_id.clone();
+            let symbol_id = result.symbol_id;
             let name = result.name.clone();
 
             // Create new workspace with selected symbol

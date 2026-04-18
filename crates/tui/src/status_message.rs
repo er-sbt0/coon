@@ -23,33 +23,58 @@ pub enum StatusMessage {
     ResetView,
 
     // ── Graph node interaction ────────────────────────────────
-    ExpandedNode { name: String },
+    ExpandedNode {
+        name: String,
+    },
     NoNodeSelected,
 
     // ── Navigation ────────────────────────────────────────────
     /// Successfully navigated (e.g. "Navigated to parent: foo").
-    Navigated { description: String, name: Option<String> },
+    Navigated {
+        description: String,
+        name: Option<String>,
+    },
     /// Navigation failed (e.g. "No parent node (at root)").
-    NavigationFailed { reason: String },
+    NavigationFailed {
+        reason: String,
+    },
 
     // ── Call direction ────────────────────────────────────────
-    SwitchedCallDirection { direction: String },
+    SwitchedCallDirection {
+        direction: String,
+    },
     OutgoingCallsLoaded,
     IncomingCallsLoaded,
     FunctionHasNoCallees,
-    LoadingCalls { direction: String },
+    LoadingCalls {
+        direction: String,
+    },
 
     // ── References ────────────────────────────────────────────
     NoFunctionSelectedForReferences,
-    FindingReferences { name: String },
-    ReferencesFound { count: usize, name: Option<String> },
-    NoReferencesFound { name: String },
+    FindingReferences {
+        name: String,
+    },
+    ReferencesFound {
+        count: usize,
+        name: Option<String>,
+    },
+    NoReferencesFound {
+        name: String,
+    },
 
     // ── Symbols / loading ─────────────────────────────────────
     DocumentSymbolsLoaded,
-    WorkspaceSymbolsLoaded { count: usize },
-    FunctionsLoadedFromWorkspace { count: usize },
-    PreloadComplete { loaded: usize, failed: usize },
+    WorkspaceSymbolsLoaded {
+        count: usize,
+    },
+    FunctionsLoadedFromWorkspace {
+        count: usize,
+    },
+    PreloadComplete {
+        loaded: usize,
+        failed: usize,
+    },
 
     // ── LSP lifecycle ─────────────────────────────────────────
     LoadingFunctionData,
@@ -58,18 +83,28 @@ pub enum StatusMessage {
     LspRequestTimedOut,
 
     // ── Workspace management ──────────────────────────────────
-    CreatedWorkspace { id: usize },
-    CreatedWorkspaceWithFunction { id: usize },
+    CreatedWorkspace {
+        id: usize,
+    },
+    CreatedWorkspaceWithFunction {
+        id: usize,
+    },
     WorkspaceClosed,
     CannotCloseLastWorkspace,
     InvalidWorkspaceIndex,
-    SwitchedToWorkspace { name: String },
+    SwitchedToWorkspace {
+        name: String,
+    },
     WorkspaceCreatedFromSearch,
     GraphWorkspaceCreated,
 
     // ── Errors ────────────────────────────────────────────────
-    LspError { error: String },
-    Error { error: String },
+    LspError {
+        error: String,
+    },
+    Error {
+        error: String,
+    },
     InvalidFilePath,
     FailedToSendLspRequest,
     FailedToSendRequest,
@@ -99,10 +134,16 @@ impl fmt::Display for StatusMessage {
             Self::NoNodeSelected => write!(f, "No node selected to expand"),
 
             // Navigation
-            Self::Navigated { description, name: Some(name) } => {
+            Self::Navigated {
+                description,
+                name: Some(name),
+            } => {
                 write!(f, "{}: {}", description, name)
             }
-            Self::Navigated { description, name: None } => write!(f, "{}", description),
+            Self::Navigated {
+                description,
+                name: None,
+            } => write!(f, "{}", description),
             Self::NavigationFailed { reason } => write!(f, "{}", reason),
 
             // Call direction
@@ -119,7 +160,10 @@ impl fmt::Display for StatusMessage {
                 write!(f, "No function selected for finding references")
             }
             Self::FindingReferences { name } => write!(f, "Finding references for '{}'...", name),
-            Self::ReferencesFound { count, name: Some(name) } => {
+            Self::ReferencesFound {
+                count,
+                name: Some(name),
+            } => {
                 write!(f, "Found {} reference(s) for '{}'", count, name)
             }
             Self::ReferencesFound { count, name: None } => {
@@ -209,25 +253,37 @@ mod tests {
 
     #[test]
     fn display_preload_with_failures() {
-        let msg = StatusMessage::PreloadComplete { loaded: 10, failed: 2 };
+        let msg = StatusMessage::PreloadComplete {
+            loaded: 10,
+            failed: 2,
+        };
         assert_eq!(msg.to_string(), "Preloaded 10 documents (2 failed)");
     }
 
     #[test]
     fn display_preload_success() {
-        let msg = StatusMessage::PreloadComplete { loaded: 10, failed: 0 };
+        let msg = StatusMessage::PreloadComplete {
+            loaded: 10,
+            failed: 0,
+        };
         assert_eq!(msg.to_string(), "Preloaded 10 documents successfully");
     }
 
     #[test]
     fn display_references_found_with_name() {
-        let msg = StatusMessage::ReferencesFound { count: 5, name: Some("bar".into()) };
+        let msg = StatusMessage::ReferencesFound {
+            count: 5,
+            name: Some("bar".into()),
+        };
         assert_eq!(msg.to_string(), "Found 5 reference(s) for 'bar'");
     }
 
     #[test]
     fn display_references_found_no_name() {
-        let msg = StatusMessage::ReferencesFound { count: 3, name: None };
+        let msg = StatusMessage::ReferencesFound {
+            count: 3,
+            name: None,
+        };
         assert_eq!(msg.to_string(), "Found 3 reference(s)");
     }
 }

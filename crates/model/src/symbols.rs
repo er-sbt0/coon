@@ -4,7 +4,7 @@ use uuid::Uuid;
 pub use lsp_types::DiagnosticSeverity;
 
 /// Unique identifier for symbols in the call graph
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SymbolId(pub Uuid);
 
 impl SymbolId {

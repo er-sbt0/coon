@@ -29,16 +29,16 @@ impl<'a> GraphTraversal<'a> {
         let mut queue = VecDeque::new();
         let mut result = Vec::new();
 
-        queue.push_back(start_id.clone());
-        visited.insert(start_id.clone());
+        queue.push_back(*start_id);
+        visited.insert(*start_id);
 
         while let Some(current_id) = queue.pop_front() {
-            result.push(current_id.clone());
+            result.push(current_id);
 
             for neighbor_id in get_neighbors(&current_id) {
                 if !visited.contains(&neighbor_id) {
-                    visited.insert(neighbor_id.clone());
-                    queue.push_back(neighbor_id.clone());
+                    visited.insert(neighbor_id);
+                    queue.push_back(neighbor_id);
                 }
             }
         }
@@ -52,7 +52,7 @@ impl<'a> GraphTraversal<'a> {
             self.graph
                 .get_callees(id)
                 .iter()
-                .map(|callee| callee.id.clone())
+                .map(|callee| callee.id)
                 .collect()
         })
     }
@@ -63,7 +63,7 @@ impl<'a> GraphTraversal<'a> {
             self.graph
                 .get_callers(id)
                 .iter()
-                .map(|caller| caller.id.clone())
+                .map(|caller| caller.id)
                 .collect()
         })
     }
@@ -71,34 +71,34 @@ impl<'a> GraphTraversal<'a> {
     /// Find the shortest path between two functions
     pub fn find_path(&self, from: &SymbolId, to: &SymbolId) -> Option<Vec<SymbolId>> {
         if from == to {
-            return Some(vec![from.clone()]);
+            return Some(vec![*from]);
         }
 
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
         let mut parent = HashMap::new();
 
-        queue.push_back(from.clone());
-        visited.insert(from.clone());
+        queue.push_back(*from);
+        visited.insert(*from);
 
         while let Some(current_id) = queue.pop_front() {
             let callees = self.graph.get_callees(&current_id);
             for callee in callees {
                 if !visited.contains(&callee.id) {
-                    visited.insert(callee.id.clone());
-                    parent.insert(callee.id.clone(), current_id.clone());
-                    queue.push_back(callee.id.clone());
+                    visited.insert(callee.id);
+                    parent.insert(callee.id, current_id);
+                    queue.push_back(callee.id);
 
                     if &callee.id == to {
                         // Reconstruct path
                         let mut path = Vec::new();
-                        let mut current = to.clone();
+                        let mut current = *to;
 
                         while let Some(prev) = parent.get(&current) {
-                            path.push(current.clone());
-                            current = prev.clone();
+                            path.push(current);
+                            current = *prev;
                         }
-                        path.push(from.clone());
+                        path.push(*from);
                         path.reverse();
                         return Some(path);
                     }
@@ -116,12 +116,12 @@ impl<'a> GraphTraversal<'a> {
         target_depth: usize,
     ) -> Vec<SymbolId> {
         if target_depth == 0 {
-            return vec![start_id.clone()];
+            return vec![*start_id];
         }
 
-        let mut current_level = vec![start_id.clone()];
+        let mut current_level = vec![*start_id];
         let mut visited = HashSet::new();
-        visited.insert(start_id.clone());
+        visited.insert(*start_id);
 
         for _ in 0..target_depth {
             let mut next_level = Vec::new();
@@ -130,8 +130,8 @@ impl<'a> GraphTraversal<'a> {
                 let callees = self.graph.get_callees(&id);
                 for callee in callees {
                     if !visited.contains(&callee.id) {
-                        visited.insert(callee.id.clone());
-                        next_level.push(callee.id.clone());
+                        visited.insert(callee.id);
+                        next_level.push(callee.id);
                     }
                 }
             }
@@ -176,16 +176,8 @@ mod tests {
         let id_c = graph.add_function(func_c);
 
         // Create call relationships: A -> B -> C
-        graph.add_call(
-            id_a.clone(),
-            id_b.clone(),
-            Location::new("test.rs".to_string(), 2, 4),
-        );
-        graph.add_call(
-            id_b.clone(),
-            id_c.clone(),
-            Location::new("test.rs".to_string(), 6, 4),
-        );
+        graph.add_call(id_a, id_b, Location::new("test.rs".to_string(), 2, 4));
+        graph.add_call(id_b, id_c, Location::new("test.rs".to_string(), 6, 4));
 
         graph
     }

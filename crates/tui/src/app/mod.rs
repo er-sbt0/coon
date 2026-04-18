@@ -250,9 +250,9 @@ mod tests {
     #[test]
     fn test_function_selection() {
         let mut app = create_test_app();
-        let func_id = app.call_graph.function_ids().next().unwrap().clone();
+        let func_id = *app.call_graph.function_ids().next().unwrap();
 
-        app.select_function(func_id.clone());
+        app.select_function(func_id);
         assert_eq!(app.selected_function, Some(func_id));
         assert_eq!(app.status_message, StatusMessage::FunctionSelected);
     }
@@ -260,11 +260,11 @@ mod tests {
     #[test]
     fn test_graph_view_initialization() {
         let mut app = create_test_app();
-        let func_id = app.call_graph.function_ids().next().unwrap().clone();
+        let func_id = *app.call_graph.function_ids().next().unwrap();
 
-        app.start_call_graph_with_function(func_id.clone());
+        app.start_call_graph_with_function(func_id);
 
-        assert_eq!(app.selected_function, Some(func_id.clone()));
+        assert_eq!(app.selected_function, Some(func_id));
         // Should have created a new workspace
         assert_eq!(app.workspaces.workspaces.len(), 2);
         // New workspace should be current

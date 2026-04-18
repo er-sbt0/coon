@@ -22,7 +22,7 @@ impl App {
                         );
 
                         // Process outgoing calls and update the call graph
-                        self.update_function_outgoing_calls(symbol_id.clone(), calls);
+                        self.update_function_outgoing_calls(symbol_id, calls);
 
                         // Mark layout as dirty to force recomputation with new data
                         if let Some(workspace) = self.get_current_workspace_mut() {
@@ -56,7 +56,9 @@ impl App {
                             }
 
                             self.status_message = if locations.is_empty() {
-                                StatusMessage::NoReferencesFound { name: function.name.clone() }
+                                StatusMessage::NoReferencesFound {
+                                    name: function.name.clone(),
+                                }
                             } else {
                                 StatusMessage::ReferencesFound {
                                     count: locations.len(),
@@ -74,7 +76,10 @@ impl App {
                                 "Could not find function with symbol_id {:?} in call graph",
                                 symbol_id
                             );
-                            self.status_message = StatusMessage::ReferencesFound { count: locations.len(), name: None };
+                            self.status_message = StatusMessage::ReferencesFound {
+                                count: locations.len(),
+                                name: None,
+                            };
                         }
                     } else {
                         log::warn!("Pending request had no symbol_id");
@@ -96,7 +101,9 @@ impl App {
                 symbols,
             } => {
                 if let Some(_pending) = self.lsp.take_pending(&request_id) {
-                    self.status_message = StatusMessage::WorkspaceSymbolsLoaded { count: symbols.len() };
+                    self.status_message = StatusMessage::WorkspaceSymbolsLoaded {
+                        count: symbols.len(),
+                    };
                     log::info!("Successfully loaded {} workspace symbols", symbols.len());
 
                     // Add the function symbols to the call graph
@@ -120,8 +127,9 @@ impl App {
                         function_count
                     );
 
-                    self.status_message =
-                        StatusMessage::FunctionsLoadedFromWorkspace { count: function_count };
+                    self.status_message = StatusMessage::FunctionsLoadedFromWorkspace {
+                        count: function_count,
+                    };
                 }
             }
             LspResponse::Error { request_id, error } => {
@@ -169,7 +177,7 @@ impl App {
                         );
 
                         // Process incoming calls and update the call graph
-                        self.update_function_incoming_calls(symbol_id.clone(), calls);
+                        self.update_function_incoming_calls(symbol_id, calls);
 
                         // Mark layout as dirty to force recomputation with new data
                         if let Some(workspace) = self.get_current_workspace_mut() {
@@ -226,7 +234,7 @@ impl App {
     ) {
         for call in calls {
             self.process_call_entry(
-                symbol_id.clone(),
+                symbol_id,
                 call.to.name,
                 call.to.detail.as_deref(),
                 &call.to.uri,
@@ -244,7 +252,7 @@ impl App {
     ) {
         for call in calls {
             self.process_call_entry(
-                symbol_id.clone(),
+                symbol_id,
                 call.from.name,
                 call.from.detail.as_deref(),
                 &call.from.uri,
@@ -287,9 +295,9 @@ impl App {
                 from_range.start.character + 1,
             );
             let (caller, callee) = if is_outgoing {
-                (symbol_id.clone(), other_id.clone())
+                (symbol_id, other_id)
             } else {
-                (other_id.clone(), symbol_id.clone())
+                (other_id, symbol_id)
             };
             self.call_graph.add_call(caller, callee, call_location);
         }

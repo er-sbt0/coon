@@ -91,43 +91,43 @@ pub fn create_demo_call_graph() -> CallGraph {
     let cleanup_id = graph.add_function(cleanup_func);
 
     graph.add_call(
-        main_id.clone(),
-        init_id.clone(),
+        main_id,
+        init_id,
         Location::new("src/main.rs".to_string(), 5, 4),
     );
     graph.add_call(
-        main_id.clone(),
-        process_id.clone(),
+        main_id,
+        process_id,
         Location::new("src/main.rs".to_string(), 8, 4),
     );
     graph.add_call(
-        init_id.clone(),
-        helper_id.clone(),
+        init_id,
+        helper_id,
         Location::new("src/app.rs".to_string(), 20, 4),
     );
     graph.add_call(
-        process_id.clone(),
-        validate_id.clone(),
+        process_id,
+        validate_id,
         Location::new("src/data.rs".to_string(), 30, 12),
     );
     graph.add_call(
-        process_id.clone(),
-        error_id.clone(),
+        process_id,
+        error_id,
         Location::new("src/data.rs".to_string(), 32, 8),
     );
     graph.add_call(
-        process_id.clone(),
-        helper_id.clone(),
+        process_id,
+        helper_id,
         Location::new("src/data.rs".to_string(), 35, 8),
     );
     graph.add_call(
-        validate_id.clone(),
-        helper_id.clone(),
+        validate_id,
+        helper_id,
         Location::new("src/validation.rs".to_string(), 12, 16),
     );
     graph.add_call(
-        main_id.clone(),
-        cleanup_id.clone(),
+        main_id,
+        cleanup_id,
         Location::new("src/main.rs".to_string(), 15, 4),
     );
 

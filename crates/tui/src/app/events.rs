@@ -84,7 +84,7 @@ impl App {
         // Request call hierarchy for the selected node without changing the root
         let selected = self
             .get_current_workspace()
-            .and_then(|w| w.graph_view_state.selected_node.clone());
+            .and_then(|w| w.graph_view_state.selected_node);
 
         if let Some(selected) = selected {
             // Request call hierarchy for this node to load its data
@@ -101,16 +101,16 @@ impl App {
                 .get_function(&selected)
                 .map(|f| f.name.as_str())
                 .unwrap_or("unknown");
-            self.status_message = StatusMessage::ExpandedNode { name: name.to_string() };
+            self.status_message = StatusMessage::ExpandedNode {
+                name: name.to_string(),
+            };
         } else {
             self.status_message = StatusMessage::NoNodeSelected;
         }
     }
 
     fn handle_find_references(&mut self) {
-        let symbol_id = self
-            .get_current_workspace()
-            .and_then(|w| w.root_symbol.clone());
+        let symbol_id = self.get_current_workspace().and_then(|w| w.root_symbol);
 
         if let Some(symbol_id) = symbol_id {
             self.request_references(&symbol_id);
@@ -128,8 +128,8 @@ impl App {
         self.request_workspace_symbols();
 
         // If there's a selected function, refresh its call hierarchy
-        if let Some(selected_id) = &self.selected_function.clone() {
-            self.request_call_hierarchy(selected_id);
+        if let Some(selected_id) = self.selected_function {
+            self.request_call_hierarchy(&selected_id);
         }
 
         self.status_message = StatusMessage::RefreshingProject;
@@ -276,8 +276,8 @@ impl App {
             .unwrap_or_else(|| format!("Graph {}", self.workspaces.next_id));
 
         // Create new workspace with this function as root
-        self.create_workspace_with_function(function_name, symbol_id.clone());
-        self.selected_function = Some(symbol_id.clone());
+        self.create_workspace_with_function(function_name, symbol_id);
+        self.selected_function = Some(symbol_id);
         self.status_message = StatusMessage::GraphWorkspaceCreated;
 
         log::info!("Graph workspace started with root: {:?}", symbol_id);

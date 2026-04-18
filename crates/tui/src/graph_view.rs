@@ -48,7 +48,7 @@ impl GraphViewState {
     /// Set the root symbol
     pub fn set_root(&mut self, symbol: SymbolId) {
         if self.root_symbol.as_ref() != Some(&symbol) {
-            self.root_symbol = Some(symbol.clone());
+            self.root_symbol = Some(symbol);
             self.selected_node = Some(symbol);
             self.layout_dirty = true;
         }
@@ -154,7 +154,7 @@ impl GraphViewState {
                             if let Some(parent_symbol) =
                                 self.adapter.node_to_symbol.get(&parent_idx)
                             {
-                                self.selected_node = Some(parent_symbol.clone());
+                                self.selected_node = Some(*parent_symbol);
                                 return true;
                             }
                         }
@@ -179,7 +179,7 @@ impl GraphViewState {
                                 if let Some(child_symbol) =
                                     self.adapter.node_to_symbol.get(&middle_child_idx)
                                 {
-                                    self.selected_node = Some(child_symbol.clone());
+                                    self.selected_node = Some(*child_symbol);
                                     return true;
                                 }
                             }
@@ -222,7 +222,7 @@ impl GraphViewState {
                         let next_pos = (current_pos + 1) % siblings.len();
                         let next_idx = siblings[next_pos];
                         if let Some(next_symbol) = self.adapter.node_to_symbol.get(&next_idx) {
-                            self.selected_node = Some(next_symbol.clone());
+                            self.selected_node = Some(*next_symbol);
                             return true;
                         }
                     }
@@ -246,7 +246,7 @@ impl GraphViewState {
                         };
                         let prev_idx = siblings[prev_pos];
                         if let Some(prev_symbol) = self.adapter.node_to_symbol.get(&prev_idx) {
-                            self.selected_node = Some(prev_symbol.clone());
+                            self.selected_node = Some(*prev_symbol);
                             return true;
                         }
                     }

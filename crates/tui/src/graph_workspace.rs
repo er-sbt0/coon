@@ -35,7 +35,7 @@ impl GraphWorkspace {
 
     /// Set the root symbol for this workspace
     pub fn set_root(&mut self, symbol: SymbolId) {
-        self.root_symbol = Some(symbol.clone());
+        self.root_symbol = Some(symbol);
         self.graph_view_state.set_root(symbol);
         self.touch();
     }

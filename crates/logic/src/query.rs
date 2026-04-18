@@ -68,7 +68,7 @@ impl<'a> GraphQueryEngine<'a> {
         let total_affected = affected_functions.len();
 
         ImpactAnalysis {
-            target_function: function_id.clone(),
+            target_function: *function_id,
             directly_affected_count: directly_affected.len(),
             total_affected_count: total_affected,
             affected_functions,
@@ -91,7 +91,7 @@ impl<'a> GraphQueryEngine<'a> {
         let direct_dependencies = self.graph.get_callees(function_id);
 
         DependencyAnalysis {
-            source_function: function_id.clone(),
+            source_function: *function_id,
             direct_dependency_count: direct_dependencies.len(),
             total_dependency_count: dependencies.len(),
             dependencies,
@@ -118,15 +118,9 @@ impl<'a> GraphQueryEngine<'a> {
             highly_connected_functions: highly_connected.len(),
             entry_point_count: entry_points.len(),
             leaf_function_count: leaf_functions.len(),
-            error_functions: functions_with_errors
-                .into_iter()
-                .map(|f| f.id.clone())
-                .collect(),
-            warning_functions: functions_with_warnings
-                .into_iter()
-                .map(|f| f.id.clone())
-                .collect(),
-            complex_functions: highly_connected.into_iter().map(|f| f.id.clone()).collect(),
+            error_functions: functions_with_errors.into_iter().map(|f| f.id).collect(),
+            warning_functions: functions_with_warnings.into_iter().map(|f| f.id).collect(),
+            complex_functions: highly_connected.into_iter().map(|f| f.id).collect(),
         }
     }
 
@@ -278,18 +272,18 @@ mod tests {
 
         // Create call relationships
         graph.add_call(
-            id_main.clone(),
-            id_helper.clone(),
+            id_main,
+            id_helper,
             Location::new("main.rs".to_string(), 5, 4),
         );
         graph.add_call(
-            id_main.clone(),
-            id_error.clone(),
+            id_main,
+            id_error,
             Location::new("main.rs".to_string(), 6, 4),
         );
         graph.add_call(
-            id_helper.clone(),
-            id_leaf.clone(),
+            id_helper,
+            id_leaf,
             Location::new("utils.rs".to_string(), 10, 4),
         );
 

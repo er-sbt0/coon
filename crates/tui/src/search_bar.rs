@@ -172,7 +172,7 @@ impl SearchBarState {
                 .functions()
                 .take(self.max_results)
                 .map(|func| SearchResult {
-                    symbol_id: func.id.clone(),
+                    symbol_id: func.id,
                     name: func.name.clone(),
                     file_path: func.definition_location.file_path.clone(),
                     line: func.definition_location.line,
@@ -220,7 +220,7 @@ impl SearchBarState {
                 };
 
                 score.map(|score| SearchResult {
-                    symbol_id: func.id.clone(),
+                    symbol_id: func.id,
                     name: func.name.clone(),
                     file_path: func.definition_location.file_path.clone(),
                     line: func.definition_location.line,

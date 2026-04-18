@@ -155,33 +155,27 @@ impl CallGraph {
     }
 
     pub fn add_function(&mut self, function: FunctionNode) -> SymbolId {
-        let id = function.id.clone();
+        let id = function.id;
         let name = function.name.clone();
         let is_new = !self.nodes.contains_key(&id);
-        self.nodes.entry(id.clone()).or_insert(function);
+        self.nodes.entry(id).or_insert(function);
         if is_new {
-            self.name_index.entry(name).or_insert(id.clone());
+            self.name_index.entry(name).or_insert(id);
         }
         id
     }
 
     pub fn add_call(&mut self, caller: SymbolId, callee: SymbolId, call_location: Location) {
         let key = (
-            caller.clone(),
-            callee.clone(),
+            caller,
+            callee,
             call_location.file_path.clone(),
             call_location.line,
             call_location.column,
         );
         if self.edge_set.insert(key) {
-            self.callees_map
-                .entry(caller.clone())
-                .or_default()
-                .push(callee.clone());
-            self.callers_map
-                .entry(callee.clone())
-                .or_default()
-                .push(caller.clone());
+            self.callees_map.entry(caller).or_default().push(callee);
+            self.callers_map.entry(callee).or_default().push(caller);
             self.edges.push(CallEdge {
                 caller,
                 callee,
@@ -240,25 +234,25 @@ impl CallGraph {
         for (id, node) in &self.nodes {
             self.name_index
                 .entry(node.name.clone())
-                .or_insert_with(|| id.clone());
+                .or_insert_with(|| *id);
         }
         for edge in &self.edges {
             let key = (
-                edge.caller.clone(),
-                edge.callee.clone(),
+                edge.caller,
+                edge.callee,
                 edge.call_location.file_path.clone(),
                 edge.call_location.line,
                 edge.call_location.column,
             );
             self.edge_set.insert(key);
             self.callees_map
-                .entry(edge.caller.clone())
+                .entry(edge.caller)
                 .or_default()
-                .push(edge.callee.clone());
+                .push(edge.callee);
             self.callers_map
-                .entry(edge.callee.clone())
+                .entry(edge.callee)
                 .or_default()
-                .push(edge.caller.clone());
+                .push(edge.caller);
         }
     }
 }
@@ -333,7 +327,7 @@ mod tests {
         let id1 = graph.add_function(f1);
         let id2 = graph.add_function(f2);
         let loc = Location::new("x.rs".to_string(), 2, 4);
-        graph.add_call(id1.clone(), id2.clone(), loc.clone());
+        graph.add_call(id1, id2, loc.clone());
 
         let json = serde_json::to_string(&graph).unwrap();
         let restored: CallGraph = serde_json::from_str(&json).unwrap();
@@ -343,7 +337,7 @@ mod tests {
 
         // deduplication must still work after round-trip
         let mut restored = restored;
-        restored.add_call(id1.clone(), id2.clone(), loc);
+        restored.add_call(id1, id2, loc);
         assert_eq!(
             restored.edges.len(),
             1,
@@ -369,11 +363,7 @@ mod tests {
         let id1 = graph.add_function(func1);
         let id2 = graph.add_function(func2);
 
-        graph.add_call(
-            id1.clone(),
-            id2.clone(),
-            Location::new("test.rs".to_string(), 2, 4),
-        );
+        graph.add_call(id1, id2, Location::new("test.rs".to_string(), 2, 4));
 
         assert_eq!(graph.nodes.len(), 2);
         assert_eq!(graph.edges.len(), 1);

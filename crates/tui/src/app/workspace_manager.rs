@@ -44,7 +44,11 @@ impl WorkspaceManager {
     }
 
     /// Create a new workspace rooted at `symbol`. Returns `(id, status_message)`.
-    pub fn create_with_function(&mut self, name: String, symbol: SymbolId) -> (usize, StatusMessage) {
+    pub fn create_with_function(
+        &mut self,
+        name: String,
+        symbol: SymbolId,
+    ) -> (usize, StatusMessage) {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -83,7 +87,9 @@ impl WorkspaceManager {
         self.current_index = index;
         if let Some(workspace) = self.workspaces.get_mut(index) {
             workspace.touch();
-            Some(StatusMessage::SwitchedToWorkspace { name: workspace.name.clone() })
+            Some(StatusMessage::SwitchedToWorkspace {
+                name: workspace.name.clone(),
+            })
         } else {
             None
         }
@@ -97,7 +103,9 @@ impl WorkspaceManager {
         self.current_index = (self.current_index + 1) % self.workspaces.len();
         if let Some(workspace) = self.workspaces.get_mut(self.current_index) {
             workspace.touch();
-            Some(StatusMessage::SwitchedToWorkspace { name: workspace.name.clone() })
+            Some(StatusMessage::SwitchedToWorkspace {
+                name: workspace.name.clone(),
+            })
         } else {
             None
         }
@@ -115,7 +123,9 @@ impl WorkspaceManager {
         }
         if let Some(workspace) = self.workspaces.get_mut(self.current_index) {
             workspace.touch();
-            Some(StatusMessage::SwitchedToWorkspace { name: workspace.name.clone() })
+            Some(StatusMessage::SwitchedToWorkspace {
+                name: workspace.name.clone(),
+            })
         } else {
             None
         }

@@ -37,7 +37,7 @@ impl<'a> PathAnalyzer<'a> {
         max_depth: usize,
     ) -> Vec<Vec<SymbolId>> {
         let mut state = PathSearchState {
-            current_path: vec![from.clone()],
+            current_path: vec![*from],
             visited: HashSet::new(),
             all_paths: Vec::new(),
             max_depth,
@@ -64,18 +64,13 @@ impl<'a> PathAnalyzer<'a> {
             return;
         }
 
-        state.visited.insert(current.clone());
+        state.visited.insert(*current);
 
         let callees = self.graph.get_callees(current);
         for callee in callees {
             if !state.visited.contains(&callee.id) {
-                state.current_path.push(callee.id.clone());
-                self.find_all_paths_recursive(
-                    &callee.id,
-                    target,
-                    state,
-                    current_depth + 1,
-                );
+                state.current_path.push(callee.id);
+                self.find_all_paths_recursive(&callee.id, target, state, current_depth + 1);
                 state.current_path.pop();
             }
         }
@@ -89,9 +84,9 @@ impl<'a> PathAnalyzer<'a> {
         let mut paths = HashMap::new();
         let mut queue = VecDeque::new();
 
-        distances.insert(source.clone(), 0);
-        paths.insert(source.clone(), vec![source.clone()]);
-        queue.push_back(source.clone());
+        distances.insert(*source, 0);
+        paths.insert(*source, vec![*source]);
+        queue.push_back(*source);
 
         while let Some(current) = queue.pop_front() {
             let current_distance = distances[&current];
@@ -102,13 +97,13 @@ impl<'a> PathAnalyzer<'a> {
                 let new_distance = current_distance + 1;
 
                 if !distances.contains_key(&callee.id) || distances[&callee.id] > new_distance {
-                    distances.insert(callee.id.clone(), new_distance);
+                    distances.insert(callee.id, new_distance);
 
                     let mut new_path = current_path.clone();
-                    new_path.push(callee.id.clone());
-                    paths.insert(callee.id.clone(), new_path);
+                    new_path.push(callee.id);
+                    paths.insert(callee.id, new_path);
 
-                    queue.push_back(callee.id.clone());
+                    queue.push_back(callee.id);
                 }
             }
         }
@@ -121,8 +116,8 @@ impl<'a> PathAnalyzer<'a> {
         let mut depths = HashMap::new();
         let mut queue = VecDeque::new();
 
-        depths.insert(start.clone(), 0);
-        queue.push_back((start.clone(), 0));
+        depths.insert(*start, 0);
+        queue.push_back((*start, 0));
 
         while let Some((current, depth)) = queue.pop_front() {
             let callees = self.graph.get_callees(&current);
@@ -130,8 +125,8 @@ impl<'a> PathAnalyzer<'a> {
                 let new_depth = depth + 1;
 
                 if !depths.contains_key(&callee.id) || depths[&callee.id] > new_depth {
-                    depths.insert(callee.id.clone(), new_depth);
-                    queue.push_back((callee.id.clone(), new_depth));
+                    depths.insert(callee.id, new_depth);
+                    queue.push_back((callee.id, new_depth));
                 }
             }
         }
@@ -142,7 +137,7 @@ impl<'a> PathAnalyzer<'a> {
     /// Find cycles in the call graph starting from a specific function
     pub fn find_cycles_from(&self, start: &SymbolId, max_depth: usize) -> Vec<Vec<SymbolId>> {
         let mut cycles = Vec::new();
-        let mut current_path = vec![start.clone()];
+        let mut current_path = vec![*start];
         let mut visited_in_path = HashSet::new();
 
         self.find_cycles_recursive(
@@ -170,7 +165,7 @@ impl<'a> PathAnalyzer<'a> {
             return;
         }
 
-        visited_in_path.insert(current.clone());
+        visited_in_path.insert(*current);
 
         let callees = self.graph.get_callees(current);
         for callee in callees {
@@ -179,11 +174,11 @@ impl<'a> PathAnalyzer<'a> {
                 if let Some(cycle_start) = current_path.iter().position(|id| id == &callee.id) {
                     let cycle = current_path[cycle_start..].to_vec();
                     let mut complete_cycle = cycle;
-                    complete_cycle.push(callee.id.clone()); // Close the cycle
+                    complete_cycle.push(callee.id); // Close the cycle
                     cycles.push(complete_cycle);
                 }
             } else {
-                current_path.push(callee.id.clone());
+                current_path.push(callee.id);
                 self.find_cycles_recursive(
                     &callee.id,
                     current_path,
@@ -251,21 +246,9 @@ mod tests {
         let id_c = graph.add_function(func_c);
 
         // Create cycle: A -> B -> C -> A
-        graph.add_call(
-            id_a.clone(),
-            id_b.clone(),
-            Location::new("test.rs".to_string(), 2, 4),
-        );
-        graph.add_call(
-            id_b.clone(),
-            id_c.clone(),
-            Location::new("test.rs".to_string(), 6, 4),
-        );
-        graph.add_call(
-            id_c.clone(),
-            id_a.clone(),
-            Location::new("test.rs".to_string(), 11, 4),
-        );
+        graph.add_call(id_a, id_b, Location::new("test.rs".to_string(), 2, 4));
+        graph.add_call(id_b, id_c, Location::new("test.rs".to_string(), 6, 4));
+        graph.add_call(id_c, id_a, Location::new("test.rs".to_string(), 11, 4));
 
         graph
     }
