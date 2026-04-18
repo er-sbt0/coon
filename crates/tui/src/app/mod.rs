@@ -3,6 +3,9 @@ use tokio::sync::mpsc;
 use ::lsp::{LspRequest, LspResponse};
 use model::{lsp_status::LspUiMessage, CallGraph, SymbolId};
 
+/// Default viewport size used before the actual terminal size is known.
+const DEFAULT_VIEWPORT_SIZE: (f32, f32) = (100.0, 100.0);
+
 use crate::actions::TreeViewState;
 use crate::search_bar::SearchBarState;
 
@@ -61,7 +64,7 @@ impl App {
             should_quit: false,
             show_help: false,
             status_message: "Ready".to_string(),
-            last_viewport_size: (100.0, 100.0),
+            last_viewport_size: DEFAULT_VIEWPORT_SIZE,
             search_bar_state: SearchBarState::new(),
             show_search_bar: false,
             show_function_search: false,

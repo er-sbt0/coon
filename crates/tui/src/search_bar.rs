@@ -6,6 +6,9 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Widget},
 };
 
+/// Default assumed number of visible search results for scroll adjustment.
+const DEFAULT_VISIBLE_RESULTS: usize = 20;
+
 /// Search mode for filtering symbols
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {
@@ -127,7 +130,7 @@ impl SearchBarState {
     pub fn select_next(&mut self) {
         if !self.filtered_results.is_empty() {
             self.selected_index = (self.selected_index + 1).min(self.filtered_results.len() - 1);
-            self.adjust_scroll(20); // Assume 20 visible results for now
+            self.adjust_scroll(DEFAULT_VISIBLE_RESULTS);
         }
     }
 
@@ -135,7 +138,7 @@ impl SearchBarState {
     pub fn select_previous(&mut self) {
         if self.selected_index > 0 {
             self.selected_index -= 1;
-            self.adjust_scroll(20); // Assume 20 visible results for now
+            self.adjust_scroll(DEFAULT_VISIBLE_RESULTS);
         }
     }
 

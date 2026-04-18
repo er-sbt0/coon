@@ -6,6 +6,9 @@ use tokio::sync::mpsc;
 use ::lsp::{LspRequest, LspResponse};
 use model::{lsp_status::LspLoadPhase, lsp_status::LspUiMessage, CallGraph, SymbolId};
 
+/// Timeout duration for pending LSP requests before they are considered failed.
+const LSP_REQUEST_TIMEOUT_SECS: u64 = 30;
+
 /// Loading state for LSP operations
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoadingState {
@@ -145,7 +148,7 @@ impl LspBridge {
 
     /// Check for timed-out requests and return status messages for each.
     fn check_timed_out_requests(&mut self) -> Vec<String> {
-        let timeout_duration = std::time::Duration::from_secs(30);
+        let timeout_duration = std::time::Duration::from_secs(LSP_REQUEST_TIMEOUT_SECS);
         let now = Instant::now();
         let mut messages = Vec::new();
         let mut timed_out = Vec::new();

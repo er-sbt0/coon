@@ -74,15 +74,6 @@ graph_view.rs: The comment says "sibling" navigation, but the implementation sor
 
 ---
 
-### 9. **Test leaks memory intentionally**
-
-call_graph_view.rs:
-```rust
-let leaked_graph = Box::leak(Box::new(graph.clone()));
-let query_engine = logic::query::GraphQueryEngine::new(leaked_graph);
-```
-`Box::leak` in tests avoids lifetime issues but leaks memory. This is a workaround for a design issue where `GraphQueryEngine` requires `'static` or overly restrictive lifetimes.
-
 ---
 
 ### 10. **Inconsistent error signaling in `LspBridge`**
@@ -90,17 +81,6 @@ let query_engine = logic::query::GraphQueryEngine::new(leaked_graph);
 `send_call_hierarchy`, `send_references`, and `send_workspace_symbols` in lsp_bridge.rs all return `Option<String>` where `None` sometimes means "success" (for `send_call_hierarchy`) and sometimes means "no channel available / function not found" (for `send_references`). The caller has no reliable way to distinguish success from silent failure.
 
 **Fix:** Return `Result<Option<String>, String>` or a dedicated enum.
-
----
-
-### 11. **Magic numbers scattered throughout**
-
-- `20` for visible results: search_bar.rs — `self.adjust_scroll(20); // Assume 20 visible results for now`
-- `100.0, 100.0` default viewport: mod.rs
-- `30` seconds timeout: lsp_bridge.rs
-- `100ms` poll interval: tui.rs
-
-These should be named constants.
 
 ---
 

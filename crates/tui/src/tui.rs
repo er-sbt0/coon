@@ -7,6 +7,9 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
 use tokio::sync::mpsc;
 
+/// Interval in milliseconds for polling terminal events between UI redraws.
+const EVENT_POLL_INTERVAL_MS: u64 = 100;
+
 use lsp::{LspRequest, LspResponse};
 use model::{lsp_status::LspUiMessage, CallGraph};
 
@@ -77,7 +80,7 @@ impl TuiApp {
             self.terminal.draw(|f| ui(f, &mut self.app))?;
 
             // Handle input with timeout to allow checking for LSP responses
-            if event::poll(std::time::Duration::from_millis(100))? {
+            if event::poll(std::time::Duration::from_millis(EVENT_POLL_INTERVAL_MS))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
                         // Handle search bar input separately
