@@ -23,17 +23,11 @@ All MPSC channels are unbounded. Large workspace symbol results can grow memory 
 **5. O(n²) graph construction and O(n) lookups** — graph.rs
 `add_call` scans all edges for dedup; `get_callers`/`get_callees` do full linear scans. Quadratic for large codebases. Need adjacency map.
 
-**6. `resolve_symbol_at_location` returns fake data** — parsing_impl.rs
-Stub returns fabricated names like `"caller_at_main:5"`. Users see incorrect symbols. Either implement or remove.
-
 **7. Random UUID `SymbolId` — no deduplication** — symbols.rs
 Rediscovering the same function creates a new ID → duplicates in graph. Need content-addressable ID.
 
 **8. Silent channel send failures** — throughout loader.rs
 `let _ = tx.send(...)` silently discards errors. When receiver drops, sender loops indefinitely burning CPU.
-
-**9. Non-deterministic sibling navigation** — graph_view.rs
-`HashMap::keys()` iteration order changes between runs. Next/previous sibling is random.
 
 ### Medium — Architectural debt and maintainability
 
