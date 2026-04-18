@@ -11,15 +11,6 @@ impl SymbolId {
         Self(Uuid::new_v5(&Uuid::NAMESPACE_OID, content.as_bytes()))
     }
 
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-}
-
-impl Default for SymbolId {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 /// Location information for symbols
@@ -96,13 +87,6 @@ pub enum DiagnosticSeverity {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_symbol_id_random() {
-        let id1 = SymbolId::new();
-        let id2 = SymbolId::new();
-        assert_ne!(id1, id2);
-    }
 
     #[test]
     fn test_symbol_id_content_addressable() {

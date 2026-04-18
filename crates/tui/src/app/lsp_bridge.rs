@@ -460,7 +460,7 @@ mod tests {
     #[test]
     fn test_clear() {
         let mut bridge = LspBridge::new();
-        let sym = SymbolId::new();
+        let sym = SymbolId::from_content("test::sym", "test.cpp", 1);
         bridge
             .loading_states
             .insert(sym.clone(), LoadingState::Loaded);
@@ -479,7 +479,7 @@ mod tests {
     #[test]
     fn test_loading_state_queries() {
         let mut bridge = LspBridge::new();
-        let sym = SymbolId::new();
+        let sym = SymbolId::from_content("test::sym", "test.cpp", 1);
 
         assert!(!bridge.is_function_loaded(&sym));
         assert!(!bridge.is_function_loading(&sym));
