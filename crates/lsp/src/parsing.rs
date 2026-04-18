@@ -149,10 +149,7 @@ pub(crate) fn parse_workspace_symbol_response_impl(
                     };
                     model::WorkspaceSymbolInfo {
                         name: symbol.name.clone(),
-                        qualified_name: make_qualified_name(
-                            &symbol.container_name,
-                            &symbol.name,
-                        ),
+                        qualified_name: make_qualified_name(&symbol.container_name, &symbol.name),
                         kind: symbol.kind,
                         location,
                         container_name: symbol.container_name.clone(),

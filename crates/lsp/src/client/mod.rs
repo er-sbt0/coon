@@ -174,18 +174,16 @@ impl LspClient {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         // 2. Send the LSP "exit" notification
-        if let Err(e) = self.send_notification("exit", serde_json::json!(null)).await {
+        if let Err(e) = self
+            .send_notification("exit", serde_json::json!(null))
+            .await
+        {
             log::warn!("Failed to send LSP exit notification: {}", e);
         }
 
         // 3. Wait briefly for the process to exit on its own
         if let Some(ref mut child) = self.process {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                child.wait(),
-            )
-            .await
-            {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await {
                 Ok(Ok(status)) => {
                     log::info!("clangd exited with status: {}", status);
                 }

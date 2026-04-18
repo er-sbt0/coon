@@ -15,11 +15,6 @@ Binary fails on any machine except the original developer's. Absolute `/home/era
 **8. Silent channel send failures** — throughout loader.rs
 `let _ = tx.send(...)` silently discards errors. When receiver drops, sender loops indefinitely burning CPU.
 
-### Medium — Architectural debt and maintainability
-
-**11. Sync TUI loop masquerading as async** — tui.rs
-`event::poll` + `event::read` block the main thread inside an `async fn`. Works only because LSP is spawned separately. Fragile.
-
 ### Low-Medium — Hygiene, testing, performance
 
 **18. Zero unit tests for LSP service layer** — `service/worker.rs`, `service/request.rs`, all `service/response/*.rs`

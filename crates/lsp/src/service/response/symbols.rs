@@ -12,8 +12,7 @@ pub(super) async fn handle_document_symbols_response(
     state: &mut LspWorkerState,
     response_tx: &mpsc::Sender<LspResponse>,
 ) {
-    if super::check_and_send_lsp_error(&message, &request_id, "document symbols", response_tx)
-        .await
+    if super::check_and_send_lsp_error(&message, &request_id, "document symbols", response_tx).await
     {
         return;
     }

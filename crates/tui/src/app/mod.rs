@@ -1,120 +1,74 @@
-use std::collections::HashMap;
-use std::time::Instant;
 use tokio::sync::mpsc;
 
 use ::lsp::{LspRequest, LspResponse};
-use model::{lsp_status::LspLoadPhase, lsp_status::LspUiMessage, CallGraph, SymbolId};
+use model::{lsp_status::LspUiMessage, CallGraph, SymbolId};
 
 use crate::actions::TreeViewState;
-use crate::graph_workspace::GraphWorkspace;
 use crate::search_bar::SearchBarState;
 
 mod events;
 mod lsp;
+pub mod lsp_bridge;
 mod update;
 mod workspace;
+pub mod workspace_manager;
 
-/// Loading state for LSP operations
-#[derive(Debug, Clone, PartialEq)]
-pub enum LoadingState {
-    NotLoaded,
-    Loading,
-    Loaded,
-    Failed(String),
-}
-
-/// Pending LSP request information
-#[derive(Debug, Clone)]
-pub struct PendingRequest {
-    pub(super) symbol_id: Option<SymbolId>,
-    pub(super) timestamp: Instant,
-}
+pub use lsp_bridge::{LoadingState, LspBridge, PendingRequest};
+pub use workspace_manager::WorkspaceManager;
 
 /// Main application state
 pub struct App {
+    // Core data
     pub call_graph: CallGraph,
     pub selected_function: Option<SymbolId>,
-    pub search_query: String,
-    pub should_quit: bool,
-    pub status_message: String,
-    pub function_list_state: ratatui::widgets::ListState,
     pub functions: Vec<SymbolId>,
+    pub function_list_state: ratatui::widgets::ListState,
     pub tree_view_state: TreeViewState,
+
+    // UI chrome
+    pub should_quit: bool,
     pub show_help: bool,
-
-    // Workspace management
-    pub workspaces: Vec<GraphWorkspace>,
-    pub current_workspace_index: usize,
-    pub next_workspace_id: usize,
-    pub show_workspace_manager: bool,
-    pub show_function_search: bool,
-    pub function_search_query: String,
-
-    // Search bar
-    pub search_bar_state: SearchBarState,
-    pub show_search_bar: bool,
-
-    // Last viewport size for recentering
+    pub status_message: String,
     pub last_viewport_size: (f32, f32),
 
-    // Lazy loading fields
-    pub loading_states: HashMap<SymbolId, LoadingState>,
-    pub lsp_response_rx: Option<mpsc::UnboundedReceiver<LspResponse>>,
-    pub lsp_request_tx: Option<mpsc::UnboundedSender<LspRequest>>,
-    pub pending_requests: HashMap<String, PendingRequest>,
+    // Search
+    pub search_bar_state: SearchBarState,
+    pub show_search_bar: bool,
+    pub show_function_search: bool,
+    pub function_search_query: String,
+    pub search_query: String,
 
-    // Async LSP loading state
-    pub lsp_status: LspLoadPhase,
-    pub lsp_rx: Option<mpsc::UnboundedReceiver<LspUiMessage>>,
-    pub lsp_channels_rx: Option<
-        mpsc::UnboundedReceiver<(
-            mpsc::UnboundedReceiver<LspResponse>,
-            mpsc::UnboundedSender<LspRequest>,
-        )>,
-    >,
+    // Extracted subsystems
+    pub lsp: LspBridge,
+    pub workspaces: WorkspaceManager,
 }
 
 impl App {
     pub fn new(call_graph: CallGraph) -> Self {
-        // Get all function IDs for the list (avoiding expensive operations)
         let functions: Vec<SymbolId> = call_graph.nodes.keys().cloned().collect();
 
-        // Initialize list state
         let mut function_list_state = ratatui::widgets::ListState::default();
         if !functions.is_empty() {
             function_list_state.select(Some(0));
         }
 
-        // Initialize with one default workspace
-        let default_workspace = GraphWorkspace::new(1, "Graph 1".to_string());
-        let workspaces = vec![default_workspace];
-
         Self {
             call_graph,
             selected_function: None,
-            search_query: String::new(),
-            should_quit: false,
-            status_message: "Ready".to_string(),
-            function_list_state,
             functions,
+            function_list_state,
             tree_view_state: TreeViewState::new(),
+            should_quit: false,
             show_help: false,
-            workspaces,
-            current_workspace_index: 0,
-            next_workspace_id: 2,
-            show_workspace_manager: false,
-            show_function_search: false,
-            function_search_query: String::new(),
+            status_message: "Ready".to_string(),
+            last_viewport_size: (100.0, 100.0),
             search_bar_state: SearchBarState::new(),
             show_search_bar: false,
-            last_viewport_size: (100.0, 100.0), // Default size, will be updated on first render
-            loading_states: HashMap::new(),
-            lsp_response_rx: None,
-            lsp_request_tx: None,
-            pending_requests: HashMap::new(),
-            lsp_status: LspLoadPhase::NotStarted,
-            lsp_rx: None,
-            lsp_channels_rx: None,
+            show_function_search: false,
+            function_search_query: String::new(),
+            search_query: String::new(),
+            lsp: LspBridge::new(),
+            workspaces: WorkspaceManager::new(),
         }
     }
 
@@ -127,47 +81,38 @@ impl App {
         )>,
     ) -> Self {
         let mut app = Self::new(call_graph);
-        app.lsp_status = LspLoadPhase::NotStarted;
-        app.lsp_rx = Some(lsp_rx);
-        app.lsp_channels_rx = Some(lsp_channels_rx);
+        app.lsp = LspBridge::new_with_loader(lsp_rx, lsp_channels_rx);
         app
     }
 
     /// Poll and handle any messages from the background LSP loader
     pub fn poll_lsp_loader_messages(&mut self) {
-        if let Some(rx) = &mut self.lsp_rx {
-            while let Ok(msg) = rx.try_recv() {
-                match msg {
-                    LspUiMessage::Progress(phase) => {
-                        self.lsp_status = phase;
-                    }
-                    LspUiMessage::AddFunction(symbol) => {
-                        // Mirror into the call graph for now
-                        let function = model::FunctionNode::new(
-                            symbol.name.clone(),
-                            symbol.qualified_name.clone(),
-                            symbol.location.clone(),
-                        );
-                        let id = self.call_graph.add_function(function);
-                        if !self.functions.contains(&id) {
-                            self.functions.push(id);
-                        }
-                    }
-                }
+        let new_symbols = self.lsp.poll_loader_messages();
+        for symbol in new_symbols {
+            let function = model::FunctionNode::new(
+                symbol.name.clone(),
+                symbol.qualified_name.clone(),
+                symbol.location.clone(),
+            );
+            let id = self.call_graph.add_function(function);
+            if !self.functions.contains(&id) {
+                self.functions.push(id);
             }
         }
     }
 
     /// Poll for LSP channels and wire them up when they arrive
     pub fn poll_lsp_channels(&mut self) {
-        if let Some(rx) = &mut self.lsp_channels_rx {
-            if let Ok((response_rx, request_tx)) = rx.try_recv() {
-                log::info!("Received LSP channels from loader - wiring up for lazy loading");
-                self.set_lsp_channels(response_rx, request_tx);
-                // Clear the receiver since we only need to do this once
-                self.lsp_channels_rx = None;
-            }
-        }
+        self.lsp.poll_channels();
+    }
+
+    /// Set the LSP channels for communication
+    pub fn set_lsp_channels(
+        &mut self,
+        response_rx: mpsc::UnboundedReceiver<LspResponse>,
+        request_tx: mpsc::UnboundedSender<LspRequest>,
+    ) {
+        self.lsp.set_channels(response_rx, request_tx);
     }
 
     pub fn select_function(&mut self, id: SymbolId) {
@@ -185,6 +130,64 @@ impl App {
 
     pub fn toggle_help(&mut self) {
         self.show_help = !self.show_help;
+    }
+
+    // Convenience delegation methods for WorkspaceManager
+
+    pub fn get_current_workspace(&self) -> Option<&crate::graph_workspace::GraphWorkspace> {
+        self.workspaces.current()
+    }
+
+    pub fn get_current_workspace_mut(
+        &mut self,
+    ) -> Option<&mut crate::graph_workspace::GraphWorkspace> {
+        self.workspaces.current_mut()
+    }
+
+    pub fn create_workspace(&mut self, name: String) -> usize {
+        let (id, msg) = self.workspaces.create(name);
+        self.status_message = msg;
+        id
+    }
+
+    pub fn create_workspace_with_function(&mut self, name: String, symbol: SymbolId) -> usize {
+        let (id, msg) = self.workspaces.create_with_function(name, symbol);
+        self.status_message = msg;
+        id
+    }
+
+    pub fn close_workspace(&mut self, index: usize) -> bool {
+        match self.workspaces.close(index) {
+            Ok(msg) => {
+                self.status_message = msg;
+                true
+            }
+            Err(msg) => {
+                self.status_message = msg;
+                false
+            }
+        }
+    }
+
+    pub fn switch_workspace(&mut self, index: usize) -> bool {
+        if let Some(msg) = self.workspaces.switch_to(index) {
+            self.status_message = msg;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn next_workspace(&mut self) {
+        if let Some(msg) = self.workspaces.next() {
+            self.status_message = msg;
+        }
+    }
+
+    pub fn previous_workspace(&mut self) {
+        if let Some(msg) = self.workspaces.previous() {
+            self.status_message = msg;
+        }
     }
 }
 
@@ -208,8 +211,8 @@ mod tests {
     #[test]
     fn test_app_creation() {
         let app = create_test_app();
-        assert_eq!(app.workspaces.len(), 1);
-        assert_eq!(app.current_workspace_index, 0);
+        assert_eq!(app.workspaces.workspaces.len(), 1);
+        assert_eq!(app.workspaces.current_index, 0);
         assert!(app.selected_function.is_none());
         assert_eq!(app.search_query, "");
         assert!(!app.should_quit);
@@ -221,9 +224,9 @@ mod tests {
         let mut app = create_test_app();
 
         app.create_workspace("Test Workspace".to_string());
-        assert_eq!(app.workspaces.len(), 2);
-        assert_eq!(app.current_workspace_index, 1);
-        assert_eq!(app.workspaces[1].name, "Test Workspace");
+        assert_eq!(app.workspaces.workspaces.len(), 2);
+        assert_eq!(app.workspaces.current_index, 1);
+        assert_eq!(app.workspaces.workspaces[1].name, "Test Workspace");
     }
 
     #[test]
@@ -232,13 +235,13 @@ mod tests {
         app.create_workspace("Workspace 2".to_string());
 
         app.next_workspace();
-        assert_eq!(app.current_workspace_index, 0);
+        assert_eq!(app.workspaces.current_index, 0);
 
         app.previous_workspace();
-        assert_eq!(app.current_workspace_index, 1);
+        assert_eq!(app.workspaces.current_index, 1);
 
         app.switch_workspace(0);
-        assert_eq!(app.current_workspace_index, 0);
+        assert_eq!(app.workspaces.current_index, 0);
     }
 
     #[test]
@@ -247,14 +250,14 @@ mod tests {
 
         // Can't close last workspace
         assert!(!app.close_workspace(0));
-        assert_eq!(app.workspaces.len(), 1);
+        assert_eq!(app.workspaces.workspaces.len(), 1);
 
         // Add another workspace and close it
         app.create_workspace("Workspace 2".to_string());
-        assert_eq!(app.workspaces.len(), 2);
+        assert_eq!(app.workspaces.workspaces.len(), 2);
 
         assert!(app.close_workspace(1));
-        assert_eq!(app.workspaces.len(), 1);
+        assert_eq!(app.workspaces.workspaces.len(), 1);
     }
 
     #[test]
@@ -263,7 +266,7 @@ mod tests {
 
         // Try to close the only workspace - should fail
         assert!(!app.close_workspace(0));
-        assert_eq!(app.workspaces.len(), 1);
+        assert_eq!(app.workspaces.workspaces.len(), 1);
     }
 
     #[test]
@@ -285,11 +288,11 @@ mod tests {
 
         assert_eq!(app.selected_function, Some(func_id.clone()));
         // Should have created a new workspace
-        assert_eq!(app.workspaces.len(), 2);
+        assert_eq!(app.workspaces.workspaces.len(), 2);
         // New workspace should be current
-        assert_eq!(app.current_workspace_index, 1);
+        assert_eq!(app.workspaces.current_index, 1);
         // New workspace should have the function as root
-        assert_eq!(app.workspaces[1].root_symbol, Some(func_id));
+        assert_eq!(app.workspaces.workspaces[1].root_symbol, Some(func_id));
     }
 
     #[test]

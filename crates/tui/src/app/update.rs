@@ -1,11 +1,10 @@
-use std::time::Instant;
-
 use lsp::LspResponse;
 use model::SymbolId;
 
 use crate::graph_adapter::CallDirection;
 
-use super::{App, LoadingState, PendingRequest};
+use super::lsp_bridge::LoadingState;
+use super::App;
 
 impl App {
     /// Handle an LSP response
@@ -13,7 +12,7 @@ impl App {
         log::info!("TUI handling LSP response: {:?}", response);
         match response {
             LspResponse::CallHierarchy { request_id, items } => {
-                if let Some(pending) = self.pending_requests.remove(&request_id) {
+                if let Some(pending) = self.lsp.take_pending(&request_id) {
                     if let Some(symbol_id) = pending.symbol_id {
                         log::info!(
                             "Received call hierarchy prepare response for symbol: {:?}, {} items",
@@ -21,116 +20,23 @@ impl App {
                             items.len()
                         );
 
-                        // If we got call hierarchy items, automatically request calls based on direction
                         if !items.is_empty() {
                             let first_item = items[0].clone();
 
-                            // Get the current workspace direction
                             let current_direction = self
                                 .get_current_workspace()
                                 .map(|w| w.graph_view_state.direction)
                                 .unwrap_or(CallDirection::Incoming);
 
-                            match current_direction {
-                                CallDirection::Outgoing => {
-                                    log::info!(
-                                        "Requesting outgoing calls for: {}",
-                                        first_item.name
-                                    );
+                            let outgoing = matches!(current_direction, CallDirection::Outgoing);
 
-                                    // Generate a new request ID for the outgoing calls request
-                                    let outgoing_request_id = uuid::Uuid::new_v4().to_string();
-
-                                    // Record pending request for outgoing calls
-                                    self.pending_requests.insert(
-                                        outgoing_request_id.clone(),
-                                        PendingRequest {
-                                            timestamp: Instant::now(),
-                                            symbol_id: Some(symbol_id.clone()),
-                                        },
-                                    );
-
-                                    // Send outgoing calls request
-                                    if let Some(tx) = &self.lsp_request_tx {
-                                        let request = lsp::LspRequest::GetOutgoingCalls {
-                                            request_id: outgoing_request_id,
-                                            call_hierarchy_item: first_item,
-                                        };
-
-                                        if let Err(e) = tx.send(request) {
-                                            log::error!(
-                                                "Failed to send outgoing calls request: {}",
-                                                e
-                                            );
-                                            self.update_loading_state(
-                                                &symbol_id,
-                                                LoadingState::Failed(
-                                                    "Failed to request outgoing calls".to_string(),
-                                                ),
-                                            );
-                                        } else {
-                                            self.status_message =
-                                                "Loading outgoing calls...".to_string();
-                                        }
-                                    } else {
-                                        log::error!("No LSP request channel available");
-                                        self.update_loading_state(
-                                            &symbol_id,
-                                            LoadingState::Failed("No LSP channel".to_string()),
-                                        );
-                                    }
-                                }
-                                CallDirection::Incoming => {
-                                    log::info!(
-                                        "Requesting incoming calls for: {}",
-                                        first_item.name
-                                    );
-
-                                    // Generate a new request ID for the incoming calls request
-                                    let incoming_request_id = uuid::Uuid::new_v4().to_string();
-
-                                    // Record pending request for incoming calls
-                                    self.pending_requests.insert(
-                                        incoming_request_id.clone(),
-                                        PendingRequest {
-                                            timestamp: Instant::now(),
-                                            symbol_id: Some(symbol_id.clone()),
-                                        },
-                                    );
-
-                                    // Send incoming calls request
-                                    if let Some(tx) = &self.lsp_request_tx {
-                                        let request = lsp::LspRequest::GetIncomingCalls {
-                                            request_id: incoming_request_id,
-                                            call_hierarchy_item: first_item,
-                                        };
-
-                                        if let Err(e) = tx.send(request) {
-                                            log::error!(
-                                                "Failed to send incoming calls request: {}",
-                                                e
-                                            );
-                                            self.update_loading_state(
-                                                &symbol_id,
-                                                LoadingState::Failed(
-                                                    "Failed to request incoming calls".to_string(),
-                                                ),
-                                            );
-                                        } else {
-                                            self.status_message =
-                                                "Loading incoming calls...".to_string();
-                                        }
-                                    } else {
-                                        log::error!("No LSP request channel available");
-                                        self.update_loading_state(
-                                            &symbol_id,
-                                            LoadingState::Failed("No LSP channel".to_string()),
-                                        );
-                                    }
-                                }
+                            if let Some(msg) = self
+                                .lsp
+                                .send_follow_up_call(&symbol_id, first_item, outgoing)
+                            {
+                                self.status_message = msg;
                             }
                         } else {
-                            // No call hierarchy items - this function has no callees
                             log::info!("No call hierarchy items found for symbol: {:?}", symbol_id);
                             self.update_loading_state(&symbol_id, LoadingState::Loaded);
                             self.status_message = "Function has no callees".to_string();
@@ -139,7 +45,7 @@ impl App {
                 }
             }
             LspResponse::OutgoingCalls { request_id, calls } => {
-                if let Some(pending) = self.pending_requests.remove(&request_id) {
+                if let Some(pending) = self.lsp.take_pending(&request_id) {
                     if let Some(symbol_id) = pending.symbol_id {
                         log::info!(
                             "Processing outgoing calls for symbol_id: {:?}, {} calls",
@@ -166,7 +72,7 @@ impl App {
                 request_id,
                 locations,
             } => {
-                if let Some(pending) = self.pending_requests.remove(&request_id) {
+                if let Some(pending) = self.lsp.take_pending(&request_id) {
                     if let Some(symbol_id) = pending.symbol_id {
                         log::info!("Processing references for symbol_id: {:?}", symbol_id);
 
@@ -214,7 +120,7 @@ impl App {
                 request_id,
                 symbols: _,
             } => {
-                if let Some(_pending) = self.pending_requests.remove(&request_id) {
+                if let Some(_pending) = self.lsp.take_pending(&request_id) {
                     self.status_message = "Document symbols loaded".to_string();
                 }
             }
@@ -222,7 +128,7 @@ impl App {
                 request_id,
                 symbols,
             } => {
-                if let Some(_pending) = self.pending_requests.remove(&request_id) {
+                if let Some(_pending) = self.lsp.take_pending(&request_id) {
                     self.status_message = format!("Loaded {} workspace symbols", symbols.len());
                     log::info!("Successfully loaded {} workspace symbols", symbols.len());
 
@@ -264,7 +170,7 @@ impl App {
                 }
             }
             LspResponse::Error { request_id, error } => {
-                if let Some(pending) = self.pending_requests.remove(&request_id) {
+                if let Some(pending) = self.lsp.take_pending(&request_id) {
                     if let Some(symbol_id) = pending.symbol_id {
                         self.update_loading_state(&symbol_id, LoadingState::Failed(error.clone()));
                     }
@@ -290,7 +196,7 @@ impl App {
                 request_id,
                 references,
             } => {
-                if let Some(pending) = self.pending_requests.remove(&request_id) {
+                if let Some(pending) = self.lsp.take_pending(&request_id) {
                     if let Some(symbol_id) = pending.symbol_id {
                         // Update the function with enhanced references
                         if let Some(function) = self.call_graph.get_function_mut(&symbol_id) {
@@ -304,7 +210,7 @@ impl App {
                 }
             }
             LspResponse::IncomingCalls { request_id, calls } => {
-                if let Some(pending) = self.pending_requests.remove(&request_id) {
+                if let Some(pending) = self.lsp.take_pending(&request_id) {
                     if let Some(symbol_id) = pending.symbol_id {
                         log::info!(
                             "Processing incoming calls for symbol_id: {:?}, {} calls",
@@ -328,7 +234,7 @@ impl App {
                 }
             }
             LspResponse::CallHierarchyPrepared { request_id, items } => {
-                if let Some(pending) = self.pending_requests.remove(&request_id) {
+                if let Some(pending) = self.lsp.take_pending(&request_id) {
                     if let Some(symbol_id) = pending.symbol_id {
                         log::info!(
                             "Call hierarchy prepared for symbol: {:?}, {} items",

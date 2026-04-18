@@ -35,13 +35,13 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     }
 
     // Show workspace manager if requested
-    if app.show_workspace_manager {
+    if app.workspaces.show_manager {
         render_workspace_manager_modal(f, size, app);
         return;
     }
 
     // Create main layout with conditional LSP status bar above graph view
-    let show_lsp_status = !matches!(app.lsp_status, LspLoadPhase::Completed);
+    let show_lsp_status = !matches!(app.lsp.status, LspLoadPhase::Completed);
 
     let chunks = if show_lsp_status {
         Layout::default()
@@ -79,7 +79,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
 }
 
 fn render_lsp_status_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    let status_text = match &app.lsp_status {
+    let status_text = match &app.lsp.status {
         LspLoadPhase::NotStarted => "LSP: not started".to_string(),
         LspLoadPhase::SpawningServer => "LSP: starting clangd…".to_string(),
         LspLoadPhase::Initializing => "LSP: initializing…".to_string(),
@@ -194,7 +194,7 @@ fn render_search_bar_overlay(f: &mut Frame, area: ratatui::layout::Rect, app: &m
 fn render_workspace_tabs(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     let mut tab_titles = Vec::new();
 
-    for (i, workspace) in app.workspaces.iter().enumerate() {
+    for (i, workspace) in app.workspaces.workspaces.iter().enumerate() {
         let mut name = workspace.name.clone();
 
         // Truncate long names
@@ -203,7 +203,7 @@ fn render_workspace_tabs(f: &mut Frame, area: ratatui::layout::Rect, app: &App) 
         }
 
         // Add active indicator
-        if i == app.current_workspace_index {
+        if i == app.workspaces.current_index {
             name = format!("[{}*]", name);
         } else {
             name = format!("[{}]", name);
@@ -220,15 +220,15 @@ fn render_workspace_tabs(f: &mut Frame, area: ratatui::layout::Rect, app: &App) 
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )
-        .select(app.current_workspace_index);
+        .select(app.workspaces.current_index);
     f.render_widget(tabs, area);
 }
 
 fn render_graph_view(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
     // Get current workspace
-    let workspace_index = app.current_workspace_index;
+    let workspace_index = app.workspaces.current_index;
 
-    if let Some(workspace) = app.workspaces.get_mut(workspace_index) {
+    if let Some(workspace) = app.workspaces.workspaces.get_mut(workspace_index) {
         // Store viewport size for potential recentering
         let viewport_size = (area.width as f32, area.height as f32);
         app.last_viewport_size = viewport_size;
@@ -358,12 +358,15 @@ fn render_workspace_manager_modal(f: &mut Frame, area: ratatui::layout::Rect, ap
     let mut text = vec![
         Line::from("Workspace Manager"),
         Line::from(""),
-        Line::from(format!("Total Workspaces: {}", app.workspaces.len())),
+        Line::from(format!(
+            "Total Workspaces: {}",
+            app.workspaces.workspaces.len()
+        )),
         Line::from(""),
     ];
 
-    for (i, workspace) in app.workspaces.iter().enumerate() {
-        let marker = if i == app.current_workspace_index {
+    for (i, workspace) in app.workspaces.workspaces.iter().enumerate() {
+        let marker = if i == app.workspaces.current_index {
             "→"
         } else {
             " "

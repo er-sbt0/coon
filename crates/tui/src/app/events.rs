@@ -101,8 +101,7 @@ impl App {
     fn handle_refresh(&mut self) {
         log::info!("Refresh action triggered - clearing state and requesting fresh data");
         // Clear all loading states and cached data to force fresh requests
-        self.loading_states.clear();
-        self.pending_requests.clear();
+        self.lsp.clear();
 
         // Request fresh workspace symbols to update the project state
         self.request_workspace_symbols();
@@ -168,8 +167,8 @@ impl App {
     }
 
     fn handle_navigate_parent(&mut self) {
-        let current_idx = self.current_workspace_index;
-        if let Some(workspace) = self.workspaces.get_mut(current_idx) {
+        let current_idx = self.workspaces.current_index;
+        if let Some(workspace) = self.workspaces.workspaces.get_mut(current_idx) {
             if workspace
                 .graph_view_state
                 .navigate_to_parent(&self.call_graph)
@@ -191,8 +190,8 @@ impl App {
     }
 
     fn handle_navigate_child(&mut self) {
-        let current_idx = self.current_workspace_index;
-        if let Some(workspace) = self.workspaces.get_mut(current_idx) {
+        let current_idx = self.workspaces.current_index;
+        if let Some(workspace) = self.workspaces.workspaces.get_mut(current_idx) {
             if workspace
                 .graph_view_state
                 .navigate_to_child(&self.call_graph)
@@ -214,8 +213,8 @@ impl App {
     }
 
     fn handle_navigate_next_sibling(&mut self) {
-        let current_idx = self.current_workspace_index;
-        if let Some(workspace) = self.workspaces.get_mut(current_idx) {
+        let current_idx = self.workspaces.current_index;
+        if let Some(workspace) = self.workspaces.workspaces.get_mut(current_idx) {
             if workspace
                 .graph_view_state
                 .navigate_next_sibling(&self.call_graph)
@@ -237,8 +236,8 @@ impl App {
     }
 
     fn handle_navigate_prev_sibling(&mut self) {
-        let current_idx = self.current_workspace_index;
-        if let Some(workspace) = self.workspaces.get_mut(current_idx) {
+        let current_idx = self.workspaces.current_index;
+        if let Some(workspace) = self.workspaces.workspaces.get_mut(current_idx) {
             if workspace
                 .graph_view_state
                 .navigate_prev_sibling(&self.call_graph)
@@ -260,12 +259,13 @@ impl App {
     }
 
     fn handle_new_workspace(&mut self) {
-        let name = format!("Graph {}", self.next_workspace_id);
+        let name = format!("Graph {}", self.workspaces.next_id);
         self.create_workspace(name);
     }
 
     fn handle_close_workspace(&mut self) {
-        self.close_workspace(self.current_workspace_index);
+        let idx = self.workspaces.current_index;
+        self.close_workspace(idx);
     }
 
     pub fn start_call_graph_with_function(&mut self, symbol_id: SymbolId) {
@@ -283,7 +283,7 @@ impl App {
                     name
                 }
             })
-            .unwrap_or_else(|| format!("Graph {}", self.next_workspace_id));
+            .unwrap_or_else(|| format!("Graph {}", self.workspaces.next_id));
 
         // Create new workspace with this function as root
         self.create_workspace_with_function(function_name, symbol_id.clone());
