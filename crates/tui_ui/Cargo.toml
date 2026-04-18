@@ -7,7 +7,7 @@ edition = "2021"
 model.workspace = true
 logic.workspace = true
 lsp_integration.workspace = true
-grid = { path = "../../grid", features = ["rendering"] }
+grid = { path = "../../../grid", features = ["rendering"] }
 ratatui.workspace = true
 crossterm.workspace = true
 log.workspace = true
