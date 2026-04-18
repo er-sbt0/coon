@@ -14,6 +14,9 @@ pub(super) enum RequestType {
     References,
     ReferencesWithSymbols,
     DocumentSymbols,
+    /// Document-symbol sub-request spawned by the enhanced-references flow.
+    /// `base_request_id` is the original `FindReferencesWithSymbols` service ID.
+    DocumentSymbolsForEnhancedRefs { base_request_id: String },
     WorkspaceSymbols,
 }
 
@@ -48,7 +51,6 @@ impl LspWorkerState {
 #[derive(Debug, Clone)]
 pub(super) struct EnhancedRequestInfo {
     pub(super) locations: Vec<model::Location>,
-    pub(super) pending_symbol_requests: HashSet<String>,
 }
 
 pub(super) async fn run_loop(

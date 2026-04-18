@@ -38,37 +38,27 @@ pub(super) async fn handle_document_symbols_response(
             );
         }
 
-        if request_id.starts_with("document_symbols_for_") {
-            handle_legacy_document_symbols_for_enhanced_references(
-                message,
+        let symbols = document_symbols_response
+            .symbols
+            .into_iter()
+            .map(|sym| DocumentSymbol {
+                name: sym.name,
+                detail: sym.container_name,
+                kind: sym.kind,
+                tags: None,
+                #[allow(deprecated)]
+                deprecated: Some(false),
+                range: lsp_types::Range::default(),
+                selection_range: lsp_types::Range::default(),
+                children: None,
+            })
+            .collect();
+        let _ = response_tx
+            .send(LspResponse::DocumentSymbols {
                 request_id,
-                state,
-                response_tx,
-            )
+                symbols,
+            })
             .await;
-        } else {
-            let symbols = document_symbols_response
-                .symbols
-                .into_iter()
-                .map(|sym| DocumentSymbol {
-                    name: sym.name,
-                    detail: sym.container_name,
-                    kind: sym.kind,
-                    tags: None,
-                    #[allow(deprecated)]
-                    deprecated: Some(false),
-                    range: lsp_types::Range::default(),
-                    selection_range: lsp_types::Range::default(),
-                    children: None,
-                })
-                .collect();
-            let _ = response_tx
-                .send(LspResponse::DocumentSymbols {
-                    request_id,
-                    symbols,
-                })
-                .await;
-        }
     } else {
         log::error!(
             "Failed to parse document symbols response for request {}",
@@ -219,80 +209,91 @@ pub(super) async fn handle_workspace_symbols_response(
     }
 }
 
-async fn handle_legacy_document_symbols_for_enhanced_references(
+/// Handle a document-symbols response that was issued as a sub-request of the
+/// enhanced-references flow.  `base_request_id` is the original
+/// `FindReferencesWithSymbols` service ID, passed via the typed
+/// `RequestType::DocumentSymbolsForEnhancedRefs` variant (no string parsing).
+pub(super) async fn handle_document_symbols_for_enhanced_refs(
     message: Value,
-    request_id: String,
+    base_request_id: String,
     state: &mut LspWorkerState,
     response_tx: &mpsc::Sender<LspResponse>,
 ) {
+    if super::check_and_send_lsp_error(
+        &message,
+        &base_request_id,
+        "document symbols (enhanced refs)",
+        response_tx,
+    )
+    .await
+    {
+        return;
+    }
+
     log::debug!(
         "Processing document symbol response for enhanced references: {}",
-        request_id
+        base_request_id
     );
 
-    if let Some(result) = message.get("result") {
-        if !result.is_null() {
-            match serde_json::from_value::<Vec<lsp_types::DocumentSymbol>>(result.clone()) {
-                Ok(document_symbols) => {
-                    log::info!(
-                        "Successfully parsed document symbols for enhanced references request {}: found {} symbols",
-                        request_id,
-                        document_symbols.len()
-                    );
-                    if let Some(base_request_id) = request_id.strip_prefix("document_symbol_for_") {
-                        references::handle_document_symbols_for_enhanced_references(
+    let Some(result) = message.get("result") else {
+        log::warn!(
+            "No result field in document symbols response for enhanced references request: {}",
+            base_request_id
+        );
+        return;
+    };
+
+    if result.is_null() {
+        log::warn!(
+            "Document symbols response was null for enhanced references request: {}",
+            base_request_id
+        );
+        return;
+    }
+
+    // clangd may return either DocumentSymbol[] or SymbolInformation[].
+    let document_symbols =
+        match serde_json::from_value::<Vec<lsp_types::DocumentSymbol>>(result.clone()) {
+            Ok(symbols) => {
+                log::info!(
+                    "Parsed {} DocumentSymbol entries for enhanced references request {}",
+                    symbols.len(),
+                    base_request_id,
+                );
+                symbols
+            }
+            Err(_) => {
+                match serde_json::from_value::<Vec<lsp_types::SymbolInformation>>(result.clone()) {
+                    Ok(symbol_infos) => {
+                        log::info!(
+                            "Parsed {} SymbolInformation entries for enhanced references request {}",
+                            symbol_infos.len(),
                             base_request_id,
-                            &document_symbols,
-                            state,
-                            response_tx,
-                        )
-                        .await;
+                        );
+                        document::convert_symbol_info_to_document_symbols(&symbol_infos)
                     }
-                }
-                Err(_) => {
-                    match serde_json::from_value::<Vec<lsp_types::SymbolInformation>>(
-                        result.clone(),
-                    ) {
-                        Ok(symbol_infos) => {
-                            log::info!(
-                                "Successfully parsed symbol information for enhanced references request {}: found {} symbols",
-                                request_id,
-                                symbol_infos.len()
-                            );
-                            let document_symbols =
-                                document::convert_symbol_info_to_document_symbols(&symbol_infos);
-                            if let Some(base_request_id) =
-                                request_id.strip_prefix("document_symbol_for_")
-                            {
-                                references::handle_document_symbols_for_enhanced_references(
-                                    base_request_id,
-                                    &document_symbols,
-                                    state,
-                                    response_tx,
-                                )
-                                .await;
-                            }
-                        }
-                        Err(e) => {
-                            log::error!(
-                                "Error parsing document symbols or symbol information for enhanced references {}: {:?}",
-                                request_id,
-                                e
-                            );
-                            log::debug!(
-                                "Raw response: {}",
-                                serde_json::to_string_pretty(result)
-                                    .unwrap_or_else(|_| "failed to serialize".to_string())
-                            );
-                        }
+                    Err(e) => {
+                        log::error!(
+                            "Failed to parse document symbols for enhanced references {}: {:?}",
+                            base_request_id,
+                            e,
+                        );
+                        log::debug!(
+                            "Raw response: {}",
+                            serde_json::to_string_pretty(result)
+                                .unwrap_or_else(|_| "failed to serialize".to_string())
+                        );
+                        return;
                     }
                 }
             }
-        } else {
-            log::warn!(
-                "Document symbols response was null for enhanced references request: {}",
-                request_id
-            );
-        }
-    }
+        };
+
+    references::handle_document_symbols_for_enhanced_references(
+        &base_request_id,
+        &document_symbols,
+        state,
+        response_tx,
+    )
+    .await;
 }

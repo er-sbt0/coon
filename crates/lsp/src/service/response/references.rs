@@ -88,135 +88,6 @@ pub(super) async fn handle_references_with_symbols_response(
     }
 }
 
-pub(super) async fn handle_hover_response(
-    message: Value,
-    request_id: String,
-    state: &mut LspWorkerState,
-    response_tx: &mpsc::Sender<LspResponse>,
-) {
-    if super::check_and_send_lsp_error(&message, &request_id, "hover", response_tx).await {
-        return;
-    }
-
-    if let Ok(Some(hover_response)) = state.client.parse_hover_response(&message) {
-        log::debug!(
-            "LSP Hover Response for request {}: hover_info={:?}",
-            request_id,
-            hover_response.hover_info
-        );
-
-        if request_id.starts_with("hover_for_") {
-            log::debug!("Raw hover response message for {}: {}", request_id, message);
-            handle_hover_for_enhanced_references(hover_response, &request_id, state, response_tx)
-                .await;
-        }
-    } else {
-        log::error!("Failed to parse hover response for request {}", request_id);
-        log::debug!("Raw response: {}", message);
-        let _ = response_tx
-            .send(LspResponse::Error {
-                request_id,
-                error: "Failed to parse hover response".to_string(),
-            })
-            .await;
-    }
-}
-
-async fn handle_hover_for_enhanced_references(
-    hover_response: crate::HoverResponse,
-    request_id: &str,
-    state: &mut LspWorkerState,
-    response_tx: &mpsc::Sender<LspResponse>,
-) {
-    if let Some(remaining) = request_id.strip_prefix("hover_for_") {
-        if let Some(last_underscore) = remaining.rfind('_') {
-            let service_request_id = &remaining[..last_underscore];
-            let index_str = &remaining[last_underscore + 1..];
-
-            if let Ok(index) = index_str.parse::<usize>() {
-                log::debug!(
-                    "Processing hover response for service_request_id={}, index={}",
-                    service_request_id,
-                    index
-                );
-
-                if let Some(pending) = state.pending_enhanced_requests.get_mut(service_request_id) {
-                    pending.pending_symbol_requests.remove(index_str);
-
-                    let symbol_name = if let Some(hover_info) = &hover_response.hover_info {
-                        crate::parsing::extract_function_name_from_signature(hover_info)
-                    } else {
-                        None
-                    };
-
-                    log::debug!(
-                        "Extracted symbol name for index {}: {:?}",
-                        index,
-                        symbol_name
-                    );
-
-                    if pending.pending_symbol_requests.is_empty() {
-                        let mut enhanced_refs = Vec::new();
-                        for (i, location) in pending.locations.iter().enumerate() {
-                            let referencing_symbol = if i == index && symbol_name.is_some() {
-                                Some(model::ReferencingSymbol {
-                                    name: symbol_name.clone().unwrap(),
-                                    qualified_name: symbol_name.clone().unwrap(),
-                                    kind: model::ReferenceSymbolKind::Function,
-                                })
-                            } else {
-                                None
-                            };
-                            enhanced_refs.push(model::Reference {
-                                location: location.clone(),
-                                referencing_symbol,
-                            });
-                        }
-
-                        log::debug!(
-                            "Completed enhanced references for {}: {} references with symbol info",
-                            service_request_id,
-                            enhanced_refs.len()
-                        );
-
-                        let _ = response_tx
-                            .send(LspResponse::ReferencesWithSymbols {
-                                request_id: service_request_id.to_string(),
-                                references: enhanced_refs,
-                            })
-                            .await;
-
-                        state.pending_enhanced_requests.remove(service_request_id);
-                    } else {
-                        log::debug!(
-                            "Still waiting for {} more hover responses for {}",
-                            pending.pending_symbol_requests.len(),
-                            service_request_id
-                        );
-                    }
-                } else {
-                    log::warn!(
-                        "No pending enhanced request found for service_request_id: {}",
-                        service_request_id
-                    );
-                }
-            } else {
-                log::warn!(
-                    "Failed to parse index from hover request ID: {}",
-                    request_id
-                );
-            }
-        } else {
-            log::warn!("Invalid hover request ID format: {}", request_id);
-        }
-    } else {
-        log::warn!(
-            "Hover request ID does not start with 'hover_for_': {}",
-            request_id
-        );
-    }
-}
-
 pub(super) async fn handle_document_symbols_for_enhanced_references(
     base_request_id: &str,
     document_symbols: &[lsp_types::DocumentSymbol],
@@ -360,17 +231,11 @@ async fn parse_enhanced_references_response(
     }
 
     log::debug!("Using service request ID: {}", service_request_id);
-    log::debug!("Using service request ID: {}", service_request_id);
 
     state.pending_enhanced_requests.insert(
         service_request_id.to_string(),
         EnhancedRequestInfo {
             locations: locations.clone(),
-            pending_symbol_requests: locations
-                .iter()
-                .enumerate()
-                .map(|(i, _)| i.to_string())
-                .collect(),
         },
     );
 
@@ -389,8 +254,13 @@ async fn parse_enhanced_references_response(
             let text_document = lsp_types::TextDocumentIdentifier { uri: document_uri };
             match state.client.document_symbol(text_document).await {
                 Ok(lsp_request_id) => {
-                    let request_id = format!("document_symbol_for_{}", service_request_id);
-                    state.track_request(lsp_request_id, request_id, RequestType::DocumentSymbols);
+                    state.track_request(
+                        lsp_request_id,
+                        service_request_id.to_string(),
+                        RequestType::DocumentSymbolsForEnhancedRefs {
+                            base_request_id: service_request_id.to_string(),
+                        },
+                    );
                     state.enhanced_lsp_requests.insert(lsp_request_id);
                     log::debug!(
                         "Sent document symbol request for {} (lsp_request_id: {})",

@@ -175,6 +175,15 @@ pub(super) async fn handle_lsp_message(
                     )
                     .await;
                 }
+                Some(RequestType::DocumentSymbolsForEnhancedRefs { base_request_id }) => {
+                    symbols::handle_document_symbols_for_enhanced_refs(
+                        message,
+                        base_request_id,
+                        state,
+                        response_tx,
+                    )
+                    .await;
+                }
                 Some(RequestType::WorkspaceSymbols) => {
                     symbols::handle_workspace_symbols_response(
                         message,

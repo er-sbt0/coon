@@ -34,8 +34,6 @@ pub(super) async fn handle_legacy_response_detection(
         } else {
             references::handle_references_response(message, request_id, state, response_tx).await;
         }
-    } else if let Ok(Some(_)) = state.client.parse_hover_response(&message) {
-        references::handle_hover_response(message, request_id, state, response_tx).await;
     } else if let Ok(Some(_)) = state.client.parse_document_symbol_response(&message) {
         symbols::handle_document_symbols_response(message, request_id, state, response_tx).await;
     } else if message.get("result").is_some() {
