@@ -97,8 +97,7 @@ impl TuiApp {
             if event::poll(std::time::Duration::from_millis(EVENT_POLL_INTERVAL_MS))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
-                        if let Some(action) =
-                            key_map::map_key_event(key, self.app.show_search_bar)
+                        if let Some(action) = key_map::map_key_event(key, self.app.show_search_bar)
                         {
                             self.app.handle_action(action);
                         }

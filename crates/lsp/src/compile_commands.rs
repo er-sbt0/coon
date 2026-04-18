@@ -15,10 +15,15 @@ pub struct CompileCommand {
 }
 
 /// Parse compile_commands.json to extract source file paths
-pub async fn parse_compile_commands(project_path: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
+pub async fn parse_compile_commands(
+    project_path: &std::path::Path,
+) -> anyhow::Result<Vec<PathBuf>> {
     let compile_commands_path = project_path.join("compile_commands.json");
 
-    if !tokio::fs::try_exists(&compile_commands_path).await.unwrap_or(false) {
+    if !tokio::fs::try_exists(&compile_commands_path)
+        .await
+        .unwrap_or(false)
+    {
         // Fallback to directory walking if no compile_commands.json exists
         log::info!("No compile_commands.json found, falling back to directory discovery");
         let project_path = project_path.to_owned();

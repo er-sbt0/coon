@@ -16,7 +16,9 @@ pub(super) enum RequestType {
     DocumentSymbols,
     /// Document-symbol sub-request spawned by the enhanced-references flow.
     /// `base_request_id` is the original `FindReferencesWithSymbols` service ID.
-    DocumentSymbolsForEnhancedRefs { base_request_id: String },
+    DocumentSymbolsForEnhancedRefs {
+        base_request_id: String,
+    },
     WorkspaceSymbols,
 }
 

@@ -119,8 +119,14 @@ mod tests {
 
     #[test]
     fn normal_mode_quit() {
-        assert_eq!(map_key_event(press(KeyCode::Char('q')), false), Some(Action::Quit));
-        assert_eq!(map_key_event(press(KeyCode::Esc), false), Some(Action::Quit));
+        assert_eq!(
+            map_key_event(press(KeyCode::Char('q')), false),
+            Some(Action::Quit)
+        );
+        assert_eq!(
+            map_key_event(press(KeyCode::Esc), false),
+            Some(Action::Quit)
+        );
     }
 
     #[test]
@@ -144,7 +150,10 @@ mod tests {
 
     #[test]
     fn search_mode_esc_closes() {
-        assert_eq!(map_key_event(press(KeyCode::Esc), true), Some(Action::ToggleSearch));
+        assert_eq!(
+            map_key_event(press(KeyCode::Esc), true),
+            Some(Action::ToggleSearch)
+        );
     }
 
     #[test]
@@ -157,8 +166,14 @@ mod tests {
 
     #[test]
     fn search_mode_navigation() {
-        assert_eq!(map_key_event(press(KeyCode::Up), true), Some(Action::SearchPrevResult));
-        assert_eq!(map_key_event(press(KeyCode::Down), true), Some(Action::SearchNextResult));
+        assert_eq!(
+            map_key_event(press(KeyCode::Up), true),
+            Some(Action::SearchPrevResult)
+        );
+        assert_eq!(
+            map_key_event(press(KeyCode::Down), true),
+            Some(Action::SearchNextResult)
+        );
     }
 
     #[test]

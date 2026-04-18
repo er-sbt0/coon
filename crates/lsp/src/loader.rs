@@ -133,15 +133,15 @@ pub async fn lsp_loader_task(
         LspLoadPhase::LoadingWorkspaceSymbols { loaded: 0 },
     ))?;
 
-    let symbol_deadline =
-        tokio::time::Instant::now() + tokio::time::Duration::from_millis(2000);
+    let symbol_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(2000);
     let mut loaded_count: usize = 0;
 
     'symbol_wait: loop {
         match tokio::time::timeout_at(symbol_deadline, lsp_service.recv_response()).await {
-            Ok(Some(LspResponse::WorkspaceSymbols { request_id, symbols }))
-                if request_id == initial_request_id =>
-            {
+            Ok(Some(LspResponse::WorkspaceSymbols {
+                request_id,
+                symbols,
+            })) if request_id == initial_request_id => {
                 info!("Received {} initial workspace symbols", symbols.len());
                 for function_node in symbols.into_iter().take(200) {
                     let workspace_symbol = model::WorkspaceSymbolInfo {

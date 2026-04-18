@@ -313,7 +313,11 @@ mod tests {
         // deduplication must still work after round-trip
         let mut restored = restored;
         restored.add_call(id1.clone(), id2.clone(), loc);
-        assert_eq!(restored.edges.len(), 1, "duplicate edge was not deduplicated");
+        assert_eq!(
+            restored.edges.len(),
+            1,
+            "duplicate edge was not deduplicated"
+        );
     }
 
     #[test]
