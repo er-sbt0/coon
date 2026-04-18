@@ -61,9 +61,6 @@ Same name, different structs, different crates. Causes confusion and unnecessary
 **15. Excessive `info!`-level logging** — loader.rs, response/references.rs
 Every LSP reference location logged at `info!`. Massive log files, I/O overhead. Should be `debug!`/`trace!`.
 
-**16. `result.clone()` on every JSON parse** — parsing.rs, call_hierarchy.rs
-`serde_json::from_value` consumes the value, but code clones first. Double allocation on every LSP response.
-
 **17. Dead code behind `#[allow(dead_code)]`** — lib.rs, lazy_graph.rs (~280 lines), large parts of `logic` crate
 Whole modules suppressed. `LazyCallGraph` never used. `logic` crate mostly unused by TUI.
 

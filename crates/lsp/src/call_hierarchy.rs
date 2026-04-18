@@ -2,6 +2,7 @@
 use anyhow::Result;
 use log;
 use lsp_types as lsp;
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -36,7 +37,7 @@ pub(crate) fn parse_prepare_call_hierarchy_response_impl(
                     }
 
                     // Try to parse the result as an array of CallHierarchyItem objects
-                    match serde_json::from_value::<Vec<lsp::CallHierarchyItem>>(result.clone()) {
+                    match Vec::<lsp::CallHierarchyItem>::deserialize(result) {
                         Ok(items) => {
                             return Ok(Some(PrepareCallHierarchyResponse {
                                 request_id: id,
@@ -94,9 +95,7 @@ pub(crate) fn parse_outgoing_calls_response_impl(
                     }
 
                     // Try to parse the result as an array of CallHierarchyOutgoingCall objects
-                    match serde_json::from_value::<Vec<lsp::CallHierarchyOutgoingCall>>(
-                        result.clone(),
-                    ) {
+                    match Vec::<lsp::CallHierarchyOutgoingCall>::deserialize(result) {
                         Ok(calls) => {
                             return Ok(Some(OutgoingCallsResponse {
                                 request_id: id,
@@ -154,9 +153,7 @@ pub(crate) fn parse_incoming_calls_response_impl(
                     }
 
                     // Try to parse the result as an array of CallHierarchyIncomingCall objects
-                    match serde_json::from_value::<Vec<lsp::CallHierarchyIncomingCall>>(
-                        result.clone(),
-                    ) {
+                    match Vec::<lsp::CallHierarchyIncomingCall>::deserialize(result) {
                         Ok(calls) => {
                             return Ok(Some(IncomingCallsResponse {
                                 request_id: id,

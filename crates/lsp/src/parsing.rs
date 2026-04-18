@@ -1,5 +1,6 @@
 use anyhow::Result;
 use lsp_types as lsp;
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -61,7 +62,7 @@ pub(crate) fn parse_find_references_response_impl(
                         "parse_find_references_response_impl: parsing result: {}",
                         result
                     );
-                    let lsp_locations: Vec<lsp::Location> = serde_json::from_value(result.clone())?;
+                    let lsp_locations = Vec::<lsp::Location>::deserialize(result)?;
                     let locations: Vec<_> =
                         lsp_locations.iter().map(convert_lsp_location).collect();
 
@@ -101,7 +102,7 @@ pub(crate) fn parse_find_references_response_impl(
                         "parse_find_references_response_impl: parsing enhanced result: {}",
                         result
                     );
-                    let lsp_locations: Vec<lsp::Location> = serde_json::from_value(result.clone())?;
+                    let lsp_locations = Vec::<lsp::Location>::deserialize(result)?;
                     let locations: Vec<_> =
                         lsp_locations.iter().map(convert_lsp_location).collect();
 
@@ -149,8 +150,7 @@ pub(crate) fn parse_workspace_symbol_response_impl(
                         }));
                     }
 
-                    let workspace_symbols: Vec<lsp::WorkspaceSymbol> =
-                        serde_json::from_value(result.clone())?;
+                    let workspace_symbols = Vec::<lsp::WorkspaceSymbol>::deserialize(result)?;
                     let symbols = workspace_symbols
                         .iter()
                         .map(|symbol| {
@@ -214,7 +214,7 @@ pub(crate) fn parse_document_symbol_response_impl(
 
                     // DocumentSymbol can return either DocumentSymbol[] or SymbolInformation[]
                     let symbols = if let Ok(doc_symbols) =
-                        serde_json::from_value::<Vec<lsp::DocumentSymbol>>(result.clone())
+                        Vec::<lsp::DocumentSymbol>::deserialize(result)
                     {
                         // Convert DocumentSymbol to our format
                         doc_symbols
@@ -224,7 +224,7 @@ pub(crate) fn parse_document_symbol_response_impl(
                             })
                             .collect()
                     } else if let Ok(symbol_infos) =
-                        serde_json::from_value::<Vec<lsp::SymbolInformation>>(result.clone())
+                        Vec::<lsp::SymbolInformation>::deserialize(result)
                     {
                         // Convert SymbolInformation to our format
                         symbol_infos
@@ -281,7 +281,7 @@ pub(crate) fn parse_hover_response_impl(
                     }
 
                     // Parse hover response
-                    if let Ok(hover) = serde_json::from_value::<lsp_types::Hover>(result.clone()) {
+                    if let Ok(hover) = lsp_types::Hover::deserialize(result) {
                         // Extract text content from hover
                         let hover_text = match &hover.contents {
                             lsp_types::HoverContents::Scalar(marked_string) => {
