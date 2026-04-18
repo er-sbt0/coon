@@ -143,14 +143,17 @@ impl GraphViewState {
 
     /// Select the next sibling node
     pub fn select_next_sibling(&mut self, _graph: &CallGraph) {
-        if let Some(selected) = &self.selected_node {
-            if let Some(_root) = &self.root_symbol {
-                // For now, just cycle through all nodes (sorted by node index for determinism)
-                let mut all_symbols: Vec<_> = self.adapter.symbol_to_node.iter().collect();
-                all_symbols.sort_by_key(|(_, &idx)| idx);
-                if let Some(current_idx) = all_symbols.iter().position(|(s, _)| *s == selected) {
-                    let next_idx = (current_idx + 1) % all_symbols.len();
-                    self.selected_node = Some(all_symbols[next_idx].0.clone());
+        if let Some(siblings) = self.get_siblings() {
+            if let Some(selected) = &self.selected_node {
+                if let Some(&selected_idx) = self.adapter.symbol_to_node.get(selected) {
+                    if let Some(current_pos) = siblings.iter().position(|&idx| idx == selected_idx)
+                    {
+                        let next_pos = (current_pos + 1) % siblings.len();
+                        let next_idx = siblings[next_pos];
+                        if let Some(next_symbol) = self.adapter.node_to_symbol.get(&next_idx) {
+                            self.selected_node = Some(next_symbol.clone());
+                        }
+                    }
                 }
             }
         }
@@ -158,17 +161,21 @@ impl GraphViewState {
 
     /// Select the previous sibling node
     pub fn select_prev_sibling(&mut self, _graph: &CallGraph) {
-        if let Some(selected) = &self.selected_node {
-            if let Some(_root) = &self.root_symbol {
-                let mut all_symbols: Vec<_> = self.adapter.symbol_to_node.iter().collect();
-                all_symbols.sort_by_key(|(_, &idx)| idx);
-                if let Some(current_idx) = all_symbols.iter().position(|(s, _)| *s == selected) {
-                    let prev_idx = if current_idx == 0 {
-                        all_symbols.len() - 1
-                    } else {
-                        current_idx - 1
-                    };
-                    self.selected_node = Some(all_symbols[prev_idx].0.clone());
+        if let Some(siblings) = self.get_siblings() {
+            if let Some(selected) = &self.selected_node {
+                if let Some(&selected_idx) = self.adapter.symbol_to_node.get(selected) {
+                    if let Some(current_pos) = siblings.iter().position(|&idx| idx == selected_idx)
+                    {
+                        let prev_pos = if current_pos == 0 {
+                            siblings.len() - 1
+                        } else {
+                            current_pos - 1
+                        };
+                        let prev_idx = siblings[prev_pos];
+                        if let Some(prev_symbol) = self.adapter.node_to_symbol.get(&prev_idx) {
+                            self.selected_node = Some(prev_symbol.clone());
+                        }
+                    }
                 }
             }
         }
