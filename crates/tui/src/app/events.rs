@@ -7,6 +7,11 @@ use crate::status_message::StatusMessage;
 
 use super::App;
 
+/// Vertical pan distance (in graph units) per Up/Down key press.
+const PAN_DELTA_VERTICAL: f32 = 3.0;
+/// Horizontal pan distance (in graph units) per Left/Right key press.
+const PAN_DELTA_HORIZONTAL: f32 = 5.0;
+
 impl App {
     pub fn handle_action(&mut self, action: Action) {
         log::info!("Handling action: {:?}", action);
@@ -67,7 +72,7 @@ impl App {
     fn handle_move_up(&mut self) {
         // Pan up in graph view
         if let Some(workspace) = self.get_current_workspace_mut() {
-            workspace.graph_view_state.viewport.pan(0.0, -3.0);
+            workspace.graph_view_state.viewport.pan(0.0, -PAN_DELTA_VERTICAL);
             self.status_message = StatusMessage::PannedUp;
         }
     }
@@ -75,7 +80,7 @@ impl App {
     fn handle_move_down(&mut self) {
         // Pan down in graph view
         if let Some(workspace) = self.get_current_workspace_mut() {
-            workspace.graph_view_state.viewport.pan(0.0, 3.0);
+            workspace.graph_view_state.viewport.pan(0.0, PAN_DELTA_VERTICAL);
             self.status_message = StatusMessage::PannedDown;
         }
     }
@@ -160,7 +165,7 @@ impl App {
     fn handle_move_left(&mut self) {
         // Pan left in graph view
         if let Some(workspace) = self.get_current_workspace_mut() {
-            workspace.graph_view_state.viewport.pan(-5.0, 0.0);
+            workspace.graph_view_state.viewport.pan(-PAN_DELTA_HORIZONTAL, 0.0);
             self.status_message = StatusMessage::PannedLeft;
         }
     }
@@ -168,7 +173,7 @@ impl App {
     fn handle_move_right(&mut self) {
         // Pan right in graph view
         if let Some(workspace) = self.get_current_workspace_mut() {
-            workspace.graph_view_state.viewport.pan(5.0, 0.0);
+            workspace.graph_view_state.viewport.pan(PAN_DELTA_HORIZONTAL, 0.0);
             self.status_message = StatusMessage::PannedRight;
         }
     }

@@ -10,6 +10,9 @@ use crate::compile_commands;
 use crate::{LspClient, LspRequest, LspResponse, LspService};
 use model::lsp_status::{LspLoadPhase, LspUiMessage};
 
+/// Maximum number of workspace symbols to load during initial discovery.
+const MAX_INITIAL_SYMBOLS: usize = 200;
+
 /// Runs the full LSP initialization sequence in the background:
 ///
 /// 1. Spawns and initializes clangd
@@ -143,7 +146,7 @@ pub async fn lsp_loader_task(
                 symbols,
             })) if request_id == initial_request_id => {
                 info!("Received {} initial workspace symbols", symbols.len());
-                for function_node in symbols.into_iter().take(200) {
+                for function_node in symbols.into_iter().take(MAX_INITIAL_SYMBOLS) {
                     let workspace_symbol = model::WorkspaceSymbolInfo {
                         name: function_node.name.clone(),
                         qualified_name: function_node.qualified_name.clone(),
