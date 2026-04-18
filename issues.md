@@ -52,12 +52,6 @@ update.rs — `update_function_outgoing_calls` and `update_function_incoming_cal
 
 ---
 
-### 6. **Duplicated navigation handler boilerplate**
-
-events.rs — `handle_navigate_parent`, `handle_navigate_child`, `handle_navigate_next_sibling`, and `handle_navigate_prev_sibling` all follow the identical pattern: get workspace by index, call a method on `graph_view_state`, look up function name, set `status_message`. Only the navigation method name and status text differ.
-
-**Fix:** Extract a generic `navigate_and_report(op, success_prefix, fail_msg)` helper.
-
 ---
 
 ### 7. **`CallGraphAdapter.build_tree` clones `HashSet<SymbolId>` on every BFS step**
@@ -71,8 +65,6 @@ graph_adapter.rs: Each node enqueued gets `let mut new_path = path.clone()`. For
 ### 8. **`select_next_sibling` / `select_prev_sibling` cycle through ALL nodes, not actual siblings**
 
 graph_view.rs: The comment says "sibling" navigation, but the implementation sorts `symbol_to_node` by node index and cycles through *every* node in the tree. Contrast with `navigate_next_sibling` (line 275) which correctly uses `get_siblings()`. This is inconsistent and misleading.
-
----
 
 ---
 

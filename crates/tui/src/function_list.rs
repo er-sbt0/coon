@@ -196,7 +196,7 @@ mod tests {
     use super::*;
     use model::{FunctionNode, Location};
 
-    fn create_test_setup() -> (CallGraph, GraphQueryEngine<'static>) {
+    fn create_test_graph() -> CallGraph {
         let mut graph = CallGraph::new();
 
         let func1 = FunctionNode::new(
@@ -213,15 +213,13 @@ mod tests {
         graph.add_function(func1);
         graph.add_function(func2);
 
-        let leaked_graph = Box::leak(Box::new(graph.clone()));
-        let query_engine = logic::query::GraphQueryEngine::new(leaked_graph);
-
-        (graph, query_engine)
+        graph
     }
 
     #[test]
     fn test_function_list_creation() {
-        let (graph, query_engine) = create_test_setup();
+        let graph = create_test_graph();
+        let query_engine = GraphQueryEngine::new(&graph);
         let list = FunctionList::new(&graph, &query_engine);
 
         assert_eq!(list.functions.len(), 2);
@@ -230,7 +228,8 @@ mod tests {
 
     #[test]
     fn test_navigation() {
-        let (graph, query_engine) = create_test_setup();
+        let graph = create_test_graph();
+        let query_engine = GraphQueryEngine::new(&graph);
         let mut list = FunctionList::new(&graph, &query_engine);
 
         assert_eq!(list.state.selected(), Some(0));
@@ -247,7 +246,8 @@ mod tests {
 
     #[test]
     fn test_search_filtering() {
-        let (graph, query_engine) = create_test_setup();
+        let graph = create_test_graph();
+        let query_engine = GraphQueryEngine::new(&graph);
         let mut list = FunctionList::new(&graph, &query_engine);
 
         assert_eq!(list.functions.len(), 2);

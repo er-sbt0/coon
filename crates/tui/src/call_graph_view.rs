@@ -133,7 +133,7 @@ mod tests {
     use super::*;
     use model::{FunctionNode, Location};
 
-    fn create_test_setup() -> (CallGraph, GraphQueryEngine<'static>) {
+    fn create_test_graph() -> CallGraph {
         let mut graph = CallGraph::new();
 
         let func1 = FunctionNode::new(
@@ -152,15 +152,13 @@ mod tests {
 
         graph.add_call(id1, id2, Location::new("test.rs".to_string(), 2, 4));
 
-        let leaked_graph = Box::leak(Box::new(graph.clone()));
-        let query_engine = logic::query::GraphQueryEngine::new(leaked_graph);
-
-        (graph, query_engine)
+        graph
     }
 
     #[test]
     fn test_call_graph_view_creation() {
-        let (graph, query_engine) = create_test_setup();
+        let graph = create_test_graph();
+        let query_engine = GraphQueryEngine::new(&graph);
         let view = CallGraphView::new(&graph, &query_engine);
 
         // Just test that we can create the view
