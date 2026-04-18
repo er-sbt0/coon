@@ -130,36 +130,9 @@ pub(crate) fn parse_workspace_symbol_response_impl(
         pending_requests,
         response,
         "workspace/symbol",
-        |id, workspace_symbols: Vec<lsp::WorkspaceSymbol>| {
-            let symbols = workspace_symbols
-                .iter()
-                .map(|symbol| {
-                    let location = match &symbol.location {
-                        lsp::OneOf::Left(location) => convert_lsp_location(location),
-                        lsp::OneOf::Right(workspace_location) => model::Location {
-                            file_path: workspace_location
-                                .uri
-                                .to_file_path()
-                                .map(|p| p.to_string_lossy().to_string())
-                                .unwrap_or_else(|_| workspace_location.uri.to_string()),
-                            line: 0,
-                            column: 0,
-                            length: None,
-                        },
-                    };
-                    model::WorkspaceSymbolInfo {
-                        name: symbol.name.clone(),
-                        qualified_name: make_qualified_name(&symbol.container_name, &symbol.name),
-                        kind: symbol.kind,
-                        location,
-                        container_name: symbol.container_name.clone(),
-                    }
-                })
-                .collect();
-            WorkspaceSymbolResponse {
-                request_id: id,
-                symbols,
-            }
+        |id, workspace_symbols: Vec<lsp::WorkspaceSymbol>| WorkspaceSymbolResponse {
+            request_id: id,
+            symbols: parse_workspace_symbols_from_result(workspace_symbols),
         },
         |id| WorkspaceSymbolResponse {
             request_id: id,
@@ -203,30 +176,11 @@ pub(crate) fn parse_document_symbol_response_impl(
     };
 
     // DocumentSymbol can return either DocumentSymbol[] or SymbolInformation[]
-    let symbols = if let Ok(doc_symbols) = Vec::<lsp::DocumentSymbol>::deserialize(result) {
-        doc_symbols
-            .into_iter()
-            .flat_map(|doc_symbol| convert_document_symbol_recursive(&doc_symbol, None))
-            .collect()
-    } else if let Ok(symbol_infos) = Vec::<lsp::SymbolInformation>::deserialize(result) {
-        symbol_infos
-            .iter()
-            .map(|symbol| model::WorkspaceSymbolInfo {
-                name: symbol.name.clone(),
-                qualified_name: make_qualified_name(&symbol.container_name, &symbol.name),
-                kind: symbol.kind,
-                location: convert_lsp_location(&symbol.location),
-                container_name: symbol.container_name.clone(),
-            })
-            .collect()
-    } else {
-        let msg = format!(
-            "Failed to parse documentSymbol result as either DocumentSymbol[] or SymbolInformation[]. Raw result: {:?}",
-            result
-        );
-        log::error!("{}", msg);
-        return Err(anyhow::anyhow!(msg));
-    };
+    let doc_symbols = parse_document_symbols_from_result(result)?;
+    let symbols = doc_symbols
+        .into_iter()
+        .flat_map(|doc_symbol| convert_document_symbol_recursive(&doc_symbol, None))
+        .collect();
 
     Ok(Some(DocumentSymbolResponse {
         request_id: id,
@@ -367,6 +321,89 @@ pub(crate) fn extract_function_name_from_signature(signature: &str) -> Option<St
     }
 
     None
+}
+
+// ---------------------------------------------------------------------------
+// Shared document-symbol deserialization helpers
+// ---------------------------------------------------------------------------
+
+/// Deserialize a `documentSymbol` **result** value (not the full response
+/// envelope) into `Vec<lsp::DocumentSymbol>`.  Handles the two shapes
+/// clangd may return: `DocumentSymbol[]` (preferred) or the legacy
+/// `SymbolInformation[]` (converted into `DocumentSymbol` for a uniform
+/// return type).
+pub(crate) fn parse_document_symbols_from_result(
+    result: &Value,
+) -> Result<Vec<lsp::DocumentSymbol>> {
+    if let Ok(doc_symbols) = Vec::<lsp::DocumentSymbol>::deserialize(result) {
+        Ok(doc_symbols)
+    } else if let Ok(symbol_infos) = Vec::<lsp::SymbolInformation>::deserialize(result) {
+        Ok(convert_symbol_info_to_document_symbols(&symbol_infos))
+    } else {
+        let msg = format!(
+            "Failed to parse documentSymbol result as either DocumentSymbol[] or SymbolInformation[]. Raw result: {:?}",
+            result
+        );
+        log::error!("{}", msg);
+        Err(anyhow::anyhow!(msg))
+    }
+}
+
+/// Convert legacy `SymbolInformation[]` into `DocumentSymbol[]`.
+///
+/// This is the single canonical implementation — used by both the
+/// `LspClient` parsing path and the `LspService` response handlers.
+pub(crate) fn convert_symbol_info_to_document_symbols(
+    symbol_infos: &[lsp::SymbolInformation],
+) -> Vec<lsp::DocumentSymbol> {
+    symbol_infos
+        .iter()
+        .map(|info| lsp::DocumentSymbol {
+            name: info.name.clone(),
+            detail: info.container_name.clone(),
+            kind: info.kind,
+            tags: info.tags.clone(),
+            #[allow(deprecated)]
+            deprecated: info.deprecated,
+            range: info.location.range,
+            selection_range: info.location.range,
+            children: None,
+        })
+        .collect()
+}
+
+/// Deserialize a workspace/symbol **result** value into
+/// `Vec<model::WorkspaceSymbolInfo>`.  This is the canonical conversion
+/// from the raw LSP JSON to our model type, used by both the `LspClient`
+/// parsing path and the `LspService` response handlers.
+pub(crate) fn parse_workspace_symbols_from_result(
+    workspace_symbols: Vec<lsp::WorkspaceSymbol>,
+) -> Vec<model::WorkspaceSymbolInfo> {
+    workspace_symbols
+        .iter()
+        .map(|symbol| {
+            let location = match &symbol.location {
+                lsp::OneOf::Left(location) => convert_lsp_location(location),
+                lsp::OneOf::Right(workspace_location) => model::Location {
+                    file_path: workspace_location
+                        .uri
+                        .to_file_path()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| workspace_location.uri.to_string()),
+                    line: 0,
+                    column: 0,
+                    length: None,
+                },
+            };
+            model::WorkspaceSymbolInfo {
+                name: symbol.name.clone(),
+                qualified_name: make_qualified_name(&symbol.container_name, &symbol.name),
+                kind: symbol.kind,
+                location,
+                container_name: symbol.container_name.clone(),
+            }
+        })
+        .collect()
 }
 
 // Helper to recursively convert DocumentSymbol to model::WorkspaceSymbolInfo

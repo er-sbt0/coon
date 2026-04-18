@@ -108,22 +108,3 @@ pub(super) fn convert_lsp_symbol_kind(kind: lsp_types::SymbolKind) -> model::Ref
         _ => model::ReferenceSymbolKind::Function,
     }
 }
-
-pub(super) fn convert_symbol_info_to_document_symbols(
-    symbol_infos: &[lsp_types::SymbolInformation],
-) -> Vec<lsp_types::DocumentSymbol> {
-    symbol_infos
-        .iter()
-        .map(|info| lsp_types::DocumentSymbol {
-            name: info.name.clone(),
-            detail: info.container_name.clone(),
-            kind: info.kind,
-            tags: info.tags.clone(),
-            #[allow(deprecated)]
-            deprecated: info.deprecated,
-            range: info.location.range,
-            selection_range: info.location.range,
-            children: None,
-        })
-        .collect()
-}
