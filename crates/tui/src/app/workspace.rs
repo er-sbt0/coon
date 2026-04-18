@@ -1,14 +1,6 @@
 use super::App;
 
 impl App {
-    /// Toggle function search modal
-    pub fn toggle_function_search(&mut self) {
-        self.show_function_search = !self.show_function_search;
-        if self.show_function_search {
-            self.function_search_query.clear();
-        }
-    }
-
     /// Toggle workspace manager modal
     pub fn toggle_workspace_manager(&mut self) {
         self.workspaces.toggle_manager();

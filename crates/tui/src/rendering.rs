@@ -28,12 +28,6 @@ pub fn ui(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    // Show function search modal if requested
-    if app.show_function_search {
-        render_function_search_modal(f, size, app);
-        return;
-    }
-
     // Show workspace manager if requested
     if app.workspaces.show_manager {
         render_workspace_manager_modal(f, size, app);
@@ -272,70 +266,6 @@ fn render_graph_view(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) 
 
         f.render_widget(paragraph, area);
     }
-}
-
-fn render_function_search_modal(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    // Create a centered popup
-    let popup_width = area.width.min(80);
-    let popup_height = area.height.min(30);
-    let popup_area = ratatui::layout::Rect {
-        x: (area.width - popup_width) / 2,
-        y: (area.height - popup_height) / 2,
-        width: popup_width,
-        height: popup_height,
-    };
-
-    // Clear the background with semi-transparent effect
-    let clear_block = Block::default()
-        .style(Style::default().bg(Color::Black))
-        .borders(Borders::NONE);
-    f.render_widget(clear_block, area);
-
-    // Filter functions based on search query
-    let filtered_functions: Vec<_> = app
-        .functions
-        .iter()
-        .filter_map(|id| app.call_graph.get_function(id))
-        .filter(|func| {
-            if app.function_search_query.is_empty() {
-                true
-            } else {
-                func.name
-                    .to_lowercase()
-                    .contains(&app.function_search_query.to_lowercase())
-            }
-        })
-        .take(popup_height as usize - 5)
-        .collect();
-
-    let mut text = vec![
-        Line::from("Search Functions"),
-        Line::from(""),
-        Line::from(format!("Query: {}_", app.function_search_query)),
-        Line::from(""),
-        Line::from(format!("Found {} function(s):", filtered_functions.len())),
-        Line::from(""),
-    ];
-
-    for (i, func) in filtered_functions.iter().enumerate() {
-        text.push(Line::from(format!("  {}. {}", i + 1, func.name)));
-    }
-
-    text.push(Line::from(""));
-    text.push(Line::from(
-        "Type to search, Enter to select first, Esc to cancel",
-    ));
-
-    let paragraph = Paragraph::new(text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Function Search")
-                .style(Style::default().fg(Color::Cyan)),
-        )
-        .style(Style::default().fg(Color::White).bg(Color::Black));
-
-    f.render_widget(paragraph, popup_area);
 }
 
 fn render_workspace_manager_modal(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {

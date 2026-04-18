@@ -24,7 +24,6 @@ pub struct App {
     pub call_graph: CallGraph,
     pub selected_function: Option<SymbolId>,
     pub functions: Vec<SymbolId>,
-    pub function_list_state: ratatui::widgets::ListState,
 
     // UI chrome
     pub should_quit: bool,
@@ -35,9 +34,6 @@ pub struct App {
     // Search
     pub search_bar_state: SearchBarState,
     pub show_search_bar: bool,
-    pub show_function_search: bool,
-    pub function_search_query: String,
-    pub search_query: String,
 
     // Extracted subsystems
     pub lsp: LspBridge,
@@ -48,25 +44,16 @@ impl App {
     pub fn new(call_graph: CallGraph) -> Self {
         let functions: Vec<SymbolId> = call_graph.function_ids().cloned().collect();
 
-        let mut function_list_state = ratatui::widgets::ListState::default();
-        if !functions.is_empty() {
-            function_list_state.select(Some(0));
-        }
-
         Self {
             call_graph,
             selected_function: None,
             functions,
-            function_list_state,
             should_quit: false,
             show_help: false,
             status_message: "Ready".to_string(),
             last_viewport_size: DEFAULT_VIEWPORT_SIZE,
             search_bar_state: SearchBarState::new(),
             show_search_bar: false,
-            show_function_search: false,
-            function_search_query: String::new(),
-            search_query: String::new(),
             lsp: LspBridge::new(),
             workspaces: WorkspaceManager::new(),
         }
@@ -118,10 +105,6 @@ impl App {
     pub fn select_function(&mut self, id: SymbolId) {
         self.selected_function = Some(id);
         self.status_message = "Function selected".to_string();
-    }
-
-    pub fn set_search_query(&mut self, query: String) {
-        self.search_query = query;
     }
 
     pub fn quit(&mut self) {

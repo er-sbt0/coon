@@ -242,7 +242,7 @@ impl SearchBarState {
     fn fuzzy_match(&self, text: &str, pattern: &str) -> Option<f32> {
         // Simple fuzzy matching algorithm
         let text_lower = text.to_lowercase();
-        let mut pattern_chars = pattern.chars().peekable();
+        let pattern_chars = pattern.chars().peekable();
         let mut text_chars = text_lower.chars().enumerate();
         let mut last_match_idx = 0;
         let mut matched_chars = 0;
