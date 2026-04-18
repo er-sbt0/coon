@@ -253,9 +253,9 @@ impl LspService {
         Ok(())
     }
 
-    /// Try to receive a response without blocking
-    pub fn try_recv_response(&mut self) -> Option<LspResponse> {
-        self.response_rx.try_recv().ok()
+    /// Receive the next response, awaiting until one arrives or the channel closes.
+    pub async fn recv_response(&mut self) -> Option<LspResponse> {
+        self.response_rx.recv().await
     }
 
     /// Shutdown the service

@@ -133,45 +133,36 @@ pub async fn lsp_loader_task(
         LspLoadPhase::LoadingWorkspaceSymbols { loaded: 0 },
     ))?;
 
-    let symbol_timeout = tokio::time::Duration::from_millis(2000);
-    let symbol_start = std::time::Instant::now();
+    let symbol_deadline =
+        tokio::time::Instant::now() + tokio::time::Duration::from_millis(2000);
     let mut loaded_count: usize = 0;
 
-    while symbol_start.elapsed() < symbol_timeout {
-        match lsp_service.try_recv_response() {
-            Some(lsp_response) => {
-                if let LspResponse::WorkspaceSymbols {
-                    request_id,
-                    symbols,
-                } = lsp_response
-                {
-                    if request_id == initial_request_id {
-                        info!("Received {} initial workspace symbols", symbols.len());
-
-                        for function_node in symbols.into_iter().take(200) {
-                            let workspace_symbol = model::WorkspaceSymbolInfo {
-                                name: function_node.name.clone(),
-                                qualified_name: function_node.qualified_name.clone(),
-                                kind: model::lsp_types::SymbolKind::FUNCTION,
-                                location: function_node.definition_location.clone(),
-                                container_name: None,
-                            };
-                            loaded_count += 1;
-                            let _ = ui_tx.send(LspUiMessage::AddFunction(workspace_symbol));
-                        }
-
-                        ui_tx.send(LspUiMessage::Progress(
-                            LspLoadPhase::LoadingWorkspaceSymbols {
-                                loaded: loaded_count,
-                            },
-                        ))?;
-                        break;
-                    }
+    'symbol_wait: loop {
+        match tokio::time::timeout_at(symbol_deadline, lsp_service.recv_response()).await {
+            Ok(Some(LspResponse::WorkspaceSymbols { request_id, symbols }))
+                if request_id == initial_request_id =>
+            {
+                info!("Received {} initial workspace symbols", symbols.len());
+                for function_node in symbols.into_iter().take(200) {
+                    let workspace_symbol = model::WorkspaceSymbolInfo {
+                        name: function_node.name.clone(),
+                        qualified_name: function_node.qualified_name.clone(),
+                        kind: model::lsp_types::SymbolKind::FUNCTION,
+                        location: function_node.definition_location.clone(),
+                        container_name: None,
+                    };
+                    loaded_count += 1;
+                    let _ = ui_tx.send(LspUiMessage::AddFunction(workspace_symbol));
                 }
+                ui_tx.send(LspUiMessage::Progress(
+                    LspLoadPhase::LoadingWorkspaceSymbols {
+                        loaded: loaded_count,
+                    },
+                ))?;
+                break 'symbol_wait;
             }
-            None => {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
+            Ok(Some(_)) => continue, // response for a different request, keep waiting
+            Ok(None) | Err(_) => break, // channel closed or deadline exceeded
         }
     }
 
@@ -258,18 +249,19 @@ pub async fn lsp_loader_task(
                     }
                 }
 
-                _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)) => {
-                    let mut response_count = 0;
-                    while let Some(response) = lsp_service.try_recv_response() {
-                        log::trace!("Forwarding LSP response to TUI: {:?}", response);
-                        if let Err(e) = tui_response_tx.send(response) {
-                            log::error!("Failed to forward LSP response to TUI: {}", e);
+                response = lsp_service.recv_response() => {
+                    match response {
+                        Some(r) => {
+                            log::trace!("Forwarding LSP response to TUI: {:?}", r);
+                            if let Err(e) = tui_response_tx.send(r) {
+                                log::error!("Failed to forward LSP response to TUI: {}", e);
+                                break;
+                            }
+                        }
+                        None => {
+                            log::debug!("LSP service response channel closed, stopping forwarder");
                             break;
                         }
-                        response_count += 1;
-                    }
-                    if response_count > 0 {
-                        log::debug!("Forwarded {} LSP responses to TUI", response_count);
                     }
                 }
             }
