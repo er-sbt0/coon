@@ -91,3 +91,50 @@ pub fn convert_lsp_position(uri: &lsp::Url, position: &lsp::Position) -> model::
         length: None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lsp_types::{Position, Range, Url};
+
+    #[test]
+    fn test_convert_lsp_location() {
+        let uri = Url::parse("file:///home/user/test.rs").unwrap();
+        let lsp_location = lsp::Location {
+            uri: uri.clone(),
+            range: Range {
+                start: Position {
+                    line: 10,
+                    character: 5,
+                },
+                end: Position {
+                    line: 10,
+                    character: 15,
+                },
+            },
+        };
+
+        let core_location = convert_lsp_location(&lsp_location);
+
+        assert_eq!(core_location.file_path, "/home/user/test.rs");
+        assert_eq!(core_location.line, 11);
+        assert_eq!(core_location.column, 6);
+        assert_eq!(core_location.length, Some(10));
+    }
+
+    #[test]
+    fn test_convert_lsp_position() {
+        let uri = Url::parse("file:///home/user/test.rs").unwrap();
+        let position = Position {
+            line: 20,
+            character: 8,
+        };
+
+        let core_location = convert_lsp_position(&uri, &position);
+
+        assert_eq!(core_location.file_path, "/home/user/test.rs");
+        assert_eq!(core_location.line, 21);
+        assert_eq!(core_location.column, 9);
+        assert_eq!(core_location.length, None);
+    }
+}

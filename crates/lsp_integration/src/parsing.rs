@@ -421,3 +421,154 @@ pub(crate) fn convert_document_symbol_recursive(
 
     results
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lsp_types::{Position, Range, Url};
+    use serde_json::Value;
+
+    // Helper to create a mock LSP response
+    fn create_mock_find_references_response(id: i64, locations: Vec<lsp::Location>) -> Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": locations
+        })
+    }
+
+    // Helper to create a mock error response
+    fn create_mock_error_response(id: i64, code: i32, message: &str) -> Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": code,
+                "message": message
+            }
+        })
+    }
+
+    // Helper to create a mock empty response
+    fn create_mock_empty_response(id: i64) -> Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": null
+        })
+    }
+
+    #[test]
+    fn test_parse_find_references_response_with_results() {
+        let mut pending_requests = HashMap::new();
+        pending_requests.insert(42, "textDocument/references".to_string());
+
+        // Create a mock client structure for parsing only
+        let mut client_data = (pending_requests,);
+
+        let uri = Url::parse("file:///home/user/test.rs").unwrap();
+        let mock_locations = vec![
+            lsp::Location {
+                uri: uri.clone(),
+                range: Range {
+                    start: Position {
+                        line: 0,
+                        character: 3,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 11,
+                    },
+                },
+            },
+            lsp::Location {
+                uri: uri.clone(),
+                range: Range {
+                    start: Position {
+                        line: 5,
+                        character: 10,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 18,
+                    },
+                },
+            },
+        ];
+
+        let mock_response = create_mock_find_references_response(42, mock_locations);
+
+        // Test the parsing function directly
+        let result =
+            parse_find_references_response_impl(&mut client_data.0, &mock_response).unwrap();
+
+        assert!(result.is_some());
+        let response = result.unwrap();
+        assert_eq!(response.request_id, 42);
+        assert_eq!(response.locations.len(), 2);
+
+        assert_eq!(response.locations[0].file_path, "/home/user/test.rs");
+        assert_eq!(response.locations[0].line, 1);
+        assert_eq!(response.locations[0].column, 4);
+        assert_eq!(response.locations[0].length, Some(8));
+
+        assert_eq!(response.locations[1].file_path, "/home/user/test.rs");
+        assert_eq!(response.locations[1].line, 6);
+        assert_eq!(response.locations[1].column, 11);
+        assert_eq!(response.locations[1].length, Some(8));
+    }
+
+    #[test]
+    fn test_parse_find_references_response_empty() {
+        let mut pending_requests = HashMap::new();
+        pending_requests.insert(42, "textDocument/references".to_string());
+
+        let mock_response = create_mock_empty_response(42);
+        let result =
+            parse_find_references_response_impl(&mut pending_requests, &mock_response).unwrap();
+
+        assert!(result.is_some());
+        let response = result.unwrap();
+        assert_eq!(response.request_id, 42);
+        assert_eq!(response.locations.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_find_references_response_wrong_method() {
+        let mut pending_requests = HashMap::new();
+        pending_requests.insert(42, "textDocument/definition".to_string());
+
+        let mock_response = create_mock_empty_response(42);
+        let result =
+            parse_find_references_response_impl(&mut pending_requests, &mock_response).unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_find_references_response_error() {
+        let mut pending_requests = HashMap::new();
+        pending_requests.insert(42, "textDocument/references".to_string());
+
+        let mock_response = create_mock_error_response(42, -32602, "No symbol found");
+        let result =
+            parse_find_references_response_impl(&mut pending_requests, &mock_response).unwrap();
+
+        assert!(result.is_some());
+        let response = result.unwrap();
+        assert_eq!(response.request_id, 42);
+        assert_eq!(response.locations.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_find_references_response_no_pending_request() {
+        let mut pending_requests = HashMap::new();
+        // No pending request for this ID
+
+        let mock_response = create_mock_empty_response(42);
+        let result =
+            parse_find_references_response_impl(&mut pending_requests, &mock_response).unwrap();
+
+        assert!(result.is_none());
+    }
+}
