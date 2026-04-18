@@ -4,6 +4,29 @@ use super::LspResponse;
 use lsp_types::{Position, Url};
 use tokio::sync::mpsc;
 
+/// Tracks a successful LSP request or sends an error response on failure.
+async fn track_or_error(
+    state: &mut LspWorkerState,
+    response_tx: &mpsc::Sender<LspResponse>,
+    result: anyhow::Result<i64>,
+    request_id: String,
+    request_type: RequestType,
+    context: &str,
+) {
+    match result {
+        Ok(lsp_id) => state.track_request(lsp_id, request_id, request_type),
+        Err(e) => {
+            log::error!("Failed to send {} request: {}", context, e);
+            let _ = response_tx
+                .send(LspResponse::Error {
+                    request_id,
+                    error: format!("Failed to {}: {}", context, e),
+                })
+                .await;
+        }
+    }
+}
+
 pub(super) async fn handle_preload_documents(
     state: &mut LspWorkerState,
     response_tx: &mpsc::Sender<LspResponse>,
@@ -47,24 +70,8 @@ pub(super) async fn handle_outgoing_calls_request(
         request_id
     );
 
-    match state.client.get_outgoing_calls(call_hierarchy_item).await {
-        Ok(lsp_request_id) => {
-            log::info!(
-                "Sent outgoing calls request to LSP server: lsp_request_id={}",
-                lsp_request_id
-            );
-            state.track_request(lsp_request_id, request_id, RequestType::OutgoingCalls);
-        }
-        Err(e) => {
-            log::error!("Failed to send outgoing calls request: {}", e);
-            let _ = response_tx
-                .send(LspResponse::Error {
-                    request_id,
-                    error: format!("Failed to request outgoing calls: {}", e),
-                })
-                .await;
-        }
-    }
+    let result = state.client.get_outgoing_calls(call_hierarchy_item).await;
+    track_or_error(state, response_tx, result, request_id, RequestType::OutgoingCalls, "outgoing calls").await;
 }
 
 pub(super) async fn handle_incoming_calls_request(
@@ -79,24 +86,8 @@ pub(super) async fn handle_incoming_calls_request(
         request_id
     );
 
-    match state.client.get_incoming_calls(call_hierarchy_item).await {
-        Ok(lsp_request_id) => {
-            log::info!(
-                "Sent incoming calls request to LSP server: lsp_request_id={}",
-                lsp_request_id
-            );
-            state.track_request(lsp_request_id, request_id, RequestType::IncomingCalls);
-        }
-        Err(e) => {
-            log::error!("Failed to send incoming calls request: {}", e);
-            let _ = response_tx
-                .send(LspResponse::Error {
-                    request_id,
-                    error: format!("Failed to request incoming calls: {}", e),
-                })
-                .await;
-        }
-    }
+    let result = state.client.get_incoming_calls(call_hierarchy_item).await;
+    track_or_error(state, response_tx, result, request_id, RequestType::IncomingCalls, "incoming calls").await;
 }
 
 pub(super) async fn handle_prepare_call_hierarchy_request(
@@ -128,32 +119,8 @@ pub(super) async fn handle_prepare_call_hierarchy_request(
         return;
     }
 
-    match state
-        .client
-        .prepare_call_hierarchy(document_uri, position)
-        .await
-    {
-        Ok(lsp_request_id) => {
-            log::info!(
-                "Sent prepare call hierarchy request to LSP server: lsp_request_id={}",
-                lsp_request_id
-            );
-            state.track_request(
-                lsp_request_id,
-                request_id,
-                RequestType::PrepareCallHierarchy,
-            );
-        }
-        Err(e) => {
-            log::error!("Failed to send prepare call hierarchy request: {}", e);
-            let _ = response_tx
-                .send(LspResponse::Error {
-                    request_id,
-                    error: format!("Failed to prepare call hierarchy: {}", e),
-                })
-                .await;
-        }
-    }
+    let result = state.client.prepare_call_hierarchy(document_uri, position).await;
+    track_or_error(state, response_tx, result, request_id, RequestType::PrepareCallHierarchy, "prepare call hierarchy").await;
 }
 
 pub(super) async fn handle_references_request(
@@ -183,24 +150,8 @@ pub(super) async fn handle_references_request(
     }
 
     let text_document = lsp_types::TextDocumentIdentifier { uri: document_uri };
-    match state.client.find_references(text_document, position).await {
-        Ok(lsp_request_id) => {
-            log::info!(
-                "Sent references request to LSP server: lsp_request_id={}",
-                lsp_request_id
-            );
-            state.track_request(lsp_request_id, request_id, RequestType::References);
-        }
-        Err(e) => {
-            log::error!("Failed to send references request: {}", e);
-            let _ = response_tx
-                .send(LspResponse::Error {
-                    request_id,
-                    error: format!("Failed to request references: {}", e),
-                })
-                .await;
-        }
-    }
+    let result = state.client.find_references(text_document, position).await;
+    track_or_error(state, response_tx, result, request_id, RequestType::References, "references").await;
 }
 
 pub(super) async fn handle_references_with_symbols_request(
@@ -230,22 +181,11 @@ pub(super) async fn handle_references_with_symbols_request(
     }
 
     let text_document = lsp_types::TextDocumentIdentifier { uri: document_uri };
-    match state
-        .client
-        .find_references_with_symbols(text_document, position)
-        .await
-    {
-        Ok(lsp_request_id) => {
-            log::info!(
-                "Sent enhanced references request to LSP server: lsp_request_id={}",
-                lsp_request_id
-            );
-            state.track_request(
-                lsp_request_id,
-                request_id,
-                RequestType::ReferencesWithSymbols,
-            );
-            state.enhanced_lsp_requests.insert(lsp_request_id);
+    let result = state.client.find_references_with_symbols(text_document, position).await;
+    match result {
+        Ok(lsp_id) => {
+            state.track_request(lsp_id, request_id, RequestType::ReferencesWithSymbols);
+            state.enhanced_lsp_requests.insert(lsp_id);
         }
         Err(e) => {
             log::error!("Failed to send enhanced references request: {}", e);
@@ -283,24 +223,8 @@ pub(super) async fn handle_document_symbols_request(
     }
 
     let text_document = lsp_types::TextDocumentIdentifier { uri: document_uri };
-    match state.client.document_symbol(text_document).await {
-        Ok(lsp_request_id) => {
-            log::info!(
-                "Sent document symbols request to LSP server: lsp_request_id={}",
-                lsp_request_id
-            );
-            state.track_request(lsp_request_id, request_id, RequestType::DocumentSymbols);
-        }
-        Err(e) => {
-            log::error!("Failed to send document symbols request: {}", e);
-            let _ = response_tx
-                .send(LspResponse::Error {
-                    request_id,
-                    error: format!("Failed to request document symbols: {}", e),
-                })
-                .await;
-        }
-    }
+    let result = state.client.document_symbol(text_document).await;
+    track_or_error(state, response_tx, result, request_id, RequestType::DocumentSymbols, "document symbols").await;
 }
 
 pub(super) async fn handle_workspace_symbols_request(
@@ -315,22 +239,6 @@ pub(super) async fn handle_workspace_symbols_request(
         request_id
     );
 
-    match state.client.workspace_symbol(&query).await {
-        Ok(lsp_request_id) => {
-            log::info!(
-                "Sent workspace symbols request to LSP server: lsp_request_id={}",
-                lsp_request_id
-            );
-            state.track_request(lsp_request_id, request_id, RequestType::WorkspaceSymbols);
-        }
-        Err(e) => {
-            log::error!("Failed to send workspace symbols request: {}", e);
-            let _ = response_tx
-                .send(LspResponse::Error {
-                    request_id,
-                    error: format!("Failed to request workspace symbols: {}", e),
-                })
-                .await;
-        }
-    }
+    let result = state.client.workspace_symbol(&query).await;
+    track_or_error(state, response_tx, result, request_id, RequestType::WorkspaceSymbols, "workspace symbols").await;
 }

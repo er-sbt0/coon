@@ -177,6 +177,20 @@ pub async fn lsp_loader_task(
         error!("Failed to send LSP channels: {}", e);
     }
 
+    /// Forwards an LSP request to the service, logging and sending an error response on failure.
+    macro_rules! forward_lsp {
+        ($tx:expr, $rid:expr, $call:expr) => {{
+            let rid = $rid;
+            if let Err(e) = $call {
+                log::error!("LSP request failed: {}", e);
+                let _ = $tx.send(LspResponse::Error {
+                    request_id: rid,
+                    error: format!("Request failed: {}", e),
+                });
+            }
+        }};
+    }
+
     tokio::spawn(async move {
         let mut lsp_service = lsp_service;
         loop {
@@ -185,78 +199,30 @@ pub async fn lsp_loader_task(
                     if let Some(request) = tui_request {
                         log::debug!("Forwarding TUI request to LSP service: {:?}", request);
                         match request {
-                            LspRequest::GetOutgoingCalls { request_id, call_hierarchy_item } => {
-                                if let Err(e) = lsp_service.request_outgoing_calls(request_id.clone(), call_hierarchy_item).await {
-                                    log::error!("Failed to send outgoing calls request: {}", e);
-                                    let _ = tui_response_tx.send(LspResponse::Error {
-                                        request_id,
-                                        error: format!("Request failed: {}", e),
-                                    });
-                                }
-                            }
-                            LspRequest::GetIncomingCalls { request_id, call_hierarchy_item } => {
-                                if let Err(e) = lsp_service.request_incoming_calls(request_id.clone(), call_hierarchy_item).await {
-                                    log::error!("Failed to send incoming calls request: {}", e);
-                                    let _ = tui_response_tx.send(LspResponse::Error {
-                                        request_id,
-                                        error: format!("Request failed: {}", e),
-                                    });
-                                }
-                            }
-                            LspRequest::FindReferences { request_id, document_uri, position } => {
-                                if let Err(e) = lsp_service.request_references(request_id.clone(), document_uri, position).await {
-                                    log::error!("Failed to send references request: {}", e);
-                                    let _ = tui_response_tx.send(LspResponse::Error {
-                                        request_id,
-                                        error: format!("Request failed: {}", e),
-                                    });
-                                }
-                            }
-                            LspRequest::GetWorkspaceSymbols { request_id, query } => {
-                                if let Err(e) = lsp_service.request_workspace_symbols(request_id.clone(), query).await {
-                                    log::error!("Failed to send workspace symbols request: {}", e);
-                                    let _ = tui_response_tx.send(LspResponse::Error {
-                                        request_id,
-                                        error: format!("Request failed: {}", e),
-                                    });
-                                }
-                            }
-                            LspRequest::FindReferencesWithSymbols { request_id, document_uri, position } => {
-                                if let Err(e) = lsp_service.request_references_with_symbols(request_id.clone(), document_uri, position).await {
-                                    log::error!("Failed to send enhanced references request: {}", e);
-                                    let _ = tui_response_tx.send(LspResponse::Error {
-                                        request_id,
-                                        error: format!("Request failed: {}", e),
-                                    });
-                                }
-                            }
-                            LspRequest::PrepareCallHierarchy { request_id, document_uri, position } => {
-                                if let Err(e) = lsp_service.request_prepare_call_hierarchy(request_id.clone(), document_uri, position).await {
-                                    log::error!("Failed to send prepare call hierarchy request: {}", e);
-                                    let _ = tui_response_tx.send(LspResponse::Error {
-                                        request_id,
-                                        error: format!("Request failed: {}", e),
-                                    });
-                                }
-                            }
-                            LspRequest::GetDocumentSymbols { request_id, document_uri } => {
-                                if let Err(e) = lsp_service.request_document_symbols(request_id.clone(), document_uri).await {
-                                    log::error!("Failed to send document symbols request: {}", e);
-                                    let _ = tui_response_tx.send(LspResponse::Error {
-                                        request_id,
-                                        error: format!("Request failed: {}", e),
-                                    });
-                                }
-                            }
-                            LspRequest::PreloadDocuments { request_id, document_uris } => {
-                                if let Err(e) = lsp_service.request_preload_documents(request_id.clone(), document_uris).await {
-                                    log::error!("Failed to send preload documents request: {}", e);
-                                    let _ = tui_response_tx.send(LspResponse::Error {
-                                        request_id,
-                                        error: format!("Request failed: {}", e),
-                                    });
-                                }
-                            }
+                            LspRequest::GetOutgoingCalls { request_id, call_hierarchy_item } =>
+                                forward_lsp!(tui_response_tx, request_id.clone(),
+                                    lsp_service.request_outgoing_calls(request_id, call_hierarchy_item).await),
+                            LspRequest::GetIncomingCalls { request_id, call_hierarchy_item } =>
+                                forward_lsp!(tui_response_tx, request_id.clone(),
+                                    lsp_service.request_incoming_calls(request_id, call_hierarchy_item).await),
+                            LspRequest::FindReferences { request_id, document_uri, position } =>
+                                forward_lsp!(tui_response_tx, request_id.clone(),
+                                    lsp_service.request_references(request_id, document_uri, position).await),
+                            LspRequest::GetWorkspaceSymbols { request_id, query } =>
+                                forward_lsp!(tui_response_tx, request_id.clone(),
+                                    lsp_service.request_workspace_symbols(request_id, query).await),
+                            LspRequest::FindReferencesWithSymbols { request_id, document_uri, position } =>
+                                forward_lsp!(tui_response_tx, request_id.clone(),
+                                    lsp_service.request_references_with_symbols(request_id, document_uri, position).await),
+                            LspRequest::PrepareCallHierarchy { request_id, document_uri, position } =>
+                                forward_lsp!(tui_response_tx, request_id.clone(),
+                                    lsp_service.request_prepare_call_hierarchy(request_id, document_uri, position).await),
+                            LspRequest::GetDocumentSymbols { request_id, document_uri } =>
+                                forward_lsp!(tui_response_tx, request_id.clone(),
+                                    lsp_service.request_document_symbols(request_id, document_uri).await),
+                            LspRequest::PreloadDocuments { request_id, document_uris } =>
+                                forward_lsp!(tui_response_tx, request_id.clone(),
+                                    lsp_service.request_preload_documents(request_id, document_uris).await),
                             LspRequest::SetProjectFiles { project_files } => {
                                 if let Err(e) = lsp_service.set_project_files(project_files).await {
                                     log::error!("Failed to forward set project files: {}", e);
