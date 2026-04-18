@@ -30,7 +30,7 @@ COON is a Rust workspace (4 crates) that visualizes C/C++ call graphs in a TUI, 
 
 ### Crates
 
-- **`core_data`** — Shared types: `CallGraph`, `FunctionNode`, `CallEdge`, `SymbolId`, LSP progress/status enums.
+- **`model`** — Shared types: `CallGraph`, `FunctionNode`, `CallEdge`, `SymbolId`, LSP progress/status enums.
 - **`lsp_integration`** — All clangd communication: `LspClient` (raw protocol), `LspService` (higher-level async service with request/response handling, document caching, symbol resolution).
 - **`logic`** — Pure graph algorithms (BFS traversal, path-finding, reachability) operating on `CallGraph`.
 - **`tui_ui`** — Ratatui TUI: `TuiApp` (main state/event loop), `GraphView`/`GraphViewState` (tree rendering via the external `grid` crate), search bar, workspace management.
