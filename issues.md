@@ -146,6 +146,3 @@ Hard-coded constants like `3.0` / `5.0` for pan delta (events.rs), `(100.0, 100.
 
 ---
 
-### 20. Stringly-typed status messages
-
-`status_message: String` in `App` is set to dozens of different ad-hoc string literals across the codebase ("Panned up", "Loading data for function...", "LSP request timed out"). Consider making it a typed enum or at least centralizing the message templates.

@@ -181,12 +181,6 @@ impl GraphViewState {
         }
     }
 
-    /// Expand a node (in the future, this will trigger LSP requests)
-    pub fn expand_node(&mut self, _symbol: &SymbolId) {
-        // For now, we just note that we'd rebuild the tree
-        // In the new API, we call update_layout when needed
-    }
-
     /// Navigate to the parent of the currently selected node
     pub fn navigate_to_parent(&mut self, _graph: &CallGraph) -> bool {
         if let Some(selected) = &self.selected_node {
