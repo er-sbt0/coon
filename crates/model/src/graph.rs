@@ -1,0 +1,178 @@
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+use crate::symbols::*;
+
+/// A node in the call graph representing a function or method
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FunctionNode {
+    pub id: SymbolId,
+    pub name: String,
+    pub qualified_name: String,
+    pub definition_location: Location,
+    pub references: Vec<Reference>, // Enhanced references with symbol information
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+impl FunctionNode {
+    pub fn new(name: String, qualified_name: String, definition_location: Location) -> Self {
+        Self {
+            id: SymbolId::new(),
+            name,
+            qualified_name,
+            definition_location,
+            references: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    /// Add a simple reference (backward compatibility)
+    pub fn add_reference(&mut self, location: Location) {
+        self.references.push(Reference {
+            location,
+            referencing_symbol: None,
+        });
+    }
+
+    /// Add an enhanced reference with symbol information
+    pub fn add_reference_with_symbol(
+        &mut self,
+        location: Location,
+        symbol: Option<ReferencingSymbol>,
+    ) {
+        self.references.push(Reference {
+            location,
+            referencing_symbol: symbol,
+        });
+    }
+
+    /// Get the names of functions that reference this function
+    pub fn get_referencing_function_names(&self) -> Vec<&str> {
+        self.references
+            .iter()
+            .filter_map(|r| r.referencing_symbol.as_ref())
+            .filter(|s| {
+                matches!(
+                    s.kind,
+                    ReferenceSymbolKind::Function
+                        | ReferenceSymbolKind::Method
+                        | ReferenceSymbolKind::Constructor
+                )
+            })
+            .map(|s| s.name.as_str())
+            .collect()
+    }
+
+    /// Get all referencing symbols of a specific kind
+    pub fn get_referencing_symbols_by_kind(
+        &self,
+        kind: ReferenceSymbolKind,
+    ) -> Vec<&ReferencingSymbol> {
+        self.references
+            .iter()
+            .filter_map(|r| r.referencing_symbol.as_ref())
+            .filter(|s| s.kind == kind)
+            .collect()
+    }
+
+    /// Get reference locations only (for backward compatibility)
+    pub fn get_reference_locations(&self) -> Vec<&Location> {
+        self.references.iter().map(|r| &r.location).collect()
+    }
+
+    pub fn add_diagnostic(&mut self, diagnostic: Diagnostic) {
+        self.diagnostics.push(diagnostic);
+    }
+}
+
+/// Edge in the call graph representing a function call relationship
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallEdge {
+    pub caller: SymbolId,
+    pub callee: SymbolId,
+    pub call_location: Location,
+}
+
+/// The main call graph structure
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallGraph {
+    pub nodes: HashMap<SymbolId, FunctionNode>,
+    pub edges: Vec<CallEdge>,
+}
+
+impl CallGraph {
+    pub fn new() -> Self {
+        Self {
+            nodes: HashMap::new(),
+            edges: Vec::new(),
+        }
+    }
+
+    pub fn add_function(&mut self, function: FunctionNode) -> SymbolId {
+        let id = function.id.clone();
+        self.nodes.insert(id.clone(), function);
+        id
+    }
+
+    pub fn add_call(&mut self, caller: SymbolId, callee: SymbolId, call_location: Location) {
+        // Check if this exact edge already exists to prevent duplicates
+        let edge_exists = self
+            .edges
+            .iter()
+            .any(|e| e.caller == caller && e.callee == callee && e.call_location == call_location);
+
+        if !edge_exists {
+            self.edges.push(CallEdge {
+                caller,
+                callee,
+                call_location,
+            });
+        }
+    }
+
+    pub fn get_function(&self, id: &SymbolId) -> Option<&FunctionNode> {
+        self.nodes.get(id)
+    }
+
+    pub fn get_function_mut(&mut self, id: &SymbolId) -> Option<&mut FunctionNode> {
+        self.nodes.get_mut(id)
+    }
+
+    pub fn find_function_by_name(&self, name: &str) -> Option<&FunctionNode> {
+        self.nodes.values().find(|f| f.name == name)
+    }
+
+    pub fn find_function_by_qualified_name_and_location(
+        &self,
+        qualified_name: &str,
+        location: &Location,
+    ) -> Option<&FunctionNode> {
+        self.nodes.values().find(|f| {
+            f.qualified_name == qualified_name
+                && f.definition_location.file_path == location.file_path
+                && f.definition_location.line == location.line
+        })
+    }
+
+    pub fn get_callers(&self, callee_id: &SymbolId) -> Vec<&FunctionNode> {
+        self.edges
+            .iter()
+            .filter(|edge| &edge.callee == callee_id)
+            .filter_map(|edge| self.nodes.get(&edge.caller))
+            .collect()
+    }
+
+    pub fn get_callees(&self, caller_id: &SymbolId) -> Vec<&FunctionNode> {
+        self.edges
+            .iter()
+            .filter(|edge| &edge.caller == caller_id)
+            .filter_map(|edge| self.nodes.get(&edge.callee))
+            .collect()
+    }
+}
+
+impl Default for CallGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
