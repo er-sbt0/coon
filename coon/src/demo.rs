@@ -1,5 +1,5 @@
-use model::{CallGraph, Diagnostic, DiagnosticSeverity, FunctionNode, Location};
 use log::debug;
+use model::{CallGraph, Diagnostic, DiagnosticSeverity, FunctionNode, Location};
 
 pub fn create_demo_call_graph() -> CallGraph {
     let mut graph = CallGraph::new();

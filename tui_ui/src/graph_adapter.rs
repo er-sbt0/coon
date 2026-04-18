@@ -1,5 +1,5 @@
-use model::{CallGraph, FunctionNode, SymbolId};
 use grid::{LayoutError, Tree};
+use model::{CallGraph, FunctionNode, SymbolId};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Direction for building call hierarchy tree

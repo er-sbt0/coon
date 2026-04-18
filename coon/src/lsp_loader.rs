@@ -3,9 +3,9 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use model::lsp_status::{LspLoadPhase, LspUiMessage};
 use lsp_integration::compile_commands;
 use lsp_integration::{LspClient, LspRequest, LspResponse, LspService};
+use model::lsp_status::{LspLoadPhase, LspUiMessage};
 
 pub async fn run_with_lsp(project_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting LSP loader and TUI asynchronously...");

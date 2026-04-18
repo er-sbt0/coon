@@ -16,8 +16,8 @@ use std::io;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
-use model::{lsp_status::LspLoadPhase, lsp_status::LspUiMessage, CallGraph, SymbolId};
 use lsp_integration::{LspRequest, LspResponse};
+use model::{lsp_status::LspLoadPhase, lsp_status::LspUiMessage, CallGraph, SymbolId};
 
 pub mod actions;
 pub mod call_graph_view;

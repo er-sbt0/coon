@@ -6,8 +6,8 @@ use ratatui::{
     Frame,
 };
 
-use model::{CallGraph, SymbolId};
 use logic::query::GraphQueryEngine;
+use model::{CallGraph, SymbolId};
 
 pub struct CallGraphView<'a> {
     graph: &'a CallGraph,

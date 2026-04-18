@@ -1,5 +1,5 @@
-use model::{ReferenceSymbolKind, ReferencingSymbol};
 use lsp_types::{DocumentSymbol, Position, Range, SymbolInformation, SymbolKind};
+use model::{ReferenceSymbolKind, ReferencingSymbol};
 
 /// Find the innermost symbol containing the given position
 pub fn find_containing_symbol<'a>(

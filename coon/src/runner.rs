@@ -1,9 +1,9 @@
 use log::info;
 use tokio::sync::mpsc;
 
+use lsp_integration::{LspRequest, LspResponse};
 use model::lsp_status::LspUiMessage;
 use model::CallGraph;
-use lsp_integration::{LspRequest, LspResponse};
 use tui_ui::TuiApp;
 
 pub async fn run_with_demo_data() -> Result<(), Box<dyn std::error::Error>> {

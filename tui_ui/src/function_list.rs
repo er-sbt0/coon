@@ -6,8 +6,8 @@ use ratatui::{
     Frame,
 };
 
-use model::{CallGraph, FunctionNode, SymbolId};
 use logic::query::GraphQueryEngine;
+use model::{CallGraph, FunctionNode, SymbolId};
 
 pub struct FunctionList<'a> {
     graph: &'a CallGraph,

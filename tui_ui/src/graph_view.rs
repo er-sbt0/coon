@@ -1,6 +1,6 @@
 use crate::graph_adapter::{CallDirection, CallGraphAdapter};
-use model::{CallGraph, FunctionNode, SymbolId};
 use grid::{LayoutConfig, LayoutEngine, LayoutResult, Position, Tree, Viewport};
+use model::{CallGraph, FunctionNode, SymbolId};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -479,7 +479,7 @@ impl<'a> StatefulWidget for GraphView<'a> {
                     // Dynamic width based on label length
                     let node_width = (func.name.len() + 2) as u16;
                     let node_height = 3u16;
-                    
+
                     self.render_node(
                         buf,
                         func,
