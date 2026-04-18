@@ -1,7 +1,8 @@
-use model::SymbolId;
+use model::{CallGraph, SymbolId};
 
 use crate::actions::Action;
 use crate::graph_adapter::CallDirection;
+use crate::graph_view::GraphViewState;
 
 use super::App;
 
@@ -166,96 +167,61 @@ impl App {
         }
     }
 
-    fn handle_navigate_parent(&mut self) {
+    fn navigate_and_report(
+        &mut self,
+        op: fn(&mut GraphViewState, &CallGraph) -> bool,
+        success_prefix: &str,
+        fail_msg: &str,
+    ) {
         let current_idx = self.workspaces.current_index;
         if let Some(workspace) = self.workspaces.workspaces.get_mut(current_idx) {
-            if workspace
-                .graph_view_state
-                .navigate_to_parent(&self.call_graph)
-            {
+            if op(&mut workspace.graph_view_state, &self.call_graph) {
                 if let Some(selected) = &workspace.graph_view_state.selected_node {
                     let name = self
                         .call_graph
                         .get_function(selected)
                         .map(|f| f.name.as_str())
                         .unwrap_or("unknown");
-                    self.status_message = format!("Navigated to parent: {}", name);
+                    self.status_message = format!("{}: {}", success_prefix, name);
                 } else {
-                    self.status_message = "Navigated to parent".to_string();
+                    self.status_message = success_prefix.to_string();
                 }
             } else {
-                self.status_message = "No parent node (at root)".to_string();
+                self.status_message = fail_msg.to_string();
             }
         }
+    }
+
+    fn handle_navigate_parent(&mut self) {
+        self.navigate_and_report(
+            GraphViewState::navigate_to_parent,
+            "Navigated to parent",
+            "No parent node (at root)",
+        );
     }
 
     fn handle_navigate_child(&mut self) {
-        let current_idx = self.workspaces.current_index;
-        if let Some(workspace) = self.workspaces.workspaces.get_mut(current_idx) {
-            if workspace
-                .graph_view_state
-                .navigate_to_child(&self.call_graph)
-            {
-                if let Some(selected) = &workspace.graph_view_state.selected_node {
-                    let name = self
-                        .call_graph
-                        .get_function(selected)
-                        .map(|f| f.name.as_str())
-                        .unwrap_or("unknown");
-                    self.status_message = format!("Navigated to child: {}", name);
-                } else {
-                    self.status_message = "Navigated to child".to_string();
-                }
-            } else {
-                self.status_message = "No child nodes".to_string();
-            }
-        }
+        self.navigate_and_report(
+            GraphViewState::navigate_to_child,
+            "Navigated to child",
+            "No child nodes",
+        );
     }
 
     fn handle_navigate_next_sibling(&mut self) {
-        let current_idx = self.workspaces.current_index;
-        if let Some(workspace) = self.workspaces.workspaces.get_mut(current_idx) {
-            if workspace
-                .graph_view_state
-                .navigate_next_sibling(&self.call_graph)
-            {
-                if let Some(selected) = &workspace.graph_view_state.selected_node {
-                    let name = self
-                        .call_graph
-                        .get_function(selected)
-                        .map(|f| f.name.as_str())
-                        .unwrap_or("unknown");
-                    self.status_message = format!("Navigated to next sibling: {}", name);
-                } else {
-                    self.status_message = "Navigated to next sibling".to_string();
-                }
-            } else {
-                self.status_message = "No sibling nodes".to_string();
-            }
-        }
+        self.navigate_and_report(
+            GraphViewState::navigate_next_sibling,
+            "Navigated to next sibling",
+            "No sibling nodes",
+        );
     }
 
     fn handle_navigate_prev_sibling(&mut self) {
-        let current_idx = self.workspaces.current_index;
-        if let Some(workspace) = self.workspaces.workspaces.get_mut(current_idx) {
-            if workspace
-                .graph_view_state
-                .navigate_prev_sibling(&self.call_graph)
-            {
-                if let Some(selected) = &workspace.graph_view_state.selected_node {
-                    let name = self
-                        .call_graph
-                        .get_function(selected)
-                        .map(|f| f.name.as_str())
-                        .unwrap_or("unknown");
-                    self.status_message = format!("Navigated to previous sibling: {}", name);
-                } else {
-                    self.status_message = "Navigated to previous sibling".to_string();
-                }
-            } else {
-                self.status_message = "No sibling nodes".to_string();
-            }
-        }
+        self.navigate_and_report(
+            GraphViewState::navigate_prev_sibling,
+            "Navigated to previous sibling",
+            "No sibling nodes",
+        );
     }
 
     fn handle_new_workspace(&mut self) {

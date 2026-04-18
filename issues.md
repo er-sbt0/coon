@@ -44,16 +44,6 @@ This dead code is confusing and adds maintenance burden.
 
 ---
 
-### 5. **Duplicated outgoing/incoming call processing logic**
-
-update.rs — `update_function_outgoing_calls` and `update_function_incoming_calls` are near-identical: both iterate calls, build a `Location`, construct a qualified name, call `add_function`, then iterate `from_ranges` to `add_call`. The only difference is which field is `from` vs `to` and the edge direction. This is a textbook DRY violation.
-
-**Fix:** Extract a shared helper parameterized on direction.
-
----
-
----
-
 ### 7. **`CallGraphAdapter.build_tree` clones `HashSet<SymbolId>` on every BFS step**
 
 graph_adapter.rs: Each node enqueued gets `let mut new_path = path.clone()`. For graphs with branching factor *b* and depth *d*, this creates *O(b^d)* cloned hash sets, each growing in size. This is a potential performance bomb on large call graphs.
