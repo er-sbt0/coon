@@ -187,7 +187,7 @@ async fn handle_hover_for_enhanced_references(
                     pending.pending_symbol_requests.remove(index_str);
 
                     let symbol_name = if let Some(hover_info) = &hover_response.hover_info {
-                        crate::extract_function_name_from_signature(hover_info)
+                        crate::parsing::extract_function_name_from_signature(hover_info)
                     } else {
                         None
                     };

@@ -256,7 +256,7 @@ pub(crate) fn parse_document_symbol_response_impl(
     Ok(None)
 }
 
-pub fn parse_hover_response_impl(
+pub(crate) fn parse_hover_response_impl(
     pending_requests: &mut HashMap<i64, String>,
     response: &Value,
 ) -> Result<Option<HoverResponse>> {
@@ -320,7 +320,7 @@ pub fn parse_hover_response_impl(
 }
 
 // Helper to extract text from MarkedString
-pub fn extract_text_from_marked_string(marked_string: &lsp_types::MarkedString) -> String {
+pub(crate) fn extract_text_from_marked_string(marked_string: &lsp_types::MarkedString) -> String {
     match marked_string {
         lsp_types::MarkedString::String(s) => s.clone(),
         lsp_types::MarkedString::LanguageString(lang_string) => {
@@ -335,7 +335,7 @@ pub fn extract_text_from_marked_string(marked_string: &lsp_types::MarkedString) 
 }
 
 // Helper to extract text from MarkupContent
-pub fn extract_text_from_markup(markup: &lsp_types::MarkupContent) -> String {
+pub(crate) fn extract_text_from_markup(markup: &lsp_types::MarkupContent) -> String {
     match markup.kind {
         lsp_types::MarkupKind::PlainText => markup.value.clone(),
         lsp_types::MarkupKind::Markdown => {
@@ -365,7 +365,7 @@ pub fn extract_text_from_markup(markup: &lsp_types::MarkupContent) -> String {
 }
 
 // Helper to extract function name from C/C++ function signature
-pub fn extract_function_name_from_signature(signature: &str) -> Option<String> {
+pub(crate) fn extract_function_name_from_signature(signature: &str) -> Option<String> {
     // Look for pattern: [return_type] function_name([params])
     let trimmed = signature.trim();
 
@@ -425,8 +425,8 @@ pub(crate) fn convert_document_symbol_recursive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lsp_types::{Position, Range, Url};
-    use serde_json::Value;
+    use lsp_types::{HoverContents, MarkedString, MarkupContent, MarkupKind, Position, Range, Url};
+    use serde_json::{json, Value};
 
     // Helper to create a mock LSP response
     fn create_mock_find_references_response(id: i64, locations: Vec<lsp::Location>) -> Value {
@@ -570,5 +570,272 @@ mod tests {
             parse_find_references_response_impl(&mut pending_requests, &mock_response).unwrap();
 
         assert!(result.is_none());
+    }
+
+    // ── Hover / parsing helper tests (moved from tests/hover_tests.rs) ──
+
+    #[test]
+    fn test_parse_hover_response_basic() {
+        let mut pending_requests = HashMap::new();
+        pending_requests.insert(1, "textDocument/hover".to_string());
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "contents": {
+                    "kind": "markdown",
+                    "value": "```c\nint foo(int x)\n```\nFunction foo defined at main.c:6"
+                },
+                "range": {
+                    "start": {"line": 5, "character": 4},
+                    "end": {"line": 5, "character": 7}
+                }
+            }
+        });
+
+        let result = parse_hover_response_impl(&mut pending_requests, &response);
+        assert!(result.is_ok());
+        let hover_response = result.unwrap();
+        assert!(hover_response.is_some());
+
+        let hover = hover_response.unwrap();
+        assert_eq!(hover.request_id, 1);
+        assert!(hover.hover_info.is_some());
+        assert!(hover.hover_info.unwrap().contains("foo"));
+    }
+
+    #[test]
+    fn test_parse_hover_response_marked_string_array() {
+        let mut pending_requests = HashMap::new();
+        pending_requests.insert(2, "textDocument/hover".to_string());
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "contents": [
+                    {"language": "c", "value": "int foo(int x)"},
+                    "Function foo returns an integer"
+                ]
+            }
+        });
+
+        let result = parse_hover_response_impl(&mut pending_requests, &response);
+        assert!(result.is_ok());
+        let hover_response = result.unwrap();
+        assert!(hover_response.is_some());
+
+        let hover = hover_response.unwrap();
+        assert_eq!(hover.request_id, 2);
+        assert!(hover.hover_info.is_some());
+        assert!(hover.hover_info.unwrap().contains("foo"));
+    }
+
+    #[test]
+    fn test_parse_hover_response_null_result() {
+        let mut pending_requests = HashMap::new();
+        pending_requests.insert(3, "textDocument/hover".to_string());
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": null
+        });
+
+        let result = parse_hover_response_impl(&mut pending_requests, &response);
+        assert!(result.is_ok());
+        let hover_response = result.unwrap();
+        assert!(hover_response.is_some());
+
+        let hover = hover_response.unwrap();
+        assert_eq!(hover.request_id, 3);
+        assert!(hover.hover_info.is_none());
+    }
+
+    #[test]
+    fn test_parse_hover_response_error() {
+        let mut pending_requests = HashMap::new();
+        pending_requests.insert(4, "textDocument/hover".to_string());
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "error": {
+                "code": -32601,
+                "message": "Method not found"
+            }
+        });
+
+        let result = parse_hover_response_impl(&mut pending_requests, &response);
+        assert!(result.is_ok());
+        let hover_response = result.unwrap();
+        assert!(hover_response.is_some());
+
+        let hover = hover_response.unwrap();
+        assert_eq!(hover.request_id, 4);
+        assert!(hover.hover_info.is_none());
+    }
+
+    #[test]
+    fn test_extract_function_name_from_signature() {
+        let test_cases = vec![
+            ("int foo(int x)", Some("foo".to_string())),
+            ("void bar()", Some("bar".to_string())),
+            (
+                "static int my_func(const char* str, int len)",
+                Some("my_func".to_string()),
+            ),
+            (
+                "unsigned long long calculate_hash(void)",
+                Some("calculate_hash".to_string()),
+            ),
+            ("int* get_pointer()", Some("get_pointer".to_string())),
+            ("const char* get_name(void)", Some("get_name".to_string())),
+            (
+                "struct Point create_point(int x, int y)",
+                Some("create_point".to_string()),
+            ),
+            ("invalid signature without parentheses", None),
+            ("", None),
+            ("()", None),
+        ];
+
+        for (signature, expected) in test_cases {
+            let result = extract_function_name_from_signature(signature);
+            assert_eq!(result, expected, "Failed for signature: '{}'", signature);
+        }
+    }
+
+    #[test]
+    fn test_extract_text_from_markup() {
+        let markdown_content = MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: "```c\nint foo(int x)\n```\nThis is a function".to_string(),
+        };
+        let result = extract_text_from_markup(&markdown_content);
+        assert_eq!(result, "foo");
+
+        let plain_content = MarkupContent {
+            kind: MarkupKind::PlainText,
+            value: "Plain text description".to_string(),
+        };
+        let result = extract_text_from_markup(&plain_content);
+        assert_eq!(result, "Plain text description");
+    }
+
+    #[test]
+    fn test_extract_text_from_marked_string() {
+        let lang_string = MarkedString::LanguageString(lsp_types::LanguageString {
+            language: "c".to_string(),
+            value: "int main(int argc, char** argv)".to_string(),
+        });
+        let result = extract_text_from_marked_string(&lang_string);
+        assert_eq!(result, "main");
+
+        let simple_string = MarkedString::String("Simple description".to_string());
+        let result = extract_text_from_marked_string(&simple_string);
+        assert_eq!(result, "Simple description");
+    }
+
+    #[test]
+    fn test_complete_hover_flow_simplified() {
+        let hover_request_id = 42i64;
+        let mut pending_requests = HashMap::new();
+        pending_requests.insert(hover_request_id, "textDocument/hover".to_string());
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": hover_request_id,
+            "result": {
+                "contents": {
+                    "kind": "markdown",
+                    "value": "```c\nint foo(int x)\n```\n\nFunction `foo` takes an integer parameter and returns an integer.\n\nDefined in main.c at line 6."
+                },
+                "range": {
+                    "start": {"line": 5, "character": 4},
+                    "end": {"line": 5, "character": 7}
+                }
+            }
+        });
+
+        let result = parse_hover_response_impl(&mut pending_requests, &response);
+        assert!(result.is_ok());
+        let hover_response = result.unwrap();
+        assert!(hover_response.is_some());
+
+        let hover = hover_response.unwrap();
+        assert_eq!(hover.request_id, hover_request_id);
+        assert!(hover.hover_info.is_some());
+        assert_eq!(hover.hover_info.unwrap(), "foo");
+    }
+
+    #[test]
+    fn test_clangd_hover_response() {
+        let mut pending_requests = HashMap::new();
+        pending_requests.insert(5, "textDocument/hover".to_string());
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "result": {
+                "contents": {
+                    "kind": "markdown",
+                    "value": "### function `foo`\n\n```cpp\nint foo(int x)\n```\n\n---\nDeclared in `/home/user/main.c:6`"
+                },
+                "range": {
+                    "start": {"line": 14, "character": 2},
+                    "end": {"line": 14, "character": 5}
+                }
+            }
+        });
+
+        let result = parse_hover_response_impl(&mut pending_requests, &response);
+        assert!(result.is_ok());
+        let hover_response = result.unwrap();
+        assert!(hover_response.is_some());
+
+        let hover = hover_response.unwrap();
+        assert_eq!(hover.request_id, 5);
+        assert!(hover.hover_info.is_some());
+        assert_eq!(hover.hover_info.unwrap(), "foo");
+    }
+
+    #[test]
+    fn test_debug_raw_json_parsing() {
+        let raw_json = r#"{
+            "jsonrpc": "2.0",
+            "id": 4,
+            "result": {
+                "contents": {
+                    "kind": "markdown",
+                    "value": "```c\nint foo(int x)\n```"
+                }
+            }
+        }"#;
+
+        let value: Value = serde_json::from_str(raw_json).unwrap();
+
+        if let Some(result) = value.get("result") {
+            match serde_json::from_value::<lsp_types::Hover>(result.clone()) {
+                Ok(hover) => {
+                    let hover_text = match &hover.contents {
+                        HoverContents::Scalar(marked_string) => {
+                            extract_text_from_marked_string(marked_string)
+                        }
+                        HoverContents::Array(marked_strings) => marked_strings
+                            .iter()
+                            .map(extract_text_from_marked_string)
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        HoverContents::Markup(markup) => extract_text_from_markup(markup),
+                    };
+                    assert_eq!(hover_text, "foo");
+                }
+                Err(e) => {
+                    panic!("Could not parse hover response: {:?}", e);
+                }
+            }
+        }
     }
 }
