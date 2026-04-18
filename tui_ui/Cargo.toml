@@ -4,14 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-model = { path = "../model" }
-logic = { path = "../logic" }
-lsp_integration = { path = "../lsp_integration" }
+model.workspace = true
+logic.workspace = true
+lsp_integration.workspace = true
 grid = { path = "../../grid", features = ["rendering"] }
-ratatui = "0.29"
-crossterm = "0.28"
-log = "0.4"
-tokio = { version = "1.0", features = ["sync"] }
-serde_json = "1.0"
-uuid = { version = "1.0", features = ["v4"] }
-lsp-types = "0.95"
+ratatui.workspace = true
+crossterm.workspace = true
+log.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+serde_json.workspace = true
+uuid.workspace = true
+lsp-types.workspace = true

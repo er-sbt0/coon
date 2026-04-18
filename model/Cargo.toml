@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
-uuid = { version = "1.0", features = ["v4", "serde"] }
-log = "0.4"
-lsp-types = "0.95"
+serde.workspace = true
+uuid.workspace = true
+log.workspace = true
+lsp-types.workspace = true
