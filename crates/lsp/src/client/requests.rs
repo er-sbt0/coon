@@ -150,19 +150,8 @@ impl LspClient {
 
     /// Send initialized notification
     pub async fn send_initialized(&mut self) -> Result<()> {
-        let notification = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "initialized",
-            "params": {}
-        });
-
-        let notification_str = serde_json::to_string(&notification)?;
-        let content_length = format!("Content-Length: {}\r\n\r\n", notification_str.len());
-        self.writer.write_all(content_length.as_bytes()).await?;
-        self.writer.write_all(notification_str.as_bytes()).await?;
-        self.writer.flush().await?;
-
-        Ok(())
+        self.send_notification("initialized", serde_json::json!({}))
+            .await
     }
 
     /// Helper to open a document

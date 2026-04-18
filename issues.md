@@ -4,22 +4,6 @@ mod.rs hardcodes `/home/eransa/opt/llvm/llvm-20.1.8-build/bin/clangd`. This will
 
 ---
 
-### 2. Massive boilerplate in the TUI-LSP forwarder (~100 lines of near-identical match arms)
-
-In loader.rs, every `LspRequest` variant follows the exact same pattern: call service method → on error, log + send `LspResponse::Error`. This should be a macro or a helper function like:
-```rust
-async fn forward<F, Fut>(service: &mut LspService, request_id: String, ...) { ... }
-```
-The same pattern repeats in request.rs across all 8 handler functions.
-
----
-
-### 3. `SymbolId` should derive `Copy`
-
-`SymbolId` wraps `Uuid` (16 bytes, `Copy`), yet it only derives `Clone`. This forces hundreds of unnecessary `.clone()` calls across the entire codebase — graph.rs, traversal.rs, graph_adapter.rs, etc. Adding `Copy` would eliminate the majority of them and make the code cleaner.
-
----
-
 ### 4. O(n) linear scan for function deduplication
 
 In mod.rs:
