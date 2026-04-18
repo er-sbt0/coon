@@ -72,7 +72,10 @@ impl App {
     fn handle_move_up(&mut self) {
         // Pan up in graph view
         if let Some(workspace) = self.get_current_workspace_mut() {
-            workspace.graph_view_state.viewport.pan(0.0, -PAN_DELTA_VERTICAL);
+            workspace
+                .graph_view_state
+                .viewport
+                .pan(0.0, -PAN_DELTA_VERTICAL);
             self.status_message = StatusMessage::PannedUp;
         }
     }
@@ -80,7 +83,10 @@ impl App {
     fn handle_move_down(&mut self) {
         // Pan down in graph view
         if let Some(workspace) = self.get_current_workspace_mut() {
-            workspace.graph_view_state.viewport.pan(0.0, PAN_DELTA_VERTICAL);
+            workspace
+                .graph_view_state
+                .viewport
+                .pan(0.0, PAN_DELTA_VERTICAL);
             self.status_message = StatusMessage::PannedDown;
         }
     }
@@ -165,7 +171,10 @@ impl App {
     fn handle_move_left(&mut self) {
         // Pan left in graph view
         if let Some(workspace) = self.get_current_workspace_mut() {
-            workspace.graph_view_state.viewport.pan(-PAN_DELTA_HORIZONTAL, 0.0);
+            workspace
+                .graph_view_state
+                .viewport
+                .pan(-PAN_DELTA_HORIZONTAL, 0.0);
             self.status_message = StatusMessage::PannedLeft;
         }
     }
@@ -173,7 +182,10 @@ impl App {
     fn handle_move_right(&mut self) {
         // Pan right in graph view
         if let Some(workspace) = self.get_current_workspace_mut() {
-            workspace.graph_view_state.viewport.pan(PAN_DELTA_HORIZONTAL, 0.0);
+            workspace
+                .graph_view_state
+                .viewport
+                .pan(PAN_DELTA_HORIZONTAL, 0.0);
             self.status_message = StatusMessage::PannedRight;
         }
     }

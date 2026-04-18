@@ -223,8 +223,6 @@ impl fmt::Display for StatusMessage {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;

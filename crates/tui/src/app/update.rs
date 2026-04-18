@@ -233,12 +233,7 @@ impl App {
         calls: Vec<lsp_types::CallHierarchyOutgoingCall>,
     ) {
         for call in calls {
-            self.process_call_entry(
-                symbol_id,
-                &call.to,
-                &call.from_ranges,
-                true,
-            );
+            self.process_call_entry(symbol_id, &call.to, &call.from_ranges, true);
         }
     }
 
@@ -248,12 +243,7 @@ impl App {
         calls: Vec<lsp_types::CallHierarchyIncomingCall>,
     ) {
         for call in calls {
-            self.process_call_entry(
-                symbol_id,
-                &call.from,
-                &call.from_ranges,
-                false,
-            );
+            self.process_call_entry(symbol_id, &call.from, &call.from_ranges, false);
         }
     }
 

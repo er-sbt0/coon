@@ -165,11 +165,20 @@ pub(super) async fn handle_document_symbols_for_enhanced_references(
 
 pub(crate) fn is_references_response(response: &Value) -> bool {
     if let Some(result) = response.get("result") {
-        if serde_json::from_value::<Vec<lsp_types::Location>>(result.clone()).is_ok() {
+        if result.is_null() {
             return true;
         }
+        // Check structural markers instead of cloning + deserializing:
+        // a references response is an array of objects each with "uri" and "range" keys.
+        if let Some(arr) = result.as_array() {
+            return arr.is_empty()
+                || arr
+                    .first()
+                    .and_then(|item| item.as_object())
+                    .is_some_and(|obj| obj.contains_key("uri") && obj.contains_key("range"));
+        }
     }
-    response.get("result").is_some_and(|r| r.is_null())
+    false
 }
 
 pub(super) fn parse_references_response_content(response: &Value) -> Vec<model::Location> {
