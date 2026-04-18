@@ -1,6 +1,7 @@
 mod call_hierarchy;
 pub mod client;
 pub mod compile_commands;
+pub mod loader;
 pub mod parsing;
 mod service;
 mod symbol_resolution;

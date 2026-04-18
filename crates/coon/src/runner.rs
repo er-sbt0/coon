@@ -1,4 +1,4 @@
-use log::info;
+use log::{error, info};
 use tokio::sync::mpsc;
 
 use lsp_integration::{LspRequest, LspResponse};
@@ -8,7 +8,7 @@ use tui_ui::TuiApp;
 
 pub async fn run_with_demo_data() -> Result<(), Box<dyn std::error::Error>> {
     info!("Creating demo call graph...");
-    let call_graph = crate::demo::create_demo_call_graph();
+    let call_graph = model::demo::create_demo_call_graph();
 
     info!(
         "Demo call graph created with {} functions and {} call relationships",
@@ -19,7 +19,28 @@ pub async fn run_with_demo_data() -> Result<(), Box<dyn std::error::Error>> {
     run_tui(call_graph).await
 }
 
-pub async fn run_tui(call_graph: CallGraph) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_with_lsp(project_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Starting LSP loader and TUI asynchronously...");
+
+    let (ui_msg_tx, ui_msg_rx) = mpsc::unbounded_channel::<LspUiMessage>();
+    let (lsp_channels_tx, lsp_channels_rx) = mpsc::unbounded_channel::<(
+        mpsc::UnboundedReceiver<LspResponse>,
+        mpsc::UnboundedSender<LspRequest>,
+    )>();
+
+    let project_path_string = project_path.to_string();
+    tokio::spawn(async move {
+        if let Err(e) =
+            lsp_integration::loader::lsp_loader_task(&project_path_string, ui_msg_tx, lsp_channels_tx).await
+        {
+            error!("LSP loader task failed: {}", e);
+        }
+    });
+
+    run_tui_async_lsp(ui_msg_rx, lsp_channels_rx).await
+}
+
+async fn run_tui(call_graph: CallGraph) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting TUI interface...");
     let mut tui_app = TuiApp::new(call_graph)?;
     tui_app.run()?;
@@ -27,7 +48,7 @@ pub async fn run_tui(call_graph: CallGraph) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-pub async fn run_tui_async_lsp(
+async fn run_tui_async_lsp(
     lsp_rx: mpsc::UnboundedReceiver<LspUiMessage>,
     lsp_channels_rx: mpsc::UnboundedReceiver<(
         mpsc::UnboundedReceiver<LspResponse>,

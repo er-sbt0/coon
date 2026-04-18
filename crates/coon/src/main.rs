@@ -3,6 +3,7 @@ use std::env;
 use std::path::Path;
 
 mod logging;
+mod runner;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -11,11 +12,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
 
     match args.len() {
-        1 => coon::runner::run_with_demo_data().await?,
+        1 => runner::run_with_demo_data().await?,
         2 => {
             let project_path = &args[1];
             if Path::new(project_path).exists() {
-                coon::lsp_loader::run_with_lsp(project_path).await?;
+                runner::run_with_lsp(project_path).await?;
             } else {
                 error!("Error: Project path '{}' does not exist", project_path);
                 print_usage();

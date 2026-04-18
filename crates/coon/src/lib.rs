@@ -1,3 +1,2 @@
-pub mod demo;
-pub mod lsp_loader;
-pub mod runner;
+// Binary crate — all logic lives in library crates.
+// runner and logging are private modules used only by main.rs.

@@ -1,31 +1,26 @@
+//! Background LSP loader task that initializes clangd, discovers files,
+//! and provides a TUI ↔ LSP bridge for lazy call-hierarchy resolution.
+
 use log::{debug, error, info};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use lsp_integration::compile_commands;
-use lsp_integration::{LspClient, LspRequest, LspResponse, LspService};
+use crate::compile_commands;
+use crate::{LspClient, LspRequest, LspResponse, LspService};
 use model::lsp_status::{LspLoadPhase, LspUiMessage};
 
-pub async fn run_with_lsp(project_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    info!("Starting LSP loader and TUI asynchronously...");
-
-    let (ui_msg_tx, ui_msg_rx) = mpsc::unbounded_channel::<LspUiMessage>();
-    let (lsp_channels_tx, lsp_channels_rx) = mpsc::unbounded_channel::<(
-        mpsc::UnboundedReceiver<LspResponse>,
-        mpsc::UnboundedSender<LspRequest>,
-    )>();
-
-    let project_path_string = project_path.to_string();
-    tokio::spawn(async move {
-        if let Err(e) = lsp_loader_task(&project_path_string, ui_msg_tx, lsp_channels_tx).await {
-            error!("LSP loader task failed: {}", e);
-        }
-    });
-
-    crate::runner::run_tui_async_lsp(ui_msg_rx, lsp_channels_rx).await
-}
-
+/// Runs the full LSP initialization sequence in the background:
+///
+/// 1. Spawns and initializes clangd
+/// 2. Discovers source files via compile_commands.json
+/// 3. Pre-loads documents into the language server
+/// 4. Fetches initial workspace symbols
+/// 5. Spins up a forwarder loop that bridges TUI requests to `LspService`
+///
+/// All progress is reported through `ui_tx`. Once the initial load is done,
+/// the TUI can send `LspRequest`s through the channel pair sent via
+/// `lsp_channels_tx`.
 pub async fn lsp_loader_task(
     project_path: &str,
     ui_tx: mpsc::UnboundedSender<LspUiMessage>,
