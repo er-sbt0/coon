@@ -4,11 +4,7 @@ pub mod compile_commands;
 pub mod loader;
 pub mod parsing;
 mod service;
-#[allow(dead_code)]
-mod symbol_resolution;
 pub mod types;
-#[allow(dead_code)]
-mod utils;
 
 // Re-export primary types for backward compatibility
 pub use client::LspClient;

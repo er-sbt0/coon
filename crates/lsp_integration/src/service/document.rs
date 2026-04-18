@@ -1,7 +1,6 @@
 use super::worker::LspWorkerState;
 use anyhow::Result;
 use lsp_types::Url;
-use std::collections::HashMap;
 
 pub(super) async fn ensure_document_opened(
     state: &mut LspWorkerState,
@@ -61,39 +60,6 @@ pub(super) async fn ensure_document_opened(
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     Ok(())
-}
-
-#[allow(dead_code)]
-pub(super) fn enhance_references_with_cached_symbols(
-    _locations: &[model::Location],
-    locations_by_file: &std::collections::HashMap<String, Vec<model::Location>>,
-    symbols_cache: &HashMap<String, Vec<lsp_types::DocumentSymbol>>,
-) -> Vec<model::Reference> {
-    let mut enhanced_references = Vec::new();
-
-    for (file_path, file_locations) in locations_by_file {
-        let file_symbols = symbols_cache.get(file_path);
-
-        for location in file_locations {
-            let position = lsp_types::Position {
-                line: location.line.saturating_sub(1),
-                character: location.column.saturating_sub(1),
-            };
-
-            let referencing_symbol = if let Some(symbols) = file_symbols {
-                crate::utils::find_containing_symbol(symbols, &position)
-            } else {
-                None
-            };
-
-            enhanced_references.push(model::Reference {
-                location: location.clone(),
-                referencing_symbol,
-            });
-        }
-    }
-
-    enhanced_references
 }
 
 pub(super) fn find_containing_symbol<'a>(
