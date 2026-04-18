@@ -111,7 +111,7 @@ mod tests {
         );
         func_with_error.add_diagnostic(Diagnostic {
             location: Location::new("error.rs".to_string(), 2, 4),
-            severity: DiagnosticSeverity::Error,
+            severity: DiagnosticSeverity::ERROR,
             message: "Compilation error".to_string(),
             code: Some("E001".to_string()),
         });
@@ -156,7 +156,7 @@ mod tests {
         let graph = create_test_graph_with_diagnostics();
         let filter = FunctionFilter::new(&graph);
 
-        let results = filter.filter_by_diagnostic_severity(DiagnosticSeverity::Error);
+        let results = filter.filter_by_diagnostic_severity(DiagnosticSeverity::ERROR);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "func_with_error");
     }

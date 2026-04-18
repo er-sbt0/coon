@@ -49,12 +49,12 @@ impl<'a> GraphQueryEngine<'a> {
             error_count: function
                 .diagnostics
                 .iter()
-                .filter(|d| d.severity == DiagnosticSeverity::Error)
+                .filter(|d| d.severity == DiagnosticSeverity::ERROR)
                 .count(),
             warning_count: function
                 .diagnostics
                 .iter()
-                .filter(|d| d.severity == DiagnosticSeverity::Warning)
+                .filter(|d| d.severity == DiagnosticSeverity::WARNING)
                 .count(),
         })
     }
@@ -104,10 +104,10 @@ impl<'a> GraphQueryEngine<'a> {
     pub fn find_problem_areas(&self) -> ProblemAreas {
         let functions_with_errors = self
             .filter
-            .filter_by_diagnostic_severity(DiagnosticSeverity::Error);
+            .filter_by_diagnostic_severity(DiagnosticSeverity::ERROR);
         let functions_with_warnings = self
             .filter
-            .filter_by_diagnostic_severity(DiagnosticSeverity::Warning);
+            .filter_by_diagnostic_severity(DiagnosticSeverity::WARNING);
         let highly_connected = self.find_highly_connected_functions(5); // functions with 5+ connections
         let entry_points = self.filter.filter_entry_points();
         let leaf_functions = self.filter.filter_leaf_functions();
@@ -248,7 +248,7 @@ mod tests {
         );
         helper_func.add_diagnostic(Diagnostic {
             location: Location::new("utils.rs".to_string(), 5, 0),
-            severity: DiagnosticSeverity::Warning,
+            severity: DiagnosticSeverity::WARNING,
             message: "Unused variable".to_string(),
             code: Some("W001".to_string()),
         });
@@ -260,7 +260,7 @@ mod tests {
         );
         error_func.add_diagnostic(Diagnostic {
             location: Location::new("error.rs".to_string(), 3, 0),
-            severity: DiagnosticSeverity::Error,
+            severity: DiagnosticSeverity::ERROR,
             message: "Type error".to_string(),
             code: Some("E001".to_string()),
         });

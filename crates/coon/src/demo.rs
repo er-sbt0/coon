@@ -48,28 +48,28 @@ pub fn create_demo_call_graph() -> CallGraph {
 
     error_prone_func.add_diagnostic(Diagnostic {
         location: Location::new("src/unsafe_module.rs".to_string(), 17, 4),
-        severity: DiagnosticSeverity::Error,
+        severity: DiagnosticSeverity::ERROR,
         message: "Potential null pointer dereference".to_string(),
         code: Some("E0001".to_string()),
     });
 
     error_prone_func.add_diagnostic(Diagnostic {
         location: Location::new("src/unsafe_module.rs".to_string(), 20, 8),
-        severity: DiagnosticSeverity::Warning,
+        severity: DiagnosticSeverity::WARNING,
         message: "Unused variable 'temp'".to_string(),
         code: Some("W0042".to_string()),
     });
 
     validate_func.add_diagnostic(Diagnostic {
         location: Location::new("src/validation.rs".to_string(), 8, 12),
-        severity: DiagnosticSeverity::Warning,
+        severity: DiagnosticSeverity::WARNING,
         message: "Consider using more specific error types".to_string(),
         code: Some("W0100".to_string()),
     });
 
     helper_func.add_diagnostic(Diagnostic {
         location: Location::new("src/utils.rs".to_string(), 35, 0),
-        severity: DiagnosticSeverity::Information,
+        severity: DiagnosticSeverity::INFORMATION,
         message: "This function could be optimized".to_string(),
         code: Some("I0005".to_string()),
     });
