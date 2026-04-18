@@ -258,75 +258,73 @@ impl App {
         }
     }
 
-    /// Update function outgoing calls from LSP response
     fn update_function_outgoing_calls(
         &mut self,
         symbol_id: SymbolId,
         calls: Vec<lsp_types::CallHierarchyOutgoingCall>,
     ) {
-        // Process outgoing calls and convert them to call graph relationships
         for call in calls {
-            // Convert LSP location to our Location type
-            let location = model::Location::new(
-                call.to.uri.path().to_string(),
-                (call.to.range.start.line + 1) as u32, // Convert from 0-indexed to 1-indexed
-                (call.to.range.start.character + 1) as u32,
+            self.process_call_entry(
+                symbol_id.clone(),
+                call.to.name,
+                &call.to.uri,
+                call.to.range,
+                &call.from_ranges,
+                true,
             );
-
-            let qualified_name = format!("{}::{}", call.to.name, location.file_path);
-            let callee_id = self.call_graph.add_function(model::FunctionNode::new(
-                call.to.name.clone(),
-                qualified_name,
-                location,
-            ));
-
-            // Create the call edge from the original function to this callee
-            // Use the call location from the LSP response
-            for from_range in &call.from_ranges {
-                let call_location = model::Location::new(
-                    call.to.uri.path().to_string(), // Use the callee's file for call location
-                    (from_range.start.line + 1) as u32,
-                    (from_range.start.character + 1) as u32,
-                );
-                self.call_graph
-                    .add_call(symbol_id.clone(), callee_id.clone(), call_location);
-            }
         }
     }
 
-    /// Update function incoming calls from LSP response
     fn update_function_incoming_calls(
         &mut self,
         symbol_id: SymbolId,
         calls: Vec<lsp_types::CallHierarchyIncomingCall>,
     ) {
-        // Process incoming calls and convert them to call graph relationships
         for call in calls {
-            // Convert LSP location to our Location type
-            let location = model::Location::new(
-                call.from.uri.path().to_string(),
-                (call.from.range.start.line + 1) as u32, // Convert from 0-indexed to 1-indexed
-                (call.from.range.start.character + 1) as u32,
+            self.process_call_entry(
+                symbol_id.clone(),
+                call.from.name,
+                &call.from.uri,
+                call.from.range,
+                &call.from_ranges,
+                false,
             );
+        }
+    }
 
-            let qualified_name = format!("{}::{}", call.from.name, location.file_path);
-            let caller_id = self.call_graph.add_function(model::FunctionNode::new(
-                call.from.name.clone(),
-                qualified_name,
-                location,
-            ));
-
-            // Create the call edge from the caller to the original function
-            // Use the call location from the LSP response
-            for from_range in &call.from_ranges {
-                let call_location = model::Location::new(
-                    call.from.uri.path().to_string(), // Use the caller's file for call location
-                    (from_range.start.line + 1) as u32,
-                    (from_range.start.character + 1) as u32,
-                );
-                self.call_graph
-                    .add_call(caller_id.clone(), symbol_id.clone(), call_location);
-            }
+    fn process_call_entry(
+        &mut self,
+        symbol_id: SymbolId,
+        other_name: String,
+        other_uri: &lsp_types::Url,
+        other_range: lsp_types::Range,
+        from_ranges: &[lsp_types::Range],
+        is_outgoing: bool,
+    ) {
+        let file_path = other_uri.path().to_string();
+        let location = model::Location::new(
+            file_path.clone(),
+            (other_range.start.line + 1) as u32,
+            (other_range.start.character + 1) as u32,
+        );
+        let qualified_name = format!("{}::{}", other_name, file_path);
+        let other_id = self.call_graph.add_function(model::FunctionNode::new(
+            other_name,
+            qualified_name,
+            location,
+        ));
+        for from_range in from_ranges {
+            let call_location = model::Location::new(
+                file_path.clone(),
+                (from_range.start.line + 1) as u32,
+                (from_range.start.character + 1) as u32,
+            );
+            let (caller, callee) = if is_outgoing {
+                (symbol_id.clone(), other_id.clone())
+            } else {
+                (other_id.clone(), symbol_id.clone())
+            };
+            self.call_graph.add_call(caller, callee, call_location);
         }
     }
 }
