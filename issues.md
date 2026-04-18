@@ -7,9 +7,6 @@ Here's the consolidated ranking, re-evaluated by real-world impact:
 **1. Hardcoded developer path** — mod.rs, utils.rs
 Binary fails on any machine except the original developer's. Absolute `/home/eransa/...` path baked in. Use `CLANGD_PATH` env var or `which clangd`.
 
-**2. Child process never killed** — mod.rs
-No `Drop` on `LspClient`. Clangd orphaned after every run. Reader task `JoinHandle` never aborted. LSP shutdown/exit protocol never sent.
-
 **3. Blocking I/O on async executor thread** — document.rs, compile_commands.rs
 `std::fs::read_to_string` / `std::fs::read_dir` block the Tokio thread. Stalls all concurrent async tasks. Use `tokio::fs`.
 
@@ -19,9 +16,6 @@ All MPSC channels are unbounded. Large workspace symbol results can grow memory 
 ---
 
 ### High — Correctness or scalability problems
-
-**5. O(n²) graph construction and O(n) lookups** — graph.rs
-`add_call` scans all edges for dedup; `get_callers`/`get_callees` do full linear scans. Quadratic for large codebases. Need adjacency map.
 
 **7. Random UUID `SymbolId` — no deduplication** — symbols.rs
 Rediscovering the same function creates a new ID → duplicates in graph. Need content-addressable ID.

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::symbols::*;
 
@@ -98,6 +98,12 @@ pub struct CallEdge {
 pub struct CallGraph {
     pub nodes: HashMap<SymbolId, FunctionNode>,
     pub edges: Vec<CallEdge>,
+    #[serde(skip)]
+    edge_set: HashSet<(SymbolId, SymbolId, String, u32, u32)>,
+    #[serde(skip)]
+    callers_map: HashMap<SymbolId, Vec<SymbolId>>,
+    #[serde(skip)]
+    callees_map: HashMap<SymbolId, Vec<SymbolId>>,
 }
 
 impl CallGraph {
@@ -105,6 +111,9 @@ impl CallGraph {
         Self {
             nodes: HashMap::new(),
             edges: Vec::new(),
+            edge_set: HashSet::new(),
+            callers_map: HashMap::new(),
+            callees_map: HashMap::new(),
         }
     }
 
@@ -115,13 +124,22 @@ impl CallGraph {
     }
 
     pub fn add_call(&mut self, caller: SymbolId, callee: SymbolId, call_location: Location) {
-        // Check if this exact edge already exists to prevent duplicates
-        let edge_exists = self
-            .edges
-            .iter()
-            .any(|e| e.caller == caller && e.callee == callee && e.call_location == call_location);
-
-        if !edge_exists {
+        let key = (
+            caller.clone(),
+            callee.clone(),
+            call_location.file_path.clone(),
+            call_location.line,
+            call_location.column,
+        );
+        if self.edge_set.insert(key) {
+            self.callees_map
+                .entry(caller.clone())
+                .or_default()
+                .push(callee.clone());
+            self.callers_map
+                .entry(callee.clone())
+                .or_default()
+                .push(caller.clone());
             self.edges.push(CallEdge {
                 caller,
                 callee,
@@ -155,19 +173,17 @@ impl CallGraph {
     }
 
     pub fn get_callers(&self, callee_id: &SymbolId) -> Vec<&FunctionNode> {
-        self.edges
-            .iter()
-            .filter(|edge| &edge.callee == callee_id)
-            .filter_map(|edge| self.nodes.get(&edge.caller))
-            .collect()
+        self.callers_map
+            .get(callee_id)
+            .map(|ids| ids.iter().filter_map(|id| self.nodes.get(id)).collect())
+            .unwrap_or_default()
     }
 
     pub fn get_callees(&self, caller_id: &SymbolId) -> Vec<&FunctionNode> {
-        self.edges
-            .iter()
-            .filter(|edge| &edge.caller == caller_id)
-            .filter_map(|edge| self.nodes.get(&edge.callee))
-            .collect()
+        self.callees_map
+            .get(caller_id)
+            .map(|ids| ids.iter().filter_map(|id| self.nodes.get(id)).collect())
+            .unwrap_or_default()
     }
 }
 
