@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use core_data::{CallGraph, SymbolId};
+use model::{CallGraph, SymbolId};
 use logic::query::GraphQueryEngine;
 
 pub struct CallGraphView<'a> {
@@ -131,7 +131,7 @@ impl<'a> CallGraphView<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_data::{FunctionNode, Location};
+    use model::{FunctionNode, Location};
 
     fn create_test_setup() -> (CallGraph, GraphQueryEngine<'static>) {
         let mut graph = CallGraph::new();

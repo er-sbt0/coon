@@ -1,4 +1,4 @@
-use core_data::{Location, Reference, ReferenceSymbolKind, ReferencingSymbol};
+use model::{Location, Reference, ReferenceSymbolKind, ReferencingSymbol};
 
 #[test]
 fn test_enhanced_reference_creation() {
@@ -36,7 +36,7 @@ fn test_enhanced_reference_creation() {
 
 #[test]
 fn test_function_node_enhanced_references() {
-    use core_data::FunctionNode;
+    use model::FunctionNode;
 
     let mut function = FunctionNode::new(
         "target_function".to_string(),

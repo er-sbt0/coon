@@ -1,5 +1,5 @@
 use crate::{filters::FunctionFilter, path::PathAnalyzer, GraphTraversal};
-use core_data::{CallGraph, DiagnosticSeverity, FunctionNode, SymbolId};
+use model::{CallGraph, DiagnosticSeverity, FunctionNode, SymbolId};
 use std::collections::HashMap;
 
 /// High-level query interface combining multiple analysis operations
@@ -230,7 +230,7 @@ pub struct GraphStatistics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_data::{Diagnostic, FunctionNode, Location};
+    use model::{Diagnostic, FunctionNode, Location};
 
     fn create_complex_test_graph() -> CallGraph {
         let mut graph = CallGraph::new();

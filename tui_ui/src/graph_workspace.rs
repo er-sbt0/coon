@@ -1,5 +1,5 @@
 use crate::graph_view::GraphViewState;
-use core_data::SymbolId;
+use model::SymbolId;
 use std::time::Instant;
 
 /// Represents an independent graph workspace/tab

@@ -1,4 +1,4 @@
-use core_data::{CallGraph, SymbolId};
+use model::{CallGraph, SymbolId};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,

@@ -4,4 +4,4 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-core_data = { path = "../core_data" }
+model = { path = "../model" }

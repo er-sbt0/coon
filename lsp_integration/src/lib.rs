@@ -29,14 +29,14 @@ mod enhanced_references_tests;
 #[derive(Debug, Clone)]
 pub struct FindReferencesResponse {
     pub request_id: i64,
-    pub locations: Vec<core_data::Location>,
+    pub locations: Vec<model::Location>,
 }
 
 /// Enhanced response from LSP find_references request with symbol information
 #[derive(Debug, Clone)]
 pub struct EnhancedReferencesResponse {
     pub request_id: i64,
-    pub references: Vec<core_data::Reference>,
+    pub references: Vec<model::Reference>,
 }
 
 /// Response from LSP workspace/symbol request
@@ -86,13 +86,13 @@ pub struct IncomingCallsResponse {
 pub struct WorkspaceSymbolInfo {
     pub name: String,
     pub kind: lsp::SymbolKind,
-    pub location: core_data::Location,
+    pub location: model::Location,
     pub container_name: Option<String>,
 }
 
-/// Convert LSP Location to our core_data Location
-pub fn convert_lsp_location(lsp_location: &lsp::Location) -> core_data::Location {
-    core_data::Location {
+/// Convert LSP Location to our model Location
+pub fn convert_lsp_location(lsp_location: &lsp::Location) -> model::Location {
+    model::Location {
         file_path: lsp_location
             .uri
             .to_file_path()
@@ -104,9 +104,9 @@ pub fn convert_lsp_location(lsp_location: &lsp::Location) -> core_data::Location
     }
 }
 
-/// Convert LSP Position to our core_data Location (without length)
-pub fn convert_lsp_position(uri: &lsp::Url, position: &lsp::Position) -> core_data::Location {
-    core_data::Location {
+/// Convert LSP Position to our model Location (without length)
+pub fn convert_lsp_position(uri: &lsp::Url, position: &lsp::Position) -> model::Location {
+    model::Location {
         file_path: uri
             .to_file_path()
             .map(|p| p.to_string_lossy().to_string())
@@ -502,8 +502,8 @@ impl LspClient {
     /// Enhance references with symbol information
     pub async fn enhance_references(
         &mut self,
-        references: Vec<core_data::Location>,
-    ) -> Result<Vec<core_data::Reference>> {
+        references: Vec<model::Location>,
+    ) -> Result<Vec<model::Reference>> {
         let mut enhanced_references = Vec::new();
 
         for location in references {
@@ -518,17 +518,17 @@ impl LspClient {
                         .and_then(|s| s.to_str())
                         .unwrap_or("unknown");
 
-                    core_data::ReferencingSymbol {
+                    model::ReferencingSymbol {
                         name: format!("{}:{}", filename, location.line),
                         qualified_name: format!(
                             "{}::{}:{}",
                             filename, location.line, location.column
                         ),
-                        kind: core_data::ReferenceSymbolKind::Function,
+                        kind: model::ReferenceSymbolKind::Function,
                     }
                 });
 
-            enhanced_references.push(core_data::Reference {
+            enhanced_references.push(model::Reference {
                 location,
                 referencing_symbol: Some(referencing_symbol),
             });
@@ -540,8 +540,8 @@ impl LspClient {
     /// Attempt to resolve the symbol at a given location
     async fn resolve_symbol_at_location(
         &mut self,
-        location: &core_data::Location,
-    ) -> Option<core_data::ReferencingSymbol> {
+        location: &model::Location,
+    ) -> Option<model::ReferencingSymbol> {
         // For now, create a basic symbol name
         // In a full implementation, this would:
         // 1. Request document symbols for the file
@@ -554,13 +554,13 @@ impl LspClient {
             .unwrap_or("unknown");
 
         // Create a more meaningful name format
-        Some(core_data::ReferencingSymbol {
+        Some(model::ReferencingSymbol {
             name: format!("caller_at_{}:{}", filename, location.line),
             qualified_name: format!(
                 "{}::caller_at_{}:{}",
                 filename, location.line, location.column
             ),
-            kind: core_data::ReferenceSymbolKind::Function,
+            kind: model::ReferenceSymbolKind::Function,
         })
     }
 
@@ -791,7 +791,7 @@ fn parse_workspace_symbol_response_impl(
                         .map(|symbol| {
                             let location = match &symbol.location {
                                 lsp::OneOf::Left(location) => convert_lsp_location(location),
-                                lsp::OneOf::Right(workspace_location) => core_data::Location {
+                                lsp::OneOf::Right(workspace_location) => model::Location {
                                     file_path: workspace_location
                                         .uri
                                         .to_file_path()
@@ -1032,7 +1032,7 @@ fn convert_document_symbol_recursive(
     let symbol_info = WorkspaceSymbolInfo {
         name: doc_symbol.name.clone(),
         kind: doc_symbol.kind,
-        location: core_data::Location {
+        location: model::Location {
             file_path: "".to_string(), // Will be filled in by caller
             line: doc_symbol.selection_range.start.line,
             column: doc_symbol.selection_range.start.character,

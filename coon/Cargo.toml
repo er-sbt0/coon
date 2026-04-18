@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-core_data = { path = "../core_data" }
+model = { path = "../model" }
 logic = { path = "../logic" }
 lsp_integration = { path = "../lsp_integration" }
 tui_ui = { path = "../tui_ui" }

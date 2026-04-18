@@ -1,4 +1,4 @@
-use core_data::SymbolId;
+use model::SymbolId;
 
 /// Actions that can be performed in the TUI
 #[derive(Debug, Clone, PartialEq)]

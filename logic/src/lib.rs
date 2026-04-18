@@ -1,4 +1,4 @@
-use core_data::{CallGraph, SymbolId};
+use model::{CallGraph, SymbolId};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 pub mod filters;
@@ -153,7 +153,7 @@ impl<'a> GraphTraversal<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_data::{FunctionNode, Location};
+    use model::{FunctionNode, Location};
 
     fn create_test_graph() -> CallGraph {
         let mut graph = CallGraph::new();

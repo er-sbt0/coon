@@ -1,4 +1,4 @@
-use core_data::{ReferenceSymbolKind, ReferencingSymbol};
+use model::{ReferenceSymbolKind, ReferencingSymbol};
 use lsp_types::{DocumentSymbol, Position, Range, SymbolInformation, SymbolKind};
 
 /// Find the innermost symbol containing the given position

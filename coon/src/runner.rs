@@ -1,8 +1,8 @@
 use log::info;
 use tokio::sync::mpsc;
 
-use core_data::lsp_status::LspUiMessage;
-use core_data::CallGraph;
+use model::lsp_status::LspUiMessage;
+use model::CallGraph;
 use lsp_integration::{LspRequest, LspResponse};
 use tui_ui::TuiApp;
 

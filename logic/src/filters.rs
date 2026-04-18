@@ -1,4 +1,4 @@
-use core_data::{CallGraph, DiagnosticSeverity, FunctionNode, SymbolId};
+use model::{CallGraph, DiagnosticSeverity, FunctionNode, SymbolId};
 
 /// Function filtering operations
 #[derive(Debug)]
@@ -107,7 +107,7 @@ impl<'a> FunctionFilter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_data::{Diagnostic, FunctionNode, Location};
+    use model::{Diagnostic, FunctionNode, Location};
 
     fn create_test_graph_with_diagnostics() -> CallGraph {
         let mut graph = CallGraph::new();

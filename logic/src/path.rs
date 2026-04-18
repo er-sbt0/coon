@@ -1,4 +1,4 @@
-use core_data::{CallGraph, SymbolId};
+use model::{CallGraph, SymbolId};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Result of a path analysis operation
@@ -227,7 +227,7 @@ impl<'a> PathAnalyzer<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_data::{FunctionNode, Location};
+    use model::{FunctionNode, Location};
 
     fn create_test_graph_with_cycle() -> CallGraph {
         let mut graph = CallGraph::new();

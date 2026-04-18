@@ -1,4 +1,4 @@
-use core_data::{CallGraph, FunctionNode, SymbolId};
+use model::{CallGraph, FunctionNode, SymbolId};
 use grid::{LayoutError, Tree};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -142,7 +142,7 @@ impl Default for CallGraphAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_data::Location;
+    use model::Location;
 
     fn create_test_graph() -> CallGraph {
         let mut graph = CallGraph::new();

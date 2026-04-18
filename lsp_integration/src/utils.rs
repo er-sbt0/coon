@@ -49,7 +49,7 @@ pub fn find_clangd() -> Option<String> {
 pub fn find_containing_symbol(
     symbols: &[lsp_types::DocumentSymbol],
     position: &lsp_types::Position,
-) -> Option<core_data::ReferencingSymbol> {
+) -> Option<model::ReferencingSymbol> {
     for symbol in symbols {
         if position_in_range(position, &symbol.range) {
             // Check children first (innermost)
@@ -74,20 +74,20 @@ fn position_in_range(position: &lsp_types::Position, range: &lsp_types::Range) -
 
 pub fn document_symbol_to_referencing_symbol(
     symbol: &lsp_types::DocumentSymbol,
-) -> core_data::ReferencingSymbol {
-    core_data::ReferencingSymbol {
+) -> model::ReferencingSymbol {
+    model::ReferencingSymbol {
         name: symbol.name.clone(),
         qualified_name: symbol.detail.as_deref().unwrap_or(&symbol.name).to_string(),
         kind: convert_lsp_symbol_kind(symbol.kind),
     }
 }
 
-fn convert_lsp_symbol_kind(kind: lsp_types::SymbolKind) -> core_data::ReferenceSymbolKind {
+fn convert_lsp_symbol_kind(kind: lsp_types::SymbolKind) -> model::ReferenceSymbolKind {
     match kind {
-        lsp_types::SymbolKind::FUNCTION => core_data::ReferenceSymbolKind::Function,
-        lsp_types::SymbolKind::METHOD => core_data::ReferenceSymbolKind::Method,
-        lsp_types::SymbolKind::CONSTRUCTOR => core_data::ReferenceSymbolKind::Constructor,
-        lsp_types::SymbolKind::VARIABLE => core_data::ReferenceSymbolKind::Variable,
-        _ => core_data::ReferenceSymbolKind::Function, // Default fallback
+        lsp_types::SymbolKind::FUNCTION => model::ReferenceSymbolKind::Function,
+        lsp_types::SymbolKind::METHOD => model::ReferenceSymbolKind::Method,
+        lsp_types::SymbolKind::CONSTRUCTOR => model::ReferenceSymbolKind::Constructor,
+        lsp_types::SymbolKind::VARIABLE => model::ReferenceSymbolKind::Variable,
+        _ => model::ReferenceSymbolKind::Function, // Default fallback
     }
 }

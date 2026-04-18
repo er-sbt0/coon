@@ -7,7 +7,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::LspClient;
-use core_data;
+use model;
 
 /// Async LSP service that handles background requests
 pub struct LspService {
@@ -59,7 +59,7 @@ impl LspWorkerState {
 #[derive(Debug, Clone)]
 struct EnhancedRequestInfo {
     request_id: String,
-    locations: Vec<core_data::Location>,
+    locations: Vec<model::Location>,
     pending_symbol_requests: HashSet<String>, // File paths we're waiting for symbols
 }
 
@@ -133,11 +133,11 @@ pub enum LspResponse {
     },
     References {
         request_id: String,
-        locations: Vec<core_data::Location>,
+        locations: Vec<model::Location>,
     },
     ReferencesWithSymbols {
         request_id: String,
-        references: Vec<core_data::Reference>,
+        references: Vec<model::Reference>,
     },
     DocumentSymbols {
         request_id: String,
@@ -145,7 +145,7 @@ pub enum LspResponse {
     },
     WorkspaceSymbols {
         request_id: String,
-        symbols: Vec<core_data::FunctionNode>,
+        symbols: Vec<model::FunctionNode>,
     },
     PreloadComplete {
         request_id: String,
@@ -1388,7 +1388,7 @@ impl LspService {
                                     crate::convert_lsp_location(location)
                                 }
                                 lsp_types::OneOf::Right(workspace_location) => {
-                                    core_data::Location {
+                                    model::Location {
                                         file_path: workspace_location
                                             .uri
                                             .to_file_path()
@@ -1418,7 +1418,7 @@ impl LspService {
                     }
 
                     // Filter to only function symbols from project files and convert to FunctionNode
-                    let function_symbols: Vec<core_data::FunctionNode> = symbols
+                    let function_symbols: Vec<model::FunctionNode> = symbols
                         .into_iter()
                         .filter(|sym| {
                             // Check if it's a function/method type
@@ -1449,7 +1449,7 @@ impl LspService {
                             } else {
                                 sym.name.clone()
                             };
-                            core_data::FunctionNode::new(sym.name, qualified_name, sym.location)
+                            model::FunctionNode::new(sym.name, qualified_name, sym.location)
                         })
                         .collect();
 
@@ -1880,7 +1880,7 @@ impl LspService {
     }
 
     /// Parse the content of a references response
-    fn parse_references_response_content(response: &Value) -> Vec<core_data::Location> {
+    fn parse_references_response_content(response: &Value) -> Vec<model::Location> {
         if let Some(result) = response.get("result") {
             if result.is_null() {
                 log::debug!("References response has null result, returning empty vec");
@@ -1929,7 +1929,7 @@ impl LspService {
         service_request_id: &str,
         state: &mut LspWorkerState,
         _response_tx: &mpsc::Sender<LspResponse>,
-    ) -> Vec<core_data::Reference> {
+    ) -> Vec<model::Reference> {
         // First get the basic locations
         let locations = Self::parse_references_response_content(message);
         let _lsp_request_id = message.get("id").and_then(|i| i.as_i64());
@@ -2012,10 +2012,10 @@ impl LspService {
 
     /// Enhance references using cached document symbols
     fn enhance_references_with_cached_symbols(
-        _locations: &[core_data::Location],
-        locations_by_file: &std::collections::HashMap<String, Vec<core_data::Location>>,
+        _locations: &[model::Location],
+        locations_by_file: &std::collections::HashMap<String, Vec<model::Location>>,
         symbols_cache: &HashMap<String, Vec<lsp_types::DocumentSymbol>>,
-    ) -> Vec<core_data::Reference> {
+    ) -> Vec<model::Reference> {
         let mut enhanced_references = Vec::new();
 
         for (file_path, file_locations) in locations_by_file {
@@ -2033,7 +2033,7 @@ impl LspService {
                     None
                 };
 
-                enhanced_references.push(core_data::Reference {
+                enhanced_references.push(model::Reference {
                     location: location.clone(),
                     referencing_symbol,
                 });
@@ -2090,16 +2090,16 @@ impl LspService {
 
                             for (i, location) in pending.locations.iter().enumerate() {
                                 let referencing_symbol = if i == index && symbol_name.is_some() {
-                                    Some(core_data::ReferencingSymbol {
+                                    Some(model::ReferencingSymbol {
                                         name: symbol_name.clone().unwrap(),
                                         qualified_name: symbol_name.clone().unwrap(), // For now, same as name
-                                        kind: core_data::ReferenceSymbolKind::Function, // Default to function
+                                        kind: model::ReferenceSymbolKind::Function, // Default to function
                                     })
                                 } else {
                                     None
                                 };
 
-                                enhanced_refs.push(core_data::Reference {
+                                enhanced_refs.push(model::Reference {
                                     location: location.clone(),
                                     referencing_symbol,
                                 });
@@ -2178,9 +2178,9 @@ impl LspService {
                 if let Some(containing_symbol) =
                     Self::find_containing_symbol(document_symbols, &position)
                 {
-                    let reference = core_data::Reference {
+                    let reference = model::Reference {
                         location: location.clone(),
-                        referencing_symbol: Some(core_data::ReferencingSymbol {
+                        referencing_symbol: Some(model::ReferencingSymbol {
                             name: containing_symbol.name.clone(),
                             qualified_name: Self::get_qualified_symbol_name(containing_symbol),
                             kind: Self::convert_lsp_symbol_kind(containing_symbol.kind),
@@ -2198,7 +2198,7 @@ impl LspService {
                     enhanced_references.push(reference);
                 } else {
                     // No containing symbol found, create reference without symbol info
-                    let reference = core_data::Reference {
+                    let reference = model::Reference {
                         location: location.clone(),
                         referencing_symbol: None,
                     };
@@ -2281,13 +2281,13 @@ impl LspService {
     }
 
     /// Convert LSP symbol kind to our enum
-    fn convert_lsp_symbol_kind(kind: lsp_types::SymbolKind) -> core_data::ReferenceSymbolKind {
+    fn convert_lsp_symbol_kind(kind: lsp_types::SymbolKind) -> model::ReferenceSymbolKind {
         match kind {
-            lsp_types::SymbolKind::FUNCTION => core_data::ReferenceSymbolKind::Function,
-            lsp_types::SymbolKind::METHOD => core_data::ReferenceSymbolKind::Method,
-            lsp_types::SymbolKind::CONSTRUCTOR => core_data::ReferenceSymbolKind::Constructor,
-            lsp_types::SymbolKind::VARIABLE => core_data::ReferenceSymbolKind::Variable,
-            _ => core_data::ReferenceSymbolKind::Function, // Default fallback
+            lsp_types::SymbolKind::FUNCTION => model::ReferenceSymbolKind::Function,
+            lsp_types::SymbolKind::METHOD => model::ReferenceSymbolKind::Method,
+            lsp_types::SymbolKind::CONSTRUCTOR => model::ReferenceSymbolKind::Constructor,
+            lsp_types::SymbolKind::VARIABLE => model::ReferenceSymbolKind::Variable,
+            _ => model::ReferenceSymbolKind::Function, // Default fallback
         }
     }
 

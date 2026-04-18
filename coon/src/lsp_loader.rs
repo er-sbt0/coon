@@ -3,7 +3,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use core_data::lsp_status::{LspLoadPhase, LspUiMessage};
+use model::lsp_status::{LspLoadPhase, LspUiMessage};
 use lsp_integration::compile_commands;
 use lsp_integration::{LspClient, LspRequest, LspResponse, LspService};
 
@@ -154,10 +154,10 @@ pub async fn lsp_loader_task(
                         info!("Received {} initial workspace symbols", symbols.len());
 
                         for function_node in symbols.into_iter().take(200) {
-                            let workspace_symbol = core_data::WorkspaceSymbolInfo {
+                            let workspace_symbol = model::WorkspaceSymbolInfo {
                                 name: function_node.name.clone(),
                                 qualified_name: function_node.qualified_name.clone(),
-                                kind: core_data::lsp_types::SymbolKind::FUNCTION,
+                                kind: model::lsp_types::SymbolKind::FUNCTION,
                                 location: function_node.definition_location.clone(),
                                 container_name: None,
                             };

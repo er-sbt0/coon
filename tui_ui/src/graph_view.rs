@@ -1,5 +1,5 @@
 use crate::graph_adapter::{CallDirection, CallGraphAdapter};
-use core_data::{CallGraph, FunctionNode, SymbolId};
+use model::{CallGraph, FunctionNode, SymbolId};
 use grid::{LayoutConfig, LayoutEngine, LayoutResult, Position, Tree, Viewport};
 use ratatui::{
     buffer::Buffer,

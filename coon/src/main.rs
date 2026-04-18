@@ -2,7 +2,7 @@ use log::error;
 use std::env;
 use std::path::Path;
 
-use core_data::logging;
+use model::logging;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -16,7 +16,7 @@ use std::io;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
-use core_data::{lsp_status::LspLoadPhase, lsp_status::LspUiMessage, CallGraph, SymbolId};
+use model::{lsp_status::LspLoadPhase, lsp_status::LspUiMessage, CallGraph, SymbolId};
 use lsp_integration::{LspRequest, LspResponse};
 
 pub mod actions;
@@ -177,7 +177,7 @@ impl App {
                     }
                     LspUiMessage::AddFunction(symbol) => {
                         // Mirror into the call graph for now
-                        let function = core_data::FunctionNode::new(
+                        let function = model::FunctionNode::new(
                             symbol.name.clone(),
                             symbol.qualified_name.clone(),
                             symbol.location.clone(),
@@ -985,7 +985,7 @@ impl App {
         // Process outgoing calls and convert them to call graph relationships
         for call in calls {
             // Convert LSP location to our Location type
-            let location = core_data::Location::new(
+            let location = model::Location::new(
                 call.to.uri.path().to_string(),
                 (call.to.range.start.line + 1) as u32, // Convert from 0-indexed to 1-indexed
                 (call.to.range.start.character + 1) as u32,
@@ -1004,14 +1004,14 @@ impl App {
             } else {
                 // Create new function
                 let callee_function =
-                    core_data::FunctionNode::new(call.to.name.clone(), qualified_name, location);
+                    model::FunctionNode::new(call.to.name.clone(), qualified_name, location);
                 self.call_graph.add_function(callee_function)
             };
 
             // Create the call edge from the original function to this callee
             // Use the call location from the LSP response
             for from_range in &call.from_ranges {
-                let call_location = core_data::Location::new(
+                let call_location = model::Location::new(
                     call.to.uri.path().to_string(), // Use the callee's file for call location
                     (from_range.start.line + 1) as u32,
                     (from_range.start.character + 1) as u32,
@@ -1031,7 +1031,7 @@ impl App {
         // Process incoming calls and convert them to call graph relationships
         for call in calls {
             // Convert LSP location to our Location type
-            let location = core_data::Location::new(
+            let location = model::Location::new(
                 call.from.uri.path().to_string(),
                 (call.from.range.start.line + 1) as u32, // Convert from 0-indexed to 1-indexed
                 (call.from.range.start.character + 1) as u32,
@@ -1050,14 +1050,14 @@ impl App {
             } else {
                 // Create new function
                 let caller_function =
-                    core_data::FunctionNode::new(call.from.name.clone(), qualified_name, location);
+                    model::FunctionNode::new(call.from.name.clone(), qualified_name, location);
                 self.call_graph.add_function(caller_function)
             };
 
             // Create the call edge from the caller to the original function
             // Use the call location from the LSP response
             for from_range in &call.from_ranges {
-                let call_location = core_data::Location::new(
+                let call_location = model::Location::new(
                     call.from.uri.path().to_string(), // Use the caller's file for call location
                     (from_range.start.line + 1) as u32,
                     (from_range.start.character + 1) as u32,
@@ -2064,7 +2064,7 @@ fn render_workspace_manager_modal(f: &mut Frame, area: ratatui::layout::Rect, ap
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_data::{FunctionNode, Location};
+    use model::{FunctionNode, Location};
 
     fn create_test_app() -> App {
         let mut graph = CallGraph::new();

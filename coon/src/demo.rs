@@ -1,4 +1,4 @@
-use core_data::{CallGraph, Diagnostic, DiagnosticSeverity, FunctionNode, Location};
+use model::{CallGraph, Diagnostic, DiagnosticSeverity, FunctionNode, Location};
 use log::debug;
 
 pub fn create_demo_call_graph() -> CallGraph {
