@@ -2,6 +2,7 @@
 **/logs
 /test_project/.cache/
 t/
+.claude/settings.local.json
 
 
 # Added by cargo

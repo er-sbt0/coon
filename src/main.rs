@@ -8,10 +8,9 @@ use uuid::Uuid;
 use core_data::logging;
 use core_data::lsp_status::{LspLoadPhase, LspUiMessage};
 use core_data::{CallGraph, Diagnostic, DiagnosticSeverity, FunctionNode, Location};
+use lsp_integration::compile_commands;
 use lsp_integration::{LspClient, LspRequest, LspResponse, LspService};
 use tui_ui::TuiApp;
-
-mod compile_commands;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

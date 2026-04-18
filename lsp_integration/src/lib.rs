@@ -9,6 +9,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 mod call_hierarchy;
+pub mod compile_commands;
 mod service;
 mod symbol_resolution;
 mod utils;
