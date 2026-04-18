@@ -1,7 +1,20 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 use crate::symbols::*;
+
+/// Compute a compact `u64` hash of an edge's identity so we can deduplicate
+/// without cloning the file-path `String` into the set.
+fn edge_hash(caller: SymbolId, callee: SymbolId, file_path: &str, line: u32, column: u32) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    caller.hash(&mut h);
+    callee.hash(&mut h);
+    file_path.hash(&mut h);
+    line.hash(&mut h);
+    column.hash(&mut h);
+    h.finish()
+}
 
 /// A node in the call graph representing a function or method
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -112,7 +125,7 @@ pub struct CallGraph {
     nodes: HashMap<SymbolId, FunctionNode>,
     edges: Vec<CallEdge>,
     #[serde(skip)]
-    edge_set: HashSet<(SymbolId, SymbolId, String, u32, u32)>,
+    edge_set: HashSet<u64>,
     #[serde(skip)]
     callers_map: HashMap<SymbolId, Vec<SymbolId>>,
     #[serde(skip)]
@@ -166,10 +179,10 @@ impl CallGraph {
     }
 
     pub fn add_call(&mut self, caller: SymbolId, callee: SymbolId, call_location: Location) {
-        let key = (
+        let key = edge_hash(
             caller,
             callee,
-            call_location.file_path.clone(),
+            &call_location.file_path,
             call_location.line,
             call_location.column,
         );
@@ -237,10 +250,10 @@ impl CallGraph {
                 .or_insert_with(|| *id);
         }
         for edge in &self.edges {
-            let key = (
+            let key = edge_hash(
                 edge.caller,
                 edge.callee,
-                edge.call_location.file_path.clone(),
+                &edge.call_location.file_path,
                 edge.call_location.line,
                 edge.call_location.column,
             );

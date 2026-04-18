@@ -16,8 +16,6 @@ if !self.functions.contains(&id) {
 
 ---
 
----
-
 ### 10. No LSP shutdown on application exit
 
 In runner.rs, the `lsp_loader_task` is spawned with `tokio::spawn` but never joined. When the TUI exits, the Tokio runtime is dropped, aborting the task without sending LSP `shutdown`/`exit`. The `Drop` impl on `LspClient` tries `start_kill()` but the child process might not receive it reliably.
@@ -58,6 +56,3 @@ graph.rs hands out `&mut FunctionNode`, but if the caller changes `node.name`, t
 
 ---
 
-### 19. Magic numbers for pan distances and viewport defaults
-
-Hard-coded constants like `3.0` / `5.0` for pan delta (events.rs), `(100.0, 100.0)` for default viewport (mod.rs), and `200` for max symbols (loader.rs) should be named constants.
