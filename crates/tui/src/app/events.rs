@@ -1,4 +1,4 @@
-use model::{CallGraph, SymbolId};
+use model::SymbolId;
 
 use crate::actions::Action;
 use crate::graph_adapter::CallDirection;
@@ -182,13 +182,13 @@ impl App {
 
     fn navigate_and_report(
         &mut self,
-        op: fn(&mut GraphViewState, &CallGraph) -> bool,
+        op: fn(&mut GraphViewState) -> bool,
         success_prefix: &str,
         fail_msg: &str,
     ) {
         let current_idx = self.workspaces.current_index;
         if let Some(workspace) = self.workspaces.workspaces.get_mut(current_idx) {
-            if op(&mut workspace.graph_view_state, &self.call_graph) {
+            if op(&mut workspace.graph_view_state) {
                 if let Some(selected) = &workspace.graph_view_state.selected_node {
                     let name = self
                         .call_graph

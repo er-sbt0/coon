@@ -142,7 +142,7 @@ impl GraphViewState {
     }
 
     /// Select the next sibling node
-    pub fn select_next_sibling(&mut self, _graph: &CallGraph) {
+    pub fn select_next_sibling(&mut self) {
         if let Some(siblings) = self.get_siblings() {
             if let Some(selected) = &self.selected_node {
                 if let Some(&selected_idx) = self.adapter.symbol_to_node.get(selected) {
@@ -160,7 +160,7 @@ impl GraphViewState {
     }
 
     /// Select the previous sibling node
-    pub fn select_prev_sibling(&mut self, _graph: &CallGraph) {
+    pub fn select_prev_sibling(&mut self) {
         if let Some(siblings) = self.get_siblings() {
             if let Some(selected) = &self.selected_node {
                 if let Some(&selected_idx) = self.adapter.symbol_to_node.get(selected) {
@@ -182,7 +182,7 @@ impl GraphViewState {
     }
 
     /// Navigate to the parent of the currently selected node
-    pub fn navigate_to_parent(&mut self, _graph: &CallGraph) -> bool {
+    pub fn navigate_to_parent(&mut self) -> bool {
         if let Some(selected) = &self.selected_node {
             if let Some(tree) = &self.tree {
                 // Find the selected node's index
@@ -206,7 +206,7 @@ impl GraphViewState {
     }
 
     /// Navigate to the first child of the currently selected node
-    pub fn navigate_to_child(&mut self, _graph: &CallGraph) -> bool {
+    pub fn navigate_to_child(&mut self) -> bool {
         if let Some(selected) = &self.selected_node {
             if let Some(tree) = &self.tree {
                 // Find the selected node's index
@@ -253,7 +253,7 @@ impl GraphViewState {
     }
 
     /// Navigate to the next sibling (j key)
-    pub fn navigate_next_sibling(&mut self, _graph: &CallGraph) -> bool {
+    pub fn navigate_next_sibling(&mut self) -> bool {
         if let Some(siblings) = self.get_siblings() {
             if let Some(selected) = &self.selected_node {
                 if let Some(&selected_idx) = self.adapter.symbol_to_node.get(selected) {
@@ -273,7 +273,7 @@ impl GraphViewState {
     }
 
     /// Navigate to the previous sibling (k key)
-    pub fn navigate_prev_sibling(&mut self, _graph: &CallGraph) -> bool {
+    pub fn navigate_prev_sibling(&mut self) -> bool {
         if let Some(siblings) = self.get_siblings() {
             if let Some(selected) = &self.selected_node {
                 if let Some(&selected_idx) = self.adapter.symbol_to_node.get(selected) {
