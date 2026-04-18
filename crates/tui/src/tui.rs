@@ -38,16 +38,18 @@ pub struct TuiApp {
 }
 
 impl TuiApp {
-    pub fn new(call_graph: CallGraph) -> Result<Self, Box<dyn std::error::Error>> {
-        install_panic_hook();
+    fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>, Box<dyn std::error::Error>> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend)?;
+        Ok(Terminal::new(backend)?)
+    }
 
+    pub fn new(call_graph: CallGraph) -> Result<Self, Box<dyn std::error::Error>> {
+        install_panic_hook();
+        let terminal = Self::setup_terminal()?;
         let app = App::new(call_graph);
-
         Ok(Self { app, terminal })
     }
 
@@ -60,14 +62,8 @@ impl TuiApp {
         )>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         install_panic_hook();
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-        let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend)?;
-
+        let terminal = Self::setup_terminal()?;
         let app = App::new_with_lsp_async(call_graph, lsp_rx, lsp_channels_rx);
-
         Ok(Self { app, terminal })
     }
 
