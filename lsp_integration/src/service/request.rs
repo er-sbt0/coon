@@ -1,8 +1,8 @@
-use lsp_types::{Position, Url};
-use tokio::sync::mpsc;
+use super::document;
 use super::worker::{LspWorkerState, RequestType};
 use super::LspResponse;
-use super::document;
+use lsp_types::{Position, Url};
+use tokio::sync::mpsc;
 
 pub(super) async fn handle_preload_documents(
     state: &mut LspWorkerState,

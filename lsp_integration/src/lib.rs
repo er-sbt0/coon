@@ -16,15 +16,6 @@ mod utils;
 
 pub use service::{LspRequest, LspResponse, LspService};
 
-#[cfg(test)]
-mod call_hierarchy_tests;
-
-#[cfg(test)]
-mod hover_tests;
-
-#[cfg(test)]
-mod enhanced_references_tests;
-
 /// Response from LSP find_references request
 #[derive(Debug, Clone)]
 pub struct FindReferencesResponse {
@@ -228,7 +219,7 @@ impl LspClient {
         })
     }
 
-    async fn send_request(&mut self, method: &str, params: Value) -> Result<i64> {
+    pub async fn send_request(&mut self, method: &str, params: Value) -> Result<i64> {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -891,7 +882,7 @@ fn parse_document_symbol_response_impl(
     Ok(None)
 }
 
-fn parse_hover_response_impl(
+pub fn parse_hover_response_impl(
     pending_requests: &mut HashMap<i64, String>,
     response: &Value,
 ) -> Result<Option<HoverResponse>> {

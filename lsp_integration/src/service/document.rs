@@ -1,7 +1,7 @@
+use super::worker::LspWorkerState;
 use anyhow::Result;
 use lsp_types::Url;
 use std::collections::HashMap;
-use super::worker::LspWorkerState;
 
 pub(super) async fn ensure_document_opened(
     state: &mut LspWorkerState,
@@ -112,16 +112,11 @@ pub(super) fn find_containing_symbol<'a>(
     None
 }
 
-pub(super) fn position_in_range(
-    position: &lsp_types::Position,
-    range: &lsp_types::Range,
-) -> bool {
+pub(super) fn position_in_range(position: &lsp_types::Position, range: &lsp_types::Range) -> bool {
     (position.line > range.start.line
-        || (position.line == range.start.line
-            && position.character >= range.start.character))
+        || (position.line == range.start.line && position.character >= range.start.character))
         && (position.line < range.end.line
-            || (position.line == range.end.line
-                && position.character <= range.end.character))
+            || (position.line == range.end.line && position.character <= range.end.character))
 }
 
 pub(super) fn get_qualified_symbol_name(symbol: &lsp_types::DocumentSymbol) -> String {
@@ -136,9 +131,7 @@ pub(super) fn get_qualified_symbol_name(symbol: &lsp_types::DocumentSymbol) -> S
     }
 }
 
-pub(super) fn convert_lsp_symbol_kind(
-    kind: lsp_types::SymbolKind,
-) -> model::ReferenceSymbolKind {
+pub(super) fn convert_lsp_symbol_kind(kind: lsp_types::SymbolKind) -> model::ReferenceSymbolKind {
     match kind {
         lsp_types::SymbolKind::FUNCTION => model::ReferenceSymbolKind::Function,
         lsp_types::SymbolKind::METHOD => model::ReferenceSymbolKind::Method,

@@ -1,9 +1,9 @@
+use super::document;
+use super::worker::{EnhancedRequestInfo, LspWorkerState, RequestType};
+use super::LspResponse;
 use lsp_types::DocumentSymbol;
 use serde_json::Value;
 use tokio::sync::mpsc;
-use super::worker::{EnhancedRequestInfo, LspWorkerState, RequestType};
-use super::LspResponse;
-use super::document;
 
 pub(super) async fn handle_lsp_message(
     message: Value,
@@ -25,13 +25,8 @@ pub(super) async fn handle_lsp_message(
                     handle_incoming_calls_response(message, request_id, state, response_tx).await;
                 }
                 Some(RequestType::PrepareCallHierarchy) => {
-                    handle_prepare_call_hierarchy_response(
-                        message,
-                        request_id,
-                        state,
-                        response_tx,
-                    )
-                    .await;
+                    handle_prepare_call_hierarchy_response(message, request_id, state, response_tx)
+                        .await;
                 }
                 Some(RequestType::References) => {
                     handle_references_response(message, request_id, state, response_tx).await;
@@ -46,8 +41,7 @@ pub(super) async fn handle_lsp_message(
                     .await;
                 }
                 Some(RequestType::DocumentSymbols) => {
-                    handle_document_symbols_response(message, request_id, state, response_tx)
-                        .await;
+                    handle_document_symbols_response(message, request_id, state, response_tx).await;
                 }
                 Some(RequestType::WorkspaceSymbols) => {
                     handle_workspace_symbols_response(message, request_id, state, response_tx)
@@ -58,8 +52,7 @@ pub(super) async fn handle_lsp_message(
                 }
                 None => {
                     log::warn!("No request type tracked for LSP request {}, falling back to content detection", id);
-                    handle_legacy_response_detection(message, request_id, state, response_tx)
-                        .await;
+                    handle_legacy_response_detection(message, request_id, state, response_tx).await;
                 }
             }
 
@@ -160,8 +153,7 @@ async fn handle_outgoing_calls_response(
         return;
     }
 
-    if let Ok(Some(outgoing_calls_response)) =
-        state.client.parse_outgoing_calls_response(&message)
+    if let Ok(Some(outgoing_calls_response)) = state.client.parse_outgoing_calls_response(&message)
     {
         log::info!(
             "LSP Outgoing Calls Response: found {} calls for request {}",
@@ -227,8 +219,7 @@ async fn handle_incoming_calls_response(
         return;
     }
 
-    if let Ok(Some(incoming_calls_response)) =
-        state.client.parse_incoming_calls_response(&message)
+    if let Ok(Some(incoming_calls_response)) = state.client.parse_incoming_calls_response(&message)
     {
         log::info!(
             "LSP Incoming Calls Response: found {} calls for request {}",
@@ -824,9 +815,7 @@ async fn handle_legacy_document_symbols_for_enhanced_references(
                         request_id,
                         document_symbols.len()
                     );
-                    if let Some(base_request_id) =
-                        request_id.strip_prefix("document_symbol_for_")
-                    {
+                    if let Some(base_request_id) = request_id.strip_prefix("document_symbol_for_") {
                         handle_document_symbols_for_enhanced_references(
                             base_request_id,
                             &document_symbols,
@@ -902,9 +891,7 @@ async fn handle_hover_for_enhanced_references(
                     index
                 );
 
-                if let Some(pending) =
-                    state.pending_enhanced_requests.get_mut(service_request_id)
-                {
+                if let Some(pending) = state.pending_enhanced_requests.get_mut(service_request_id) {
                     pending.pending_symbol_requests.remove(index_str);
 
                     let symbol_name = if let Some(hover_info) = &hover_response.hover_info {
@@ -922,16 +909,15 @@ async fn handle_hover_for_enhanced_references(
                     if pending.pending_symbol_requests.is_empty() {
                         let mut enhanced_refs = Vec::new();
                         for (i, location) in pending.locations.iter().enumerate() {
-                            let referencing_symbol =
-                                if i == index && symbol_name.is_some() {
-                                    Some(model::ReferencingSymbol {
-                                        name: symbol_name.clone().unwrap(),
-                                        qualified_name: symbol_name.clone().unwrap(),
-                                        kind: model::ReferenceSymbolKind::Function,
-                                    })
-                                } else {
-                                    None
-                                };
+                            let referencing_symbol = if i == index && symbol_name.is_some() {
+                                Some(model::ReferencingSymbol {
+                                    name: symbol_name.clone().unwrap(),
+                                    qualified_name: symbol_name.clone().unwrap(),
+                                    kind: model::ReferenceSymbolKind::Function,
+                                })
+                            } else {
+                                None
+                            };
                             enhanced_refs.push(model::Reference {
                                 location: location.clone(),
                                 referencing_symbol,
@@ -1140,8 +1126,7 @@ async fn parse_enhanced_references_response(
         },
     );
 
-    let mut files_to_analyze: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut files_to_analyze: std::collections::HashSet<String> = std::collections::HashSet::new();
     for location in locations.iter() {
         files_to_analyze.insert(location.file_path.clone());
     }
@@ -1157,11 +1142,7 @@ async fn parse_enhanced_references_response(
             match state.client.document_symbol(text_document).await {
                 Ok(lsp_request_id) => {
                     let request_id = format!("document_symbol_for_{}", service_request_id);
-                    state.track_request(
-                        lsp_request_id,
-                        request_id,
-                        RequestType::DocumentSymbols,
-                    );
+                    state.track_request(lsp_request_id, request_id, RequestType::DocumentSymbols);
                     state.enhanced_lsp_requests.insert(lsp_request_id);
                     log::debug!(
                         "Sent document symbol request for {} (lsp_request_id: {})",
@@ -1184,4 +1165,3 @@ async fn parse_enhanced_references_response(
 
     Vec::new()
 }
-

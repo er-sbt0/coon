@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use super::{LspRequest, LspResponse};
+use crate::LspClient;
 use lsp_types::Url;
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
-use crate::LspClient;
-use super::{LspRequest, LspResponse};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum RequestType {

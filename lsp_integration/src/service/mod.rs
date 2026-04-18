@@ -1,10 +1,10 @@
+use crate::LspClient;
 use anyhow::Result;
 use lsp_types::{CallHierarchyItem, CallHierarchyOutgoingCall, DocumentSymbol, Position, Url};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
-use crate::LspClient;
 
 mod document;
 mod request;
@@ -197,11 +197,7 @@ impl LspService {
     }
 
     /// Request workspace symbols for project refresh
-    pub async fn request_workspace_symbols(
-        &self,
-        request_id: String,
-        query: String,
-    ) -> Result<()> {
+    pub async fn request_workspace_symbols(&self, request_id: String, query: String) -> Result<()> {
         self.request_tx
             .send(LspRequest::GetWorkspaceSymbols { request_id, query })
             .await?;
