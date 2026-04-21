@@ -55,10 +55,12 @@ pub async fn lsp_loader_task(
         match tokio::time::timeout(std::time::Duration::from_millis(100), rx_for_init.recv()).await
         {
             Ok(Some(message)) => {
-                debug!(
-                    "Init phase - received LSP message: {}",
-                    serde_json::to_string_pretty(&message)?
-                );
+                if log::log_enabled!(log::Level::Debug) {
+                    debug!(
+                        "Init phase - received LSP message: {}",
+                        serde_json::to_string_pretty(&message).unwrap_or_default()
+                    );
+                }
                 if let Some(id) = message.get("id").and_then(|i| i.as_i64()) {
                     if id == init_id {
                         if let Some(error) = message.get("error") {
