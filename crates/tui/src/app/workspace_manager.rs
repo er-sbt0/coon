@@ -135,7 +135,7 @@ impl WorkspaceManager {
     pub fn rename(&mut self, index: usize, new_name: String) -> Option<StatusMessage> {
         if let Some(workspace) = self.workspaces.get_mut(index) {
             workspace.name = new_name.clone();
-            Some(StatusMessage::SwitchedToWorkspace { name: new_name })
+            Some(StatusMessage::RenamedWorkspace { name: new_name })
         } else {
             None
         }

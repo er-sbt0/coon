@@ -26,7 +26,6 @@ coon/src/runner.rs — Runs the synchronous Ratatui loop inside `#[tokio::main]`
 ## Low
 
 **16.** `DEFAULT_VIEWPORT_SIZE = (100.0, 100.0)` — no units or explanation (tui/src/app/mod.rs).  
-**17.** `initialize_with_capabilities` is a near-clone of `initialize` used only in tests — will silently diverge (lsp/src/client/requests.rs).  
 **18.** `logic` crate doesn't re-export `GraphQueryEngine` from its root, making it awkward to use (logic/src/lib.rs).  
 **19.** Emoji in help text (`📐`, `🎮`) — inconsistent terminal width handling can misalign the layout (tui/src/rendering.rs).  
 **20.** Tests access private `nodes`/`edges` fields directly instead of using the existing `node_count()`/`edge_count()` accessors (model/src/graph.rs).

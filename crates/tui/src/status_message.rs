@@ -96,6 +96,9 @@ pub enum StatusMessage {
     SwitchedToWorkspace {
         name: String,
     },
+    RenamedWorkspace {
+        name: String,
+    },
     WorkspaceCreatedFromSearch,
     GraphWorkspaceCreated,
 
@@ -207,6 +210,9 @@ impl fmt::Display for StatusMessage {
             Self::InvalidWorkspaceIndex => write!(f, "Invalid workspace index"),
             Self::SwitchedToWorkspace { name } => {
                 write!(f, "Switched to workspace: {}", name)
+            }
+            Self::RenamedWorkspace { name } => {
+                write!(f, "Renamed workspace to: {}", name)
             }
             Self::WorkspaceCreatedFromSearch => write!(f, "Workspace created from search"),
             Self::GraphWorkspaceCreated => write!(f, "Graph workspace created"),
