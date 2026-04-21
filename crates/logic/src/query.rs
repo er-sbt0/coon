@@ -6,9 +6,9 @@ use std::collections::HashMap;
 #[derive(Debug)]
 pub struct GraphQueryEngine<'a> {
     graph: &'a CallGraph,
-    pub traversal: GraphTraversal<'a>,
-    pub filter: FunctionFilter<'a>,
-    pub path_analyzer: PathAnalyzer<'a>,
+    traversal: GraphTraversal<'a>,
+    filter: FunctionFilter<'a>,
+    path_analyzer: PathAnalyzer<'a>,
 }
 
 impl<'a> GraphQueryEngine<'a> {

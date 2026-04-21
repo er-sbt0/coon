@@ -15,12 +15,6 @@ logic/src/traversal.rs — Defined, re-exported from the crate root, but every t
 ### 10. All `LspBridge` fields are `pub`
 tui/src/app/lsp_bridge.rs — ~8 internal fields all `pub`, letting callers bypass the bridge's invariants. Should be `pub(crate)` or `pub(super)` at most.
 
-### 11. `GraphQueryEngine` leaky abstraction
-logic/src/query.rs — `pub traversal`, `pub filter`, `pub path_analyzer` fields let callers bypass the higher-level query interface.
-
-### 13. `WorkspaceManager::rename` emits wrong `StatusMessage` variant
-tui/src/app/workspace_manager.rs — Returns `StatusMessage::SwitchedToWorkspace` on a successful rename, which implies a tab switch happened.
-
 ### 14. `serde_json::to_string_pretty` in a tight polling loop
 lsp/src/loader.rs — Allocates and formats full JSON on every message during init even when `debug` logging is disabled. Should be a lazy format or guarded with `log_enabled!`.
 
