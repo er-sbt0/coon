@@ -1,11 +1,27 @@
 use crate::types::{CornerType, EdgePath, EdgeSegment, EdgeSegmentType, Position};
 
-/// Compute orthogonal edge routing (horizontal-vertical-horizontal)
+/// Compute orthogonal edge routing (horizontal-vertical-horizontal).
+/// `mid_x` controls where the vertical bar is placed; pass `None` to use the
+/// midpoint between `from.x` and `to.x`.
 pub fn compute_orthogonal_routing(
     parent_id: usize,
     child_id: usize,
     from: Position,
     to: Position,
+) -> EdgePath {
+    compute_orthogonal_routing_with_mid(parent_id, child_id, from, to, (from.x + to.x) / 2.0)
+}
+
+/// Like [`compute_orthogonal_routing`] but with an explicit `mid_x` for the
+/// vertical bar.  Callers that route many edges between the same layer pair
+/// should pass distinct `mid_x` values to avoid all bars stacking on the same
+/// column.
+pub fn compute_orthogonal_routing_with_mid(
+    parent_id: usize,
+    child_id: usize,
+    from: Position,
+    to: Position,
+    mid_x: f32,
 ) -> EdgePath {
     let mut segments = Vec::new();
 
@@ -13,8 +29,7 @@ pub fn compute_orthogonal_routing(
     if (to.y - from.y).abs() <= 0.1 {
         segments.push(EdgeSegment::new(from, to, EdgeSegmentType::Horizontal));
     } else {
-        // Calculate midpoint for routing
-        let mid_x = (from.x + to.x) / 2.0;
+        // Use caller-supplied mid_x (may differ per edge to avoid overlap)
 
         // Segment 1: Horizontal from parent to midpoint
         if (mid_x - from.x).abs() > 0.1 {

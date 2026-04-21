@@ -22,60 +22,113 @@ pub fn render_back_edges(
 }
 
 /// Render edges for a DAG layout (no tree structure needed), with arrowheads.
+///
+/// When `reverse_arrows` is `true` the arrowhead is placed at the **from** end of
+/// each edge instead of the **to** end.  Use this in "incoming callers" views
+/// where DAG edges flow caller-outward but the logical arrow should point back
+/// toward the callee (selected node).
 pub fn render_dag_edges(
     buf: &mut Buffer,
     layout: &LayoutResult,
     viewport: &Viewport,
     area: Rect,
     style: Style,
+    reverse_arrows: bool,
 ) {
     for edge in layout.edges() {
         render_edge_path(buf, edge, viewport, area, style);
-        render_arrowhead(buf, edge, viewport, area, style);
+        render_arrowhead(buf, edge, viewport, area, style, reverse_arrows);
     }
 }
 
-/// Render a `▶` or `▼` arrowhead at the tip of the last segment of an edge path.
+/// Render a `▶` or `▼` arrowhead near the destination (or source when
+/// `reverse_arrows` is `true`) of an edge path.
 fn render_arrowhead(
     buf: &mut Buffer,
     path: &EdgePath,
     viewport: &Viewport,
     area: Rect,
     style: Style,
+    reverse_arrows: bool,
 ) {
-    // Find the last non-Corner segment to determine arrival direction
-    let last_real = path
-        .segments
-        .iter()
-        .rev()
-        .find(|s| !matches!(s.segment_type, EdgeSegmentType::Corner(_)));
+    // In normal mode: arrowhead at the TO end of the last real segment.
+    // In reverse mode: arrowhead at the FROM end of the first real segment,
+    // pointing back toward the source node.
+    let (seg, tip_pos, going_right, going_down) = if !reverse_arrows {
+        let last = match path
+            .segments
+            .iter()
+            .rev()
+            .find(|s| !matches!(s.segment_type, EdgeSegmentType::Corner(_)))
+        {
+            Some(s) => s,
+            None => return,
+        };
+        (
+            last,
+            last.to,
+            last.to.x >= last.from.x,
+            last.to.y >= last.from.y,
+        )
+    } else {
+        let first = match path
+            .segments
+            .iter()
+            .find(|s| !matches!(s.segment_type, EdgeSegmentType::Corner(_)))
+        {
+            Some(s) => s,
+            None => return,
+        };
+        // Use the first segment's type; tip is the FROM end; direction reflects edge travel
+        (
+            first,
+            first.from,
+            first.to.x >= first.from.x,
+            first.to.y >= first.from.y,
+        )
+    };
 
-    if let Some(seg) = last_real {
-        let tip = seg.to;
-        let screen = viewport.world_to_screen(tip);
-        let x = screen.x as i32;
-        let y = screen.y as i32;
+    let screen = viewport.world_to_screen(tip_pos);
+    let sx = screen.x as i32;
+    let sy = screen.y as i32;
 
-        if x >= 0 && x < area.width as i32 && y >= 0 && y < area.height as i32 {
-            let arrow = match seg.segment_type {
-                EdgeSegmentType::Horizontal => {
-                    if seg.to.x >= seg.from.x {
-                        "▶"
-                    } else {
-                        "◀"
-                    }
+    let (arrow, x, y) = match seg.segment_type {
+        EdgeSegmentType::Horizontal => {
+            if !reverse_arrows {
+                if going_right {
+                    ("▶", sx - 1, sy) // arrives from left → just left of right node's border
+                } else {
+                    ("◀", sx + 1, sy) // arrives from right → just right of left node's border
                 }
-                EdgeSegmentType::Vertical => {
-                    if seg.to.y >= seg.from.y {
-                        "▼"
-                    } else {
-                        "▲"
-                    }
+            } else {
+                // Reversed: sit just outside the FROM node pointing back inward
+                if going_right {
+                    ("◀", sx + 1, sy) // edge goes right; reversed ◀ clears the right border of FROM node
+                } else {
+                    ("▶", sx - 1, sy) // edge goes left; reversed ▶ clears the left border of FROM node
                 }
-                _ => return,
-            };
-            buf.set_string(area.x + x as u16, area.y + y as u16, arrow, style);
+            }
         }
+        EdgeSegmentType::Vertical => {
+            if !reverse_arrows {
+                if going_down {
+                    ("▼", sx, sy - 1)
+                } else {
+                    ("▲", sx, sy + 1)
+                }
+            } else {
+                if going_down {
+                    ("▲", sx, sy + 1)
+                } else {
+                    ("▼", sx, sy - 1)
+                }
+            }
+        }
+        _ => return,
+    };
+
+    if x >= 0 && x < area.width as i32 && y >= 0 && y < area.height as i32 {
+        buf.set_string(area.x + x as u16, area.y + y as u16, arrow, style);
     }
 }
 

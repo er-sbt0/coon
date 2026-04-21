@@ -3,7 +3,7 @@ use grid::{Dag, LayoutConfig, LayoutEngine, LayoutResult, Position, Viewport};
 use model::{CallGraph, FunctionNode, SymbolId};
 use ratatui::{
     buffer::Buffer,
-    layout::Rect,
+    layout::{Alignment, Rect},
     style::{Color, Style},
     text::Line,
     widgets::{Block, Borders, Paragraph, StatefulWidget, Widget},
@@ -28,7 +28,7 @@ impl GraphViewState {
     pub fn new() -> Self {
         let config = LayoutConfig::new()
             .with_node_size(24.0, 3.0) // 24-char fixed width, 3-row height
-            .with_spacing(5.0, 28.0, 1.0); // node_separation (height+gap), level_separation (width+gap), subtree_separation
+            .with_spacing(5.0, 36.0, 1.0); // node_separation (row gap), level_separation (width+gap≈2.4×node_sep to match ~2:1 cell aspect ratio), subtree_separation
 
         Self {
             adapter: CallGraphAdapter::new(),
@@ -327,7 +327,8 @@ impl<'a> GraphView<'a> {
         let block = Block::bordered().border_style(border_style);
         let paragraph = Paragraph::new(label.as_ref())
             .block(block)
-            .style(text_style);
+            .style(text_style)
+            .alignment(Alignment::Center);
         paragraph.render(node_area, buf);
     }
 
@@ -407,12 +408,16 @@ impl<'a> StatefulWidget for GraphView<'a> {
             grid::LayoutBounds::new(0.0, inner_area.width as f32, 0.0, inner_area.height as f32);
 
         // Render forward edges
+        // In Incoming mode the DAG edges flow root→caller, but the logical arrow
+        // should point toward the callee (root), so reverse the arrowheads.
+        let reverse_arrows = state.direction == CallDirection::Incoming;
         grid::render_dag_edges(
             buf,
             layout,
             &state.viewport,
             inner_area,
             Style::default().fg(Color::DarkGray),
+            reverse_arrows,
         );
 
         // Render back-edges (cycles) in red

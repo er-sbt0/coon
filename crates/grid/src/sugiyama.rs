@@ -5,7 +5,7 @@ use petgraph::graph::DiGraph;
 
 use crate::config::LayoutConfig;
 use crate::dag::Dag;
-use crate::edge_router::compute_orthogonal_routing;
+use crate::edge_router::{compute_orthogonal_routing, compute_orthogonal_routing_with_mid};
 use crate::error::LayoutError;
 use crate::result::LayoutResult;
 use crate::types::{EdgePath, LayoutBounds, Position};
@@ -366,12 +366,112 @@ fn route_edges(
         chains.entry(*orig).or_default().push(*edge);
     }
 
+    // -----------------------------------------------------------------------
+    // Pre-compute per-edge stagger fractions — two separate fracs:
+    //
+    // 1. `exit_frac`  (per parent→child rank within the same parent)
+    //    Controls the vertical exit port on the parent node so that siblings
+    //    leave from different rows.  f = (k+1)/(n+1) where n = sibling count.
+    //
+    // 2. `mid_frac`   (per edge rank within the same LAYER-PAIR)
+    //    Controls the horizontal position of the vertical bar so that edges
+    //    from *different parents* that cross the same inter-layer gap also get
+    //    distinct columns.  Without this, all single-child parents produce
+    //    frac=0.5 and their bars form a shared visual spine that appears to
+    //    cut through the bounding boxes of every node whose y falls in range.
+    // -----------------------------------------------------------------------
+
+    // Build node → layer index map
+    let mut node_to_layer: Vec<usize> = vec![0; all_positions.len().max(g.positions.len())];
+    for (layer_idx, nodes) in g.layers.iter().enumerate() {
+        for &node in nodes {
+            if node < node_to_layer.len() {
+                node_to_layer[node] = layer_idx;
+            }
+        }
+    }
+
+    // --- exit_frac: per-parent sibling rank ---
+    let mut parent_to_children: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for &(u, v) in chains.keys() {
+        parent_to_children.entry(u).or_default().push(v);
+    }
+    // Sort each child list by destination Y for stable, visually consistent ordering
+    for children in parent_to_children.values_mut() {
+        children.sort_by(|&a, &b| {
+            let ay = all_positions.get(a).map(|p| p.y).unwrap_or(0.0);
+            let by_ = all_positions.get(b).map(|p| p.y).unwrap_or(0.0);
+            ay.partial_cmp(&by_).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    let exit_frac: BTreeMap<(usize, usize), f32> = parent_to_children
+        .iter()
+        .flat_map(|(&parent, children)| {
+            let n = children.len() as f32;
+            children
+                .iter()
+                .enumerate()
+                .map(move |(k, &child)| ((parent, child), (k as f32 + 1.0) / (n + 1.0)))
+        })
+        .collect();
+
+    // --- mid_frac: per-layer-pair rank (avoids shared spine across parents) ---
+    // Group all edges by (src_layer, dst_layer); sort by midpoint-y for
+    // deterministic, visually ordered assignment.
+    let mut layer_pair_edges: BTreeMap<(usize, usize), Vec<(usize, usize)>> = BTreeMap::new();
+    for &(u, v) in chains.keys() {
+        let lu = if u < node_to_layer.len() {
+            node_to_layer[u]
+        } else {
+            0
+        };
+        let lv = if v < node_to_layer.len() {
+            node_to_layer[v]
+        } else {
+            0
+        };
+        layer_pair_edges.entry((lu, lv)).or_default().push((u, v));
+    }
+    for edges in layer_pair_edges.values_mut() {
+        edges.sort_by(|&(u1, v1), &(u2, v2)| {
+            let mid1 = (all_positions.get(u1).map(|p| p.y).unwrap_or(0.0)
+                + all_positions.get(v1).map(|p| p.y).unwrap_or(0.0))
+                / 2.0;
+            let mid2 = (all_positions.get(u2).map(|p| p.y).unwrap_or(0.0)
+                + all_positions.get(v2).map(|p| p.y).unwrap_or(0.0))
+                / 2.0;
+            mid1.partial_cmp(&mid2).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    let mid_frac: BTreeMap<(usize, usize), f32> = layer_pair_edges
+        .iter()
+        .flat_map(|(_, edges)| {
+            let n = edges.len() as f32;
+            edges
+                .iter()
+                .enumerate()
+                .map(move |(k, &(u, v))| ((u, v), (k as f32 + 1.0) / (n + 1.0)))
+        })
+        .collect();
+
+    // Keep `stagger` as an alias for exit_frac for backward compatibility in
+    // the waypoint adjustment code below.
+    let stagger = exit_frac;
+
     let mut result = Vec::new();
 
     for ((u, v), mut segments) in chains {
         if u >= all_positions.len() || v >= all_positions.len() {
             continue;
         }
+
+        // exit_frac: controls the vertical exit port on the parent node
+        let frac = stagger.get(&(u, v)).copied().unwrap_or(0.5);
+        // mid_frac: controls the horizontal column of the vertical bar within
+        // the inter-layer gap.  Using the layer-pair rank prevents bars from
+        // different parents (but the same layer pair) from sharing one column
+        // and forming a continuous visual spine.
+        let mfrac = mid_frac.get(&(u, v)).copied().unwrap_or(0.5);
 
         // Sort segments in ascending layer order (= ascending x)
         segments.sort_by(|a, b| {
@@ -394,30 +494,35 @@ fn route_edges(
         }
 
         // Adjust waypoints to use node-border connection ports:
-        // - first (parent): exit from right edge, vertically centered
+        // - first (parent): exit from right edge; Y staggered by sibling rank
         // - last (child):   enter from left edge, vertically centered
         // - dummies:        vertically centered pass-through
         if waypoints.len() >= 2 {
             let last_idx = waypoints.len() - 1;
-            // Parent right-exit port
+            // Parent right-exit port — stagger exit Y so siblings don't share a port
             waypoints[0].x += node_width - 1.0;
-            waypoints[0].y += node_height / 2.0;
-            // Child left-entry port
+            waypoints[0].y += node_height * frac;
+            // Child left-entry port — keep centered (multiple parents are rarer)
             waypoints[last_idx].y += node_height / 2.0;
             // Dummy pass-through: vertically center only
-            // (dummy x is already between the two real nodes)
             for wp in &mut waypoints[1..last_idx] {
                 wp.y += node_height / 2.0;
             }
         } else if waypoints.len() == 1 {
-            // Self-loop or degenerate: just center vertically
             waypoints[0].y += node_height / 2.0;
         }
 
-        // Route each consecutive hop; combine all segments into a single EdgePath
+        // Route each consecutive hop using a staggered mid_x so that edges
+        // between the same layer pair don't share a vertical bar column.
         let mut edge_segments = Vec::new();
         for w in waypoints.windows(2) {
-            let hop = compute_orthogonal_routing(u, v, w[0], w[1]);
+            let gap = w[1].x - w[0].x;
+            // Use layer-pair frac (mfrac) for mid_x so edges from different
+            // parents in the same layer pair get distinct vertical columns.
+            // Clamp to [0.25, 0.75] so the bar never lands right on a border.
+            let clamped = 0.25 + mfrac * 0.5;
+            let mid_x = w[0].x + gap * clamped;
+            let hop = compute_orthogonal_routing_with_mid(u, v, w[0], w[1], mid_x);
             edge_segments.extend(hop.segments);
         }
 
