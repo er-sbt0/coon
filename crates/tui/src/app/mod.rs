@@ -10,6 +10,7 @@ use crate::graph_view::LayoutSettings;
 use crate::search_bar::SearchBarState;
 use crate::status_message::StatusMessage;
 
+mod event_translate;
 mod events;
 mod lsp;
 pub mod lsp_bridge;
@@ -17,14 +18,14 @@ mod update;
 mod workspace;
 pub mod workspace_manager;
 
+pub use event_translate::app_event_to_status;
 pub use lsp_bridge::{LoadingState, LspBridge, PendingRequest};
 pub use workspace_manager::WorkspaceManager;
 
 /// Main application state
 pub struct App {
-    // Core data
-    pub call_graph: CallGraph,
-    pub selected_function: Option<SymbolId>,
+    /// Frontend-agnostic core: owns call_graph, selected_function, lsp, core workspaces.
+    pub core: ::core::CoreApp,
 
     // UI chrome
     pub should_quit: bool,
@@ -36,8 +37,7 @@ pub struct App {
     pub search_bar_state: SearchBarState,
     pub show_search_bar: bool,
 
-    // Extracted subsystems
-    pub lsp: LspBridge,
+    // TUI workspace manager (owns GraphViewState per workspace)
     pub workspaces: WorkspaceManager,
 }
 
@@ -48,15 +48,13 @@ impl App {
 
     pub fn new_with_settings(call_graph: CallGraph, settings: LayoutSettings) -> Self {
         Self {
-            call_graph,
-            selected_function: None,
+            core: ::core::CoreApp::new(call_graph),
             should_quit: false,
             show_help: false,
             status_message: StatusMessage::Ready,
             last_viewport_size: DEFAULT_VIEWPORT_SIZE,
             search_bar_state: SearchBarState::new(),
             show_search_bar: false,
-            lsp: LspBridge::new(),
             workspaces: WorkspaceManager::new_with_settings(settings),
         }
     }
@@ -70,27 +68,28 @@ impl App {
         )>,
         settings: LayoutSettings,
     ) -> Self {
+        let lsp = LspBridge::new_with_loader(lsp_rx, lsp_channels_rx);
         let mut app = Self::new_with_settings(call_graph, settings);
-        app.lsp = LspBridge::new_with_loader(lsp_rx, lsp_channels_rx);
+        app.core = ::core::CoreApp::new_with_lsp(app.core.call_graph.clone(), lsp);
         app
     }
 
     /// Poll and handle any messages from the background LSP loader
     pub fn poll_lsp_loader_messages(&mut self) {
-        let new_symbols = self.lsp.poll_loader_messages();
+        let new_symbols = self.core.lsp.poll_loader_messages();
         for symbol in new_symbols {
             let function = model::FunctionNode::new(
                 symbol.name.clone(),
                 symbol.qualified_name.clone(),
                 symbol.location.clone(),
             );
-            self.call_graph.add_function(function);
+            self.core.call_graph.add_function(function);
         }
     }
 
     /// Poll for LSP channels and wire them up when they arrive
     pub fn poll_lsp_channels(&mut self) {
-        self.lsp.poll_channels();
+        self.core.lsp.poll_channels();
     }
 
     /// Set the LSP channels for communication
@@ -99,11 +98,11 @@ impl App {
         response_rx: mpsc::UnboundedReceiver<LspResponse>,
         request_tx: mpsc::UnboundedSender<LspRequest>,
     ) {
-        self.lsp.set_channels(response_rx, request_tx);
+        self.core.lsp.set_channels(response_rx, request_tx);
     }
 
     pub fn select_function(&mut self, id: SymbolId) {
-        self.selected_function = Some(id);
+        self.core.selected_function = Some(id);
         self.status_message = StatusMessage::FunctionSelected;
     }
 
@@ -197,7 +196,7 @@ mod tests {
         let app = create_test_app();
         assert_eq!(app.workspaces.workspaces.len(), 1);
         assert_eq!(app.workspaces.current_index, 0);
-        assert!(app.selected_function.is_none());
+        assert!(app.core.selected_function.is_none());
         assert_eq!(app.search_bar_state.query, "");
         assert!(!app.should_quit);
         assert!(!app.show_help);
@@ -256,21 +255,21 @@ mod tests {
     #[test]
     fn test_function_selection() {
         let mut app = create_test_app();
-        let func_id = *app.call_graph.function_ids().next().unwrap();
+        let func_id = *app.core.call_graph.function_ids().next().unwrap();
 
         app.select_function(func_id);
-        assert_eq!(app.selected_function, Some(func_id));
+        assert_eq!(app.core.selected_function, Some(func_id));
         assert_eq!(app.status_message, StatusMessage::FunctionSelected);
     }
 
     #[test]
     fn test_graph_view_initialization() {
         let mut app = create_test_app();
-        let func_id = *app.call_graph.function_ids().next().unwrap();
+        let func_id = *app.core.call_graph.function_ids().next().unwrap();
 
         app.start_call_graph_with_function(func_id);
 
-        assert_eq!(app.selected_function, Some(func_id));
+        assert_eq!(app.core.selected_function, Some(func_id));
         // Should have created a new workspace
         assert_eq!(app.workspaces.workspaces.len(), 2);
         // New workspace should be current

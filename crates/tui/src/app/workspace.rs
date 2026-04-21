@@ -19,7 +19,7 @@ impl App {
             self.search_bar_state.activate();
             self.show_search_bar = true;
             // Update results immediately
-            self.search_bar_state.update_results(&self.call_graph);
+            self.search_bar_state.update_results(&self.core.call_graph);
         }
     }
 
@@ -27,7 +27,7 @@ impl App {
     pub fn handle_search_input(&mut self, c: char) {
         if self.show_search_bar {
             self.search_bar_state.insert_char(c);
-            self.search_bar_state.update_results(&self.call_graph);
+            self.search_bar_state.update_results(&self.core.call_graph);
         }
     }
 
@@ -35,7 +35,7 @@ impl App {
     pub fn handle_search_backspace(&mut self) {
         if self.show_search_bar {
             self.search_bar_state.delete_char();
-            self.search_bar_state.update_results(&self.call_graph);
+            self.search_bar_state.update_results(&self.core.call_graph);
         }
     }
 

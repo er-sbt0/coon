@@ -5,6 +5,7 @@ members = [
     "crates/model",
     "crates/lsp",
     "crates/logic",
+    "crates/core",
     "crates/tui",
     "crates/grid"
 ]
@@ -28,6 +29,7 @@ tempfile = "3.0"
 # Internal crates
 model = { path = "crates/model" }
 logic = { path = "crates/logic" }
+core = { path = "crates/core" }
 lsp = { path = "crates/lsp" }
 tui = { path = "crates/tui" }
 grid = { path = "crates/grid", features = ["rendering"] }

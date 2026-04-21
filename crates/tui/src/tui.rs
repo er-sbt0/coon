@@ -78,7 +78,7 @@ impl TuiApp {
         response_rx: mpsc::UnboundedReceiver<LspResponse>,
         request_tx: mpsc::UnboundedSender<LspRequest>,
     ) {
-        self.app.lsp.set_channels(response_rx, request_tx);
+        self.app.core.lsp.set_channels(response_rx, request_tx);
     }
 
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {

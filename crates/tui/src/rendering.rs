@@ -35,7 +35,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     }
 
     // Create main layout with conditional LSP status bar above graph view
-    let show_lsp_status = !matches!(app.lsp.status, LspLoadPhase::Completed);
+    let show_lsp_status = !matches!(app.core.lsp.status, LspLoadPhase::Completed);
 
     let chunks = if show_lsp_status {
         Layout::default()
@@ -73,7 +73,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
 }
 
 fn render_lsp_status_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    let status_text = match &app.lsp.status {
+    let status_text = match &app.core.lsp.status {
         LspLoadPhase::NotStarted => "LSP: not started".to_string(),
         LspLoadPhase::SpawningServer => "LSP: starting clangd…".to_string(),
         LspLoadPhase::Initializing => "LSP: initializing…".to_string(),
@@ -230,7 +230,7 @@ fn render_graph_view(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) 
         // Update layout if dirty (efficient - only recomputes when needed)
         if let Err(e) = workspace
             .graph_view_state
-            .update_layout(&app.call_graph, viewport_size)
+            .update_layout(&app.core.call_graph, viewport_size)
         {
             // If layout update fails, show error
             let error_text = vec![
@@ -248,7 +248,7 @@ fn render_graph_view(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) 
         }
 
         // Create the graph view widget
-        let graph_view = GraphView::new(&app.call_graph).show_help(app.show_help);
+        let graph_view = GraphView::new(&app.core.call_graph).show_help(app.show_help);
 
         // Render with workspace's graph view state
         f.render_stateful_widget(graph_view, area, &mut workspace.graph_view_state);
@@ -305,7 +305,7 @@ fn render_workspace_manager_modal(f: &mut Frame, area: ratatui::layout::Rect, ap
         let root_info = workspace
             .root_symbol
             .as_ref()
-            .and_then(|id| app.call_graph.get_function(id))
+            .and_then(|id| app.core.call_graph.get_function(id))
             .map(|f| f.name.as_str())
             .unwrap_or("(empty)");
 

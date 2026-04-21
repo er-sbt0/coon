@@ -2,14 +2,8 @@ use grid::{Dag, LayoutError};
 use model::{CallGraph, FunctionNode, SymbolId};
 use std::collections::{HashMap, VecDeque};
 
-/// Direction for building call hierarchy tree
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CallDirection {
-    /// Show who this function calls (callees)
-    Outgoing,
-    /// Show who calls this function (callers)
-    Incoming,
-}
+// Re-export CallDirection from model for crate-internal use
+pub use model::CallDirection;
 
 /// Adapter between CallGraph and Grid's TreeStructure
 #[derive(Debug)]

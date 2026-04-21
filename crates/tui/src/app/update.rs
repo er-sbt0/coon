@@ -1,9 +1,9 @@
 use lsp::LspResponse;
-use model::SymbolId;
+use model::{CallDirection, SymbolId};
 
-use crate::graph_adapter::CallDirection;
 use crate::status_message::StatusMessage;
 
+use super::event_translate::apply_event_to_status;
 use super::lsp_bridge::LoadingState;
 use super::App;
 
@@ -13,7 +13,7 @@ impl App {
         log::info!("TUI handling LSP response: {:?}", response);
         match response {
             LspResponse::OutgoingCalls { request_id, calls } => {
-                if let Some(pending) = self.lsp.take_pending(&request_id) {
+                if let Some(pending) = self.core.lsp.take_pending(&request_id) {
                     if let Some(symbol_id) = pending.symbol_id {
                         log::info!(
                             "Processing outgoing calls for symbol_id: {:?}, {} calls",
@@ -40,12 +40,12 @@ impl App {
                 request_id,
                 locations,
             } => {
-                if let Some(pending) = self.lsp.take_pending(&request_id) {
+                if let Some(pending) = self.core.lsp.take_pending(&request_id) {
                     if let Some(symbol_id) = pending.symbol_id {
                         log::info!("Processing references for symbol_id: {:?}", symbol_id);
 
                         // Process references and update the function
-                        if let Some(function) = self.call_graph.get_function_mut(&symbol_id) {
+                        if let Some(function) = self.core.call_graph.get_function_mut(&symbol_id) {
                             log::info!("Found function '{}' in call graph, clearing existing {} references", function.name, function.references.len());
 
                             // Clear existing references first to avoid duplicates
@@ -92,7 +92,7 @@ impl App {
                 request_id,
                 symbols: _,
             } => {
-                if let Some(_pending) = self.lsp.take_pending(&request_id) {
+                if let Some(_pending) = self.core.lsp.take_pending(&request_id) {
                     self.status_message = StatusMessage::DocumentSymbolsLoaded;
                 }
             }
@@ -100,7 +100,7 @@ impl App {
                 request_id,
                 symbols,
             } => {
-                if let Some(_pending) = self.lsp.take_pending(&request_id) {
+                if let Some(_pending) = self.core.lsp.take_pending(&request_id) {
                     self.status_message = StatusMessage::WorkspaceSymbolsLoaded {
                         count: symbols.len(),
                     };
@@ -118,7 +118,7 @@ impl App {
                             symbol.definition_location.column
                         );
 
-                        self.call_graph.add_function(symbol);
+                        self.core.call_graph.add_function(symbol);
                         function_count += 1;
                     }
 
@@ -133,7 +133,7 @@ impl App {
                 }
             }
             LspResponse::Error { request_id, error } => {
-                if let Some(pending) = self.lsp.take_pending(&request_id) {
+                if let Some(pending) = self.core.lsp.take_pending(&request_id) {
                     if let Some(symbol_id) = pending.symbol_id {
                         self.update_loading_state(&symbol_id, LoadingState::Failed(error.clone()));
                     }
@@ -154,10 +154,10 @@ impl App {
                 request_id,
                 references,
             } => {
-                if let Some(pending) = self.lsp.take_pending(&request_id) {
+                if let Some(pending) = self.core.lsp.take_pending(&request_id) {
                     if let Some(symbol_id) = pending.symbol_id {
                         // Update the function with enhanced references
-                        if let Some(function) = self.call_graph.get_function_mut(&symbol_id) {
+                        if let Some(function) = self.core.call_graph.get_function_mut(&symbol_id) {
                             // Clear existing references and add new enhanced ones
                             function.references = references;
                         }
@@ -168,7 +168,7 @@ impl App {
                 }
             }
             LspResponse::IncomingCalls { request_id, calls } => {
-                if let Some(pending) = self.lsp.take_pending(&request_id) {
+                if let Some(pending) = self.core.lsp.take_pending(&request_id) {
                     if let Some(symbol_id) = pending.symbol_id {
                         log::info!(
                             "Processing incoming calls for symbol_id: {:?}, {} calls",
@@ -192,7 +192,7 @@ impl App {
                 }
             }
             LspResponse::CallHierarchyPrepared { request_id, items } => {
-                if let Some(pending) = self.lsp.take_pending(&request_id) {
+                if let Some(pending) = self.core.lsp.take_pending(&request_id) {
                     if let Some(symbol_id) = pending.symbol_id {
                         log::info!(
                             "Received call hierarchy prepare response for symbol: {:?}, {} items",
@@ -210,11 +210,16 @@ impl App {
 
                             let outgoing = matches!(current_direction, CallDirection::Outgoing);
 
-                            if let Some(msg) = self
+                            if let Some(ev) = self
+                                .core
                                 .lsp
                                 .send_follow_up_call(&symbol_id, first_item, outgoing)
                             {
-                                self.status_message = msg;
+                                apply_event_to_status(
+                                    &mut self.status_message,
+                                    &ev,
+                                    &self.core.call_graph,
+                                );
                             }
                         } else {
                             log::info!("No call hierarchy items found for symbol: {:?}", symbol_id);
@@ -268,7 +273,7 @@ impl App {
             Some(detail) if !detail.is_empty() => format!("{}::{}", detail, other_name),
             _ => other_name.clone(),
         };
-        let other_id = self.call_graph.add_function(model::FunctionNode::new(
+        let other_id = self.core.call_graph.add_function(model::FunctionNode::new(
             other_name,
             qualified_name,
             location,
@@ -284,7 +289,7 @@ impl App {
             } else {
                 (other_id, symbol_id)
             };
-            self.call_graph.add_call(caller, callee, call_location);
+            self.core.call_graph.add_call(caller, callee, call_location);
         }
     }
 }

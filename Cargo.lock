@@ -276,6 +276,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "core"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "logic",
+ "lsp",
+ "lsp-types",
+ "model",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1302,6 +1315,7 @@ dependencies = [
 name = "tui"
 version = "0.1.0"
 dependencies = [
+ "core",
  "crossterm",
  "grid",
  "log",

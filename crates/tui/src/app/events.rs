@@ -1,7 +1,6 @@
-use model::SymbolId;
+use model::{CallDirection, SymbolId};
 
 use crate::actions::Action;
-use crate::graph_adapter::CallDirection;
 use crate::graph_view::GraphViewState;
 use crate::status_message::StatusMessage;
 
@@ -54,12 +53,12 @@ impl App {
             Action::SearchNextResult => self.search_bar_state.select_next(),
             Action::SearchCycleMode => {
                 self.search_bar_state.cycle_search_mode();
-                self.search_bar_state.update_results(&self.call_graph);
+                self.search_bar_state.update_results(&self.core.call_graph);
             }
             Action::SearchBackspace => self.handle_search_backspace(),
             Action::SearchDeleteForward => {
                 self.search_bar_state.delete_char_forward();
-                self.search_bar_state.update_results(&self.call_graph);
+                self.search_bar_state.update_results(&self.core.call_graph);
             }
             Action::SearchCursorLeft => self.search_bar_state.move_cursor_left(),
             Action::SearchCursorRight => self.search_bar_state.move_cursor_right(),
@@ -108,6 +107,7 @@ impl App {
             }
 
             let name = self
+                .core
                 .call_graph
                 .get_function(&selected)
                 .map(|f| f.name.as_str())
@@ -133,13 +133,13 @@ impl App {
     fn handle_refresh(&mut self) {
         log::info!("Refresh action triggered - clearing state and requesting fresh data");
         // Clear all loading states and cached data to force fresh requests
-        self.lsp.clear();
+        self.core.lsp.clear();
 
         // Request fresh workspace symbols to update the project state
         self.request_workspace_symbols();
 
         // If there's a selected function, refresh its call hierarchy
-        if let Some(selected_id) = self.selected_function {
+        if let Some(selected_id) = self.core.selected_function {
             self.request_call_hierarchy(&selected_id);
         }
 
@@ -211,6 +211,7 @@ impl App {
             if op(&mut workspace.graph_view_state) {
                 if let Some(selected) = &workspace.graph_view_state.selected_node {
                     let name = self
+                        .core
                         .call_graph
                         .get_function(selected)
                         .map(|f| f.name.as_str())
@@ -247,7 +248,7 @@ impl App {
             if state.cycle_active_parent() {
                 let parent_symbol = state.active_parent_symbol();
                 let parent_name = parent_symbol
-                    .and_then(|psym| self.call_graph.get_function(&psym))
+                    .and_then(|psym| self.core.call_graph.get_function(&psym))
                     .map(|f| f.name.clone());
                 self.status_message = StatusMessage::Navigated {
                     description: "Active parent switched to".to_string(),
@@ -300,6 +301,7 @@ impl App {
 
         // Get function name for workspace
         let function_name = self
+            .core
             .call_graph
             .get_function(&symbol_id)
             .map(|f| {
@@ -314,7 +316,7 @@ impl App {
 
         // Create new workspace with this function as root
         self.create_workspace_with_function(function_name, symbol_id);
-        self.selected_function = Some(symbol_id);
+        self.core.selected_function = Some(symbol_id);
         self.status_message = StatusMessage::GraphWorkspaceCreated;
 
         log::info!("Graph workspace started with root: {:?}", symbol_id);

@@ -7,6 +7,7 @@ edition = "2021"
 model.workspace = true
 logic.workspace = true
 lsp.workspace = true
+core.workspace = true
 grid.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true

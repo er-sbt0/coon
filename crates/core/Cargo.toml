@@ -1,0 +1,13 @@
+[package]
+name = "core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+model.workspace = true
+lsp.workspace = true
+logic.workspace = true
+log.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+lsp-types.workspace = true
+uuid.workspace = true

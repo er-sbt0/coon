@@ -1,0 +1,35 @@
+use model::SymbolId;
+
+/// Domain commands dispatched to `CoreApp`.
+///
+/// These are the frontend-agnostic subset of actions — everything that changes
+/// graph or workspace state. TUI-only concerns (viewport pan, search cursor)
+/// have no `Command` equivalent and are handled locally by the TUI.
+#[derive(Debug, Clone)]
+pub enum Command {
+    // ---- Graph interaction ----
+    /// Select a function as the current focus.
+    SelectFunction(SymbolId),
+    /// Expand or collapse the currently selected node.
+    ExpandOrCollapse,
+    /// Find references for the currently selected function.
+    FindReferences,
+    /// Refresh workspace symbols from clangd.
+    Refresh,
+    /// Toggle between outgoing and incoming call direction.
+    ToggleCallDirection,
+
+    // ---- Workspace management ----
+    NewWorkspace,
+    CloseWorkspace(usize),
+    NextWorkspace,
+    PreviousWorkspace,
+    SwitchWorkspace(usize),
+    RenameWorkspace(usize, String),
+    /// Create a new workspace rooted at the given function.
+    StartGraphFromFunction(SymbolId),
+
+    // ---- Search (query resolved by the frontend before dispatch) ----
+    /// The user confirmed a search selection; switch focus to this symbol.
+    SearchSelectFunction(SymbolId),
+}
