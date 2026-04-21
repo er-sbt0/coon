@@ -74,35 +74,15 @@ impl LspClient {
             .await
     }
 
-    /// Send an enhanced find references request that will resolve symbol names
+    /// Send an enhanced find references request that will resolve symbol names.
+    /// Identical wire request to `find_references`; the enhanced/plain discrimination
+    /// is carried by `RequestType` in the worker, not by the method string here.
     pub async fn find_references_with_symbols(
         &mut self,
         document_id: lsp::TextDocumentIdentifier,
         position: lsp::Position,
     ) -> Result<i64> {
-        // For now, this uses the same request as find_references
-        // The enhancement happens in the response processing
-        let params = lsp::ReferenceParams {
-            text_document_position: lsp::TextDocumentPositionParams {
-                text_document: document_id,
-                position,
-            },
-            context: lsp::ReferenceContext {
-                include_declaration: true,
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        };
-
-        let request_id = self
-            .send_request("textDocument/references", serde_json::to_value(params)?)
-            .await?;
-
-        // Mark this request as enhanced for special processing
-        self.pending_requests
-            .insert(request_id, "textDocument/references_enhanced".to_string());
-
-        Ok(request_id)
+        self.find_references(document_id, position).await
     }
 
     /// Helper for workspace symbol requests

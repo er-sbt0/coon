@@ -12,12 +12,6 @@ lsp/src/client/mod.rs — `LspClient::new()` checks for `/home/eransa/opt/llvm/.
 ### 6. Magic 500ms sleeps in the initialization path
 lsp/src/loader.rs — Two unexplained `sleep(500ms)` calls where the code should wait on actual LSP acknowledgement messages instead. Slow *and* still racy.
 
-### 7. Channel-of-channels design
-coon/src/runner.rs / lsp/src/loader.rs — A channel whose payload is `(UnboundedReceiver<LspResponse>, UnboundedSender<LspRequest>)` is used for a one-time handoff. A `oneshot` channel makes the intent explicit and is much easier to reason about.
-
-### 8. Dual parallel response type systems
-lsp/src/types.rs and lsp/src/service/mod.rs — `types.rs` defines response structs with `request_id: i64`; the service defines `LspResponse` with `request_id: String`. Both coexist but the former is only a transient parsing intermediary that adds indirection without value.
-
 ### 9. `TraversalResult` is exported but never returned
 logic/src/traversal.rs — Defined, re-exported from the crate root, but every traversal method returns `Vec<SymbolId>` directly. Dead API surface.
 

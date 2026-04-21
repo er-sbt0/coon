@@ -127,9 +127,8 @@ pub(crate) fn parse_find_references_response_impl(
         None => return Ok(None),
     };
 
-    // Matches both normal and enhanced reference requests.
     match pending_requests.get(&id).map(|s| s.as_str()) {
-        Some("textDocument/references") | Some("textDocument/references_enhanced") => {
+        Some("textDocument/references") => {
             pending_requests.remove(&id);
         }
         _ => return Ok(None),
