@@ -24,6 +24,9 @@ pub enum Action {
     NavigateChild,
     NavigateNextSibling,
     NavigatePrevSibling,
+    /// Cycle the active parent of the currently selected node (for DAG nodes
+    /// that have more than one parent).  Does not move the selection.
+    CycleParent,
 
     // -- workspace management --
     NewWorkspace,

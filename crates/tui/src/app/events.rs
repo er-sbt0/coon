@@ -36,6 +36,7 @@ impl App {
             Action::NavigateChild => self.handle_navigate_child(),
             Action::NavigateNextSibling => self.handle_navigate_next_sibling(),
             Action::NavigatePrevSibling => self.handle_navigate_prev_sibling(),
+            Action::CycleParent => self.handle_cycle_parent(),
 
             // Workspace management
             Action::NewWorkspace => self.handle_new_workspace(),
@@ -239,6 +240,26 @@ impl App {
             "Navigated to parent",
             "No parent node (at root)",
         );
+    }
+
+    fn handle_cycle_parent(&mut self) {
+        if let Some(workspace) = self.get_current_workspace_mut() {
+            let state = &mut workspace.graph_view_state;
+            if state.cycle_active_parent() {
+                let parent_symbol = state.active_parent_symbol();
+                let parent_name = parent_symbol
+                    .and_then(|psym| self.call_graph.get_function(&psym))
+                    .map(|f| f.name.clone());
+                self.status_message = StatusMessage::Navigated {
+                    description: "Active parent switched to".to_string(),
+                    name: parent_name,
+                };
+            } else {
+                self.status_message = StatusMessage::NavigationFailed {
+                    reason: "Node has only one parent".to_string(),
+                };
+            }
+        }
     }
 
     fn handle_navigate_child(&mut self) {

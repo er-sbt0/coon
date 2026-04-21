@@ -79,6 +79,7 @@ fn map_normal_key(key: KeyEvent) -> Option<Action> {
 
         // Graph navigation (hjkl)
         KeyCode::Char('h') => Some(Action::NavigateParent),
+        KeyCode::Char('H') => Some(Action::CycleParent),
         KeyCode::Char('l') => Some(Action::NavigateChild),
         KeyCode::Char('k') => Some(Action::NavigatePrevSibling),
         KeyCode::Char('j') => Some(Action::NavigateNextSibling),

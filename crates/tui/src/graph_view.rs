@@ -1,6 +1,7 @@
 use crate::graph_adapter::{CallDirection, CallGraphAdapter};
 use grid::{Dag, LayoutConfig, LayoutEngine, LayoutResult, Position, Viewport};
 use model::{CallGraph, FunctionNode, SymbolId};
+use std::collections::HashMap;
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Rect},
@@ -22,6 +23,9 @@ pub struct GraphViewState {
     pub max_depth: Option<usize>,
     layout_dirty: bool,
     tree_version: u64,
+    /// Per-node index into its `predecessors` list, so the user can cycle
+    /// through all parents of a shared (multi-parent) DAG node.
+    parent_cursor: HashMap<SymbolId, usize>,
 }
 
 impl GraphViewState {
@@ -42,6 +46,7 @@ impl GraphViewState {
             max_depth: Some(5),
             layout_dirty: true,
             tree_version: 0,
+            parent_cursor: HashMap::new(),
         }
     }
 
@@ -135,13 +140,53 @@ impl GraphViewState {
         }
     }
 
-    /// Navigate to the parent of the currently selected node
-    pub fn navigate_to_parent(&mut self) -> bool {
-        if let Some(selected) = &self.selected_node {
+    /// Cycle the active parent for the currently selected node.
+    ///
+    /// This advances the parent cursor so that the next call to
+    /// `navigate_to_parent` (and sibling navigation) uses the next parent in
+    /// the predecessors list.  Returns `true` when there are at least two
+    /// parents to cycle between.
+    pub fn cycle_active_parent(&mut self) -> bool {
+        if let Some(selected) = &self.selected_node.clone() {
             if let Some(dag) = &self.dag {
                 if let Some(&selected_idx) = self.adapter.symbol_to_node.get(selected) {
                     if let Ok(node) = dag.node(selected_idx) {
-                        if let Some(&parent_idx) = node.predecessors.first() {
+                        let n = node.predecessors.len();
+                        if n >= 2 {
+                            let cursor = self.parent_cursor.entry(*selected).or_insert(0);
+                            *cursor = (*cursor + 1) % n;
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Return the symbol of the currently active parent (honoring the parent
+    /// cursor), or `None` if the selected node has no parents.
+    pub fn active_parent_symbol(&self) -> Option<SymbolId> {
+        let selected = self.selected_node.as_ref()?;
+        let dag = self.dag.as_ref()?;
+        let &selected_idx = self.adapter.symbol_to_node.get(selected)?;
+        let node = dag.node(selected_idx).ok()?;
+        let cursor = self.parent_cursor.get(selected).copied().unwrap_or(0);
+        let &parent_idx = node.predecessors.get(cursor)?;
+        self.adapter.node_to_symbol.get(&parent_idx).copied()
+    }
+
+    /// Navigate to the active parent of the currently selected node.
+    ///
+    /// When a node has multiple parents, use `cycle_active_parent` first to
+    /// choose which parent to visit.
+    pub fn navigate_to_parent(&mut self) -> bool {
+        if let Some(selected) = &self.selected_node.clone() {
+            if let Some(dag) = &self.dag {
+                if let Some(&selected_idx) = self.adapter.symbol_to_node.get(selected) {
+                    if let Ok(node) = dag.node(selected_idx) {
+                        let cursor = self.parent_cursor.get(selected).copied().unwrap_or(0);
+                        if let Some(&parent_idx) = node.predecessors.get(cursor) {
                             if let Some(parent_symbol) =
                                 self.adapter.node_to_symbol.get(&parent_idx)
                             {
@@ -180,13 +225,14 @@ impl GraphViewState {
         false
     }
 
-    /// Get siblings of the currently selected node (nodes sharing the same first predecessor)
+    /// Get siblings of the currently selected node (nodes sharing the same active predecessor)
     fn get_siblings(&self) -> Option<Vec<usize>> {
         if let Some(selected) = &self.selected_node {
             if let Some(dag) = &self.dag {
                 if let Some(&selected_idx) = self.adapter.symbol_to_node.get(selected) {
                     if let Ok(node) = dag.node(selected_idx) {
-                        if let Some(&parent_idx) = node.predecessors.first() {
+                        let cursor = self.parent_cursor.get(selected).copied().unwrap_or(0);
+                        if let Some(&parent_idx) = node.predecessors.get(cursor) {
                             if let Ok(parent) = dag.node(parent_idx) {
                                 return Some(parent.successors.clone());
                             }
@@ -336,12 +382,15 @@ impl<'a> GraphView<'a> {
         let help_text = vec![
             Line::from("Graph View Controls:"),
             Line::from(""),
-            Line::from("  ←↓↑→  Pan view"),
-            Line::from("  j/k   Next/Prev node"),
-            Line::from("  d     Toggle direction"),
-            Line::from("  r     Reset view"),
-            Line::from("  ?     Toggle help"),
-            Line::from("  Tab   Switch view"),
+            Line::from("  ←↓↑→    Pan view"),
+            Line::from("  h/l     Parent / Child"),
+            Line::from("  H       Cycle active parent"),
+            Line::from("  j/k     Next / Prev sibling"),
+            Line::from("  Enter   Expand node"),
+            Line::from("  f       Search"),
+            Line::from("  t       Toggle direction"),
+            Line::from("  r       Reset view"),
+            Line::from("  ?       Toggle help"),
         ];
 
         let help_area = Rect {
