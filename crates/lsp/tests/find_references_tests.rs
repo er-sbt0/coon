@@ -106,7 +106,6 @@ async fn test_find_references_integration() {
 
     assert!(parsed.is_some());
     let find_refs_response = parsed.unwrap();
-    assert_eq!(find_refs_response.request_id, ref_id);
 
     // We should find at least one reference (the call site) for a proper C++ file
     // If empty, it might be because clangd needs compilation database or headers
@@ -202,7 +201,6 @@ async fn test_find_references_no_results() {
     // LSP server might return None (no response parsed) if there's an error,
     // or Some with empty locations if no references found
     if let Some(find_refs_response) = parsed {
-        assert_eq!(find_refs_response.request_id, ref_id);
         assert!(
             find_refs_response.locations.is_empty(),
             "Expected no references for comment position"

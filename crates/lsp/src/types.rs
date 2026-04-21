@@ -3,56 +3,42 @@ use lsp_types as lsp;
 /// Response from LSP find_references request
 #[derive(Debug, Clone)]
 pub struct FindReferencesResponse {
-    pub request_id: i64,
     pub locations: Vec<model::Location>,
-}
-
-/// Enhanced response from LSP find_references request with symbol information
-#[derive(Debug, Clone)]
-pub struct EnhancedReferencesResponse {
-    pub request_id: i64,
-    pub references: Vec<model::Reference>,
 }
 
 /// Response from LSP workspace/symbol request
 #[derive(Debug, Clone)]
 pub struct WorkspaceSymbolResponse {
-    pub request_id: i64,
     pub symbols: Vec<model::WorkspaceSymbolInfo>,
 }
 
 /// Response from LSP textDocument/documentSymbol request
 #[derive(Debug, Clone)]
 pub struct DocumentSymbolResponse {
-    pub request_id: i64,
     pub symbols: Vec<model::WorkspaceSymbolInfo>,
 }
 
 /// Response from LSP textDocument/hover request
 #[derive(Debug, Clone)]
 pub struct HoverResponse {
-    pub request_id: i64,
-    pub hover_info: Option<String>, // Simplified hover content
+    pub hover_info: Option<String>,
 }
 
 /// Response from LSP textDocument/prepareCallHierarchy request
 #[derive(Debug, Clone)]
 pub struct PrepareCallHierarchyResponse {
-    pub request_id: i64,
     pub items: Vec<lsp::CallHierarchyItem>,
 }
 
 /// Response from LSP callHierarchy/outgoingCalls request
 #[derive(Debug, Clone)]
 pub struct OutgoingCallsResponse {
-    pub request_id: i64,
     pub calls: Vec<lsp::CallHierarchyOutgoingCall>,
 }
 
 /// Response from LSP callHierarchy/incomingCalls request
 #[derive(Debug, Clone)]
 pub struct IncomingCallsResponse {
-    pub request_id: i64,
     pub calls: Vec<lsp::CallHierarchyIncomingCall>,
 }
 

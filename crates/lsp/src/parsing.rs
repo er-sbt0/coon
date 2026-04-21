@@ -20,23 +20,22 @@ use crate::types::{
 /// matching or custom deserialization can call this directly after doing
 /// their own ID / method checks.
 pub(crate) fn parse_lsp_result<T, R>(
-    id: i64,
     response: &Value,
     method_label: &str,
-    build_result: impl FnOnce(i64, T) -> R,
-    build_empty: impl FnOnce(i64) -> R,
+    build_result: impl FnOnce(T) -> R,
+    build_empty: impl FnOnce() -> R,
 ) -> Result<Option<R>>
 where
     T: for<'de> Deserialize<'de>,
 {
     if let Some(error) = response.get("error") {
         log::warn!("LSP error for {}: {:?}", method_label, error);
-        return Ok(Some(build_empty(id)));
+        return Ok(Some(build_empty()));
     }
 
     match response.get("result") {
         Some(result) if !result.is_null() => match T::deserialize(result) {
-            Ok(parsed) => Ok(Some(build_result(id, parsed))),
+            Ok(parsed) => Ok(Some(build_result(parsed))),
             Err(e) => {
                 let msg = format!(
                     "Failed to parse {} result: {}. Raw result: {:?}",
@@ -48,7 +47,7 @@ where
         },
         _ => {
             log::warn!("No result in {} response", method_label);
-            Ok(Some(build_empty(id)))
+            Ok(Some(build_empty()))
         }
     }
 }
@@ -63,8 +62,8 @@ pub(crate) fn parse_lsp_response<T, R>(
     pending_requests: &mut HashMap<i64, String>,
     response: &Value,
     method_name: &str,
-    build_result: impl FnOnce(i64, T) -> R,
-    build_empty: impl FnOnce(i64) -> R,
+    build_result: impl FnOnce(T) -> R,
+    build_empty: impl FnOnce() -> R,
 ) -> Result<Option<R>>
 where
     T: for<'de> Deserialize<'de>,
@@ -83,7 +82,7 @@ where
         _ => return Ok(None),
     }
 
-    parse_lsp_result(id, response, method_name, build_result, build_empty)
+    parse_lsp_result(response, method_name, build_result, build_empty)
 }
 
 // ---------------------------------------------------------------------------
@@ -135,15 +134,12 @@ pub(crate) fn parse_find_references_response_impl(
     }
 
     parse_lsp_result(
-        id,
         response,
         "textDocument/references",
-        |id, lsp_locations: Vec<lsp::Location>| FindReferencesResponse {
-            request_id: id,
+        |lsp_locations: Vec<lsp::Location>| FindReferencesResponse {
             locations: lsp_locations.iter().map(convert_lsp_location).collect(),
         },
-        |id| FindReferencesResponse {
-            request_id: id,
+        || FindReferencesResponse {
             locations: Vec::new(),
         },
     )
@@ -157,12 +153,10 @@ pub(crate) fn parse_workspace_symbol_response_impl(
         pending_requests,
         response,
         "workspace/symbol",
-        |id, workspace_symbols: Vec<lsp::WorkspaceSymbol>| WorkspaceSymbolResponse {
-            request_id: id,
+        |workspace_symbols: Vec<lsp::WorkspaceSymbol>| WorkspaceSymbolResponse {
             symbols: parse_workspace_symbols_from_result(workspace_symbols),
         },
-        |id| WorkspaceSymbolResponse {
-            request_id: id,
+        || WorkspaceSymbolResponse {
             symbols: Vec::new(),
         },
     )
@@ -176,18 +170,14 @@ pub(crate) fn parse_document_symbol_response_impl(
         pending_requests,
         response,
         "textDocument/documentSymbol",
-        |id, RawDocumentSymbols(doc_symbols)| {
+        |RawDocumentSymbols(doc_symbols)| {
             let symbols = doc_symbols
                 .into_iter()
                 .flat_map(|doc_symbol| convert_document_symbol_recursive(&doc_symbol, None))
                 .collect();
-            DocumentSymbolResponse {
-                request_id: id,
-                symbols,
-            }
+            DocumentSymbolResponse { symbols }
         },
-        |id| DocumentSymbolResponse {
-            request_id: id,
+        || DocumentSymbolResponse {
             symbols: Vec::new(),
         },
     )
@@ -201,7 +191,7 @@ pub(crate) fn parse_hover_response_impl(
         pending_requests,
         response,
         "textDocument/hover",
-        |id, hover: lsp_types::Hover| {
+        |hover: lsp_types::Hover| {
             let hover_text = match &hover.contents {
                 lsp_types::HoverContents::Scalar(marked_string) => {
                     extract_text_from_marked_string(marked_string)
@@ -214,7 +204,6 @@ pub(crate) fn parse_hover_response_impl(
                 lsp_types::HoverContents::Markup(markup) => extract_text_from_markup(markup),
             };
             HoverResponse {
-                request_id: id,
                 hover_info: if hover_text.is_empty() {
                     None
                 } else {
@@ -222,10 +211,7 @@ pub(crate) fn parse_hover_response_impl(
                 },
             }
         },
-        |id| HoverResponse {
-            request_id: id,
-            hover_info: None,
-        },
+        || HoverResponse { hover_info: None },
     )
 }
 
@@ -499,7 +485,6 @@ mod tests {
 
         assert!(result.is_some());
         let response = result.unwrap();
-        assert_eq!(response.request_id, 42);
         assert_eq!(response.locations.len(), 2);
 
         assert_eq!(response.locations[0].file_path, "/home/user/test.rs");
@@ -524,7 +509,6 @@ mod tests {
 
         assert!(result.is_some());
         let response = result.unwrap();
-        assert_eq!(response.request_id, 42);
         assert_eq!(response.locations.len(), 0);
     }
 
@@ -551,7 +535,6 @@ mod tests {
 
         assert!(result.is_some());
         let response = result.unwrap();
-        assert_eq!(response.request_id, 42);
         assert_eq!(response.locations.len(), 0);
     }
 
@@ -595,7 +578,6 @@ mod tests {
         assert!(hover_response.is_some());
 
         let hover = hover_response.unwrap();
-        assert_eq!(hover.request_id, 1);
         assert!(hover.hover_info.is_some());
         assert!(hover.hover_info.unwrap().contains("foo"));
     }
@@ -622,7 +604,6 @@ mod tests {
         assert!(hover_response.is_some());
 
         let hover = hover_response.unwrap();
-        assert_eq!(hover.request_id, 2);
         assert!(hover.hover_info.is_some());
         assert!(hover.hover_info.unwrap().contains("foo"));
     }
@@ -644,7 +625,6 @@ mod tests {
         assert!(hover_response.is_some());
 
         let hover = hover_response.unwrap();
-        assert_eq!(hover.request_id, 3);
         assert!(hover.hover_info.is_none());
     }
 
@@ -668,7 +648,6 @@ mod tests {
         assert!(hover_response.is_some());
 
         let hover = hover_response.unwrap();
-        assert_eq!(hover.request_id, 4);
         assert!(hover.hover_info.is_none());
     }
 
@@ -735,13 +714,12 @@ mod tests {
 
     #[test]
     fn test_complete_hover_flow_simplified() {
-        let hover_request_id = 42i64;
         let mut pending_requests = HashMap::new();
-        pending_requests.insert(hover_request_id, "textDocument/hover".to_string());
+        pending_requests.insert(42i64, "textDocument/hover".to_string());
 
         let response = json!({
             "jsonrpc": "2.0",
-            "id": hover_request_id,
+            "id": 42,
             "result": {
                 "contents": {
                     "kind": "markdown",
@@ -760,7 +738,6 @@ mod tests {
         assert!(hover_response.is_some());
 
         let hover = hover_response.unwrap();
-        assert_eq!(hover.request_id, hover_request_id);
         assert!(hover.hover_info.is_some());
         assert_eq!(hover.hover_info.unwrap(), "foo");
     }
@@ -791,7 +768,6 @@ mod tests {
         assert!(hover_response.is_some());
 
         let hover = hover_response.unwrap();
-        assert_eq!(hover.request_id, 5);
         assert!(hover.hover_info.is_some());
         assert_eq!(hover.hover_info.unwrap(), "foo");
     }

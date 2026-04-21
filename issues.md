@@ -9,9 +9,6 @@ lsp/src/client/mod.rs — `LspClient::new()` checks for `/home/eransa/opt/llvm/.
 
 ## Medium
 
-### 6. Magic 500ms sleeps in the initialization path
-lsp/src/loader.rs — Two unexplained `sleep(500ms)` calls where the code should wait on actual LSP acknowledgement messages instead. Slow *and* still racy.
-
 ### 9. `TraversalResult` is exported but never returned
 logic/src/traversal.rs — Defined, re-exported from the crate root, but every traversal method returns `Vec<SymbolId>` directly. Dead API surface.
 

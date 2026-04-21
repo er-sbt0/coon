@@ -14,14 +14,8 @@ pub(crate) fn parse_prepare_call_hierarchy_response_impl(
         pending_requests,
         response,
         "textDocument/prepareCallHierarchy",
-        |id, items| PrepareCallHierarchyResponse {
-            request_id: id,
-            items,
-        },
-        |id| PrepareCallHierarchyResponse {
-            request_id: id,
-            items: Vec::new(),
-        },
+        |items| PrepareCallHierarchyResponse { items },
+        || PrepareCallHierarchyResponse { items: Vec::new() },
     )
 }
 
@@ -34,14 +28,8 @@ pub(crate) fn parse_outgoing_calls_response_impl(
         pending_requests,
         response,
         "callHierarchy/outgoingCalls",
-        |id, calls| OutgoingCallsResponse {
-            request_id: id,
-            calls,
-        },
-        |id| OutgoingCallsResponse {
-            request_id: id,
-            calls: Vec::new(),
-        },
+        |calls| OutgoingCallsResponse { calls },
+        || OutgoingCallsResponse { calls: Vec::new() },
     )
 }
 
@@ -54,13 +42,7 @@ pub(crate) fn parse_incoming_calls_response_impl(
         pending_requests,
         response,
         "callHierarchy/incomingCalls",
-        |id, calls| IncomingCallsResponse {
-            request_id: id,
-            calls,
-        },
-        |id| IncomingCallsResponse {
-            request_id: id,
-            calls: Vec::new(),
-        },
+        |calls| IncomingCallsResponse { calls },
+        || IncomingCallsResponse { calls: Vec::new() },
     )
 }
