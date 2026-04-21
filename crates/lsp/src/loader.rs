@@ -86,7 +86,8 @@ pub async fn lsp_loader_task(
 
     info!("Sending initialized notification...");
     lsp_client.send_initialized().await?;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // No sleep needed: the server already responded to `initialize`, so it is
+    // ready to accept `textDocument/didOpen` immediately after `initialized`.
 
     ui_tx.send(LspUiMessage::Progress(LspLoadPhase::DiscoveringFiles))?;
     let source_files = compile_commands::parse_compile_commands(&root_path).await?;
@@ -118,9 +119,36 @@ pub async fn lsp_loader_task(
             total,
         }))?;
 
-        let _preload_request_id = lsp_service.preload_documents(document_uris.clone()).await?;
+        let preload_request_id = lsp_service.preload_documents(document_uris.clone()).await?;
 
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Wait for the service worker to confirm all didOpen notifications were sent.
+        let preload_timeout = tokio::time::Duration::from_secs(30);
+        let preload_deadline = tokio::time::Instant::now() + preload_timeout;
+        loop {
+            match tokio::time::timeout_at(preload_deadline, lsp_service.recv_response()).await {
+                Ok(Some(LspResponse::PreloadComplete {
+                    request_id,
+                    loaded_count,
+                    failed_count,
+                })) if request_id == preload_request_id => {
+                    info!(
+                        "Preload complete: {} loaded, {} failed",
+                        loaded_count, failed_count
+                    );
+                    break;
+                }
+                Ok(Some(_)) => continue, // unrelated response, keep waiting
+                Ok(None) => {
+                    let msg = "LSP service channel closed during preload".to_string();
+                    ui_tx.send(LspUiMessage::Progress(LspLoadPhase::Failed(msg.clone())))?;
+                    return Err(msg.into());
+                }
+                Err(_) => {
+                    log::warn!("Preload timed out after {:?}; continuing anyway", preload_timeout);
+                    break;
+                }
+            }
+        }
         ui_tx.send(LspUiMessage::Progress(LspLoadPhase::PreloadingDocuments {
             done: total,
             total,
