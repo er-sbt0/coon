@@ -58,9 +58,18 @@ impl LspClient {
     }
 
     async fn from_process(tx: mpsc::Sender<Value>, mut process: Child) -> Result<Self> {
-        let writer = process.stdin.take().ok_or_else(|| anyhow::anyhow!("clangd process stdin not captured"))?;
-        let stdout = process.stdout.take().ok_or_else(|| anyhow::anyhow!("clangd process stdout not captured"))?;
-        let stderr = process.stderr.take().ok_or_else(|| anyhow::anyhow!("clangd process stderr not captured"))?;
+        let writer = process
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("clangd process stdin not captured"))?;
+        let stdout = process
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("clangd process stdout not captured"))?;
+        let stderr = process
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("clangd process stderr not captured"))?;
 
         let stderr_handle = tokio::spawn(async move {
             let mut stderr_reader = BufReader::new(stderr);

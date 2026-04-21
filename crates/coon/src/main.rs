@@ -1,51 +1,67 @@
+use clap::Parser;
 use log::error;
-use std::env;
 use std::path::Path;
+use tui::LayoutSettings;
 
 mod demo;
 mod logging;
 mod runner;
 
+#[derive(Parser)]
+#[command(about = "COON - C/C++ call graph visualizer")]
+struct Args {
+    /// Path to the C/C++ project directory (omit to run with demo data)
+    project_path: Option<String>,
+
+    /// Vertical gap between sibling nodes in rows
+    #[arg(long, value_name = "ROWS")]
+    node_separation: Option<f32>,
+
+    /// Horizontal distance between graph levels in columns
+    #[arg(long, value_name = "COLS")]
+    level_separation: Option<f32>,
+
+    /// Width of each node box in characters
+    #[arg(long, value_name = "CHARS")]
+    node_width: Option<f32>,
+
+    /// Height of each node box in rows
+    #[arg(long, value_name = "ROWS")]
+    node_height: Option<f32>,
+
+    /// Minimum gap between separate subtrees
+    #[arg(long, value_name = "ROWS")]
+    subtree_separation: Option<f32>,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     logging::init_logging().map_err(|e| format!("Failed to initialize logging: {}", e))?;
 
-    let args: Vec<String> = env::args().collect();
+    let args = Args::parse();
 
-    match args.len() {
-        1 => runner::run_with_demo_data().await?,
-        2 => {
-            let project_path = &args[1];
-            if Path::new(project_path).exists() {
-                runner::run_with_lsp(project_path).await?;
+    let defaults = LayoutSettings::default();
+    let settings = LayoutSettings {
+        node_separation: args.node_separation.unwrap_or(defaults.node_separation),
+        level_separation: args.level_separation.unwrap_or(defaults.level_separation),
+        node_width: args.node_width.unwrap_or(defaults.node_width),
+        node_height: args.node_height.unwrap_or(defaults.node_height),
+        subtree_separation: args
+            .subtree_separation
+            .unwrap_or(defaults.subtree_separation),
+    };
+
+    match args.project_path {
+        None => runner::run_with_demo_data(settings).await?,
+        Some(ref path) => {
+            if Path::new(path).exists() {
+                runner::run_with_lsp(path, settings).await?;
             } else {
-                error!("Error: Project path '{}' does not exist", project_path);
-                print_usage();
+                error!("Error: Project path '{}' does not exist", path);
                 std::process::exit(1);
             }
-        }
-        _ => {
-            print_usage();
-            std::process::exit(1);
         }
     }
 
     Ok(())
-}
-
-fn print_usage() {
-    let program_name = env::args().next().unwrap_or_else(|| "coon".to_string());
-    println!("Usage:");
-    println!("  {} [project_path]", program_name);
-    println!();
-    println!("Options:");
-    println!("  project_path    Path to the project directory for LSP analysis");
-    println!("                  If not provided, runs with demo data");
-    println!();
-    println!("Examples:");
-    println!("  {}                    # Run with demo data", program_name);
-    println!(
-        "  {} /path/to/project   # Analyze a real project",
-        program_name
-    );
 }

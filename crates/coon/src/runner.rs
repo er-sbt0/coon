@@ -4,9 +4,11 @@ use tokio::sync::{mpsc, oneshot};
 use lsp::{LspRequest, LspResponse};
 use model::lsp_status::LspUiMessage;
 use model::CallGraph;
-use tui::TuiApp;
+use tui::{LayoutSettings, TuiApp};
 
-pub async fn run_with_demo_data() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_with_demo_data(
+    settings: LayoutSettings,
+) -> Result<(), Box<dyn std::error::Error>> {
     info!("Creating demo call graph...");
     let call_graph = crate::demo::create_demo_call_graph();
 
@@ -16,10 +18,13 @@ pub async fn run_with_demo_data() -> Result<(), Box<dyn std::error::Error>> {
         call_graph.edge_count()
     );
 
-    run_tui(call_graph).await
+    run_tui(call_graph, settings).await
 }
 
-pub async fn run_with_lsp(project_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_with_lsp(
+    project_path: &str,
+    settings: LayoutSettings,
+) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting LSP loader and TUI asynchronously...");
 
     let (ui_msg_tx, ui_msg_rx) = mpsc::unbounded_channel::<LspUiMessage>();
@@ -37,7 +42,7 @@ pub async fn run_with_lsp(project_path: &str) -> Result<(), Box<dyn std::error::
         }
     });
 
-    let tui_result = run_tui_async_lsp(ui_msg_rx, lsp_channels_rx).await;
+    let tui_result = run_tui_async_lsp(ui_msg_rx, lsp_channels_rx, settings).await;
 
     // Wait for the LSP loader task to finish its graceful shutdown.
     // The forwarder loop will exit once TUI channels are dropped,
@@ -52,9 +57,12 @@ pub async fn run_with_lsp(project_path: &str) -> Result<(), Box<dyn std::error::
     tui_result
 }
 
-async fn run_tui(call_graph: CallGraph) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_tui(
+    call_graph: CallGraph,
+    settings: LayoutSettings,
+) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting TUI interface...");
-    let mut tui_app = TuiApp::new(call_graph)?;
+    let mut tui_app = TuiApp::new(call_graph, settings)?;
     tokio::task::block_in_place(|| tui_app.run())?;
     info!("TUI exited. Goodbye!");
     Ok(())
@@ -66,10 +74,11 @@ async fn run_tui_async_lsp(
         mpsc::UnboundedReceiver<LspResponse>,
         mpsc::UnboundedSender<LspRequest>,
     )>,
+    settings: LayoutSettings,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting TUI interface with async LSP loading...");
     let call_graph = CallGraph::new();
-    let mut tui_app = TuiApp::new_with_lsp_async(call_graph, lsp_rx, lsp_channels_rx)?;
+    let mut tui_app = TuiApp::new_with_lsp_async(call_graph, lsp_rx, lsp_channels_rx, settings)?;
     tokio::task::block_in_place(|| tui_app.run())?;
     info!("TUI exited. Goodbye!");
     Ok(())

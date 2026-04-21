@@ -28,6 +28,7 @@ use lsp::{LspRequest, LspResponse};
 use model::{lsp_status::LspUiMessage, CallGraph};
 
 use crate::app::App;
+use crate::graph_view::LayoutSettings;
 use crate::key_map;
 use crate::rendering::ui;
 
@@ -47,10 +48,13 @@ impl TuiApp {
         Ok(Terminal::new(backend)?)
     }
 
-    pub fn new(call_graph: CallGraph) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(
+        call_graph: CallGraph,
+        settings: LayoutSettings,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         install_panic_hook();
         let terminal = Self::setup_terminal()?;
-        let app = App::new(call_graph);
+        let app = App::new_with_settings(call_graph, settings);
         Ok(Self { app, terminal })
     }
 
@@ -61,10 +65,11 @@ impl TuiApp {
             mpsc::UnboundedReceiver<LspResponse>,
             mpsc::UnboundedSender<LspRequest>,
         )>,
+        settings: LayoutSettings,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         install_panic_hook();
         let terminal = Self::setup_terminal()?;
-        let app = App::new_with_lsp_async(call_graph, lsp_rx, lsp_channels_rx);
+        let app = App::new_with_lsp_async(call_graph, lsp_rx, lsp_channels_rx, settings);
         Ok(Self { app, terminal })
     }
 

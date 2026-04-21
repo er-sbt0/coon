@@ -1,5 +1,27 @@
 use crate::graph_adapter::{CallDirection, CallGraphAdapter};
 use grid::{Dag, LayoutConfig, LayoutEngine, LayoutResult, Position, Viewport};
+
+/// Layout configuration for the graph view, settable from the command line.
+#[derive(Debug, Clone)]
+pub struct LayoutSettings {
+    pub node_width: f32,
+    pub node_height: f32,
+    pub node_separation: f32,
+    pub level_separation: f32,
+    pub subtree_separation: f32,
+}
+
+impl Default for LayoutSettings {
+    fn default() -> Self {
+        Self {
+            node_width: 24.0,
+            node_height: 3.0,
+            node_separation: 5.0,
+            level_separation: 36.0,
+            subtree_separation: 1.0,
+        }
+    }
+}
 use model::{CallGraph, FunctionNode, SymbolId};
 use ratatui::{
     buffer::Buffer,
@@ -29,10 +51,14 @@ pub struct GraphViewState {
 }
 
 impl GraphViewState {
-    pub fn new() -> Self {
+    pub fn new(settings: &LayoutSettings) -> Self {
         let config = LayoutConfig::new()
-            .with_node_size(24.0, 3.0) // 24-char fixed width, 3-row height
-            .with_spacing(5.0, 36.0, 1.0); // node_separation (row gap), level_separation (width+gap≈2.4×node_sep to match ~2:1 cell aspect ratio), subtree_separation
+            .with_node_size(settings.node_width, settings.node_height)
+            .with_spacing(
+                settings.node_separation,
+                settings.level_separation,
+                settings.subtree_separation,
+            );
 
         Self {
             adapter: CallGraphAdapter::new(),
@@ -293,7 +319,7 @@ impl GraphViewState {
 
 impl Default for GraphViewState {
     fn default() -> Self {
-        Self::new()
+        Self::new(&LayoutSettings::default())
     }
 }
 

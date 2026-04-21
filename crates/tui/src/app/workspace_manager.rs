@@ -1,5 +1,6 @@
 use model::SymbolId;
 
+use crate::graph_view::LayoutSettings;
 use crate::graph_workspace::GraphWorkspace;
 use crate::status_message::StatusMessage;
 
@@ -12,6 +13,7 @@ pub struct WorkspaceManager {
     pub current_index: usize,
     pub next_id: usize,
     pub show_manager: bool,
+    layout_settings: LayoutSettings,
 }
 
 impl Default for WorkspaceManager {
@@ -23,12 +25,18 @@ impl Default for WorkspaceManager {
 impl WorkspaceManager {
     /// Create a manager pre-populated with one default workspace.
     pub fn new() -> Self {
-        let default_workspace = GraphWorkspace::new(1, "Graph 1".to_string());
+        Self::new_with_settings(LayoutSettings::default())
+    }
+
+    /// Create a manager with custom layout settings applied to all workspaces.
+    pub fn new_with_settings(settings: LayoutSettings) -> Self {
+        let default_workspace = GraphWorkspace::new(1, "Graph 1".to_string(), &settings);
         Self {
             workspaces: vec![default_workspace],
             current_index: 0,
             next_id: 2,
             show_manager: false,
+            layout_settings: settings,
         }
     }
 
@@ -37,7 +45,7 @@ impl WorkspaceManager {
         let id = self.next_id;
         self.next_id += 1;
 
-        let workspace = GraphWorkspace::new(id, name);
+        let workspace = GraphWorkspace::new(id, name, &self.layout_settings);
         self.workspaces.push(workspace);
         self.current_index = self.workspaces.len() - 1;
         (id, StatusMessage::CreatedWorkspace { id })
@@ -52,7 +60,7 @@ impl WorkspaceManager {
         let id = self.next_id;
         self.next_id += 1;
 
-        let workspace = GraphWorkspace::new_with_root(id, name, symbol);
+        let workspace = GraphWorkspace::new_with_root(id, name, symbol, &self.layout_settings);
         self.workspaces.push(workspace);
         self.current_index = self.workspaces.len() - 1;
         (id, StatusMessage::CreatedWorkspaceWithFunction { id })

@@ -12,7 +12,7 @@ pub mod tui;
 pub use actions::Action;
 pub use app::{App, LoadingState, PendingRequest};
 pub use graph_adapter::{CallDirection, CallGraphAdapter};
-pub use graph_view::{GraphView, GraphViewState};
+pub use graph_view::{GraphView, GraphViewState, LayoutSettings};
 pub use graph_workspace::GraphWorkspace;
 pub use rendering::ui;
 pub use search_bar::{SearchBar, SearchBarState};

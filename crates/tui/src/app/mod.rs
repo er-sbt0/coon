@@ -6,6 +6,7 @@ use model::{lsp_status::LspUiMessage, CallGraph, SymbolId};
 /// Default viewport size used before the actual terminal size is known.
 const DEFAULT_VIEWPORT_SIZE: (f32, f32) = (100.0, 100.0);
 
+use crate::graph_view::LayoutSettings;
 use crate::search_bar::SearchBarState;
 use crate::status_message::StatusMessage;
 
@@ -42,6 +43,10 @@ pub struct App {
 
 impl App {
     pub fn new(call_graph: CallGraph) -> Self {
+        Self::new_with_settings(call_graph, LayoutSettings::default())
+    }
+
+    pub fn new_with_settings(call_graph: CallGraph, settings: LayoutSettings) -> Self {
         Self {
             call_graph,
             selected_function: None,
@@ -52,7 +57,7 @@ impl App {
             search_bar_state: SearchBarState::new(),
             show_search_bar: false,
             lsp: LspBridge::new(),
-            workspaces: WorkspaceManager::new(),
+            workspaces: WorkspaceManager::new_with_settings(settings),
         }
     }
 
@@ -63,8 +68,9 @@ impl App {
             mpsc::UnboundedReceiver<LspResponse>,
             mpsc::UnboundedSender<LspRequest>,
         )>,
+        settings: LayoutSettings,
     ) -> Self {
-        let mut app = Self::new(call_graph);
+        let mut app = Self::new_with_settings(call_graph, settings);
         app.lsp = LspBridge::new_with_loader(lsp_rx, lsp_channels_rx);
         app
     }

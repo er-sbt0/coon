@@ -1,4 +1,4 @@
-use crate::graph_view::GraphViewState;
+use crate::graph_view::{GraphViewState, LayoutSettings};
 use model::SymbolId;
 use std::time::Instant;
 
@@ -14,21 +14,26 @@ pub struct GraphWorkspace {
 
 impl GraphWorkspace {
     /// Create a new workspace with a default name
-    pub fn new(id: usize, name: String) -> Self {
+    pub fn new(id: usize, name: String, settings: &LayoutSettings) -> Self {
         let now = Instant::now();
         Self {
             id,
             name,
             root_symbol: None,
-            graph_view_state: GraphViewState::new(),
+            graph_view_state: GraphViewState::new(settings),
             created_at: now,
             last_accessed: now,
         }
     }
 
     /// Create a new workspace with a root symbol
-    pub fn new_with_root(id: usize, name: String, symbol: SymbolId) -> Self {
-        let mut workspace = Self::new(id, name);
+    pub fn new_with_root(
+        id: usize,
+        name: String,
+        symbol: SymbolId,
+        settings: &LayoutSettings,
+    ) -> Self {
+        let mut workspace = Self::new(id, name, settings);
         workspace.set_root(symbol);
         workspace
     }

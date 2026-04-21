@@ -88,8 +88,12 @@ pub async fn lsp_loader_task(
 
     info!("Sending initialized notification...");
     lsp_client.send_initialized().await?;
-    // No sleep needed: the server already responded to `initialize`, so it is
-    // ready to accept `textDocument/didOpen` immediately after `initialized`.
+    // clangd processes `initialized` asynchronously: it loads compile_commands.json
+    // and enqueues background indexing only after this notification is handled.
+    // Without a pause here, `workspace/symbol` arrives before the compile DB is
+    // loaded and returns 0 symbols. 500 ms is sufficient for clangd to finish
+    // the synchronous startup phase on typical projects.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     ui_tx.send(LspUiMessage::Progress(LspLoadPhase::DiscoveringFiles))?;
     let source_files = compile_commands::parse_compile_commands(&root_path).await?;
@@ -146,7 +150,10 @@ pub async fn lsp_loader_task(
                     return Err(msg.into());
                 }
                 Err(_) => {
-                    log::warn!("Preload timed out after {:?}; continuing anyway", preload_timeout);
+                    log::warn!(
+                        "Preload timed out after {:?}; continuing anyway",
+                        preload_timeout
+                    );
                     break;
                 }
             }
@@ -155,6 +162,13 @@ pub async fn lsp_loader_task(
             done: total,
             total,
         }))?;
+
+        // PreloadComplete only means the didOpen notifications were sent, not
+        // that clangd has processed them.  clangd loads the compilation database
+        // and starts background indexing in reaction to didOpen; without a pause
+        // here, workspace/symbol arrives before the compile DB is loaded and
+        // returns 0 symbols.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
     let initial_request_id = Uuid::new_v4().to_string();
@@ -206,7 +220,10 @@ pub async fn lsp_loader_task(
     let (tui_request_tx, tui_request_rx) = mpsc::unbounded_channel::<LspRequest>();
     let (tui_response_tx, tui_response_rx) = mpsc::unbounded_channel::<LspResponse>();
 
-    if lsp_channels_tx.send((tui_response_rx, tui_request_tx)).is_err() {
+    if lsp_channels_tx
+        .send((tui_response_rx, tui_request_tx))
+        .is_err()
+    {
         error!("Failed to send LSP channels: receiver was dropped");
     }
 
