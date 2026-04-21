@@ -8,6 +8,12 @@ pub struct LayoutResult {
     bounds: LayoutBounds,
     edges: Vec<EdgePath>,
     cross_edges: Vec<EdgePath>,
+    /// Per-parent edge lines for nodes that have multiple incoming edges.
+    /// These are trimmed to end at the merge column; no arrowhead is drawn on them.
+    merged_edges: Vec<EdgePath>,
+    /// One shared horizontal trunk per child node that has multiple incoming edges.
+    /// Rendered with a single arrowhead pointing into the child node.
+    merge_trunks: Vec<EdgePath>,
     version: u64,
 }
 
@@ -19,6 +25,8 @@ impl LayoutResult {
             bounds,
             edges: Vec::new(),
             cross_edges: Vec::new(),
+            merged_edges: Vec::new(),
+            merge_trunks: Vec::new(),
             version,
         }
     }
@@ -123,6 +131,16 @@ impl LayoutResult {
             .find(|e| e.parent_id == parent_id && e.child_id == child_id)
     }
 
+    /// Get per-parent edge lines for multi-incoming-edge nodes (no arrowhead drawn on them).
+    pub fn merged_edges(&self) -> &[EdgePath] {
+        &self.merged_edges
+    }
+
+    /// Get one shared trunk per child node that has multiple incoming edges.
+    pub fn merge_trunks(&self) -> &[EdgePath] {
+        &self.merge_trunks
+    }
+
     /// Push a single pre-routed edge path (used by Sugiyama engine).
     pub(crate) fn push_edge(&mut self, path: EdgePath) {
         self.edges.push(path);
@@ -131,6 +149,16 @@ impl LayoutResult {
     /// Push a single pre-routed cross-edge path (used by Sugiyama back-edge routing).
     pub(crate) fn push_cross_edge(&mut self, path: EdgePath) {
         self.cross_edges.push(path);
+    }
+
+    /// Push a trimmed per-parent edge line (part of a merge group; no arrowhead).
+    pub(crate) fn push_merged_edge(&mut self, path: EdgePath) {
+        self.merged_edges.push(path);
+    }
+
+    /// Push a shared merge trunk (one per multi-parent child; carries the arrowhead).
+    pub(crate) fn push_merge_trunk(&mut self, path: EdgePath) {
+        self.merge_trunks.push(path);
     }
 
     /// Add cross-edges (non-tree edges) between already-laid-out nodes.

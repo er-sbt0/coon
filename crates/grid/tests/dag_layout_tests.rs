@@ -209,10 +209,12 @@ fn long_span_edge_produces_single_edge_path() {
     // 4 real nodes
     assert_eq!(result.positions().len(), 4);
 
-    // The long-span edge (0→3) should be exactly one EdgePath
+    // The long-span edge (0→3) should be exactly one EdgePath.
+    // Because node 3 has multiple incoming edges it is placed in merged_edges.
     let long_paths: Vec<_> = result
         .edges()
         .iter()
+        .chain(result.merged_edges().iter())
         .filter(|e| e.parent_id == 0 && e.child_id == 3)
         .collect();
     assert_eq!(long_paths.len(), 1);
@@ -244,4 +246,65 @@ fn disconnected_graph_both_roots_at_layer_zero() {
     // Children (1 and 3) at layer 1
     assert_eq!(result.position(1).unwrap().x, level_sep);
     assert_eq!(result.position(3).unwrap().x, level_sep);
+}
+
+// ---------------------------------------------------------------------------
+// Merge trunks: multiple parents → same child should produce exactly one trunk
+// ---------------------------------------------------------------------------
+#[test]
+fn multi_parent_node_produces_one_merge_trunk_and_no_arrowhead_on_individual_edges() {
+    // 0 → 2
+    // 1 → 2   (two parents for node 2)
+    let mut dag: Dag<u32> = Dag::new();
+    for i in 0..3 {
+        dag.add_node(i);
+    }
+    dag.add_edge(0, 2).unwrap();
+    dag.add_edge(1, 2).unwrap();
+
+    let mut engine = LayoutEngine::new();
+    let result = engine.compute_dag(&dag).unwrap();
+
+    // Node 2 has two parents, so its edges should be in merged_edges (not edges).
+    let in_plain: usize = result.edges().iter().filter(|e| e.child_id == 2).count();
+    assert_eq!(
+        in_plain, 0,
+        "multi-parent edges should not appear in plain edges()"
+    );
+
+    let in_merged: usize = result
+        .merged_edges()
+        .iter()
+        .filter(|e| e.child_id == 2)
+        .count();
+    assert_eq!(
+        in_merged, 2,
+        "each parent should contribute one merged edge"
+    );
+
+    // Exactly one trunk for child 2.
+    let trunks: usize = result
+        .merge_trunks()
+        .iter()
+        .filter(|t| t.child_id == 2)
+        .count();
+    assert_eq!(trunks, 1, "exactly one merge trunk per multi-parent child");
+
+    // Trunk must be a single Horizontal segment ending at child left border.
+    let trunk = result
+        .merge_trunks()
+        .iter()
+        .find(|t| t.child_id == 2)
+        .unwrap();
+    assert_eq!(trunk.segments.len(), 1);
+    let seg = &trunk.segments[0];
+    let child_x = result.position(2).unwrap().x;
+    assert!(
+        (seg.to.x - child_x).abs() < 0.1,
+        "trunk TO.x should be the child node's left border x"
+    );
+    assert!(
+        seg.from.x < seg.to.x,
+        "trunk should travel right into the child"
+    );
 }

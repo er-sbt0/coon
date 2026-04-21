@@ -24,4 +24,4 @@ pub use types::{
 
 // Re-export rendering functions when feature is enabled
 #[cfg(feature = "rendering")]
-pub use rendering::{render_back_edges, render_cross_edges, render_dag_edges};
+pub use rendering::{render_back_edges, render_cross_edges, render_dag_edges, render_merge_trunks};

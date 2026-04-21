@@ -57,8 +57,16 @@ pub(crate) fn compute_sugiyama<T>(
     let nw = config.node_width;
     let nh = config.node_height;
 
-    for path in route_edges(&sg, &all_positions, dag.len(), nw, nh) {
+    let routed = route_edges(&sg, &all_positions, dag.len(), nw, nh);
+    let (single_edges, merged_edges, merge_trunks) = split_merged_edges(routed, &all_positions, nh);
+    for path in single_edges {
         result.push_edge(path);
+    }
+    for path in merged_edges {
+        result.push_merged_edge(path);
+    }
+    for path in merge_trunks {
+        result.push_merge_trunk(path);
     }
 
     for &(u, v) in &back_edges {
@@ -408,10 +416,21 @@ fn route_edges(
         .iter()
         .flat_map(|(&parent, children)| {
             let n = children.len() as f32;
-            children
-                .iter()
-                .enumerate()
-                .map(move |(k, &child)| ((parent, child), (k as f32 + 1.0) / (n + 1.0)))
+            children.iter().enumerate().map(move |(k, &child)| {
+                // When a parent has multiple children, all wires exit from the
+                // same center-right port (0.5).  This ensures they share a single
+                // visual exit point, which matters for the reverse-arrow view
+                // where these ports become arrowhead targets (multiple staggered
+                // arrows into the same node looks wrong).  Individual wires still
+                // diverge cleanly at their own mid_x corner positions.
+                // For single-child parents the standard (k+1)/(n+1) formula is fine.
+                let frac = if n > 1.0 {
+                    0.5
+                } else {
+                    (k as f32 + 1.0) / (n + 1.0)
+                };
+                ((parent, child), frac)
+            })
         })
         .collect();
 
@@ -536,6 +555,103 @@ fn route_edges(
     }
 
     result
+}
+
+/// Post-process routed edges: for any child node that has more than one incoming
+/// edge, trim each per-parent path so it ends at a shared "merge column" one cell
+/// left of the child node, then emit a single short trunk from that column into
+/// the child.  Returns `(single_edges, merged_edges, merge_trunks)`.
+///
+/// * `single_edges`  — unchanged paths for children with exactly one parent.
+/// * `merged_edges`  — trimmed per-parent paths (rendered as lines, no arrowhead).
+/// * `merge_trunks`  — one horizontal trunk per multi-parent child (carries the
+///                     single shared arrowhead).
+fn split_merged_edges(
+    paths: Vec<EdgePath>,
+    positions: &[Position],
+    node_height: f32,
+) -> (Vec<EdgePath>, Vec<EdgePath>, Vec<EdgePath>) {
+    use std::collections::BTreeMap;
+
+    // Group paths by child_id while preserving order.
+    let mut by_child: BTreeMap<usize, Vec<EdgePath>> = BTreeMap::new();
+    for path in paths {
+        by_child.entry(path.child_id).or_default().push(path);
+    }
+
+    let mut single_edges: Vec<EdgePath> = Vec::new();
+    let mut merged_edges: Vec<EdgePath> = Vec::new();
+    let mut merge_trunks: Vec<EdgePath> = Vec::new();
+
+    for (child_id, group) in by_child {
+        if group.len() <= 1 {
+            // Single parent — no merging needed.
+            single_edges.extend(group);
+        } else {
+            // Multiple parents share this child.
+            let child_pos = match positions.get(child_id) {
+                Some(p) => *p,
+                None => {
+                    single_edges.extend(group);
+                    continue;
+                }
+            };
+            let merge_x = child_pos.x - 1.0;
+            let child_entry_y = child_pos.y + node_height / 2.0;
+
+            for mut path in group {
+                // Find the last Horizontal segment and shorten it to merge_x.
+                let last_h_idx = path
+                    .segments
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(_, s)| {
+                        matches!(s.segment_type, crate::types::EdgeSegmentType::Horizontal)
+                    })
+                    .map(|(i, _)| i);
+
+                if let Some(idx) = last_h_idx {
+                    let seg = &mut path.segments[idx];
+                    if (merge_x - seg.from.x).abs() < 0.05 {
+                        // Would become zero-length — remove it entirely.
+                        path.segments.remove(idx);
+                    } else {
+                        seg.to.x = merge_x;
+                        seg.to.y = child_entry_y;
+                        // Also correct the from.y to match child_entry_y (last H is always flat).
+                        seg.from.y = child_entry_y;
+                    }
+                }
+
+                if !path.segments.is_empty() {
+                    merged_edges.push(path);
+                }
+            }
+
+            // One shared trunk: horizontal from merge_x to child left border.
+            if merge_x < child_pos.x {
+                use crate::types::{EdgePath, EdgeSegment, EdgeSegmentType, Position};
+                merge_trunks.push(EdgePath {
+                    parent_id: child_id, // sentinel — same id as child marks it as a trunk
+                    child_id,
+                    segments: vec![EdgeSegment {
+                        from: Position {
+                            x: merge_x,
+                            y: child_entry_y,
+                        },
+                        to: Position {
+                            x: child_pos.x,
+                            y: child_entry_y,
+                        },
+                        segment_type: EdgeSegmentType::Horizontal,
+                    }],
+                });
+            }
+        }
+    }
+
+    (single_edges, merged_edges, merge_trunks)
 }
 
 // ---------------------------------------------------------------------------

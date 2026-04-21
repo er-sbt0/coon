@@ -4,6 +4,7 @@
 
 use crate::{EdgePath, EdgeSegment, EdgeSegmentType, LayoutResult, Viewport};
 use ratatui::{buffer::Buffer, layout::Rect, style::Style};
+use std::collections::HashSet;
 
 /// Render back-edges (reversed cycles) from a DAG layout with a distinct style.
 ///
@@ -27,6 +28,9 @@ pub fn render_back_edges(
 /// each edge instead of the **to** end.  Use this in "incoming callers" views
 /// where DAG edges flow caller-outward but the logical arrow should point back
 /// toward the callee (selected node).
+///
+/// Also renders per-parent lines for nodes with multiple incoming edges (without
+/// arrowheads — those are emitted by `render_merge_trunks`).
 pub fn render_dag_edges(
     buf: &mut Buffer,
     layout: &LayoutResult,
@@ -35,9 +39,64 @@ pub fn render_dag_edges(
     style: Style,
     reverse_arrows: bool,
 ) {
+    // Draw all edge lines first.
     for edge in layout.edges() {
         render_edge_path(buf, edge, viewport, area, style);
-        render_arrowhead(buf, edge, viewport, area, style, reverse_arrows);
+    }
+    // Merged per-parent lines — draw wires only, no arrowheads.
+    for edge in layout.merged_edges() {
+        render_edge_path(buf, edge, viewport, area, style);
+    }
+
+    // Draw arrowheads deduplicated by logical target node:
+    //   • normal mode   → deduplicate by child_id  (multiple parents → same child)
+    //   • reverse mode  → deduplicate by parent_id (multiple children → same parent,
+    //                     arrows point BACK into the parent/root node)
+    // This ensures exactly one arrowhead per target node regardless of how many
+    // wires converge on it.
+    let mut seen: HashSet<usize> = HashSet::new();
+    for edge in layout.edges() {
+        let key = if reverse_arrows {
+            edge.parent_id
+        } else {
+            edge.child_id
+        };
+        if seen.insert(key) {
+            render_arrowhead(buf, edge, viewport, area, style, reverse_arrows);
+        }
+    }
+
+    // In reverse mode, merged_edges represent paths from each parent toward a
+    // shared child.  The arrowhead should appear at the parent (FROM) end of
+    // each wire — one per distinct parent — so draw them here instead of
+    // relying on the merge trunk (which points the wrong way in reverse mode).
+    if reverse_arrows {
+        for edge in layout.merged_edges() {
+            if seen.insert(edge.parent_id) {
+                render_arrowhead(buf, edge, viewport, area, style, reverse_arrows);
+            }
+        }
+    }
+}
+
+/// Render the single shared arrowhead trunk for each node that has multiple
+/// incoming edges.  Call this after `render_dag_edges` so trunks paint on top.
+pub fn render_merge_trunks(
+    buf: &mut Buffer,
+    layout: &LayoutResult,
+    viewport: &Viewport,
+    area: Rect,
+    style: Style,
+    reverse_arrows: bool,
+) {
+    for trunk in layout.merge_trunks() {
+        render_edge_path(buf, trunk, viewport, area, style);
+        // In reverse mode the arrowheads are drawn on the individual
+        // merged_edges (one per parent) inside render_dag_edges, so the
+        // shared trunk does not need its own arrowhead.
+        if !reverse_arrows {
+            render_arrowhead(buf, trunk, viewport, area, style, reverse_arrows);
+        }
     }
 }
 

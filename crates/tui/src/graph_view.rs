@@ -1,7 +1,6 @@
 use crate::graph_adapter::{CallDirection, CallGraphAdapter};
 use grid::{Dag, LayoutConfig, LayoutEngine, LayoutResult, Position, Viewport};
 use model::{CallGraph, FunctionNode, SymbolId};
-use std::collections::HashMap;
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Rect},
@@ -9,6 +8,7 @@ use ratatui::{
     text::Line,
     widgets::{Block, Borders, Paragraph, StatefulWidget, Widget},
 };
+use std::collections::HashMap;
 
 /// State for the graph view
 pub struct GraphViewState {
@@ -461,6 +461,16 @@ impl<'a> StatefulWidget for GraphView<'a> {
         // should point toward the callee (root), so reverse the arrowheads.
         let reverse_arrows = state.direction == CallDirection::Incoming;
         grid::render_dag_edges(
+            buf,
+            layout,
+            &state.viewport,
+            inner_area,
+            Style::default().fg(Color::DarkGray),
+            reverse_arrows,
+        );
+
+        // Render the single shared arrowhead for nodes with multiple incoming edges.
+        grid::render_merge_trunks(
             buf,
             layout,
             &state.viewport,
