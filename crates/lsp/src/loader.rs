@@ -173,20 +173,31 @@ pub async fn lsp_loader_task(
 
     info!("LSP loader: starting lazy-loading TUI bridge");
 
-    let (tui_request_tx, mut tui_request_rx) = mpsc::unbounded_channel::<LspRequest>();
+    let (tui_request_tx, tui_request_rx) = mpsc::unbounded_channel::<LspRequest>();
     let (tui_response_tx, tui_response_rx) = mpsc::unbounded_channel::<LspResponse>();
 
     if let Err(e) = lsp_channels_tx.send((tui_response_rx, tui_request_tx)) {
         error!("Failed to send LSP channels: {}", e);
     }
 
-    /// Forwards an LSP request to the service, logging and sending an error response on failure.
+    run_tui_lsp_bridge(lsp_service, tui_request_rx, tui_response_tx).await;
+
+    Ok(())
+}
+
+/// Bridges TUI ↔ LSP indefinitely: forwards `LspRequest`s to `lsp_service` and pipes
+/// responses back through `tui_response_tx`. Owns the service and shuts it down on exit.
+async fn run_tui_lsp_bridge(
+    mut lsp_service: LspService,
+    mut tui_request_rx: mpsc::UnboundedReceiver<LspRequest>,
+    tui_response_tx: mpsc::UnboundedSender<LspResponse>,
+) {
     macro_rules! forward_lsp {
-        ($tx:expr, $rid:expr, $call:expr) => {{
+        ($rid:expr, $call:expr) => {{
             let rid = $rid;
             if let Err(e) = $call {
                 log::error!("LSP request failed: {}", e);
-                let _ = $tx.send(LspResponse::Error {
+                let _ = tui_response_tx.send(LspResponse::Error {
                     request_id: rid,
                     error: format!("Request failed: {}", e),
                 });
@@ -194,7 +205,6 @@ pub async fn lsp_loader_task(
         }};
     }
 
-    let mut lsp_service = lsp_service;
     loop {
         tokio::select! {
             tui_request = tui_request_rx.recv() => {
@@ -202,28 +212,28 @@ pub async fn lsp_loader_task(
                     log::debug!("Forwarding TUI request to LSP service: {:?}", request);
                     match request {
                         LspRequest::GetOutgoingCalls { request_id, call_hierarchy_item } =>
-                            forward_lsp!(tui_response_tx, request_id.clone(),
+                            forward_lsp!(request_id.clone(),
                                 lsp_service.request_outgoing_calls(request_id, call_hierarchy_item).await),
                         LspRequest::GetIncomingCalls { request_id, call_hierarchy_item } =>
-                            forward_lsp!(tui_response_tx, request_id.clone(),
+                            forward_lsp!(request_id.clone(),
                                 lsp_service.request_incoming_calls(request_id, call_hierarchy_item).await),
                         LspRequest::FindReferences { request_id, document_uri, position } =>
-                            forward_lsp!(tui_response_tx, request_id.clone(),
+                            forward_lsp!(request_id.clone(),
                                 lsp_service.request_references(request_id, document_uri, position).await),
                         LspRequest::GetWorkspaceSymbols { request_id, query } =>
-                            forward_lsp!(tui_response_tx, request_id.clone(),
+                            forward_lsp!(request_id.clone(),
                                 lsp_service.request_workspace_symbols(request_id, query).await),
                         LspRequest::FindReferencesWithSymbols { request_id, document_uri, position } =>
-                            forward_lsp!(tui_response_tx, request_id.clone(),
+                            forward_lsp!(request_id.clone(),
                                 lsp_service.request_references_with_symbols(request_id, document_uri, position).await),
                         LspRequest::PrepareCallHierarchy { request_id, document_uri, position } =>
-                            forward_lsp!(tui_response_tx, request_id.clone(),
+                            forward_lsp!(request_id.clone(),
                                 lsp_service.request_prepare_call_hierarchy(request_id, document_uri, position).await),
                         LspRequest::GetDocumentSymbols { request_id, document_uri } =>
-                            forward_lsp!(tui_response_tx, request_id.clone(),
+                            forward_lsp!(request_id.clone(),
                                 lsp_service.request_document_symbols(request_id, document_uri).await),
                         LspRequest::PreloadDocuments { request_id, document_uris } =>
-                            forward_lsp!(tui_response_tx, request_id.clone(),
+                            forward_lsp!(request_id.clone(),
                                 lsp_service.request_preload_documents(request_id, document_uris).await),
                         LspRequest::SetProjectFiles { project_files } => {
                             if let Err(e) = lsp_service.set_project_files(project_files).await {
@@ -260,11 +270,8 @@ pub async fn lsp_loader_task(
     }
     log::debug!("LSP-TUI forwarder loop ended, shutting down LSP service");
 
-    // Gracefully shut down the LSP service (sends shutdown + exit to clangd)
     if let Err(e) = lsp_service.shutdown().await {
         log::error!("Error during LSP service shutdown: {}", e);
     }
     info!("LSP loader: graceful shutdown complete");
-
-    Ok(())
 }
