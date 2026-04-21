@@ -21,9 +21,6 @@ tui/src/app/lsp_bridge.rs — ~8 internal fields all `pub`, letting callers bypa
 ### 11. `GraphQueryEngine` leaky abstraction
 logic/src/query.rs — `pub traversal`, `pub filter`, `pub path_analyzer` fields let callers bypass the higher-level query interface.
 
-### 12. `Action::RenameWorkspace` is a permanently stubbed no-op
-tui/src/app/events.rs — The handler is `{}` with a `TODO` comment. A user can trigger it and get no feedback. Remove it from the enum and key map until implemented.
-
 ### 13. `WorkspaceManager::rename` emits wrong `StatusMessage` variant
 tui/src/app/workspace_manager.rs — Returns `StatusMessage::SwitchedToWorkspace` on a successful rename, which implies a tab switch happened.
 

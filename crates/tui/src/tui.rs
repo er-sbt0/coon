@@ -6,7 +6,7 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
 use std::sync::Once;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 static PANIC_HOOK: Once = Once::new();
 
@@ -57,7 +57,7 @@ impl TuiApp {
     pub fn new_with_lsp_async(
         call_graph: CallGraph,
         lsp_rx: mpsc::UnboundedReceiver<LspUiMessage>,
-        lsp_channels_rx: mpsc::UnboundedReceiver<(
+        lsp_channels_rx: oneshot::Receiver<(
             mpsc::UnboundedReceiver<LspResponse>,
             mpsc::UnboundedSender<LspRequest>,
         )>,

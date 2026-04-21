@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use ::lsp::{LspRequest, LspResponse};
 use model::{lsp_status::LspLoadPhase, lsp_status::LspUiMessage, CallGraph, SymbolId};
@@ -47,7 +47,7 @@ pub struct LspBridge {
     pub loader_rx: Option<mpsc::UnboundedReceiver<LspUiMessage>>,
     /// One-shot channel to receive the LSP request/response channels once the loader is ready
     pub channels_rx: Option<
-        mpsc::UnboundedReceiver<(
+        oneshot::Receiver<(
             mpsc::UnboundedReceiver<LspResponse>,
             mpsc::UnboundedSender<LspRequest>,
         )>,
@@ -77,7 +77,7 @@ impl LspBridge {
     /// Create an LspBridge wired to a background LSP loader
     pub fn new_with_loader(
         loader_rx: mpsc::UnboundedReceiver<LspUiMessage>,
-        channels_rx: mpsc::UnboundedReceiver<(
+        channels_rx: oneshot::Receiver<(
             mpsc::UnboundedReceiver<LspResponse>,
             mpsc::UnboundedSender<LspRequest>,
         )>,
@@ -105,11 +105,18 @@ impl LspBridge {
 
     /// Poll for LSP channels delivered by the background loader and wire them up
     pub fn poll_channels(&mut self) {
-        if let Some(rx) = &mut self.channels_rx {
-            if let Ok((response_rx, request_tx)) = rx.try_recv() {
-                log::info!("Received LSP channels from loader - wiring up for lazy loading");
-                self.set_channels(response_rx, request_tx);
-                self.channels_rx = None;
+        if let Some(mut rx) = self.channels_rx.take() {
+            match rx.try_recv() {
+                Ok((response_rx, request_tx)) => {
+                    log::info!("Received LSP channels from loader - wiring up for lazy loading");
+                    self.set_channels(response_rx, request_tx);
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    self.channels_rx = Some(rx);
+                }
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    log::warn!("LSP channels sender dropped before sending");
+                }
             }
         }
     }

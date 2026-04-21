@@ -1,5 +1,5 @@
 use log::{error, info};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use lsp::{LspRequest, LspResponse};
 use model::lsp_status::LspUiMessage;
@@ -23,7 +23,7 @@ pub async fn run_with_lsp(project_path: &str) -> Result<(), Box<dyn std::error::
     info!("Starting LSP loader and TUI asynchronously...");
 
     let (ui_msg_tx, ui_msg_rx) = mpsc::unbounded_channel::<LspUiMessage>();
-    let (lsp_channels_tx, lsp_channels_rx) = mpsc::unbounded_channel::<(
+    let (lsp_channels_tx, lsp_channels_rx) = oneshot::channel::<(
         mpsc::UnboundedReceiver<LspResponse>,
         mpsc::UnboundedSender<LspRequest>,
     )>();
@@ -62,7 +62,7 @@ async fn run_tui(call_graph: CallGraph) -> Result<(), Box<dyn std::error::Error>
 
 async fn run_tui_async_lsp(
     lsp_rx: mpsc::UnboundedReceiver<LspUiMessage>,
-    lsp_channels_rx: mpsc::UnboundedReceiver<(
+    lsp_channels_rx: oneshot::Receiver<(
         mpsc::UnboundedReceiver<LspResponse>,
         mpsc::UnboundedSender<LspRequest>,
     )>,

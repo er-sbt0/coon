@@ -3,7 +3,7 @@
 
 use log::{debug, error, info};
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::compile_commands;
@@ -27,7 +27,7 @@ const MAX_INITIAL_SYMBOLS: usize = 200;
 pub async fn lsp_loader_task(
     project_path: &str,
     ui_tx: mpsc::UnboundedSender<LspUiMessage>,
-    lsp_channels_tx: mpsc::UnboundedSender<(
+    lsp_channels_tx: oneshot::Sender<(
         mpsc::UnboundedReceiver<LspResponse>,
         mpsc::UnboundedSender<LspRequest>,
     )>,
@@ -176,8 +176,8 @@ pub async fn lsp_loader_task(
     let (tui_request_tx, tui_request_rx) = mpsc::unbounded_channel::<LspRequest>();
     let (tui_response_tx, tui_response_rx) = mpsc::unbounded_channel::<LspResponse>();
 
-    if let Err(e) = lsp_channels_tx.send((tui_response_rx, tui_request_tx)) {
-        error!("Failed to send LSP channels: {}", e);
+    if lsp_channels_tx.send((tui_response_rx, tui_request_tx)).is_err() {
+        error!("Failed to send LSP channels: receiver was dropped");
     }
 
     run_tui_lsp_bridge(lsp_service, tui_request_rx, tui_response_tx).await;
