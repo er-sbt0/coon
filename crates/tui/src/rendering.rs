@@ -29,7 +29,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     }
 
     // Show workspace manager if requested
-    if app.workspaces.show_manager {
+    if app.show_workspace_manager {
         render_workspace_manager_modal(f, size, app);
         return;
     }
@@ -188,7 +188,7 @@ fn render_search_bar_overlay(f: &mut Frame, area: ratatui::layout::Rect, app: &m
 fn render_workspace_tabs(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     let mut tab_titles = Vec::new();
 
-    for (i, workspace) in app.workspaces.workspaces.iter().enumerate() {
+    for (i, workspace) in app.core.workspaces.workspaces.iter().enumerate() {
         let mut name = workspace.name.clone();
 
         // Truncate long names
@@ -197,7 +197,7 @@ fn render_workspace_tabs(f: &mut Frame, area: ratatui::layout::Rect, app: &App) 
         }
 
         // Add active indicator
-        if i == app.workspaces.current_index {
+        if i == app.core.workspaces.current_index {
             name = format!("[{}*]", name);
         } else {
             name = format!("[{}]", name);
@@ -214,56 +214,64 @@ fn render_workspace_tabs(f: &mut Frame, area: ratatui::layout::Rect, app: &App) 
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )
-        .select(app.workspaces.current_index);
+        .select(app.core.workspaces.current_index);
     f.render_widget(tabs, area);
 }
 
 fn render_graph_view(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
-    // Get current workspace
-    let workspace_index = app.workspaces.current_index;
+    // Get current workspace id
+    let workspace_id = match app.core.workspaces.current() {
+        Some(w) => w.id,
+        None => {
+            let empty_text = vec![
+                Line::from("No workspace available"),
+                Line::from(""),
+                Line::from("Press CtrlN to create a new workspace"),
+            ];
+            let paragraph = Paragraph::new(empty_text)
+                .block(Block::default().borders(Borders::ALL).title("Graph View"))
+                .style(Style::default().fg(Color::Gray));
+            f.render_widget(paragraph, area);
+            return;
+        }
+    };
 
-    if let Some(workspace) = app.workspaces.workspaces.get_mut(workspace_index) {
-        // Store viewport size for potential recentering
-        let viewport_size = (area.width as f32, area.height as f32);
-        app.last_viewport_size = viewport_size;
+    let viewport_size = (area.width as f32, area.height as f32);
+    app.last_viewport_size = viewport_size;
 
-        // Update layout if dirty (efficient - only recomputes when needed)
-        if let Err(e) = workspace
-            .graph_view_state
-            .update_layout(&app.core.call_graph, viewport_size)
-        {
-            // If layout update fails, show error
+    if app.view_states.contains_key(&workspace_id) {
+        // Update layout if dirty (borrow call_graph separately to satisfy borrow checker)
+        let update_result = {
+            let call_graph = &app.core.call_graph;
+            let vs = app.view_states.get_mut(&workspace_id).unwrap();
+            vs.update_layout(call_graph, viewport_size)
+        };
+
+        if let Err(e) = update_result {
             let error_text = vec![
                 Line::from("Layout Error"),
                 Line::from(""),
                 Line::from(format!("Failed to compute layout: {}", e)),
             ];
-
             let paragraph = Paragraph::new(error_text)
                 .block(Block::default().borders(Borders::ALL).title("Graph View"))
                 .style(Style::default().fg(Color::Red));
-
             f.render_widget(paragraph, area);
             return;
         }
 
-        // Create the graph view widget
         let graph_view = GraphView::new(&app.core.call_graph).show_help(app.show_help);
-
-        // Render with workspace's graph view state
-        f.render_stateful_widget(graph_view, area, &mut workspace.graph_view_state);
+        let vs = app.view_states.get_mut(&workspace_id).unwrap();
+        f.render_stateful_widget(graph_view, area, vs);
     } else {
-        // No workspace available - render empty state
         let empty_text = vec![
             Line::from("No workspace available"),
             Line::from(""),
             Line::from("Press CtrlN to create a new workspace"),
         ];
-
         let paragraph = Paragraph::new(empty_text)
             .block(Block::default().borders(Borders::ALL).title("Graph View"))
             .style(Style::default().fg(Color::Gray));
-
         f.render_widget(paragraph, area);
     }
 }
@@ -290,13 +298,13 @@ fn render_workspace_manager_modal(f: &mut Frame, area: ratatui::layout::Rect, ap
         Line::from(""),
         Line::from(format!(
             "Total Workspaces: {}",
-            app.workspaces.workspaces.len()
+            app.core.workspaces.workspaces.len()
         )),
         Line::from(""),
     ];
 
-    for (i, workspace) in app.workspaces.workspaces.iter().enumerate() {
-        let marker = if i == app.workspaces.current_index {
+    for (i, workspace) in app.core.workspaces.workspaces.iter().enumerate() {
+        let marker = if i == app.core.workspaces.current_index {
             "→"
         } else {
             " "

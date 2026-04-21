@@ -1,9 +1,8 @@
-use model::{CallDirection, SymbolId};
-
 use crate::actions::Action;
 use crate::graph_view::GraphViewState;
 use crate::status_message::StatusMessage;
 
+use super::apply_events;
 use super::App;
 
 /// Vertical pan distance (in graph units) per Up/Down key press.
@@ -15,19 +14,19 @@ impl App {
     pub fn handle_action(&mut self, action: Action) {
         log::info!("Handling action: {:?}", action);
         match action {
-            // Viewport panning
+            // Viewport panning — handled in-place on TUI state, no core dispatch.
             Action::MoveUp => self.handle_move_up(),
             Action::MoveDown => self.handle_move_down(),
             Action::MoveLeft => self.handle_move_left(),
             Action::MoveRight => self.handle_move_right(),
 
-            // Tree interaction
+            // Tree interaction — route through CoreApp
             Action::ExpandOrCollapse => self.handle_expand_or_collapse(),
-            Action::FindReferences => self.handle_find_references(),
-            Action::Refresh => self.handle_refresh(),
+            Action::FindReferences => self.dispatch_cmd(::core::Command::FindReferences),
+            Action::Refresh => self.dispatch_cmd(::core::Command::Refresh),
             Action::Quit => self.quit(),
             Action::Help => self.toggle_help(),
-            Action::ToggleCallDirection => self.handle_toggle_call_direction(),
+            Action::ToggleCallDirection => self.dispatch_cmd(::core::Command::ToggleCallDirection),
             Action::ResetView => self.handle_reset_view(),
 
             // Graph navigation (hjkl)
@@ -37,16 +36,19 @@ impl App {
             Action::NavigatePrevSibling => self.handle_navigate_prev_sibling(),
             Action::CycleParent => self.handle_cycle_parent(),
 
-            // Workspace management
-            Action::NewWorkspace => self.handle_new_workspace(),
-            Action::CloseWorkspace => self.handle_close_workspace(),
-            Action::NextWorkspace => self.next_workspace(),
-            Action::PreviousWorkspace => self.previous_workspace(),
+            // Workspace management — route through CoreApp
+            Action::NewWorkspace => self.dispatch_cmd(::core::Command::NewWorkspace),
+            Action::CloseWorkspace => {
+                let idx = self.core.workspaces.current_index;
+                self.dispatch_cmd(::core::Command::CloseWorkspace(idx));
+            }
+            Action::NextWorkspace => self.dispatch_cmd(::core::Command::NextWorkspace),
+            Action::PreviousWorkspace => self.dispatch_cmd(::core::Command::PreviousWorkspace),
             Action::SwitchWorkspace(index) => {
-                self.switch_workspace(index);
+                self.dispatch_cmd(::core::Command::SwitchWorkspace(index));
             }
 
-            // Search bar
+            // Search bar — handled entirely in TUI
             Action::ToggleSearch => self.toggle_search_bar(),
             Action::SearchConfirm => self.select_from_search(),
             Action::SearchPrevResult => self.search_bar_state.select_previous(),
@@ -68,42 +70,36 @@ impl App {
         }
     }
 
+    /// Dispatch a `Command` through `CoreApp` and apply the resulting events.
+    fn dispatch_cmd(&mut self, cmd: ::core::Command) {
+        let events = self.core.dispatch(cmd);
+        apply_events(self, events);
+    }
+
     fn handle_move_up(&mut self) {
-        // Pan up in graph view
-        if let Some(workspace) = self.get_current_workspace_mut() {
-            workspace
-                .graph_view_state
-                .viewport
-                .pan(0.0, -PAN_DELTA_VERTICAL);
+        if let Some(vs) = self.current_view_state_mut() {
+            vs.viewport.pan(0.0, -PAN_DELTA_VERTICAL);
             self.status_message = StatusMessage::PannedUp;
         }
     }
 
     fn handle_move_down(&mut self) {
-        // Pan down in graph view
-        if let Some(workspace) = self.get_current_workspace_mut() {
-            workspace
-                .graph_view_state
-                .viewport
-                .pan(0.0, PAN_DELTA_VERTICAL);
+        if let Some(vs) = self.current_view_state_mut() {
+            vs.viewport.pan(0.0, PAN_DELTA_VERTICAL);
             self.status_message = StatusMessage::PannedDown;
         }
     }
 
     fn handle_expand_or_collapse(&mut self) {
-        // Request call hierarchy for the selected node without changing the root
         let selected = self
-            .get_current_workspace()
-            .and_then(|w| w.graph_view_state.selected_node);
+            .current_view_state()
+            .and_then(|vs| vs.selected_node);
 
         if let Some(selected) = selected {
-            // Request call hierarchy for this node to load its data
-            // This will populate the graph with children without changing the root
             self.request_call_hierarchy(&selected);
 
-            // Mark layout dirty to refresh the view with updated data
-            if let Some(workspace) = self.get_current_workspace_mut() {
-                workspace.graph_view_state.mark_layout_dirty();
+            if let Some(vs) = self.current_view_state_mut() {
+                vs.mark_layout_dirty();
             }
 
             let name = self
@@ -120,82 +116,24 @@ impl App {
         }
     }
 
-    fn handle_find_references(&mut self) {
-        let symbol_id = self.get_current_workspace().and_then(|w| w.root_symbol);
-
-        if let Some(symbol_id) = symbol_id {
-            self.request_references(&symbol_id);
-        } else {
-            self.status_message = StatusMessage::NoFunctionSelectedForReferences;
-        }
-    }
-
-    fn handle_refresh(&mut self) {
-        log::info!("Refresh action triggered - clearing state and requesting fresh data");
-        // Clear all loading states and cached data to force fresh requests
-        self.core.lsp.clear();
-
-        // Request fresh workspace symbols to update the project state
-        self.request_workspace_symbols();
-
-        // If there's a selected function, refresh its call hierarchy
-        if let Some(selected_id) = self.core.selected_function {
-            self.request_call_hierarchy(&selected_id);
-        }
-
-        self.status_message = StatusMessage::RefreshingProject;
-    }
-
-    fn handle_toggle_call_direction(&mut self) {
-        // Toggle direction and get the new direction value
-        let new_direction = if let Some(workspace) = self.get_current_workspace_mut() {
-            workspace.graph_view_state.toggle_direction();
-            workspace.graph_view_state.mark_layout_dirty();
-            Some(workspace.graph_view_state.direction)
-        } else {
-            None
-        };
-
-        // Update status message after releasing the mutable borrow
-        if let Some(direction) = new_direction {
-            let direction_str = match direction {
-                CallDirection::Outgoing => "outgoing",
-                CallDirection::Incoming => "incoming",
-            };
-            self.status_message = StatusMessage::SwitchedCallDirection {
-                direction: direction_str.to_string(),
-            };
-        }
-    }
-
     fn handle_move_left(&mut self) {
-        // Pan left in graph view
-        if let Some(workspace) = self.get_current_workspace_mut() {
-            workspace
-                .graph_view_state
-                .viewport
-                .pan(-PAN_DELTA_HORIZONTAL, 0.0);
+        if let Some(vs) = self.current_view_state_mut() {
+            vs.viewport.pan(-PAN_DELTA_HORIZONTAL, 0.0);
             self.status_message = StatusMessage::PannedLeft;
         }
     }
 
     fn handle_move_right(&mut self) {
-        // Pan right in graph view
-        if let Some(workspace) = self.get_current_workspace_mut() {
-            workspace
-                .graph_view_state
-                .viewport
-                .pan(PAN_DELTA_HORIZONTAL, 0.0);
+        if let Some(vs) = self.current_view_state_mut() {
+            vs.viewport.pan(PAN_DELTA_HORIZONTAL, 0.0);
             self.status_message = StatusMessage::PannedRight;
         }
     }
 
     fn handle_reset_view(&mut self) {
-        // Capture viewport size before mutable borrow
         let viewport_size = self.last_viewport_size;
-        if let Some(workspace) = self.get_current_workspace_mut() {
-            // Recenter the viewport on the root node
-            workspace.graph_view_state.recenter_viewport(viewport_size);
+        if let Some(vs) = self.current_view_state_mut() {
+            vs.recenter_viewport(viewport_size);
             self.status_message = StatusMessage::ResetView;
         }
     }
@@ -206,26 +144,21 @@ impl App {
         success_prefix: &str,
         fail_msg: &str,
     ) {
-        let current_idx = self.workspaces.current_index;
-        if let Some(workspace) = self.workspaces.workspaces.get_mut(current_idx) {
-            if op(&mut workspace.graph_view_state) {
-                if let Some(selected) = &workspace.graph_view_state.selected_node {
-                    let name = self
-                        .core
-                        .call_graph
-                        .get_function(selected)
-                        .map(|f| f.name.as_str())
-                        .unwrap_or("unknown");
-                    self.status_message = StatusMessage::Navigated {
-                        description: success_prefix.to_string(),
-                        name: Some(name.to_string()),
-                    };
-                } else {
-                    self.status_message = StatusMessage::Navigated {
-                        description: success_prefix.to_string(),
-                        name: None,
-                    };
-                }
+        let id = match self.core.workspaces.current() {
+            Some(w) => w.id,
+            None => return,
+        };
+        if let Some(vs) = self.view_states.get_mut(&id) {
+            if op(vs) {
+                let name = vs
+                    .selected_node
+                    .as_ref()
+                    .and_then(|s| self.core.call_graph.get_function(s))
+                    .map(|f| f.name.clone());
+                self.status_message = StatusMessage::Navigated {
+                    description: success_prefix.to_string(),
+                    name,
+                };
             } else {
                 self.status_message = StatusMessage::NavigationFailed {
                     reason: fail_msg.to_string(),
@@ -243,11 +176,14 @@ impl App {
     }
 
     fn handle_cycle_parent(&mut self) {
-        if let Some(workspace) = self.get_current_workspace_mut() {
-            let state = &mut workspace.graph_view_state;
-            if state.cycle_active_parent() {
-                let parent_symbol = state.active_parent_symbol();
-                let parent_name = parent_symbol
+        let id = match self.core.workspaces.current() {
+            Some(w) => w.id,
+            None => return,
+        };
+        if let Some(vs) = self.view_states.get_mut(&id) {
+            if vs.cycle_active_parent() {
+                let parent_name = vs
+                    .active_parent_symbol()
                     .and_then(|psym| self.core.call_graph.get_function(&psym))
                     .map(|f| f.name.clone());
                 self.status_message = StatusMessage::Navigated {
@@ -284,41 +220,5 @@ impl App {
             "Navigated to previous sibling",
             "No sibling nodes",
         );
-    }
-
-    fn handle_new_workspace(&mut self) {
-        let name = format!("Graph {}", self.workspaces.next_id);
-        self.create_workspace(name);
-    }
-
-    fn handle_close_workspace(&mut self) {
-        let idx = self.workspaces.current_index;
-        self.close_workspace(idx);
-    }
-
-    pub fn start_call_graph_with_function(&mut self, symbol_id: SymbolId) {
-        log::info!("Starting graph view with function: {:?}", symbol_id);
-
-        // Get function name for workspace
-        let function_name = self
-            .core
-            .call_graph
-            .get_function(&symbol_id)
-            .map(|f| {
-                let name = f.name.clone();
-                if name.len() > 20 {
-                    format!("{}...", &name[..17])
-                } else {
-                    name
-                }
-            })
-            .unwrap_or_else(|| format!("Graph {}", self.workspaces.next_id));
-
-        // Create new workspace with this function as root
-        self.create_workspace_with_function(function_name, symbol_id);
-        self.core.selected_function = Some(symbol_id);
-        self.status_message = StatusMessage::GraphWorkspaceCreated;
-
-        log::info!("Graph workspace started with root: {:?}", symbol_id);
     }
 }

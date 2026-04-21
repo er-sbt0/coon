@@ -25,8 +25,8 @@ impl App {
                         self.update_function_outgoing_calls(symbol_id, calls);
 
                         // Mark layout as dirty to force recomputation with new data
-                        if let Some(workspace) = self.get_current_workspace_mut() {
-                            workspace.graph_view_state.mark_layout_dirty();
+                        if let Some(vs) = self.current_view_state_mut() {
+                            vs.mark_layout_dirty();
                         }
 
                         // Update loading state to loaded
@@ -180,8 +180,8 @@ impl App {
                         self.update_function_incoming_calls(symbol_id, calls);
 
                         // Mark layout as dirty to force recomputation with new data
-                        if let Some(workspace) = self.get_current_workspace_mut() {
-                            workspace.graph_view_state.mark_layout_dirty();
+                        if let Some(vs) = self.current_view_state_mut() {
+                            vs.mark_layout_dirty();
                         }
 
                         // Update loading state to loaded
@@ -204,8 +204,8 @@ impl App {
                             let first_item = items[0].clone();
 
                             let current_direction = self
-                                .get_current_workspace()
-                                .map(|w| w.graph_view_state.direction)
+                                .current_view_state()
+                                .map(|vs| vs.direction)
                                 .unwrap_or(CallDirection::Incoming);
 
                             let outgoing = matches!(current_direction, CallDirection::Outgoing);

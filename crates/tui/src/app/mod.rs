@@ -1,12 +1,10 @@
+use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
 
 use ::lsp::{LspRequest, LspResponse};
 use model::{lsp_status::LspUiMessage, CallGraph, SymbolId};
 
-/// Default viewport size used before the actual terminal size is known.
-const DEFAULT_VIEWPORT_SIZE: (f32, f32) = (100.0, 100.0);
-
-use crate::graph_view::LayoutSettings;
+use crate::graph_view::{GraphViewState, LayoutSettings};
 use crate::search_bar::SearchBarState;
 use crate::status_message::StatusMessage;
 
@@ -16,11 +14,12 @@ mod lsp;
 pub mod lsp_bridge;
 mod update;
 mod workspace;
-pub mod workspace_manager;
 
-pub use event_translate::app_event_to_status;
+pub use event_translate::{app_event_to_status, apply_events};
 pub use lsp_bridge::{LoadingState, LspBridge, PendingRequest};
-pub use workspace_manager::WorkspaceManager;
+
+/// Default viewport size used before the actual terminal size is known.
+const DEFAULT_VIEWPORT_SIZE: (f32, f32) = (100.0, 100.0);
 
 /// Main application state
 pub struct App {
@@ -37,8 +36,14 @@ pub struct App {
     pub search_bar_state: SearchBarState,
     pub show_search_bar: bool,
 
-    // TUI workspace manager (owns GraphViewState per workspace)
-    pub workspaces: WorkspaceManager,
+    /// Per-workspace view state (GraphViewState), keyed by CoreWorkspace id.
+    pub view_states: HashMap<usize, GraphViewState>,
+
+    /// Whether the workspace-manager modal overlay is visible.
+    pub show_workspace_manager: bool,
+
+    /// Layout settings used when creating new GraphViewState instances.
+    pub layout_settings: LayoutSettings,
 }
 
 impl App {
@@ -47,15 +52,21 @@ impl App {
     }
 
     pub fn new_with_settings(call_graph: CallGraph, settings: LayoutSettings) -> Self {
+        let core = ::core::CoreApp::new(call_graph);
+        let initial_id = core.workspaces.current().map(|w| w.id).unwrap_or(1);
+        let mut view_states = HashMap::new();
+        view_states.insert(initial_id, GraphViewState::new(&settings));
         Self {
-            core: ::core::CoreApp::new(call_graph),
+            core,
             should_quit: false,
             show_help: false,
             status_message: StatusMessage::Ready,
             last_viewport_size: DEFAULT_VIEWPORT_SIZE,
             search_bar_state: SearchBarState::new(),
             show_search_bar: false,
-            workspaces: WorkspaceManager::new_with_settings(settings),
+            view_states,
+            show_workspace_manager: false,
+            layout_settings: settings,
         }
     }
 
@@ -69,27 +80,22 @@ impl App {
         settings: LayoutSettings,
     ) -> Self {
         let lsp = LspBridge::new_with_loader(lsp_rx, lsp_channels_rx);
-        let mut app = Self::new_with_settings(call_graph, settings);
-        app.core = ::core::CoreApp::new_with_lsp(app.core.call_graph.clone(), lsp);
-        app
-    }
-
-    /// Poll and handle any messages from the background LSP loader
-    pub fn poll_lsp_loader_messages(&mut self) {
-        let new_symbols = self.core.lsp.poll_loader_messages();
-        for symbol in new_symbols {
-            let function = model::FunctionNode::new(
-                symbol.name.clone(),
-                symbol.qualified_name.clone(),
-                symbol.location.clone(),
-            );
-            self.core.call_graph.add_function(function);
+        let core = ::core::CoreApp::new_with_lsp(call_graph, lsp);
+        let initial_id = core.workspaces.current().map(|w| w.id).unwrap_or(1);
+        let mut view_states = HashMap::new();
+        view_states.insert(initial_id, GraphViewState::new(&settings));
+        Self {
+            core,
+            should_quit: false,
+            show_help: false,
+            status_message: StatusMessage::Ready,
+            last_viewport_size: DEFAULT_VIEWPORT_SIZE,
+            search_bar_state: SearchBarState::new(),
+            show_search_bar: false,
+            view_states,
+            show_workspace_manager: false,
+            layout_settings: settings,
         }
-    }
-
-    /// Poll for LSP channels and wire them up when they arrive
-    pub fn poll_lsp_channels(&mut self) {
-        self.core.lsp.poll_channels();
     }
 
     /// Set the LSP channels for communication
@@ -114,62 +120,34 @@ impl App {
         self.show_help = !self.show_help;
     }
 
-    // Convenience delegation methods for WorkspaceManager
+    // -------------------------------------------------------------------------
+    // View-state helpers
+    // -------------------------------------------------------------------------
 
-    pub fn get_current_workspace(&self) -> Option<&crate::graph_workspace::GraphWorkspace> {
-        self.workspaces.current()
+    /// Id of the currently active workspace, if any.
+    pub fn current_workspace_id(&self) -> Option<usize> {
+        self.core.workspaces.current().map(|w| w.id)
     }
 
-    pub fn get_current_workspace_mut(
-        &mut self,
-    ) -> Option<&mut crate::graph_workspace::GraphWorkspace> {
-        self.workspaces.current_mut()
+    /// Immutable reference to the current workspace's view state.
+    pub fn current_view_state(&self) -> Option<&GraphViewState> {
+        let id = self.core.workspaces.current()?.id;
+        self.view_states.get(&id)
     }
 
-    pub fn create_workspace(&mut self, name: String) -> usize {
-        let (id, msg) = self.workspaces.create(name);
-        self.status_message = msg;
-        id
+    /// Mutable reference to the current workspace's view state.
+    pub fn current_view_state_mut(&mut self) -> Option<&mut GraphViewState> {
+        let id = self.core.workspaces.current()?.id;
+        self.view_states.get_mut(&id)
     }
 
-    pub fn create_workspace_with_function(&mut self, name: String, symbol: SymbolId) -> usize {
-        let (id, msg) = self.workspaces.create_with_function(name, symbol);
-        self.status_message = msg;
-        id
-    }
-
-    pub fn close_workspace(&mut self, index: usize) -> bool {
-        match self.workspaces.close(index) {
-            Ok(msg) => {
-                self.status_message = msg;
-                true
-            }
-            Err(msg) => {
-                self.status_message = msg;
-                false
-            }
-        }
-    }
-
-    pub fn switch_workspace(&mut self, index: usize) -> bool {
-        if let Some(msg) = self.workspaces.switch_to(index) {
-            self.status_message = msg;
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn next_workspace(&mut self) {
-        if let Some(msg) = self.workspaces.next_workspace() {
-            self.status_message = msg;
-        }
-    }
-
-    pub fn previous_workspace(&mut self) {
-        if let Some(msg) = self.workspaces.previous() {
-            self.status_message = msg;
-        }
+    pub fn start_call_graph_with_function(&mut self, symbol_id: SymbolId) {
+        log::info!("Starting graph view with function: {:?}", symbol_id);
+        let events = self
+            .core
+            .dispatch(::core::Command::StartGraphFromFunction(symbol_id));
+        apply_events(self, events);
+        self.status_message = StatusMessage::GraphWorkspaceCreated;
     }
 }
 
@@ -177,7 +155,6 @@ impl App {
 mod tests {
     use super::*;
     use crate::actions::Action;
-    use crate::status_message::StatusMessage;
     use model::{FunctionNode, Location};
 
     fn create_test_app() -> App {
@@ -194,37 +171,43 @@ mod tests {
     #[test]
     fn test_app_creation() {
         let app = create_test_app();
-        assert_eq!(app.workspaces.workspaces.len(), 1);
-        assert_eq!(app.workspaces.current_index, 0);
+        assert_eq!(app.core.workspaces.workspaces.len(), 1);
+        assert_eq!(app.core.workspaces.current_index, 0);
         assert!(app.core.selected_function.is_none());
         assert_eq!(app.search_bar_state.query, "");
         assert!(!app.should_quit);
         assert!(!app.show_help);
+        assert_eq!(app.view_states.len(), 1);
     }
 
     #[test]
     fn test_workspace_creation() {
         let mut app = create_test_app();
 
-        app.create_workspace("Test Workspace".to_string());
-        assert_eq!(app.workspaces.workspaces.len(), 2);
-        assert_eq!(app.workspaces.current_index, 1);
-        assert_eq!(app.workspaces.workspaces[1].name, "Test Workspace");
+        let events = app.core.dispatch(::core::Command::NewWorkspace);
+        apply_events(&mut app, events);
+        assert_eq!(app.core.workspaces.workspaces.len(), 2);
+        assert_eq!(app.core.workspaces.current_index, 1);
+        assert_eq!(app.view_states.len(), 2);
     }
 
     #[test]
     fn test_workspace_switching() {
         let mut app = create_test_app();
-        app.create_workspace("Workspace 2".to_string());
+        let events = app.core.dispatch(::core::Command::NewWorkspace);
+        apply_events(&mut app, events);
 
-        app.next_workspace();
-        assert_eq!(app.workspaces.current_index, 0);
+        let events = app.core.dispatch(::core::Command::NextWorkspace);
+        apply_events(&mut app, events);
+        assert_eq!(app.core.workspaces.current_index, 0);
 
-        app.previous_workspace();
-        assert_eq!(app.workspaces.current_index, 1);
+        let events = app.core.dispatch(::core::Command::PreviousWorkspace);
+        apply_events(&mut app, events);
+        assert_eq!(app.core.workspaces.current_index, 1);
 
-        app.switch_workspace(0);
-        assert_eq!(app.workspaces.current_index, 0);
+        let events = app.core.dispatch(::core::Command::SwitchWorkspace(0));
+        apply_events(&mut app, events);
+        assert_eq!(app.core.workspaces.current_index, 0);
     }
 
     #[test]
@@ -232,24 +215,27 @@ mod tests {
         let mut app = create_test_app();
 
         // Can't close last workspace
-        assert!(!app.close_workspace(0));
-        assert_eq!(app.workspaces.workspaces.len(), 1);
+        let events = app.core.dispatch(::core::Command::CloseWorkspace(0));
+        apply_events(&mut app, events);
+        assert_eq!(app.core.workspaces.workspaces.len(), 1);
 
         // Add another workspace and close it
-        app.create_workspace("Workspace 2".to_string());
-        assert_eq!(app.workspaces.workspaces.len(), 2);
+        let events = app.core.dispatch(::core::Command::NewWorkspace);
+        apply_events(&mut app, events);
+        assert_eq!(app.core.workspaces.workspaces.len(), 2);
 
-        assert!(app.close_workspace(1));
-        assert_eq!(app.workspaces.workspaces.len(), 1);
+        let events = app.core.dispatch(::core::Command::CloseWorkspace(1));
+        apply_events(&mut app, events);
+        assert_eq!(app.core.workspaces.workspaces.len(), 1);
     }
 
     #[test]
     fn test_minimum_one_workspace() {
         let mut app = create_test_app();
 
-        // Try to close the only workspace - should fail
-        assert!(!app.close_workspace(0));
-        assert_eq!(app.workspaces.workspaces.len(), 1);
+        let events = app.core.dispatch(::core::Command::CloseWorkspace(0));
+        apply_events(&mut app, events);
+        assert_eq!(app.core.workspaces.workspaces.len(), 1);
     }
 
     #[test]
@@ -271,25 +257,28 @@ mod tests {
 
         assert_eq!(app.core.selected_function, Some(func_id));
         // Should have created a new workspace
-        assert_eq!(app.workspaces.workspaces.len(), 2);
+        assert_eq!(app.core.workspaces.workspaces.len(), 2);
         // New workspace should be current
-        assert_eq!(app.workspaces.current_index, 1);
+        assert_eq!(app.core.workspaces.current_index, 1);
         // New workspace should have the function as root
-        assert_eq!(app.workspaces.workspaces[1].root_symbol, Some(func_id));
+        assert_eq!(
+            app.core.workspaces.workspaces[1].root_symbol,
+            Some(func_id)
+        );
+        // view_states should have entries for both workspaces
+        assert_eq!(app.view_states.len(), 2);
     }
 
     #[test]
     fn test_action_handling() {
         let mut app = create_test_app();
 
-        // Test help toggle
         app.handle_action(Action::Help);
         assert!(app.show_help);
 
         app.handle_action(Action::Help);
         assert!(!app.show_help);
 
-        // Test quit
         app.handle_action(Action::Quit);
         assert!(app.should_quit);
     }

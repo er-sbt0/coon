@@ -27,6 +27,7 @@ const EVENT_POLL_INTERVAL_MS: u64 = 100;
 use lsp::{LspRequest, LspResponse};
 use model::{lsp_status::LspUiMessage, CallGraph};
 
+use crate::app::apply_events;
 use crate::app::App;
 use crate::graph_view::LayoutSettings;
 use crate::key_map;
@@ -83,14 +84,11 @@ impl TuiApp {
 
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         loop {
-            // Drain any async LSP loader messages
-            self.app.poll_lsp_loader_messages();
-
-            // Poll for LSP channels and wire them up when they arrive
-            self.app.poll_lsp_channels();
-
-            // Check for LSP responses first
-            self.app.check_lsp_responses();
+            // Drive LSP: drain loader, channels, and pending responses.
+            // core.tick() returns AppEvents; apply_events() translates them to
+            // view-state mutations and status messages.
+            let tick_events = self.app.core.tick();
+            apply_events(&mut self.app, tick_events);
 
             // Draw UI
             self.terminal.draw(|f| ui(f, &mut self.app))?;

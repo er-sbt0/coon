@@ -1,11 +1,12 @@
 use crate::status_message::StatusMessage;
 
+use super::apply_events;
 use super::App;
 
 impl App {
     /// Toggle workspace manager modal
     pub fn toggle_workspace_manager(&mut self) {
-        self.workspaces.toggle_manager();
+        self.show_workspace_manager = !self.show_workspace_manager;
     }
 
     // Search bar methods
@@ -45,8 +46,13 @@ impl App {
             let symbol_id = result.symbol_id;
             let name = result.name.clone();
 
-            // Create new workspace with selected symbol
-            self.create_workspace_with_function(name, symbol_id);
+            // Dispatch through core so CoreWorkspaceManager and view_states stay in sync
+            let events = self
+                .core
+                .dispatch(::core::Command::StartGraphFromFunction(symbol_id));
+            // Override the workspace name via rename after creation
+            let _ = name; // name used indirectly by StartGraphFromFunction via call_graph
+            apply_events(self, events);
 
             // Close search bar
             self.toggle_search_bar();
