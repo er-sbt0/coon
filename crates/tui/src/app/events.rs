@@ -43,7 +43,6 @@ impl App {
             Action::CloseWorkspace => self.handle_close_workspace(),
             Action::NextWorkspace => self.next_workspace(),
             Action::PreviousWorkspace => self.previous_workspace(),
-            Action::RenameWorkspace => {} // TODO: Implement rename UI
             Action::SwitchWorkspace(index) => {
                 self.switch_workspace(index);
             }

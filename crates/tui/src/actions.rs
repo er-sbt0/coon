@@ -33,7 +33,6 @@ pub enum Action {
     CloseWorkspace,
     NextWorkspace,
     PreviousWorkspace,
-    RenameWorkspace,
     /// Switch to workspace at the given 0-based index.
     SwitchWorkspace(usize),
 
