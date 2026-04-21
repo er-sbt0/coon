@@ -25,8 +25,9 @@ impl<'a> GraphQueryEngine<'a> {
     pub fn search_functions(&self, query: &str) -> Vec<&FunctionNode> {
         let mut results = self.filter.filter_by_name(query);
         results.extend(self.filter.filter_by_file(query));
-        results.sort_by(|a, b| a.name.cmp(&b.name));
+        results.sort_by_key(|f| f.id.0);
         results.dedup_by(|a, b| a.id == b.id);
+        results.sort_by(|a, b| a.name.cmp(&b.name));
         results
     }
 

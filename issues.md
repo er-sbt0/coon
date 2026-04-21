@@ -5,14 +5,8 @@
 ### 1. Hardcoded developer machine path
 lsp/src/client/mod.rs — `LspClient::new()` checks for `/home/eransa/opt/llvm/...` and prefers it over `clangd` from `PATH`. Makes the binary non-portable for everyone else and should be removed entirely.
 
-### 2. Incorrect deduplication in `search_functions`
-logic/src/query.rs — `sort_by(|a, b| a.name.cmp(&b.name))` followed by `dedup_by(|a, b| a.id == b.id)` is wrong. `dedup_by` only removes *consecutive* duplicates, so after sorting by name (not id) there will be silent duplicates in results.
-
 ### 3. Fragile post-insert mutation hack for `references_enhanced`
 lsp/src/client/requests.rs — `send_request` inserts a request under `"textDocument/references"`, then the caller immediately overwrites it with the fake method string `"textDocument/references_enhanced"` as a routing tag. This is a layering violation; the `RequestType` enum in the worker is the proper place for that discrimination.
-
-### 4. `lsp_loader_task` monolith — SRP violation
-lsp/src/loader.rs — ~240 lines, handling clangd spawning, initialization, file discovery, symbol loading, *and* the indefinite TUI↔LSP forwarder loop. The last concern especially belongs in its own function/struct.
 
 ### 5. `unwrap()` on process stdio handles
 lsp/src/client/mod.rs — `process.stdin.take().unwrap()` etc. right after spawn. They'll be `Some`, but are inconsistent with the rest of the crate using `anyhow::Result`.
