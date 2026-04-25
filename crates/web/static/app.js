@@ -254,6 +254,45 @@ cy.on('tap', 'node', (e) => {
   expandNode(e.target.id());
 });
 
+// ── Expand button overlay ─────────────────────────────────────────────────────
+
+const expandBtn = document.getElementById('expand-btn');
+let expandTargetId = null;
+let hideTimer = null;
+
+function showExpandBtn(node) {
+  clearTimeout(hideTimer);
+  expandTargetId = node.id();
+  const bb = node.renderedBoundingBox();
+  const container = document.getElementById('cy').getBoundingClientRect();
+  // Position inside the node at top-right (2px from right edge, 4px from top).
+  // Keeping it inside the node boundary means there's no gap for the cursor to
+  // cross, so mouseenter on the button fires before the hide timer can expire.
+  const x = container.left + bb.x2 - 22;
+  const y = container.top  + bb.y1 + 4;
+  expandBtn.style.left    = `${x}px`;
+  expandBtn.style.top     = `${y}px`;
+  expandBtn.style.display = 'flex';
+}
+
+function hideExpandBtn() {
+  hideTimer = setTimeout(() => {
+    expandBtn.style.display = 'none';
+    expandTargetId = null;
+  }, 300);
+}
+
+cy.on('mouseover', 'node', (e) => showExpandBtn(e.target));
+cy.on('mouseout',  'node', ()     => hideExpandBtn());
+
+expandBtn.addEventListener('mouseenter', () => clearTimeout(hideTimer));
+expandBtn.addEventListener('mouseleave', () => hideExpandBtn());
+expandBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  if (expandTargetId) expandNode(expandTargetId);
+  expandBtn.style.display = 'none';
+});
+
 // ── Direction toggle ──────────────────────────────────────────────────────────
 
 function updateDirToggle() {

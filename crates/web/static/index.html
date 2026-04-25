@@ -88,7 +88,29 @@
     #fn-list .empty { color: #484f58; font-style: italic; padding: 12px 10px; cursor: default; }
     #fn-list .empty:hover { background: transparent; }
 
-    #cy { flex: 1; background: #0d1117; }
+    #cy { flex: 1; background: #0d1117; position: relative; }
+
+    #expand-btn {
+      position: fixed;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      width: 20px;
+      height: 20px;
+      background: #58a6ff;
+      color: #0d1117;
+      font-size: 14px;
+      font-weight: bold;
+      line-height: 1;
+      border-radius: 50%;
+      cursor: pointer;
+      z-index: 100;
+      pointer-events: auto;
+      user-select: none;
+      box-shadow: 0 0 4px rgba(88,166,255,0.6);
+      transition: background 0.15s;
+    }
+    #expand-btn:hover { background: #79c0ff; }
 
     #info {
       background: #161b22;
@@ -113,6 +135,7 @@
       <ul id="fn-list"><li class="empty">No symbols loaded yet</li></ul>
     </div>
     <div id="cy"></div>
+    <div id="expand-btn" title="Expand node (+)">+</div>
   </div>
   <div id="info">Click a function in the sidebar to explore its call graph.</div>
   <script src="app.js"></script>
