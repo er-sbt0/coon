@@ -1,10 +1,11 @@
 use model::{LspLoadPhase, SymbolId};
+use serde::{Deserialize, Serialize};
 
 /// Events emitted by `CoreApp` in response to commands and LSP messages.
 ///
 /// Frontends translate these into their own display representation.
 /// The TUI maps them to `StatusMessage`; the web frontend serialises them to JSON.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AppEvent {
     // ---- Graph data changes ----
     /// Workspace symbols were fetched/refreshed from clangd.

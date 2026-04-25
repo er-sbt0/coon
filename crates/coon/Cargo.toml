@@ -6,6 +6,9 @@ edition = "2021"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 model.workspace = true
+core.workspace = true
+web.workspace = true
+axum.workspace = true
 logic.workspace = true
 lsp.workspace = true
 tui.workspace = true

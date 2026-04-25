@@ -13,6 +13,10 @@ struct Args {
     /// Path to the C/C++ project directory (omit to run with demo data)
     project_path: Option<String>,
 
+    /// Start the web server instead of the TUI (e.g. --web 8080)
+    #[arg(long, value_name = "PORT")]
+    web: Option<u16>,
+
     /// Vertical gap between sibling nodes in rows
     #[arg(long, value_name = "ROWS")]
     node_separation: Option<f32>,
@@ -51,9 +55,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(defaults.subtree_separation),
     };
 
-    match args.project_path {
-        None => runner::run_with_demo_data(settings).await?,
-        Some(ref path) => {
+    match (args.web, args.project_path) {
+        (Some(port), None) => runner::run_web(port).await?,
+        (Some(port), Some(ref path)) => {
+            if Path::new(path).exists() {
+                runner::run_web_with_lsp(path, port).await?;
+            } else {
+                error!("Error: Project path '{}' does not exist", path);
+                std::process::exit(1);
+            }
+        }
+        (None, None) => runner::run_with_demo_data(settings).await?,
+        (None, Some(ref path)) => {
             if Path::new(path).exists() {
                 runner::run_with_lsp(path, settings).await?;
             } else {

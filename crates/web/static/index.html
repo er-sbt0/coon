@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>COON — Call Graph</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.29.2/cytoscape.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0d1117; color: #e0e0e0; font-family: monospace; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+
+    #toolbar {
+      background: #161b22;
+      padding: 6px 12px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      border-bottom: 1px solid #30363d;
+      flex-shrink: 0;
+    }
+    #toolbar h1 { font-size: 0.95rem; color: #e94560; letter-spacing: 0.1em; }
+    #status { font-size: 0.75rem; color: #8b949e; }
+    #dir-toggle {
+      background: #21262d;
+      border: 1px solid #30363d;
+      color: #c9d1d9;
+      font-family: monospace;
+      font-size: 0.75rem;
+      padding: 3px 10px;
+      cursor: pointer;
+      border-radius: 3px;
+      margin-left: auto;
+    }
+    #dir-toggle:hover { background: #30363d; color: #e0e0e0; }
+
+    #main {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    #sidebar {
+      width: 260px;
+      min-width: 200px;
+      background: #161b22;
+      border-right: 1px solid #30363d;
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+    }
+    #sidebar-header {
+      padding: 8px 10px 4px;
+      font-size: 0.7rem;
+      color: #8b949e;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      border-bottom: 1px solid #30363d;
+    }
+    #search {
+      width: 100%;
+      background: #0d1117;
+      border: none;
+      border-bottom: 1px solid #30363d;
+      color: #e0e0e0;
+      font-family: monospace;
+      font-size: 0.8rem;
+      padding: 6px 10px;
+      outline: none;
+    }
+    #search::placeholder { color: #484f58; }
+    #fn-list {
+      flex: 1;
+      overflow-y: auto;
+      list-style: none;
+    }
+    #fn-list li {
+      padding: 5px 10px;
+      font-size: 0.78rem;
+      cursor: pointer;
+      border-bottom: 1px solid #21262d;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: #c9d1d9;
+    }
+    #fn-list li:hover { background: #1f2937; color: #58a6ff; }
+    #fn-list li.selected { background: #1f3a5f; color: #58a6ff; }
+    #fn-list .empty { color: #484f58; font-style: italic; padding: 12px 10px; cursor: default; }
+    #fn-list .empty:hover { background: transparent; }
+
+    #cy { flex: 1; background: #0d1117; }
+
+    #info {
+      background: #161b22;
+      padding: 4px 12px;
+      font-size: 0.72rem;
+      color: #8b949e;
+      border-top: 1px solid #30363d;
+      flex-shrink: 0;
+    }
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <h1>COON</h1>
+    <span id="status">Connecting…</span>
+    <button id="dir-toggle" title="Toggle between outgoing and incoming calls">→ Outgoing</button>
+  </div>
+  <div id="main">
+    <div id="sidebar">
+      <div id="sidebar-header">Functions <span id="fn-count"></span></div>
+      <input id="search" type="text" placeholder="filter…" autocomplete="off" />
+      <ul id="fn-list"><li class="empty">No symbols loaded yet</li></ul>
+    </div>
+    <div id="cy"></div>
+  </div>
+  <div id="info">Click a function in the sidebar to explore its call graph.</div>
+  <script src="app.js"></script>
+</body>
+</html>

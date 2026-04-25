@@ -14,6 +14,11 @@ use crate::workspace::CoreWorkspaceManager;
 pub struct CoreApp {
     pub call_graph: CallGraph,
     pub selected_function: Option<SymbolId>,
+    /// The node used as the BFS root for layout computation in the web frontend.
+    /// Set to `Some(id)` when the user expands a node in-place (so the subgraph
+    /// is centred on that node). Cleared whenever the workspace root or direction
+    /// changes so the view resets to the normal root-anchored layout.
+    pub layout_focus: Option<SymbolId>,
     pub lsp: LspBridge,
     pub workspaces: CoreWorkspaceManager,
 }
@@ -24,6 +29,7 @@ impl CoreApp {
         Self {
             call_graph,
             selected_function: None,
+            layout_focus: None,
             lsp: LspBridge::new(),
             workspaces: CoreWorkspaceManager::new(),
         }
@@ -34,6 +40,7 @@ impl CoreApp {
         Self {
             call_graph,
             selected_function: None,
+            layout_focus: None,
             lsp,
             workspaces: CoreWorkspaceManager::new(),
         }
@@ -46,7 +53,7 @@ impl CoreApp {
     /// Dispatch a domain command and return events describing what changed.
     pub fn dispatch(&mut self, cmd: Command) -> Vec<AppEvent> {
         log::info!("CoreApp::dispatch {:?}", cmd);
-        match cmd {
+        let events = match cmd {
             Command::SelectFunction(id) => self.cmd_select_function(id),
             Command::ExpandOrCollapse => self.cmd_expand_or_collapse(),
             Command::FindReferences => self.cmd_find_references(),
@@ -60,7 +67,14 @@ impl CoreApp {
             Command::RenameWorkspace(index, name) => self.cmd_rename_workspace(index, name),
             Command::StartGraphFromFunction(id) => self.cmd_start_graph_from_function(id),
             Command::SearchSelectFunction(id) => self.cmd_search_select_function(id),
-        }
+            Command::ExpandFunction(id) => self.cmd_expand_function(id),
+        };
+        log::info!(
+            "CoreApp::dispatch result: {} event(s): {:?}",
+            events.len(),
+            events
+        );
+        events
     }
 
     /// Poll LSP channels and loader; return events for anything that arrived.
@@ -74,6 +88,7 @@ impl CoreApp {
 
         // Ingest new symbols from the background loader
         let new_symbols = self.lsp.poll_loader_messages();
+        let symbol_count = new_symbols.len();
         for symbol in new_symbols {
             let function = FunctionNode::new(
                 symbol.name.clone(),
@@ -81,6 +96,13 @@ impl CoreApp {
                 symbol.location.clone(),
             );
             self.call_graph.add_function(function);
+        }
+        if symbol_count > 0 {
+            log::info!(
+                "CoreApp::tick ingested {} new symbol(s), graph now has {} nodes",
+                symbol_count,
+                self.call_graph.node_count()
+            );
         }
 
         // Emit current LSP phase as a progress event
@@ -102,17 +124,26 @@ impl CoreApp {
     // -------------------------------------------------------------------------
 
     fn handle_lsp_response(&mut self, response: LspResponse) -> Vec<AppEvent> {
-        log::info!("CoreApp: handling LSP response {:?}", response);
+        log::debug!("CoreApp: handling LSP response {:?}", response);
         let mut events = Vec::new();
 
         match response {
             LspResponse::OutgoingCalls { request_id, calls } => {
                 if let Some(pending) = self.lsp.take_pending(&request_id) {
                     if let Some(symbol_id) = pending.symbol_id {
+                        let count = calls.len();
                         for call in calls {
                             self.process_call_entry(symbol_id, &call.to, &call.from_ranges, true);
                         }
                         self.lsp.set_loading_state(symbol_id, LoadingState::Loaded);
+                        log::info!(
+                            "CoreApp: OutgoingCalls loaded for {:?}: {} callee(s)",
+                            symbol_id,
+                            count
+                        );
+                        if count == 0 {
+                            events.push(AppEvent::FunctionHasNoCallees);
+                        }
                         events.push(AppEvent::OutgoingCallsLoaded { symbol_id });
                         events.push(AppEvent::LayoutDirty);
                     }
@@ -121,6 +152,7 @@ impl CoreApp {
             LspResponse::IncomingCalls { request_id, calls } => {
                 if let Some(pending) = self.lsp.take_pending(&request_id) {
                     if let Some(symbol_id) = pending.symbol_id {
+                        let count = calls.len();
                         for call in calls {
                             self.process_call_entry(
                                 symbol_id,
@@ -130,6 +162,14 @@ impl CoreApp {
                             );
                         }
                         self.lsp.set_loading_state(symbol_id, LoadingState::Loaded);
+                        log::info!(
+                            "CoreApp: IncomingCalls loaded for {:?}: {} caller(s)",
+                            symbol_id,
+                            count
+                        );
+                        if count == 0 {
+                            events.push(AppEvent::FunctionHasNoCallees);
+                        }
                         events.push(AppEvent::IncomingCallsLoaded { symbol_id });
                         events.push(AppEvent::LayoutDirty);
                     }
@@ -234,6 +274,9 @@ impl CoreApp {
 
     fn cmd_select_function(&mut self, id: SymbolId) -> Vec<AppEvent> {
         self.selected_function = Some(id);
+        // Changing the root resets the layout focus so the view is anchored to the new root.
+        self.layout_focus = None;
+        log::info!("CoreApp: root changed to {:?}, layout_focus cleared", id);
         // Also update the current workspace root
         if let Some(ws) = self.workspaces.current_mut() {
             ws.set_root(id);
@@ -288,11 +331,17 @@ impl CoreApp {
     }
 
     fn cmd_toggle_call_direction(&mut self) -> Vec<AppEvent> {
+        // Direction change resets the layout focus to the workspace root.
+        self.layout_focus = None;
         if let Some(ws) = self.workspaces.current_mut() {
             ws.direction = match ws.direction {
                 CallDirection::Outgoing => CallDirection::Incoming,
                 CallDirection::Incoming => CallDirection::Outgoing,
             };
+            log::info!(
+                "CoreApp: direction toggled to {:?}, layout_focus cleared",
+                ws.direction
+            );
         }
         vec![AppEvent::LayoutDirty]
     }
@@ -356,6 +405,32 @@ impl CoreApp {
 
     fn cmd_search_select_function(&mut self, id: SymbolId) -> Vec<AppEvent> {
         self.cmd_select_function(id)
+    }
+
+    fn cmd_expand_function(&mut self, id: SymbolId) -> Vec<AppEvent> {
+        self.selected_function = Some(id);
+        // Shift the layout BFS window to this node so its children become visible
+        // without changing the workspace root_symbol.
+        //
+        // If the user clicks the same already-loaded node again, layout_focus
+        // is unchanged and nothing needs to be done — avoid a redundant snapshot.
+        if self.layout_focus == Some(id) && self.lsp.is_function_loaded(&id) {
+            log::info!(
+                "CoreApp: expand in-place {:?} — already focused and loaded, no-op",
+                id
+            );
+            return vec![];
+        }
+        self.layout_focus = Some(id);
+        log::info!("CoreApp: expand in-place {:?}, layout_focus set", id);
+        // Unlike SelectFunction, do NOT change root_symbol — expand in place.
+        if !self.lsp.is_function_loaded(&id) && !self.lsp.is_function_loading(&id) {
+            self.lsp.set_loading_state(id, LoadingState::Loading);
+            if let Some(ev) = self.lsp.send_call_hierarchy(&self.call_graph, &id) {
+                return vec![ev, AppEvent::LayoutDirty];
+            }
+        }
+        vec![AppEvent::LayoutDirty]
     }
 
     // -------------------------------------------------------------------------

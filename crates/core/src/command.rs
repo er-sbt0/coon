@@ -1,11 +1,12 @@
 use model::SymbolId;
+use serde::{Deserialize, Serialize};
 
 /// Domain commands dispatched to `CoreApp`.
 ///
 /// These are the frontend-agnostic subset of actions — everything that changes
 /// graph or workspace state. TUI-only concerns (viewport pan, search cursor)
 /// have no `Command` equivalent and are handled locally by the TUI.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
     // ---- Graph interaction ----
     /// Select a function as the current focus.
@@ -32,4 +33,8 @@ pub enum Command {
     // ---- Search (query resolved by the frontend before dispatch) ----
     /// The user confirmed a search selection; switch focus to this symbol.
     SearchSelectFunction(SymbolId),
+
+    /// Load call hierarchy for a specific function without changing the graph root.
+    /// Used by the web frontend to expand a node in-place.
+    ExpandFunction(SymbolId),
 }

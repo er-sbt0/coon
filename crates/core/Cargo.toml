@@ -11,3 +11,6 @@ log.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 lsp-types.workspace = true
 uuid.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+grid.workspace = true

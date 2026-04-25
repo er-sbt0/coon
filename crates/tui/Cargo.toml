@@ -8,7 +8,7 @@ model.workspace = true
 logic.workspace = true
 lsp.workspace = true
 core.workspace = true
-grid.workspace = true
+grid = { workspace = true, features = ["rendering"] }
 ratatui.workspace = true
 crossterm.workspace = true
 log.workspace = true

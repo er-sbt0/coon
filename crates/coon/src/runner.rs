@@ -1,3 +1,4 @@
+use ::core::{CoreApp, LspBridge};
 use log::{error, info};
 use tokio::sync::{mpsc, oneshot};
 
@@ -81,5 +82,47 @@ async fn run_tui_async_lsp(
     let mut tui_app = TuiApp::new_with_lsp_async(call_graph, lsp_rx, lsp_channels_rx, settings)?;
     tokio::task::block_in_place(|| tui_app.run())?;
     info!("TUI exited. Goodbye!");
+    Ok(())
+}
+
+pub async fn run_web(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    let call_graph = crate::demo::create_demo_call_graph();
+    let app_core = CoreApp::new(call_graph);
+    let state = web::AppState::new(app_core);
+    let app = web::router(state);
+    let addr = format!("0.0.0.0:{port}");
+    info!("Web server listening on http://{addr}");
+    axum::serve(tokio::net::TcpListener::bind(&addr).await?, app).await?;
+    Ok(())
+}
+
+pub async fn run_web_with_lsp(
+    project_path: &str,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Starting LSP loader for web server on {}...", project_path);
+
+    let (ui_msg_tx, ui_msg_rx) = mpsc::unbounded_channel::<LspUiMessage>();
+    let (lsp_channels_tx, lsp_channels_rx) = oneshot::channel::<(
+        mpsc::UnboundedReceiver<LspResponse>,
+        mpsc::UnboundedSender<LspRequest>,
+    )>();
+
+    let project_path_string = project_path.to_string();
+    tokio::spawn(async move {
+        if let Err(e) =
+            lsp::loader::lsp_loader_task(&project_path_string, ui_msg_tx, lsp_channels_tx).await
+        {
+            error!("LSP loader task failed: {}", e);
+        }
+    });
+
+    let lsp = LspBridge::new_with_loader(ui_msg_rx, lsp_channels_rx);
+    let app_core = CoreApp::new_with_lsp(CallGraph::new(), lsp);
+    let state = web::AppState::new(app_core);
+    let app = web::router(state);
+    let addr = format!("0.0.0.0:{port}");
+    info!("Web server listening on http://{addr}");
+    axum::serve(tokio::net::TcpListener::bind(&addr).await?, app).await?;
     Ok(())
 }
