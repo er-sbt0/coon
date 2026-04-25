@@ -105,8 +105,13 @@ pub fn apply_events(app: &mut App, events: Vec<AppEvent>) {
             }
             AppEvent::WorkspaceClosed => {
                 // Remove view_states for workspaces that no longer exist.
-                let live: HashSet<usize> =
-                    app.core.workspaces.workspaces.iter().map(|w| w.id).collect();
+                let live: HashSet<usize> = app
+                    .core
+                    .workspaces
+                    .workspaces
+                    .iter()
+                    .map(|w| w.id)
+                    .collect();
                 app.view_states.retain(|id, _| live.contains(id));
             }
             AppEvent::LayoutDirty => {
@@ -128,4 +133,3 @@ pub fn apply_events(app: &mut App, events: Vec<AppEvent>) {
         apply_event_to_status(&mut app.status_message, event, &graph_clone);
     }
 }
-

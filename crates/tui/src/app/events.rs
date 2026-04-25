@@ -91,9 +91,7 @@ impl App {
     }
 
     fn handle_expand_or_collapse(&mut self) {
-        let selected = self
-            .current_view_state()
-            .and_then(|vs| vs.selected_node);
+        let selected = self.current_view_state().and_then(|vs| vs.selected_node);
 
         if let Some(selected) = selected {
             self.request_call_hierarchy(&selected);

@@ -261,10 +261,7 @@ mod tests {
         // New workspace should be current
         assert_eq!(app.core.workspaces.current_index, 1);
         // New workspace should have the function as root
-        assert_eq!(
-            app.core.workspaces.workspaces[1].root_symbol,
-            Some(func_id)
-        );
+        assert_eq!(app.core.workspaces.workspaces[1].root_symbol, Some(func_id));
         // view_states should have entries for both workspaces
         assert_eq!(app.view_states.len(), 2);
     }
