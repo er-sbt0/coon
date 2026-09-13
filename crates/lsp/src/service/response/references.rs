@@ -108,14 +108,13 @@ pub(super) async fn handle_document_symbols_for_enhanced_references(
                 character: location.column.saturating_sub(1),
             };
 
-            if let Some(containing_symbol) =
-                document::find_containing_symbol(document_symbols, &position)
-            {
+            let symbol_path = document::find_containing_symbol_path(document_symbols, &position);
+            if let Some(containing_symbol) = symbol_path.last() {
                 enhanced_references.push(model::Reference {
                     location: location.clone(),
                     referencing_symbol: Some(model::ReferencingSymbol {
                         name: containing_symbol.name.clone(),
-                        qualified_name: document::get_qualified_symbol_name(containing_symbol),
+                        qualified_name: document::qualified_name_of(&symbol_path),
                         kind: document::convert_lsp_symbol_kind(containing_symbol.kind),
                     }),
                 });

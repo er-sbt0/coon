@@ -32,6 +32,17 @@ impl LspClient {
                 call_hierarchy: Some(lsp::CallHierarchyClientCapabilities {
                     dynamic_registration: Some(false),
                 }),
+                // Ask for the nested form. Without this clangd falls back to
+                // the flat `SymbolInformation[]`, where every namespace and
+                // class is a sibling spanning its whole body — so looking up
+                // which symbol encloses a position lands on the outermost
+                // namespace instead of the function, and there is no tree to
+                // read a scope out of.
+                document_symbol: Some(lsp::DocumentSymbolClientCapabilities {
+                    dynamic_registration: Some(false),
+                    hierarchical_document_symbol_support: Some(true),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             ..Default::default()
