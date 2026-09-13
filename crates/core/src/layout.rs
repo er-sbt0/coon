@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 
 use grid::{Dag, LayoutConfig, LayoutEngine};
+use logic::{ClusterId, ClusterKey, Clustering};
 use model::{CallDirection, CallGraph, SymbolId};
 use serde::{Deserialize, Serialize};
 
@@ -156,7 +158,13 @@ fn to_centre(pos: &grid::Position, orientation: LayoutOrientation) -> NodePos {
 /// no node moves relative to its own level, and no two nodes can collide.
 ///
 /// Only ever a stretch, never a squash, and capped: see `MAX_LEVEL_STRETCH`.
-fn balance_aspect(positions: &mut HashMap<SymbolId, NodePos>, orientation: LayoutOrientation) {
+///
+/// Generic in the key only so the rooted tree and the cluster map can share it;
+/// it reads nothing but the positions.
+fn balance_aspect<K: Eq + std::hash::Hash>(
+    positions: &mut HashMap<K, NodePos>,
+    orientation: LayoutOrientation,
+) {
     if positions.len() < 2 {
         return;
     }
@@ -281,6 +289,392 @@ pub fn compute_layout(
 
     balance_aspect(&mut positions, opts.orientation);
     positions
+}
+
+// ---------------------------------------------------------------------------
+// The cluster map
+// ---------------------------------------------------------------------------
+
+/// One element of the cluster map: a function, or a whole community standing in
+/// for the functions inside it.
+///
+/// It serialises as a string rather than as serde's usual tagged enum, because
+/// it is a map key on the wire and JSON has no keys but strings. That costs
+/// nothing and buys something: cytoscape needs a stable string element id for
+/// every node it draws, and this is one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LayoutNodeId {
+    Symbol(SymbolId),
+    Cluster(ClusterKey),
+}
+
+impl fmt::Display for LayoutNodeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LayoutNodeId::Symbol(symbol) => write!(f, "fn:{}", symbol.0),
+            LayoutNodeId::Cluster(key) => write!(f, "cluster:{}:{}", key.level, key.anchor.0),
+        }
+    }
+}
+
+impl std::str::FromStr for LayoutNodeId {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let uuid = |raw: &str| {
+            uuid::Uuid::parse_str(raw).map_err(|e| format!("`{text}` holds no uuid: {e}"))
+        };
+        if let Some(rest) = text.strip_prefix("fn:") {
+            return Ok(LayoutNodeId::Symbol(SymbolId(uuid(rest)?)));
+        }
+        if let Some(rest) = text.strip_prefix("cluster:") {
+            let (level, anchor) = rest
+                .split_once(':')
+                .ok_or_else(|| format!("`{text}` is missing the cluster level"))?;
+            let level = level
+                .parse::<usize>()
+                .map_err(|e| format!("`{text}` holds no level: {e}"))?;
+            return Ok(LayoutNodeId::Cluster(ClusterKey {
+                level,
+                anchor: SymbolId(uuid(anchor)?),
+            }));
+        }
+        Err(format!("`{text}` is neither a function nor a cluster"))
+    }
+}
+
+impl Serialize for LayoutNodeId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for LayoutNodeId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// A labelled box around everything one expanded cluster turned into.
+///
+/// There is deliberately **no rectangle** here. The client draws a group as a
+/// cytoscape compound parent, which sizes and places itself around whatever
+/// children it is given; working a rect out in Rust would be computing the same
+/// geometry twice, and the Rust copy would drift the moment cytoscape's
+/// padding, label height or child bounds changed under it. So a group says what
+/// is inside it and the renderer decides where that puts its edges.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupBox {
+    pub key: ClusterKey,
+    pub label: String,
+    /// How many functions the cluster holds altogether, however few of them the
+    /// current expansion actually draws.
+    pub count: usize,
+    pub level: usize,
+    /// The elements whose parent this box is: display nodes, plus the key of
+    /// any nested group. A `Cluster` id in here names a group exactly when it is
+    /// *not* also in [`GraphLayout::nodes`] — a cluster is either expanded, and
+    /// so a box listed in [`GraphLayout::groups`], or collapsed, and so a node
+    /// described by a [`MetaNode`], and never both.
+    pub members: Vec<LayoutNodeId>,
+}
+
+/// A community the user has not opened, drawn as a single node standing in for
+/// everything inside it.
+///
+/// The counterpart to [`GroupBox`], and deliberately the same four fields: a
+/// cluster that is closed is a node and needs a name on it, a cluster that is
+/// open is a box and needs a name on that. Which of the two a `ClusterKey`
+/// names is not something the client should have to work out for itself, and
+/// the snapshot carries no [`Clustering`] for it to work it out *from* — so the
+/// layout says so, once, in whichever list the cluster landed in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetaNode {
+    pub key: ClusterKey,
+    pub label: String,
+    /// How many leaf functions the meta-node stands in for — the `+N` the
+    /// client draws on it.
+    pub count: usize,
+    pub level: usize,
+}
+
+/// One aggregated call relation between two display nodes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayoutEdge {
+    pub source: LayoutNodeId,
+    pub target: LayoutNodeId,
+    /// How many individual calls this one line stands for, so the client can
+    /// draw a heavily used relation more heavily than a stray one.
+    pub weight: usize,
+}
+
+/// A laid-out cluster map: where each element sits, which boxes enclose them,
+/// and what calls between them.
+///
+/// `groups` and `metas` are two halves of one statement about the clustering:
+/// every cluster the walk reached is in exactly one of them — `groups` the ones
+/// that were opened, `metas` the ones that were not — and the `metas` are
+/// precisely the `Cluster` keys that appear in `nodes`. So a client can draw the
+/// whole map from this one structure: `nodes` says where things sit, `metas`
+/// says what to write on the closed ones, `groups` what to write on the boxes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GraphLayout {
+    pub nodes: HashMap<LayoutNodeId, NodePos>,
+    pub groups: Vec<GroupBox>,
+    pub metas: Vec<MetaNode>,
+    pub edges: Vec<LayoutEdge>,
+}
+
+/// Lay out the cluster map: the communities the user has not opened as single
+/// meta-nodes, the ones they have as boxes around whatever is a level finer.
+///
+/// This is a second path alongside [`compute_layout`], not a replacement.
+/// A rooted call tree starts from one function and walks outwards; the map
+/// starts from the whole graph and walks *inwards* as far as `expanded` says,
+/// so the two share their geometry (`layout_config`, `to_centre`,
+/// `balance_aspect`) and nothing else.
+///
+/// Functions the clustering leaves out — the isolated ones, see
+/// [`logic::cluster`] — are in no cluster and therefore on no map.
+pub fn compute_cluster_layout(
+    graph: &CallGraph,
+    clustering: &Clustering,
+    expanded: &HashSet<ClusterKey>,
+    direction: CallDirection,
+    orientation: LayoutOrientation,
+) -> GraphLayout {
+    let mut walk = Walk::default();
+
+    for &id in clustering.top_level() {
+        descend(clustering, id, expanded, None, &mut walk);
+    }
+
+    let Walk {
+        display,
+        node_groups,
+        owner,
+        groups,
+        metas,
+        ..
+    } = walk;
+
+    if display.is_empty() {
+        return GraphLayout::default();
+    }
+
+    let edges = aggregate_calls(graph, &owner, direction);
+
+    // `Dag::add_node` hands out indices in call order, so a node's index is its
+    // position in `display` and no second lookup table is needed.
+    let mut dag: Dag<LayoutNodeId> = Dag::new();
+    for node in &display {
+        dag.add_node(*node);
+    }
+    let index: HashMap<LayoutNodeId, usize> = display
+        .iter()
+        .enumerate()
+        .map(|(i, node)| (*node, i))
+        .collect();
+    for edge in &edges {
+        // Aggregated calls between communities are freely cyclic — A calls into
+        // B and B calls back — which `grid` breaks for itself in its cycle pass.
+        let _ = dag.add_edge(index[&edge.source], index[&edge.target]);
+    }
+
+    let mut engine = match LayoutEngine::with_config(layout_config(orientation)) {
+        Ok(e) => e,
+        Err(_) => LayoutEngine::new(),
+    };
+    // Grouped, not flat: a box is only drawable if the nodes it encloses sit
+    // next to each other. Left to the plain barycentre ordering a community's
+    // members land wherever their neighbours pull them, and two compound
+    // parents drawn around two scattered sets interpenetrate — which reads as a
+    // broken canvas rather than as a map. See `LayoutEngine::compute_dag_grouped`.
+    let layout = match engine.compute_dag_grouped(&dag, &node_groups) {
+        Ok(l) => l,
+        Err(_) => return GraphLayout::default(),
+    };
+
+    let mut nodes: HashMap<LayoutNodeId, NodePos> = display
+        .iter()
+        .enumerate()
+        .filter_map(|(i, node)| {
+            layout
+                .position(i)
+                .map(|pos| (*node, to_centre(&pos, orientation)))
+        })
+        .collect();
+    balance_aspect(&mut nodes, orientation);
+
+    GraphLayout {
+        nodes,
+        groups,
+        metas,
+        edges,
+    }
+}
+
+/// What one walk of the dendrogram builds up.
+///
+/// The walk produces four things at once and they have to stay in step — the
+/// display list and its group tags are read by index, and `owner` decides which
+/// display node a call lands on — so they travel together rather than as six
+/// `&mut` parameters threaded through the recursion.
+#[derive(Default)]
+struct Walk {
+    /// Everything that gets a position, in the order it was reached.
+    display: Vec<LayoutNodeId>,
+    /// Parallel to `display`: the innermost open cluster each node sits in, as
+    /// an id `grid` treats as opaque. A node inside nested open clusters takes
+    /// the deepest one, because that is the box whose edge it must not be
+    /// separated from — hold the innermost runs together and the outer boxes,
+    /// built from those runs, hold together too.
+    node_groups: Vec<Option<u32>>,
+    /// Which display node each clustered function's calls are attributed to.
+    owner: HashMap<SymbolId, LayoutNodeId>,
+    groups: Vec<GroupBox>,
+    metas: Vec<MetaNode>,
+    /// Handed out on entering an expanded cluster. Ids need only be distinct,
+    /// and the walk is deterministic, so a counter is as good a name as any.
+    next_group: u32,
+}
+
+/// Turn one cluster into either a meta-node or a box, recursing while the user
+/// has opened what we find.
+///
+/// Always returns the cluster's own id, because that is what its parent box
+/// wants to list either way: collapsed it names the meta-node, expanded it
+/// names the nested box.
+///
+/// A cluster that `expanded` names but whose parent is *closed* is never
+/// reached, so a stale expansion set costs nothing — the deeper entry simply
+/// waits, and takes effect the moment the user opens the cluster above it.
+///
+/// `enclosing` is the group id of the innermost box we are already inside, and
+/// is what anything placed here is tagged with unless this cluster opens a box
+/// of its own and claims it.
+fn descend(
+    clustering: &Clustering,
+    id: ClusterId,
+    expanded: &HashSet<ClusterKey>,
+    enclosing: Option<u32>,
+    walk: &mut Walk,
+) -> Option<LayoutNodeId> {
+    let cluster = clustering.cluster(id)?;
+    let me = LayoutNodeId::Cluster(cluster.key);
+
+    if !expanded.contains(&cluster.key) {
+        walk.display.push(me);
+        // A closed cluster belongs to whatever box we are inside, if any: it is
+        // a single node, so there is no run of its own to keep together.
+        walk.node_groups.push(enclosing);
+        walk.metas.push(MetaNode {
+            key: cluster.key,
+            label: cluster.label.clone(),
+            count: cluster.members.len(),
+            level: cluster.level,
+        });
+        // Every call into or out of any member is a call on the meta-node now.
+        for member in &cluster.members {
+            walk.owner.insert(*member, me);
+        }
+        return Some(me);
+    }
+
+    // Opening a cluster draws a box, and everything the recursion puts on the
+    // canvas from here down is inside it unless a deeper box claims it first.
+    let mine = walk.next_group;
+    walk.next_group += 1;
+
+    // Level 0 is as fine as the dendrogram goes, so opening one of those boxes
+    // is what finally puts functions on the canvas.
+    let members: Vec<LayoutNodeId> = if cluster.level == 0 {
+        cluster
+            .members
+            .iter()
+            .map(|symbol| {
+                let node = LayoutNodeId::Symbol(*symbol);
+                walk.display.push(node);
+                walk.node_groups.push(Some(mine));
+                walk.owner.insert(*symbol, node);
+                node
+            })
+            .collect()
+    } else {
+        cluster
+            .children
+            .iter()
+            .filter_map(|&child| descend(clustering, child, expanded, Some(mine), walk))
+            .collect()
+    };
+
+    walk.groups.push(GroupBox {
+        key: cluster.key,
+        label: cluster.label.clone(),
+        count: cluster.members.len(),
+        level: cluster.level,
+        members,
+    });
+    Some(me)
+}
+
+/// Roll every call up to the pair of display nodes it runs between.
+///
+/// `CallGraph` exposes no `edges()`, so the calls have to be walked the way
+/// `logic::cluster` walks them: `get_callees` per function, which returns one
+/// entry per distinct call *site* and so counts multiplicity for free.
+///
+/// Calls whose two ends land on the same display node are dropped. Those are
+/// the ones internal to a collapsed community, and drawing them would be a
+/// self-loop on a box whose whole purpose is to not show its insides.
+fn aggregate_calls(
+    graph: &CallGraph,
+    owner: &HashMap<SymbolId, LayoutNodeId>,
+    direction: CallDirection,
+) -> Vec<LayoutEdge> {
+    let mut weights: HashMap<(LayoutNodeId, LayoutNodeId), usize> = HashMap::new();
+
+    for caller in graph.function_ids() {
+        let Some(&from) = owner.get(caller) else {
+            continue;
+        };
+        for callee in graph.get_callees(caller) {
+            let Some(&to) = owner.get(&callee.id) else {
+                continue;
+            };
+            if from == to {
+                continue;
+            }
+            // `direction` says which way the user is reading the graph, so an
+            // incoming map is the same aggregation with every arrow turned
+            // round — exactly what `compute_layout` does with get_callers.
+            let pair = match direction {
+                CallDirection::Outgoing => (from, to),
+                CallDirection::Incoming => (to, from),
+            };
+            *weights.entry(pair).or_insert(0) += 1;
+        }
+    }
+
+    // `graph.function_ids()` is a HashMap iteration, so the aggregate has to be
+    // sorted before it decides node order in the DAG — otherwise the same graph
+    // lays out differently from one run to the next.
+    let mut edges: Vec<LayoutEdge> = weights
+        .into_iter()
+        .map(|((source, target), weight)| LayoutEdge {
+            source,
+            target,
+            weight,
+        })
+        .collect();
+    edges.sort_by(|a, b| {
+        a.source
+            .to_string()
+            .cmp(&b.source.to_string())
+            .then_with(|| a.target.to_string().cmp(&b.target.to_string()))
+    });
+    edges
 }
 
 #[cfg(test)]
@@ -559,5 +953,951 @@ mod tests {
         let opts = LayoutOptions::default();
         assert!(compute_layout(&graph, None, CallDirection::Outgoing, &opts).is_empty());
     }
-}
 
+    // -----------------------------------------------------------------------
+    // The cluster map
+    // -----------------------------------------------------------------------
+
+    use crate::demo::create_demo_call_graph;
+    use logic::Clustering;
+
+    fn demo() -> (CallGraph, Clustering) {
+        let graph = create_demo_call_graph();
+        let clustering = Clustering::compute(&graph);
+        (graph, clustering)
+    }
+
+    /// Every cluster in the clustering, top level first, keyed the way the
+    /// workspace's expansion set keys them.
+    fn all_keys(clustering: &Clustering) -> HashSet<ClusterKey> {
+        clustering.clusters().map(|c| c.key).collect()
+    }
+
+    fn clusters_of(layout: &GraphLayout) -> Vec<ClusterKey> {
+        layout
+            .nodes
+            .keys()
+            .filter_map(|node| match node {
+                LayoutNodeId::Cluster(key) => Some(*key),
+                LayoutNodeId::Symbol(_) => None,
+            })
+            .collect()
+    }
+
+    fn symbols_of(layout: &GraphLayout) -> Vec<SymbolId> {
+        layout
+            .nodes
+            .keys()
+            .filter_map(|node| match node {
+                LayoutNodeId::Symbol(symbol) => Some(*symbol),
+                LayoutNodeId::Cluster(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_closed_map_is_one_node_per_top_level_community() {
+        let (graph, clustering) = demo();
+        let expanded = HashSet::new();
+        let layout = compute_cluster_layout(
+            &graph,
+            &clustering,
+            &expanded,
+            CallDirection::Outgoing,
+            LayoutOrientation::LeftRight,
+        );
+
+        let top: HashSet<ClusterKey> = clustering
+            .top_level()
+            .iter()
+            .map(|id| clustering.cluster(*id).unwrap().key)
+            .collect();
+        assert!(top.len() > 1, "the demo graph is meant to have communities");
+
+        assert_eq!(
+            clusters_of(&layout).into_iter().collect::<HashSet<_>>(),
+            top,
+            "a map nobody has opened shows the top level and nothing else"
+        );
+        assert!(
+            symbols_of(&layout).is_empty(),
+            "no functions until one opens"
+        );
+        assert_eq!(
+            layout.nodes.len(),
+            top.len(),
+            "and every one of them is placed"
+        );
+        assert!(
+            layout.groups.is_empty(),
+            "a box needs an open cluster to exist"
+        );
+    }
+
+    #[test]
+    fn opening_a_cluster_swaps_it_for_its_children_and_adds_one_box() {
+        let (graph, clustering) = demo();
+        let closed = HashSet::new();
+        let before = compute_cluster_layout(
+            &graph,
+            &clustering,
+            &closed,
+            CallDirection::Outgoing,
+            LayoutOrientation::LeftRight,
+        );
+
+        // A top-level cluster with sub-clusters under it, so opening it is a
+        // step down the dendrogram rather than straight to functions.
+        let opened = clustering
+            .top_level()
+            .iter()
+            .map(|id| clustering.cluster(*id).unwrap())
+            .find(|c| c.level > 0 && c.children.len() > 1)
+            .expect("the demo graph is meant to produce a hierarchy");
+        let children: HashSet<ClusterKey> = opened
+            .children
+            .iter()
+            .map(|id| clustering.cluster(*id).unwrap().key)
+            .collect();
+
+        let expanded = HashSet::from([opened.key]);
+        let after = compute_cluster_layout(
+            &graph,
+            &clustering,
+            &expanded,
+            CallDirection::Outgoing,
+            LayoutOrientation::LeftRight,
+        );
+
+        let shown: HashSet<ClusterKey> = clusters_of(&after).into_iter().collect();
+        assert!(
+            !shown.contains(&opened.key),
+            "the cluster itself is now a box, not a node"
+        );
+        assert!(children.is_subset(&shown), "its children took its place");
+        assert_eq!(after.nodes.len(), before.nodes.len() - 1 + children.len());
+
+        assert_eq!(
+            after.groups.len(),
+            1,
+            "exactly one box for one open cluster"
+        );
+        let group = &after.groups[0];
+        assert_eq!(group.key, opened.key);
+        assert_eq!(group.label, opened.label);
+        assert_eq!(
+            group.count,
+            opened.members.len(),
+            "the box counts functions"
+        );
+        assert_eq!(group.level, opened.level);
+        assert_eq!(
+            group.members.iter().copied().collect::<HashSet<_>>(),
+            children.iter().map(|k| LayoutNodeId::Cluster(*k)).collect(),
+        );
+    }
+
+    #[test]
+    fn opening_everything_reaches_the_functions_themselves() {
+        let (graph, clustering) = demo();
+        let expanded = all_keys(&clustering);
+        let layout = compute_cluster_layout(
+            &graph,
+            &clustering,
+            &expanded,
+            CallDirection::Outgoing,
+            LayoutOrientation::LeftRight,
+        );
+
+        assert!(
+            clusters_of(&layout).is_empty(),
+            "with every box open there is no community left to stand in for anything"
+        );
+
+        let clustered: HashSet<SymbolId> = graph
+            .function_ids()
+            .copied()
+            .filter(|id| clustering.cluster_of(id).is_some())
+            .collect();
+        assert_eq!(
+            symbols_of(&layout).into_iter().collect::<HashSet<_>>(),
+            clustered
+        );
+        assert_eq!(layout.nodes.len(), clustered.len(), "all of them placed");
+
+        // Every cluster at every level is open, so every one is a box, and the
+        // level-0 boxes are the ones holding functions.
+        assert_eq!(layout.groups.len(), clustering.clusters().count());
+        for group in &layout.groups {
+            assert!(!group.members.is_empty());
+            if group.level == 0 {
+                assert!(group
+                    .members
+                    .iter()
+                    .all(|m| matches!(m, LayoutNodeId::Symbol(_))));
+            }
+        }
+    }
+
+    /// The display node a symbol is drawn as, worked out through
+    /// `Clustering::ancestry` rather than through the walk `compute_cluster_layout`
+    /// does, so the two have to agree for a reason.
+    fn drawn_as(clustering: &Clustering, symbol: &SymbolId) -> Option<LayoutNodeId> {
+        let top = clustering.ancestry(symbol).last().copied()?;
+        Some(LayoutNodeId::Cluster(clustering.cluster(top)?.key))
+    }
+
+    #[test]
+    fn edge_weights_count_the_calls_that_actually_cross() {
+        let (graph, clustering) = demo();
+        let expanded = HashSet::new();
+        let layout = compute_cluster_layout(
+            &graph,
+            &clustering,
+            &expanded,
+            CallDirection::Outgoing,
+            LayoutOrientation::LeftRight,
+        );
+
+        let mut expected: HashMap<(LayoutNodeId, LayoutNodeId), usize> = HashMap::new();
+        for caller in graph.function_ids() {
+            let Some(from) = drawn_as(&clustering, caller) else {
+                continue;
+            };
+            for callee in graph.get_callees(caller) {
+                let Some(to) = drawn_as(&clustering, &callee.id) else {
+                    continue;
+                };
+                if from == to {
+                    continue;
+                }
+                *expected.entry((from, to)).or_insert(0) += 1;
+            }
+        }
+        assert!(!expected.is_empty(), "the communities are meant to talk");
+
+        let actual: HashMap<(LayoutNodeId, LayoutNodeId), usize> = layout
+            .edges
+            .iter()
+            .map(|e| ((e.source, e.target), e.weight))
+            .collect();
+        assert_eq!(
+            actual.len(),
+            layout.edges.len(),
+            "one edge per ordered pair"
+        );
+        assert_eq!(actual, expected);
+
+        for edge in &layout.edges {
+            assert_ne!(
+                edge.source, edge.target,
+                "a call inside a closed community is that community's own business"
+            );
+            assert!(layout.nodes.contains_key(&edge.source));
+            assert!(layout.nodes.contains_key(&edge.target));
+        }
+    }
+
+    #[test]
+    fn reading_the_map_incoming_turns_every_arrow_round() {
+        let (graph, clustering) = demo();
+        let expanded = HashSet::new();
+        let of = |direction| {
+            compute_cluster_layout(
+                &graph,
+                &clustering,
+                &expanded,
+                direction,
+                LayoutOrientation::LeftRight,
+            )
+        };
+
+        let out = of(CallDirection::Outgoing);
+        let incoming = of(CallDirection::Incoming);
+
+        let reversed: HashMap<(LayoutNodeId, LayoutNodeId), usize> = out
+            .edges
+            .iter()
+            .map(|e| ((e.target, e.source), e.weight))
+            .collect();
+        let actual: HashMap<(LayoutNodeId, LayoutNodeId), usize> = incoming
+            .edges
+            .iter()
+            .map(|e| ((e.source, e.target), e.weight))
+            .collect();
+        assert_eq!(actual, reversed);
+    }
+
+    /// Two triangles joined by a single call: two communities, one relation
+    /// between them, which is the smallest map that has a direction at all.
+    fn two_communities() -> (CallGraph, Clustering) {
+        let mut graph = CallGraph::new();
+        let triangle = |graph: &mut CallGraph, prefix: &str, base: u32| {
+            let mut ids = Vec::new();
+            for (offset, suffix) in ["a", "b", "c"].iter().enumerate() {
+                let name = format!("{prefix}_{suffix}");
+                let f = FunctionNode::new(
+                    name.clone(),
+                    name,
+                    Location::new("src/x.c".to_string(), base + offset as u32, 0),
+                );
+                let id = f.id;
+                graph.add_function(f);
+                ids.push(id);
+            }
+            for (offset, (from, to)) in [(0, 1), (1, 2), (0, 2)].into_iter().enumerate() {
+                graph.add_call(
+                    ids[from],
+                    ids[to],
+                    Location::new("src/x.c".to_string(), base + 100 + offset as u32, 0),
+                );
+            }
+            ids
+        };
+        let left = triangle(&mut graph, "left", 10);
+        let right = triangle(&mut graph, "right", 40);
+        graph.add_call(
+            left[2],
+            right[0],
+            Location::new("src/x.c".to_string(), 500, 0),
+        );
+
+        let clustering = Clustering::compute(&graph);
+        (graph, clustering)
+    }
+
+    #[test]
+    fn the_map_transposes_for_a_top_down_orientation() {
+        let (graph, clustering) = two_communities();
+        assert_eq!(clustering.top_level().len(), 2, "two communities, one edge");
+
+        let expanded = HashSet::new();
+        let of = |orientation| {
+            compute_cluster_layout(
+                &graph,
+                &clustering,
+                &expanded,
+                CallDirection::Outgoing,
+                orientation,
+            )
+        };
+
+        let side_by_side = of(LayoutOrientation::LeftRight);
+        let stacked = of(LayoutOrientation::TopDown);
+        assert_eq!(side_by_side.nodes.len(), 2);
+        assert_eq!(stacked.nodes.len(), 2);
+
+        let pair = |layout: &GraphLayout| {
+            let mut positions: Vec<NodePos> = layout.nodes.values().copied().collect();
+            positions.sort_by(|a, b| (a.x, a.y).partial_cmp(&(b.x, b.y)).unwrap());
+            (positions[0], positions[1])
+        };
+
+        // Left-to-right, the caller's community sits a level to the left of the
+        // callee's and the two share a row.
+        let (a, b) = pair(&side_by_side);
+        assert!(
+            (b.x - a.x).abs() >= LEVEL_SEPARATION,
+            "level pitch {} must clear a node plus its gutter",
+            b.x - a.x
+        );
+        assert!((a.y - b.y).abs() < 1.0, "one level apart, same row");
+
+        // Transposed, the same relation runs down the canvas instead — the
+        // levels advance along y and the two share a column.
+        let (a, b) = pair(&stacked);
+        assert!(
+            (b.y - a.y).abs() >= LEVEL_SEPARATION_TOPDOWN,
+            "level pitch {} must clear a node plus its top-down gutter",
+            b.y - a.y
+        );
+        assert!((a.x - b.x).abs() < 1.0, "one level apart, same column");
+    }
+
+    /// A stale expansion set can name a cluster whose parent is shut — the
+    /// user opened both, closed the parent, and the child's key stayed behind.
+    #[test]
+    fn a_cluster_opened_under_a_closed_one_waits_its_turn() {
+        let (graph, clustering) = demo();
+        let parent = clustering
+            .top_level()
+            .iter()
+            .map(|id| clustering.cluster(*id).unwrap())
+            .find(|c| c.level > 0 && !c.children.is_empty())
+            .expect("a hierarchy");
+        let child = clustering.cluster(parent.children[0]).unwrap();
+
+        let closed = HashSet::new();
+        let baseline = compute_cluster_layout(
+            &graph,
+            &clustering,
+            &closed,
+            CallDirection::Outgoing,
+            LayoutOrientation::LeftRight,
+        );
+
+        // Only the child is open, and nothing reaches it.
+        let stale = HashSet::from([child.key]);
+        let layout = compute_cluster_layout(
+            &graph,
+            &clustering,
+            &stale,
+            CallDirection::Outgoing,
+            LayoutOrientation::LeftRight,
+        );
+        assert!(
+            layout.groups.is_empty(),
+            "an expansion under a closed cluster draws no box"
+        );
+        assert_eq!(
+            clusters_of(&layout).into_iter().collect::<HashSet<_>>(),
+            clusters_of(&baseline).into_iter().collect::<HashSet<_>>(),
+            "and leaves the map exactly as it was"
+        );
+
+        // Open the parent and the entry that was waiting takes effect.
+        let both = HashSet::from([parent.key, child.key]);
+        let layout = compute_cluster_layout(
+            &graph,
+            &clustering,
+            &both,
+            CallDirection::Outgoing,
+            LayoutOrientation::LeftRight,
+        );
+        assert_eq!(layout.groups.len(), 2, "the parent's box and the child's");
+        assert!(layout.groups.iter().any(|g| g.key == child.key));
+    }
+
+    #[test]
+    fn an_empty_clustering_lays_out_nothing() {
+        let graph = CallGraph::new();
+        let clustering = Clustering::compute(&graph);
+        assert!(clustering.is_empty());
+
+        let expanded = HashSet::new();
+        let layout = compute_cluster_layout(
+            &graph,
+            &clustering,
+            &expanded,
+            CallDirection::Outgoing,
+            LayoutOrientation::LeftRight,
+        );
+
+        assert!(layout.nodes.is_empty());
+        assert!(layout.groups.is_empty());
+        assert!(layout.edges.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Meta-nodes, and keeping a box's contents together
+    // -----------------------------------------------------------------------
+
+    /// The leaf functions under a cluster, counted by walking the dendrogram
+    /// down to level 0 rather than by trusting `Cluster::members` — the field
+    /// `MetaNode::count` is copied from is the one under test.
+    fn leaves_under(clustering: &Clustering, id: ClusterId) -> HashSet<SymbolId> {
+        let cluster = clustering.cluster(id).expect("a live cluster id");
+        if cluster.level == 0 {
+            return cluster.members.iter().copied().collect();
+        }
+        cluster
+            .children
+            .iter()
+            .flat_map(|&child| leaves_under(clustering, child))
+            .collect()
+    }
+
+    /// The first top-level cluster with enough children to be worth opening.
+    fn openable(clustering: &Clustering) -> &logic::Cluster {
+        clustering
+            .top_level()
+            .iter()
+            .map(|id| clustering.cluster(*id).unwrap())
+            .find(|c| c.level > 0 && c.children.len() > 1)
+            .expect("the demo graph is meant to produce a hierarchy")
+    }
+
+    /// Every display node inside one box, descending through nested boxes. A
+    /// `Cluster` member is a box exactly when it is not itself a placed node.
+    fn drawn_members(layout: &GraphLayout, key: ClusterKey) -> HashSet<LayoutNodeId> {
+        let group = layout
+            .groups
+            .iter()
+            .find(|g| g.key == key)
+            .expect("an open cluster has a box");
+        let mut inside = HashSet::new();
+        for member in &group.members {
+            if layout.nodes.contains_key(member) {
+                inside.insert(*member);
+            } else if let LayoutNodeId::Cluster(nested) = member {
+                inside.extend(drawn_members(layout, *nested));
+            }
+        }
+        inside
+    }
+
+    /// The placed nodes bucketed into layers and ordered along the axis siblings
+    /// spread on — which is y left-to-right and x top-down, the same transpose
+    /// `to_centre` undoes. Contiguity is a property *within* a layer: two nodes
+    /// a level apart say nothing about each other's neighbours.
+    ///
+    /// Every node on a layer is given the same level-axis coordinate and
+    /// `balance_aspect` scales that axis uniformly, so bucketing on the exact
+    /// bits is sound and no tolerance has to be invented.
+    fn layers(
+        positions: &HashMap<LayoutNodeId, NodePos>,
+        orientation: LayoutOrientation,
+    ) -> Vec<Vec<LayoutNodeId>> {
+        let axes = |p: &NodePos| match orientation {
+            LayoutOrientation::LeftRight => (p.x, p.y),
+            LayoutOrientation::TopDown => (p.y, p.x),
+        };
+        let mut by_level: HashMap<u32, Vec<(f32, LayoutNodeId)>> = HashMap::new();
+        for (node, pos) in positions {
+            let (level, cross) = axes(pos);
+            by_level
+                .entry(level.to_bits())
+                .or_default()
+                .push((cross, *node));
+        }
+        let mut levels: Vec<(u32, Vec<(f32, LayoutNodeId)>)> = by_level.into_iter().collect();
+        levels.sort_by_key(|(level, _)| *level);
+        levels
+            .into_iter()
+            .map(|(_, mut row)| {
+                row.sort_by(|a, b| {
+                    a.0.partial_cmp(&b.0)
+                        .unwrap()
+                        .then_with(|| a.1.to_string().cmp(&b.1.to_string()))
+                });
+                row.into_iter().map(|(_, node)| node).collect()
+            })
+            .collect()
+    }
+
+    /// Where `members` sit in one layer's order.
+    fn slots(layer: &[LayoutNodeId], members: &HashSet<LayoutNodeId>) -> Vec<usize> {
+        layer
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| members.contains(node))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// True when nothing outside `members` sits between two of them.
+    fn contiguous(layer: &[LayoutNodeId], members: &HashSet<LayoutNodeId>) -> bool {
+        slots(layer, members)
+            .windows(2)
+            .all(|pair| pair[1] == pair[0] + 1)
+    }
+
+    /// A layer worth testing: two of the group's members, and at least one
+    /// outsider that could have come to rest between them.
+    fn could_be_split(layer: &[LayoutNodeId], members: &HashSet<LayoutNodeId>) -> bool {
+        let inside = slots(layer, members).len();
+        inside > 1 && inside < layer.len()
+    }
+
+    /// The order `compute_cluster_layout` reaches display nodes in, rebuilt from
+    /// the clustering alone.
+    ///
+    /// `grid` knows its nodes by index and the index is the position in that
+    /// list, so a reference layout that added its nodes in any other order would
+    /// be a different layout and would prove nothing.
+    fn display_order(clustering: &Clustering, expanded: &HashSet<ClusterKey>) -> Vec<LayoutNodeId> {
+        fn walk(
+            clustering: &Clustering,
+            id: ClusterId,
+            expanded: &HashSet<ClusterKey>,
+            out: &mut Vec<LayoutNodeId>,
+        ) {
+            let cluster = clustering.cluster(id).expect("a live cluster id");
+            if !expanded.contains(&cluster.key) {
+                out.push(LayoutNodeId::Cluster(cluster.key));
+            } else if cluster.level == 0 {
+                out.extend(cluster.members.iter().map(|s| LayoutNodeId::Symbol(*s)));
+            } else {
+                for &child in &cluster.children {
+                    walk(clustering, child, expanded, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for &id in clustering.top_level() {
+            walk(clustering, id, expanded, &mut out);
+        }
+        out
+    }
+
+    /// The same map laid out the way it was before grouping: one flat DAG
+    /// through `compute_dag`, with no idea which nodes belong together.
+    ///
+    /// This is the baseline for both of the things worth knowing about the
+    /// switch — that it changed nothing when nothing is open, and that it
+    /// changed the right thing when something is.
+    fn flat_layout(
+        clustering: &Clustering,
+        expanded: &HashSet<ClusterKey>,
+        edges: &[LayoutEdge],
+        orientation: LayoutOrientation,
+    ) -> HashMap<LayoutNodeId, NodePos> {
+        let display = display_order(clustering, expanded);
+        let index: HashMap<LayoutNodeId, usize> = display
+            .iter()
+            .enumerate()
+            .map(|(i, node)| (*node, i))
+            .collect();
+        let mut dag: Dag<LayoutNodeId> = Dag::new();
+        for node in &display {
+            dag.add_node(*node);
+        }
+        for edge in edges {
+            let _ = dag.add_edge(index[&edge.source], index[&edge.target]);
+        }
+        let mut engine =
+            LayoutEngine::with_config(layout_config(orientation)).expect("a valid config");
+        let laid_out = engine.compute_dag(&dag).expect("a layout");
+        let mut positions: HashMap<LayoutNodeId, NodePos> = display
+            .iter()
+            .enumerate()
+            .filter_map(|(i, node)| {
+                laid_out
+                    .position(i)
+                    .map(|pos| (*node, to_centre(&pos, orientation)))
+            })
+            .collect();
+        balance_aspect(&mut positions, orientation);
+        positions
+    }
+
+    /// A graph whose communities the ungrouped layout pulls apart.
+    ///
+    /// The demo graph is no use for this: open one of its communities and the
+    /// members land on separate levels, where contiguity means nothing and any
+    /// assertion about it passes for free. What is needed is a community whose
+    /// members share a level with a stranger, and whose callers sit far enough
+    /// apart that the barycentre heuristic wants to put the stranger between
+    /// them. So: a star community `a*`, two of whose points are called from
+    /// elsewhere, plus a handful of triangles that cluster on their own and give
+    /// the layer something to interleave with.
+    ///
+    /// The exact communities are Louvain's to decide and are not asserted here;
+    /// what the test needs is only that *some* box comes out split without
+    /// grouping, and it checks that before it checks anything else.
+    fn interleaving_graph() -> (CallGraph, Clustering, SymbolId) {
+        let mut graph = CallGraph::new();
+        let mut ids: HashMap<&str, SymbolId> = HashMap::new();
+        let mut line = 1u32;
+        for name in [
+            "a0", "a1", "a2", "a3", "p1", "p2", "p3", "q1", "q2", "q3", "r1", "r2", "r3", "b1",
+            "b2", "b3",
+        ] {
+            let f = FunctionNode::new(
+                name.to_string(),
+                name.to_string(),
+                Location::new("src/x.c".to_string(), line, 0),
+            );
+            line += 1;
+            ids.insert(name, f.id);
+            graph.add_function(f);
+        }
+        for (from, to) in [
+            // The star, with `a3` called three times so that the two callers it
+            // picks up below cannot tempt Louvain into moving it out.
+            ("a0", "a1"),
+            ("a0", "a2"),
+            ("a0", "a3"),
+            ("a0", "a3"),
+            ("a0", "a3"),
+            // Four triangles, each tight enough to be a community.
+            ("p1", "p2"),
+            ("p2", "p3"),
+            ("p1", "p3"),
+            ("q1", "q2"),
+            ("q2", "q3"),
+            ("q1", "q3"),
+            ("r1", "r2"),
+            ("r2", "r3"),
+            ("r1", "r3"),
+            ("b1", "b2"),
+            ("b2", "b3"),
+            ("b1", "b3"),
+            // The calls that spread the star's points across the level.
+            ("p1", "a1"),
+            ("q1", "a3"),
+            ("r1", "a3"),
+            ("p2", "b1"),
+        ] {
+            graph.add_call(
+                ids[from],
+                ids[to],
+                Location::new("src/x.c".to_string(), line, 0),
+            );
+            line += 1;
+        }
+        let clustering = Clustering::compute(&graph);
+        (graph, clustering, ids["a0"])
+    }
+
+    /// Opening a community must put its members next to each other, because the
+    /// client draws a box round them and a box round a scattered set swallows
+    /// whatever it happens to span.
+    ///
+    /// The first assertion is the one that keeps this honest: the same map laid
+    /// out flat, the way it was before `compute_dag_grouped`, has to come out
+    /// split. Without that this test would pass on a layout that never had a
+    /// problem.
+    #[test]
+    fn an_open_clusters_members_land_side_by_side() {
+        let (graph, clustering, anchor) = interleaving_graph();
+        let community = clustering
+            .cluster_of(&anchor)
+            .expect("a clustered function");
+        let opened = clustering.cluster(community).expect("its community");
+        let expanded = HashSet::from([opened.key]);
+
+        for orientation in [LayoutOrientation::LeftRight, LayoutOrientation::TopDown] {
+            let layout = compute_cluster_layout(
+                &graph,
+                &clustering,
+                &expanded,
+                CallDirection::Outgoing,
+                orientation,
+            );
+            let members = drawn_members(&layout, opened.key);
+            assert!(members.len() > 1, "a box with one thing in it cannot split");
+
+            let flat = flat_layout(&clustering, &expanded, &layout.edges, orientation);
+            assert!(
+                layers(&flat, orientation)
+                    .iter()
+                    .any(|layer| !contiguous(layer, &members)),
+                "{orientation:?}: the ungrouped layout has to scatter this box, \
+                 or holding it together is untested"
+            );
+
+            let mut tested = 0;
+            for layer in layers(&layout.nodes, orientation) {
+                assert!(
+                    contiguous(&layer, &members),
+                    "{orientation:?}: an outsider sits inside the box, layer {layer:?}"
+                );
+                if could_be_split(&layer, &members) {
+                    tested += 1;
+                }
+            }
+            assert!(
+                tested > 0,
+                "{orientation:?}: no layer holds two members and an outsider that \
+                 could have come between them"
+            );
+        }
+    }
+
+    /// The same guarantee one level in: a box inside a box is still a box.
+    ///
+    /// The tag a node carries is its *innermost* open cluster, so it is the
+    /// inner runs that `grid` is asked to keep whole. An outer box is built from
+    /// those runs and from its own meta-nodes, and holding it together as well
+    /// is a further constraint this does not yet make — which is why the claim
+    /// here is about the inner box, and about it staying inside its parent's
+    /// run rather than wandering off among strangers.
+    #[test]
+    fn a_nested_box_stays_whole_inside_the_one_around_it() {
+        let (graph, clustering) = demo();
+        // Everything open: every level-0 box is then nested in the level-1 box
+        // that owns it, which is the case worth checking and the one a user
+        // reaches by opening twice.
+        let expanded = all_keys(&clustering);
+        let nested: Vec<(ClusterKey, ClusterKey)> = clustering
+            .clusters()
+            .filter(|c| c.level == 0)
+            .map(|c| {
+                let parent = clustering
+                    .cluster(c.parent.expect("a level-0 cluster has a parent here"))
+                    .unwrap();
+                (c.key, parent.key)
+            })
+            .collect();
+        assert!(nested.len() > 1, "the demo graph is meant to nest");
+
+        for orientation in [LayoutOrientation::LeftRight, LayoutOrientation::TopDown] {
+            let layout = compute_cluster_layout(
+                &graph,
+                &clustering,
+                &expanded,
+                CallDirection::Outgoing,
+                orientation,
+            );
+            let flat = flat_layout(&clustering, &expanded, &layout.edges, orientation);
+            let (mut tested, mut would_have_split) = (0, 0);
+
+            for (inner, outer) in &nested {
+                let inside = drawn_members(&layout, *inner);
+                let around = drawn_members(&layout, *outer);
+                assert!(inside.is_subset(&around), "the inner box is in the outer");
+                assert!(around.len() > inside.len(), "and is not all of it");
+
+                if layers(&flat, orientation)
+                    .iter()
+                    .any(|layer| !contiguous(layer, &inside))
+                {
+                    would_have_split += 1;
+                }
+                for layer in layers(&layout.nodes, orientation) {
+                    assert!(
+                        contiguous(&layer, &inside),
+                        "{orientation:?}: the inner box is split, layer {layer:?}"
+                    );
+                    // Two of the inner box's members, and a sibling of the box
+                    // itself on the same level to come between them: this is the
+                    // level where the nesting is actually load-bearing.
+                    if could_be_split(&layer, &inside) && !slots(&layer, &around).is_empty() {
+                        tested += 1;
+                    }
+                }
+            }
+            assert!(
+                tested > 0,
+                "{orientation:?}: no level puts two of an inner box's members \
+                 beside anything that could split them"
+            );
+            assert!(
+                would_have_split > 0,
+                "{orientation:?}: the ungrouped layout has to scatter one of \
+                 these boxes, or nesting them is untested"
+            );
+        }
+    }
+
+    #[test]
+    fn every_closed_cluster_is_named_and_no_open_one_is() {
+        let (graph, clustering) = demo();
+        let opened = openable(&clustering);
+        let nested = clustering.cluster(opened.children[0]).unwrap();
+
+        for expanded in [
+            HashSet::new(),
+            HashSet::from([opened.key]),
+            HashSet::from([opened.key, nested.key]),
+            all_keys(&clustering),
+        ] {
+            let layout = compute_cluster_layout(
+                &graph,
+                &clustering,
+                &expanded,
+                CallDirection::Outgoing,
+                LayoutOrientation::LeftRight,
+            );
+
+            let named: HashSet<ClusterKey> = layout.metas.iter().map(|m| m.key).collect();
+            assert_eq!(
+                named.len(),
+                layout.metas.len(),
+                "a meta-node gets described once, not twice"
+            );
+            assert_eq!(
+                named,
+                clusters_of(&layout).into_iter().collect::<HashSet<_>>(),
+                "`metas` is exactly the cluster ids `nodes` places"
+            );
+            for group in &layout.groups {
+                assert!(
+                    !named.contains(&group.key),
+                    "an expanded cluster is a box, and a box is not a meta-node"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_meta_node_says_what_it_hides_and_what_to_call_it() {
+        let (graph, clustering) = demo();
+        let opened = openable(&clustering);
+        let expanded = HashSet::from([opened.key]);
+        let layout = compute_cluster_layout(
+            &graph,
+            &clustering,
+            &expanded,
+            CallDirection::Outgoing,
+            LayoutOrientation::LeftRight,
+        );
+        assert!(layout.metas.len() > 1, "several communities stay shut");
+
+        for meta in &layout.metas {
+            let cluster = clustering
+                .by_key(meta.key)
+                .expect("a meta-node names a live cluster");
+            assert_eq!(meta.label, cluster.label, "the clustering names its own");
+            assert_eq!(meta.level, cluster.level);
+            assert_eq!(
+                meta.count,
+                leaves_under(&clustering, cluster.id).len(),
+                "`+N` counts the functions underneath, at whatever depth"
+            );
+            assert!(meta.count > 0, "an empty community is not a community");
+        }
+    }
+
+    /// The regression guard: with nothing open there are no groups, so the
+    /// grouped engine has to return what the flat one returned — not close, the
+    /// same bits. A map nobody has opened is the first thing anyone sees, and it
+    /// must not have moved.
+    #[test]
+    fn a_map_with_nothing_open_is_laid_out_exactly_as_before() {
+        let (graph, clustering) = demo();
+        let expanded = HashSet::new();
+
+        for orientation in [LayoutOrientation::LeftRight, LayoutOrientation::TopDown] {
+            let layout = compute_cluster_layout(
+                &graph,
+                &clustering,
+                &expanded,
+                CallDirection::Outgoing,
+                orientation,
+            );
+            let flat = flat_layout(&clustering, &expanded, &layout.edges, orientation);
+
+            assert_eq!(layout.nodes.len(), flat.len());
+            assert!(!flat.is_empty());
+            for (node, before) in &flat {
+                let after = layout.nodes.get(node).expect("the same nodes");
+                assert_eq!(after.x.to_bits(), before.x.to_bits(), "{node} moved in x");
+                assert_eq!(after.y.to_bits(), before.y.to_bits(), "{node} moved in y");
+            }
+        }
+    }
+
+    /// A `LayoutNodeId` is a JSON *map key*, and JSON has no keys but strings —
+    /// so its string form is the wire contract, not an implementation detail.
+    #[test]
+    fn a_layout_node_id_is_a_string_on_the_wire() {
+        let symbol = SymbolId::from_content("a", "a.c", 1);
+        for node in [
+            LayoutNodeId::Symbol(symbol),
+            LayoutNodeId::Cluster(ClusterKey {
+                level: 2,
+                anchor: symbol,
+            }),
+        ] {
+            let json = serde_json::to_value(node).expect("serialises");
+            assert!(json.is_string(), "{json} has to be usable as a map key");
+            assert_eq!(
+                serde_json::from_value::<LayoutNodeId>(json).expect("round-trips"),
+                node
+            );
+        }
+
+        let mut nodes = HashMap::new();
+        nodes.insert(LayoutNodeId::Symbol(symbol), NodePos { x: 1.0, y: 2.0 });
+        let layout = GraphLayout {
+            nodes,
+            groups: Vec::new(),
+            metas: Vec::new(),
+            edges: Vec::new(),
+        };
+        let json = serde_json::to_value(&layout).expect("a whole layout serialises");
+        assert!(json["nodes"][format!("fn:{}", symbol.0)].is_object());
+    }
+}

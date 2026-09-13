@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use crate::app::CoreApp;
 use crate::command::Command;
 use crate::events::AppEvent;
-use crate::layout::{compute_layout, LayoutOptions, LayoutOrientation, NodePos};
+use crate::layout::{
+    compute_cluster_layout, compute_layout, GraphLayout, LayoutOptions, LayoutOrientation, NodePos,
+};
 use crate::workspace::ViewMode;
 
 /// Messages the backend sends to the client.
@@ -27,6 +29,13 @@ pub enum ServerMsg {
     Snapshot {
         graph: CallGraph,
         layout: HashMap<SymbolId, NodePos>,
+        /// The cluster map, present only while the active workspace is showing
+        /// one. It is a second, parallel layout rather than a replacement for
+        /// `layout`: the two views draw different things out of the same graph,
+        /// and a client that knows nothing about clusters goes on reading
+        /// `layout` and never sees this field at all.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cluster_layout: Option<GraphLayout>,
         workspaces: Vec<WorkspaceInfo>,
         /// Index into `workspaces` of the active tab. The workspace commands
         /// (`SwitchWorkspace`, `CloseWorkspace`, `RenameWorkspace`) address
@@ -97,6 +106,7 @@ pub fn snapshot_of(core: &CoreApp) -> ServerMsg {
     ServerMsg::Snapshot {
         graph: core.call_graph.clone(),
         layout,
+        cluster_layout: cluster_layout_of(core),
         workspaces: workspace_infos(core),
         active_workspace: core.workspaces.current_index,
         selected: core.selected_function,
@@ -111,6 +121,26 @@ pub fn layout_of(core: &CoreApp) -> ServerMsg {
     ServerMsg::Layout {
         layout: compute_layout(&core.call_graph, root, direction, &layout_options(core)),
     }
+}
+
+/// The cluster map for the active workspace, or `None` when it is showing the
+/// rooted call tree instead.
+///
+/// Computing it is not free — it walks every call in the graph — so it is done
+/// only for the view that is actually on screen, and `ViewMode` still defaults
+/// to `Rooted`, so in practice nothing asks for it yet.
+fn cluster_layout_of(core: &CoreApp) -> Option<GraphLayout> {
+    let ws = core.workspaces.current()?;
+    if ws.view != ViewMode::ClusterMap {
+        return None;
+    }
+    Some(compute_cluster_layout(
+        &core.call_graph,
+        core.clustering(),
+        &ws.expanded_clusters,
+        ws.direction,
+        ws.orientation,
+    ))
 }
 
 /// Layout options taken from the active workspace.
@@ -358,6 +388,37 @@ mod tests {
                 "workspace field `{field}` is read by the client"
             );
         }
+    }
+
+    /// The cluster map rides along on the snapshot rather than replacing the
+    /// rooted layout, and only for the view that is actually showing.
+    #[test]
+    fn the_cluster_map_is_absent_until_a_workspace_asks_for_it() {
+        let mut core = CoreApp::new(crate::demo::create_demo_call_graph());
+
+        let json = serde_json::to_value(snapshot_of(&core)).expect("snapshot serialises");
+        assert!(
+            json.get("cluster_layout").is_none(),
+            "a rooted workspace must send exactly what it sent before"
+        );
+
+        core.workspaces
+            .current_mut()
+            .expect("a default workspace")
+            .set_view(ViewMode::ClusterMap);
+
+        let json = serde_json::to_value(snapshot_of(&core)).expect("snapshot serialises");
+        let map = json
+            .get("cluster_layout")
+            .expect("the map view carries a map");
+        assert!(
+            map["nodes"].as_object().is_some_and(|n| !n.is_empty()),
+            "and the map has the communities on it"
+        );
+        assert!(
+            json.get("layout").is_some(),
+            "the rooted layout still ships"
+        );
     }
 
     #[test]
