@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use logic::{ClusterId, Clustering};
+use logic::{ClusterKey, Clustering};
 use lsp::LspResponse;
 use model::{CallDirection, CallGraph, FunctionNode, Location, LspLoadPhase, SymbolId};
 
@@ -106,8 +106,8 @@ impl CoreApp {
             Command::ToggleCollapsed(id) => self.cmd_toggle_collapsed(id),
             Command::SetGraphOrientation(o) => self.cmd_set_graph_orientation(o),
             Command::SetViewMode(view) => self.cmd_set_view_mode(view),
-            Command::ToggleClusterExpanded(id) => self.cmd_toggle_cluster_expanded(id),
-            Command::DrillIntoCluster(id) => self.cmd_drill_into_cluster(id),
+            Command::ToggleClusterExpanded(key) => self.cmd_toggle_cluster_expanded(key),
+            Command::DrillIntoCluster(key) => self.cmd_drill_into_cluster(key),
             Command::ZoomOutToClusters => self.cmd_zoom_out_to_clusters(),
             Command::NewWorkspace => self.cmd_new_workspace(),
             Command::CloseWorkspace(index) => self.cmd_close_workspace(index),
@@ -458,23 +458,23 @@ impl CoreApp {
         }
     }
 
-    fn cmd_toggle_cluster_expanded(&mut self, id: ClusterId) -> Vec<AppEvent> {
+    fn cmd_toggle_cluster_expanded(&mut self, key: ClusterKey) -> Vec<AppEvent> {
         match self.workspaces.current_mut() {
             Some(ws) => {
-                ws.toggle_cluster_expanded(id);
+                ws.toggle_cluster_expanded(key);
                 vec![AppEvent::LayoutDirty]
             }
             None => vec![],
         }
     }
 
-    fn cmd_drill_into_cluster(&mut self, id: ClusterId) -> Vec<AppEvent> {
-        // A cluster with no entry point has nothing to root a tree at, and an
-        // unknown id is a click against a clustering that has since been
-        // recomputed. Either way the honest answer is to leave the view where
-        // the user left it rather than root it somewhere arbitrary.
-        let Some(entry) = self.clustering.cluster(id).and_then(|c| c.entry_point) else {
-            log::info!("CoreApp: drill into {id:?} ignored — no entry point to root at");
+    fn cmd_drill_into_cluster(&mut self, key: ClusterKey) -> Vec<AppEvent> {
+        // A cluster with no entry point has nothing to root a tree at, and a key
+        // that resolves to nothing is a click against a clustering whose anchor
+        // has since moved. Either way the honest answer is to leave the view
+        // where the user left it rather than root it somewhere arbitrary.
+        let Some(entry) = self.clustering.by_key(key).and_then(|c| c.entry_point) else {
+            log::info!("CoreApp: drill into {key:?} ignored — no entry point to root at");
             return vec![];
         };
 
@@ -737,6 +737,14 @@ mod tests {
         (graph, left, right)
     }
 
+    /// The key naming the cluster that holds `symbol` — what the cluster
+    /// commands take, since they come back from a frontend whose snapshot may
+    /// predate a recompute.
+    fn key_of(app: &CoreApp, symbol: SymbolId) -> ClusterKey {
+        let id = app.clustering().cluster_of(&symbol).expect("clustered");
+        app.clustering().cluster(id).expect("a known id").key
+    }
+
     /// Pretend the settling period has already elapsed, rather than sleeping
     /// through it for real in a unit test.
     fn backdate(app: &mut CoreApp) {
@@ -876,14 +884,14 @@ mod tests {
         let mut app = CoreApp::new(graph);
         app.dispatch(Command::SetViewMode(ViewMode::ClusterMap));
 
-        let cluster = app.clustering().cluster_of(&right[0]).expect("clustered");
+        let key = key_of(&app, right[0]);
         let entry = app
             .clustering()
-            .cluster(cluster)
+            .by_key(key)
             .and_then(|c| c.entry_point)
             .expect("a cluster with members has a front door");
 
-        let events = app.dispatch(Command::DrillIntoCluster(cluster));
+        let events = app.dispatch(Command::DrillIntoCluster(key));
         assert!(events.iter().any(|e| matches!(e, AppEvent::LayoutDirty)));
 
         let ws = app.workspaces.current().expect("a workspace");
@@ -898,9 +906,12 @@ mod tests {
         let mut app = CoreApp::new(graph);
         app.dispatch(Command::SetViewMode(ViewMode::ClusterMap));
 
-        // A click against a clustering that has since been recomputed, or an
-        // id that never existed. Either way there is nothing to root at.
-        let events = app.dispatch(Command::DrillIntoCluster(ClusterId(9_999)));
+        // A click against a clustering whose anchor has since moved, or a key
+        // that never named anything. Either way there is nothing to root at.
+        let events = app.dispatch(Command::DrillIntoCluster(ClusterKey {
+            level: 0,
+            anchor: SymbolId::from_content("nobody", "nowhere.c", 1),
+        }));
 
         assert!(events.is_empty());
         let ws = app.workspaces.current().expect("a workspace");
@@ -913,8 +924,7 @@ mod tests {
         let (graph, _, right) = two_triangles();
         let mut app = CoreApp::new(graph);
 
-        let cluster = app.clustering().cluster_of(&right[0]).expect("clustered");
-        app.dispatch(Command::DrillIntoCluster(cluster));
+        app.dispatch(Command::DrillIntoCluster(key_of(&app, right[0])));
         assert_eq!(app.workspaces.current().unwrap().view, ViewMode::Rooted);
 
         let events = app.dispatch(Command::ZoomOutToClusters);
@@ -931,18 +941,18 @@ mod tests {
     fn toggling_a_cluster_round_trips_and_a_new_root_clears_it() {
         let (graph, left, right) = two_triangles();
         let mut app = CoreApp::new(graph);
-        let cluster = app.clustering().cluster_of(&right[0]).expect("clustered");
+        let key = key_of(&app, right[0]);
 
-        let events = app.dispatch(Command::ToggleClusterExpanded(cluster));
+        let events = app.dispatch(Command::ToggleClusterExpanded(key));
         assert!(events.iter().any(|e| matches!(e, AppEvent::LayoutDirty)));
         assert!(app
             .workspaces
             .current()
             .unwrap()
             .expanded_clusters
-            .contains(&cluster));
+            .contains(&key));
 
-        app.dispatch(Command::ToggleClusterExpanded(cluster));
+        app.dispatch(Command::ToggleClusterExpanded(key));
         assert!(app
             .workspaces
             .current()
@@ -950,7 +960,7 @@ mod tests {
             .expanded_clusters
             .is_empty());
 
-        app.dispatch(Command::ToggleClusterExpanded(cluster));
+        app.dispatch(Command::ToggleClusterExpanded(key));
         app.dispatch(Command::SelectFunction(left[0]));
         assert!(
             app.workspaces

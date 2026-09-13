@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
-use logic::ClusterId;
+use logic::ClusterKey;
 use model::{CallDirection, SymbolId};
 use serde::{Deserialize, Serialize};
 
@@ -50,7 +50,12 @@ pub struct CoreWorkspace {
     /// Which view this workspace is showing.
     pub view: ViewMode,
     /// Clusters the user has opened on the map. Everything else stays a box.
-    pub expanded_clusters: HashSet<ClusterId>,
+    ///
+    /// Keyed by [`ClusterKey`] rather than `ClusterId` because this set outlives
+    /// the clustering it was filled from: the graph grows, the clustering is
+    /// recomputed, and the ids are handed out afresh. A key goes on naming the
+    /// community the user opened; an id would quietly start naming another one.
+    pub expanded_clusters: HashSet<ClusterKey>,
     pub created_at: Instant,
     pub last_accessed: Instant,
 }
@@ -124,7 +129,7 @@ impl CoreWorkspace {
     }
 
     /// Open or close one cluster on the map. Returns true if now expanded.
-    pub fn toggle_cluster_expanded(&mut self, cluster: ClusterId) -> bool {
+    pub fn toggle_cluster_expanded(&mut self, cluster: ClusterKey) -> bool {
         self.touch();
         if self.expanded_clusters.remove(&cluster) {
             false
@@ -382,7 +387,10 @@ mod tests {
     #[test]
     fn cluster_expansion_toggles_and_resets_with_the_root() {
         let mut ws = CoreWorkspace::new(1, "w".to_string());
-        let cluster = ClusterId(7);
+        let cluster = ClusterKey {
+            level: 1,
+            anchor: SymbolId::from_content("anchor", "test.c", 1),
+        };
 
         assert!(ws.toggle_cluster_expanded(cluster), "first toggle opens");
         assert!(ws.expanded_clusters.contains(&cluster));

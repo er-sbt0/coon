@@ -4,7 +4,7 @@ pub mod path;
 pub mod query;
 pub mod traversal;
 
-pub use cluster::{Cluster, ClusterId, Clustering};
+pub use cluster::{Cluster, ClusterId, ClusterKey, Clustering};
 pub use query::{
     DependencyAnalysis, FunctionInfo, GraphQueryEngine, GraphStatistics, ImpactAnalysis,
     ProblemAreas,

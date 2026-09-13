@@ -1,4 +1,4 @@
-use logic::ClusterId;
+use logic::ClusterKey;
 use model::SymbolId;
 
 use crate::layout::LayoutOrientation;
@@ -38,10 +38,15 @@ pub enum Command {
     /// one" — the same reason `SetGraphOrientation` takes an orientation.
     SetViewMode(ViewMode),
     /// Open or close one cluster's contents on the map. The box stays visible.
-    ToggleClusterExpanded(ClusterId),
+    ///
+    /// Named by [`ClusterKey`], not `ClusterId`: this arrives from a frontend
+    /// holding a snapshot that the next recompute may already have invalidated,
+    /// and an id would then open some other community without complaint.
+    ToggleClusterExpanded(ClusterKey),
     /// Leave the map for the call tree rooted at this cluster's entry point —
-    /// the member the clustering picked as its front door.
-    DrillIntoCluster(ClusterId),
+    /// the member the clustering picked as its front door. Keyed for the same
+    /// reason as `ToggleClusterExpanded`.
+    DrillIntoCluster(ClusterKey),
     /// Leave the call tree and go back to the map.
     ZoomOutToClusters,
 

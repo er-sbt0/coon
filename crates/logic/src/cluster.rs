@@ -38,20 +38,63 @@ const REACHABILITY_MEMBER_LIMIT: usize = 200;
 /// risk a hang on a pathological graph.
 const MAX_LOCAL_MOVING_SWEEPS: usize = 100;
 
-/// Identifier for a cluster within one [`Clustering`].
+/// Index handle for a cluster within one [`Clustering`], valid until the next
+/// recompute and no longer.
 ///
-/// Ids are assigned sequentially when the dendrogram is flattened, so they are
-/// *not* stable identifiers across recomputes: the same group of functions can
-/// come back under a different id after the graph grows. Stability across
-/// recomputes comes from seeding ([`Clustering::compute_seeded`]), which keeps
-/// the *grouping* intact; it does not keep the numbering intact.
+/// Ids are assigned sequentially when the dendrogram is flattened, in the order
+/// the clusters at a level sort by their lowest member, so they are *not* names
+/// for a community: the same group of functions routinely comes back under a
+/// different id once the graph grows, because one new symbol sorting ahead of
+/// the others renumbers everything behind it. Seeding
+/// ([`Clustering::compute_seeded`]) keeps the *grouping* stable across a
+/// recompute; it says nothing at all about the numbering.
+///
+/// So an id is for indexing the clustering you are holding right now. Anything
+/// that outlives it — workspace state, a snapshot the frontend keeps, a command
+/// arriving back over the wire — must name clusters with a [`ClusterKey`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ClusterId(pub u32);
+
+/// A name for a cluster that survives a recompute.
+///
+/// The clusters at one level partition the clustered symbols — every clustered
+/// symbol is in exactly one of them — so any member chosen by a rule that looks
+/// only at the member set picks out its cluster uniquely within that level. The
+/// lowest member by uuid is the cheapest such rule, and it is already the one
+/// `build_clustering` uses to order clusters within a level, so the anchor is
+/// simply the first entry of [`Cluster::members`]. A level plus that anchor is
+/// therefore something a frontend can hold across a recompute, and it goes on
+/// naming the same community for as long as that community keeps its lowest
+/// member — which seeded Louvain, regrouping only where new edges argue for it,
+/// mostly does.
+///
+/// It is a durable handle rather than an identity, and the two ways it can slip
+/// are worth being plain about:
+///
+/// - A cluster that splits keeps its key on whichever half still holds the
+///   anchor; the other half comes back under a key of its own.
+/// - A cluster whose anchor member moves elsewhere gets a new key, and the old
+///   key now names whichever cluster took that member in.
+///
+/// Either way a key someone was holding stops resolving to what they opened,
+/// and a box they had expanded comes back closed. That is a re-collapse, not
+/// corruption: nothing is lost that the next click does not restore, which is
+/// exactly what a [`ClusterId`] — stale after *every* recompute, and silently
+/// pointing at some unrelated community — cannot promise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ClusterKey {
+    pub level: usize,
+    /// The cluster's lowest member, ordered by uuid bytes — the same ordering
+    /// every other ordering in this module descends from.
+    pub anchor: SymbolId,
+}
 
 /// One community at one level of the dendrogram.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cluster {
     pub id: ClusterId,
+    /// The handle to use for anything that outlives this `Clustering`.
+    pub key: ClusterKey,
     pub level: usize,
     pub parent: Option<ClusterId>,
     /// Sub-clusters one level finer; empty at level 0.
@@ -72,6 +115,10 @@ pub struct Clustering {
     levels: Vec<Vec<ClusterId>>,
     /// Level-0 lookup; isolated symbols are absent by design.
     index: HashMap<SymbolId, ClusterId>,
+    /// `anchors[l]` resolves a level-`l` [`ClusterKey`]'s anchor to its cluster,
+    /// so [`Clustering::by_key`] is a lookup rather than a scan over every
+    /// cluster at the level.
+    anchors: Vec<HashMap<SymbolId, ClusterId>>,
 }
 
 impl Clustering {
@@ -124,6 +171,17 @@ impl Clustering {
 
     pub fn cluster(&self, id: ClusterId) -> Option<&Cluster> {
         self.clusters.get(id.0 as usize)
+    }
+
+    /// The cluster named by `key`, or `None` when nothing at that level is
+    /// anchored on that symbol — a level this clustering does not have, or a
+    /// key from before a recompute that moved its anchor into another
+    /// community.
+    pub fn by_key(&self, key: ClusterKey) -> Option<&Cluster> {
+        self.anchors
+            .get(key.level)
+            .and_then(|level| level.get(&key.anchor))
+            .and_then(|id| self.cluster(*id))
     }
 
     /// The finest (level 0) cluster holding `symbol`, or `None` if the symbol is
@@ -534,6 +592,13 @@ fn build_clustering(
                     .collect()
             };
 
+            // Populated communities are the only ones given ids, so there is
+            // always a lowest member for the key to anchor on.
+            let key = ClusterKey {
+                level,
+                anchor: member_symbols[0],
+            };
+
             let entry_point = choose_entry_point(graph, &member_symbols);
             let label = entry_point
                 .and_then(|id| graph.get_function(&id))
@@ -542,6 +607,7 @@ fn build_clustering(
 
             clusters.push(Cluster {
                 id,
+                key,
                 level,
                 parent,
                 children,
@@ -559,10 +625,16 @@ fn build_clustering(
         .flat_map(|(bucket, id)| bucket.iter().map(move |&node| (symbols[node], id)))
         .collect();
 
+    let mut anchors: Vec<HashMap<SymbolId, ClusterId>> = vec![HashMap::new(); levels.len()];
+    for cluster in &clusters {
+        anchors[cluster.level].insert(cluster.key.anchor, cluster.id);
+    }
+
     Clustering {
         clusters,
         levels,
         index,
+        anchors,
     }
 }
 
@@ -948,6 +1020,134 @@ mod tests {
         }
         assert_ne!(left_cluster, right_cluster);
         assert!(seeded.cluster_of(&extra).is_some());
+    }
+
+    #[test]
+    fn a_key_anchors_on_the_lowest_member_and_is_unique_within_its_level() {
+        let graph = layered_graph();
+        let clustering = Clustering::compute(&graph);
+
+        for level in 0..clustering.level_count() {
+            let mut seen: HashSet<ClusterKey> = HashSet::new();
+            for id in clustering.level(level) {
+                let cluster = clustering.cluster(*id).unwrap();
+                let lowest = cluster
+                    .members
+                    .iter()
+                    .min_by_key(|member| member.0)
+                    .copied()
+                    .expect("a populated cluster");
+
+                assert_eq!(cluster.key.level, level);
+                assert_eq!(cluster.key.anchor, lowest);
+                // Uniqueness is what makes the key a name at all, and it comes
+                // from the clusters at a level partitioning the symbols.
+                assert!(
+                    seen.insert(cluster.key),
+                    "two clusters at level {level} share a key"
+                );
+                assert_eq!(
+                    clustering.by_key(cluster.key).map(|c| c.id),
+                    Some(cluster.id)
+                );
+            }
+        }
+    }
+
+    /// The reason [`ClusterKey`] exists. A frontend holds a reference to a
+    /// cluster, the graph grows underneath it, and the reference has to still
+    /// mean the community the user was looking at.
+    #[test]
+    fn a_key_outlives_the_recompute_that_renumbers_the_ids() {
+        let (graph, _, _) = two_triangles();
+        let before = Clustering::compute(&graph);
+        assert_eq!(before.level(0).len(), 2);
+
+        // Hold on to the first cluster at level 0 — the one nothing is about to
+        // be added to, so its membership, and therefore its anchor, is the same
+        // on both sides of the recompute.
+        let kept = before.cluster(before.level(0)[0]).unwrap().clone();
+
+        // Grow the *other* cluster by a symbol that sorts below everything in
+        // the graph. That cluster now holds the lowest member at level 0, so it
+        // takes the first id and the ids behind it all shift along.
+        let other = before.cluster(*before.level(0).last().unwrap()).unwrap();
+        let attach_to = other.members[0];
+
+        let mut grown = graph.clone();
+        let (name, line) = name_sorting_below(&graph);
+        let extra = add(&mut grown, &name, line);
+        call(&mut grown, extra, attach_to, 5_000);
+
+        let after = Clustering::compute_seeded(&grown, Some(&before));
+
+        let resolved = after
+            .by_key(kept.key)
+            .expect("the key still names a cluster after the recompute");
+        assert_eq!(
+            resolved.members, kept.members,
+            "the key resolves to the community the user was holding"
+        );
+
+        // And the id does not, which is the whole point: had the workspace
+        // stored `kept.id`, it would now be naming the community that grew.
+        assert_ne!(
+            resolved.id, kept.id,
+            "the fixture is meant to renumber the level; it no longer does"
+        );
+        assert_ne!(
+            after.cluster(kept.id).map(|c| c.members.clone()),
+            Some(kept.members.clone()),
+            "the raw id now names a different set of functions"
+        );
+    }
+
+    #[test]
+    fn a_key_naming_a_level_that_does_not_exist_resolves_to_nothing() {
+        let (graph, left, _) = two_triangles();
+        let clustering = Clustering::compute(&graph);
+        let key = clustering
+            .cluster(clustering.cluster_of(&left[0]).unwrap())
+            .unwrap()
+            .key;
+
+        assert!(clustering.by_key(key).is_some());
+        assert!(clustering
+            .by_key(ClusterKey {
+                level: clustering.level_count(),
+                anchor: key.anchor,
+            })
+            .is_none());
+        assert!(
+            clustering
+                .by_key(ClusterKey {
+                    level: 0,
+                    anchor: SymbolId::from_content("nobody", "nowhere.c", 1),
+                })
+                .is_none(),
+            "an anchor no cluster is keyed on names nothing either"
+        );
+    }
+
+    /// A name and line whose `SymbolId` sorts below every id already in `graph`.
+    ///
+    /// A `SymbolId` is a v5 uuid of the symbol's name and location, so a name
+    /// that sorts ahead of the existing ones cannot be written down by hand; it
+    /// has to be searched for. It is worth searching for, because cluster ids
+    /// are handed out in symbol order and a new lowest symbol therefore
+    /// renumbers its whole level — which is exactly the hazard a stored
+    /// `ClusterId` walks into.
+    fn name_sorting_below(graph: &CallGraph) -> (String, u32) {
+        let lowest = graph
+            .function_ids()
+            .map(|symbol| symbol.0)
+            .min()
+            .expect("a non-empty graph");
+
+        (0u32..10_000)
+            .map(|n| (format!("early_{n}"), 900 + n))
+            .find(|(name, line)| SymbolId::from_content(name, "test.c", *line).0 < lowest)
+            .expect("one of ten thousand uuids sorts below a handful of others")
     }
 
     #[test]

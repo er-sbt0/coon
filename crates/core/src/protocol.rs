@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use logic::ClusterId;
+use logic::ClusterKey;
 use model::{CallDirection, CallGraph, LspLoadPhase, SymbolId};
 use serde::{Deserialize, Serialize};
 
@@ -62,7 +62,9 @@ pub struct WorkspaceInfo {
     /// Which view this workspace is showing — the cluster map or a rooted tree.
     pub view: ViewMode,
     /// Clusters the user has opened on the map, so the client can mark them.
-    pub expanded_clusters: Vec<ClusterId>,
+    /// These are the keys the client sends back, so they have to survive a
+    /// recompute the client did not see.
+    pub expanded_clusters: Vec<ClusterKey>,
 }
 
 /// Build a full `ServerMsg::Snapshot` from current `CoreApp` state.
@@ -315,8 +317,8 @@ mod tests {
             "{\"SetGraphOrientation\":\"LeftRight\"}".to_string(),
             "{\"SetViewMode\":\"ClusterMap\"}".to_string(),
             "{\"SetViewMode\":\"Rooted\"}".to_string(),
-            "{\"ToggleClusterExpanded\":3}".to_string(),
-            "{\"DrillIntoCluster\":3}".to_string(),
+            format!("{{\"ToggleClusterExpanded\":{{\"level\":0,\"anchor\":{id}}}}}"),
+            format!("{{\"DrillIntoCluster\":{{\"level\":2,\"anchor\":{id}}}}}"),
             "\"ZoomOutToClusters\"".to_string(),
         ];
 
