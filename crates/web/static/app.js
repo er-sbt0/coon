@@ -369,7 +369,7 @@ function renderBreadcrumb() {
   // hierarchy and however many boxes the user has opened on it.
   if (currentView === 'ClusterMap') {
     const here = document.createElement('button');
-    here.className = 'crumb current';
+    here.className = 'crumb view current';
     here.textContent = 'Cluster map';
     here.title = 'Click a community to open it, double-click to drill into its call tree';
     here.addEventListener('click', fitGraph);
@@ -386,6 +386,17 @@ function renderBreadcrumb() {
     return;
   }
 
+  // The map is where a rooted tree came from: picking a function is the
+  // gesture that left it, so the way back belongs at the head of the path and
+  // not only in the palette. Shown even with no root, where it is the only
+  // thing there is to do from here.
+  const toMap = document.createElement('button');
+  toMap.className = 'crumb view';
+  toMap.textContent = 'Cluster map';
+  toMap.title = 'Back to the cluster map (Ctrl+M)';
+  toMap.addEventListener('click', showClusterMap);
+  crumbEl.appendChild(toMap);
+
   if (!rootNodeId) {
     const span = document.createElement('span');
     span.className = 'placeholder';
@@ -395,15 +406,15 @@ function renderBreadcrumb() {
   }
 
   const path = pathFromRoot(rootNodeId, selectedNodeId);
-  path.forEach((id, i) => {
-    if (i > 0) {
-      const sep = document.createElement('span');
-      sep.className = 'sep';
-      sep.textContent = '›';
-      crumbEl.appendChild(sep);
-    }
+  path.forEach((id) => {
+    // Always: the map crumb precedes the whole path, so every entry has
+    // something to its left to be separated from.
+    const sep = document.createElement('span');
+    sep.className = 'sep';
+    sep.textContent = '›';
+    crumbEl.appendChild(sep);
     const crumb = document.createElement('button');
-    crumb.className = 'crumb' + (i === path.length - 1 ? ' current' : '');
+    crumb.className = 'crumb' + (id === path[path.length - 1] ? ' current' : '');
     crumb.textContent = allFunctions[id]?.name ?? id;
     crumb.title = allFunctions[id]?.qualified_name ?? '';
     crumb.addEventListener('click', () => expandNode(id));
@@ -701,6 +712,27 @@ function markPathToSelection() {
       cy.$id(`${id}=>${path[i - 1]}`).addClass('on-path');
     }
   });
+}
+
+// ── View ──────────────────────────────────────────────────────────────────────
+
+function showClusterMap() {
+  if (currentView !== 'ClusterMap') sendCommand('ZoomOutToClusters');
+}
+
+/// Ctrl+M. A toggle rather than two bindings because a key has no label to
+/// read as a lie — the objection that keeps the *visible* view control a pair
+/// of named segments does not apply here.
+///
+/// Going back to the tree needs a tree to go back to: a workspace that has
+/// never been rooted would land on the 'No graph selected' canvas, so on the
+/// map with no root this does nothing rather than stranding the user there.
+function toggleView() {
+  if (currentView === 'ClusterMap') {
+    if (rootNodeId) sendCommand({ SetViewMode: 'Rooted' });
+  } else {
+    sendCommand('ZoomOutToClusters');
+  }
 }
 
 // ── Depth ─────────────────────────────────────────────────────────────────────
@@ -1140,8 +1172,8 @@ function buildCommands() {
 
     // The two views, named rather than toggled — the same reason the
     // orientation control shows both segments instead of one that flips.
-    { id: 'view.clusters', label: 'View: Cluster Map', disabled: onMap, run: () => sendCommand('ZoomOutToClusters') },
-    { id: 'view.rooted', label: 'View: Rooted Graph', disabled: !onMap, run: () => sendCommand({ SetViewMode: 'Rooted' }) },
+    { id: 'view.clusters', label: 'View: Cluster Map', hint: 'Ctrl+M', disabled: onMap, run: showClusterMap },
+    { id: 'view.rooted', label: 'View: Rooted Graph', hint: 'Ctrl+M', disabled: !onMap || !rootNodeId, run: () => sendCommand({ SetViewMode: 'Rooted' }) },
     {
       id: 'view.closeclusters',
       label: 'View: Close All Open Communities',
@@ -1238,6 +1270,7 @@ document.addEventListener('keydown', (e) => {
   }
   else if (key === 'f') { e.preventDefault(); searchEl.focus(); searchEl.select(); }
   else if (key === 'r') { e.preventDefault(); sendCommand('Refresh'); }
+  else if (key === 'm') { e.preventDefault(); toggleView(); }
   else if (key === 'd' && e.shiftKey) { e.preventDefault(); setOrientation(currentOrientation === 'LeftRight' ? 'TopDown' : 'LeftRight'); }
   else if (key === 'd') { e.preventDefault(); sendCommand('ToggleCallDirection'); }
   else if (key === ']') { e.preventDefault(); setDepth(graphDepth + 1); }

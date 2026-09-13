@@ -157,6 +157,9 @@ body.is-desktop #window-controls { display: flex; }
 }
 #breadcrumb .crumb:hover { background: var(--surface-hover); color: var(--text); }
 #breadcrumb .crumb.current { color: var(--text); }
+/* 'Cluster map' names a view, not a symbol: sans for chrome, mono for code.
+   It never shrinks away either — it is the way back out of a long path. */
+#breadcrumb .crumb.view { font-family: var(--font-ui); flex-shrink: 0; }
 #breadcrumb .sep { color: var(--text-dim); flex-shrink: 0; }
 #breadcrumb .placeholder { color: var(--text-dim); font-family: var(--font-ui); }
 
