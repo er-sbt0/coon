@@ -39,9 +39,21 @@ window.CoonPalette = (() => {
 
   /// Subsequence match with boundary and adjacency scoring.
   /// Returns { score, indices } or null when `query` isn't a subsequence.
+  ///
+  /// Two passes, because preferring word starts is a ranking rule that must
+  /// never decide whether there is a match at all. Skipping ahead to a boundary
+  /// can step clean over the letters the rest of the query still needs:
+  /// "cluster" against "View: Cluster Map of This Function" matches `clus`
+  /// inside Cluster, then takes the `T` of **T**his over the `t` of Clus**t**er
+  /// — and there is no `e` after it, so a label the user is looking straight at
+  /// comes back as no match. Greedy has no way back, so when it fails, fall
+  /// back to the plain leftmost subsequence, which cannot skip anything.
   function fuzzyMatch(query, text) {
     if (!query) return { score: 0, indices: [] };
+    return scan(query, text, true) ?? scan(query, text, false);
+  }
 
+  function scan(query, text, preferBoundary) {
     const q = query.toLowerCase();
     const t = text.toLowerCase();
     const indices = [];
@@ -58,7 +70,7 @@ window.CoonPalette = (() => {
         const at = t.indexOf(ch, from);
         if (at === -1) break;
         if (found === -1) found = at;
-        if (isBoundary(text, at)) { found = at; break; }
+        if (!preferBoundary || isBoundary(text, at)) { found = at; break; }
         from = at + 1;
       }
       if (found === -1) return null;
