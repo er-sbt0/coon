@@ -23,16 +23,25 @@ struct SugiyamaGraph {
     /// `is_dummy[node_idx]` — true for inserted dummy nodes (used in Phase 4 rendering)
     #[allow(dead_code)]
     is_dummy: Vec<bool>,
+    /// `groups[node_idx]` — optional group membership, used in Phase 3b to keep
+    /// the members of one group contiguous within a layer. `None` = ungrouped.
+    groups: Vec<Option<u32>>,
     /// All edges (real + dummy-chain segments)
     edges: Vec<(usize, usize)>,
     /// Parallel to `edges`: original real (u, v) this segment belongs to
     original_edge: Vec<(usize, usize)>,
 }
 
-/// Entry point called from `LayoutEngine::compute_dag`.
-pub(crate) fn compute_sugiyama<T>(
+/// Entry point called from `LayoutEngine::compute_dag` and
+/// `LayoutEngine::compute_dag_grouped`.
+///
+/// `groups[i]` is the group of node `i`; `None`, and any index past the end of
+/// the slice, means the node belongs to no group. An empty slice is therefore
+/// the ungrouped layout, byte for byte.
+pub(crate) fn compute_sugiyama_grouped<T>(
     dag: &Dag<T>,
     config: &LayoutConfig,
+    groups: &[Option<u32>],
 ) -> Result<LayoutResult, LayoutError> {
     if dag.is_empty() {
         return Err(LayoutError::EmptyTree);
@@ -41,7 +50,7 @@ pub(crate) fn compute_sugiyama<T>(
     let all_dag_edges: Vec<(usize, usize)> = dag.edges().collect();
     let (forward_edges, back_edges) = remove_cycles(dag.len(), &all_dag_edges);
     let layers = assign_layers(dag.len(), &forward_edges);
-    let mut sg = insert_dummy_nodes(dag.len(), &layers, &forward_edges);
+    let mut sg = insert_dummy_nodes(dag.len(), &layers, &forward_edges, groups);
 
     let passes = config.crossing_minimization_passes.unwrap_or(2);
     minimize_crossings(&mut sg, passes);
@@ -186,12 +195,14 @@ fn insert_dummy_nodes(
     dag_len: usize,
     layers: &[usize],
     forward_edges: &[(usize, usize)],
+    groups: &[Option<u32>],
 ) -> SugiyamaGraph {
     if dag_len == 0 {
         return SugiyamaGraph {
             layers: vec![],
             positions: vec![],
             is_dummy: vec![],
+            groups: vec![],
             edges: vec![],
             original_edge: vec![],
         };
@@ -206,6 +217,9 @@ fn insert_dummy_nodes(
     }
 
     let mut is_dummy = vec![false; dag_len];
+    // Group membership for the expanded graph: real nodes take theirs from the
+    // caller, dummies inherit below.
+    let mut node_groups: Vec<Option<u32>> = (0..dag_len).map(|i| group_of(groups, i)).collect();
     let mut next_id = dag_len;
     let mut all_edges: Vec<(usize, usize)> = Vec::new();
     let mut original_edge: Vec<(usize, usize)> = Vec::new();
@@ -219,12 +233,20 @@ fn insert_dummy_nodes(
             all_edges.push((u, v));
             original_edge.push((u, v));
         } else if lv > lu + 1 {
-            // Long-span edge: insert dummy chain through intermediate layers
+            // Long-span edge: insert dummy chain through intermediate layers.
+            // A dummy joins the group only when the edge stays inside one: a
+            // wire routed through a group is fine, a wire merely passing by
+            // must not split that group's run.
+            let dummy_group = match (group_of(groups, u), group_of(groups, v)) {
+                (Some(gu), Some(gv)) if gu == gv => Some(gu),
+                _ => None,
+            };
             let mut prev = u;
             for l in (lu + 1)..lv {
                 let dummy = next_id;
                 next_id += 1;
                 is_dummy.push(true);
+                node_groups.push(dummy_group);
                 layer_nodes[l].push(dummy);
                 all_edges.push((prev, dummy));
                 original_edge.push((u, v));
@@ -251,9 +273,15 @@ fn insert_dummy_nodes(
         layers: layer_nodes,
         positions,
         is_dummy,
+        groups: node_groups,
         edges: all_edges,
         original_edge,
     }
+}
+
+/// Group of original node `i`, treating a short slice as all-`None`.
+fn group_of(groups: &[Option<u32>], i: usize) -> Option<u32> {
+    groups.get(i).copied().flatten()
 }
 
 // ---------------------------------------------------------------------------
@@ -280,7 +308,7 @@ fn minimize_crossings(g: &mut SugiyamaGraph, passes: usize) {
     for _ in 0..passes {
         // Top-down: sort each layer by mean predecessor position in the layer above
         for l in 1..g.layers.len() {
-            let sorted = sort_by_barycenter(&g.layers[l], &preds, &g.positions);
+            let sorted = sort_by_barycenter(&g.layers[l], &preds, &g.positions, &g.groups);
             for (pos, &u) in sorted.iter().enumerate() {
                 g.positions[u] = Some(pos);
             }
@@ -289,7 +317,7 @@ fn minimize_crossings(g: &mut SugiyamaGraph, passes: usize) {
 
         // Bottom-up: sort each layer by mean successor position in the layer below
         for l in (0..g.layers.len().saturating_sub(1)).rev() {
-            let sorted = sort_by_barycenter(&g.layers[l], &succs, &g.positions);
+            let sorted = sort_by_barycenter(&g.layers[l], &succs, &g.positions, &g.groups);
             for (pos, &u) in sorted.iter().enumerate() {
                 g.positions[u] = Some(pos);
             }
@@ -298,12 +326,31 @@ fn minimize_crossings(g: &mut SugiyamaGraph, passes: usize) {
     }
 }
 
+/// Order one layer by barycenter, keeping the members of a group contiguous.
+///
+/// A node's own barycenter is the mean position of its neighbours in the
+/// adjacent layer, as in the ungrouped case. A group's barycenter is the mean
+/// of its members' own barycenters *within this layer*, so the group travels as
+/// a block. The sort key is `(group barycenter, group id, own barycenter)`:
+///
+/// * an ungrouped node uses its own barycenter in the group slot, so it
+///   competes as a group of one and can come to rest between two groups rather
+///   than being pushed to an end;
+/// * the group id only breaks exact ties between two groups that landed on the
+///   same barycenter — without it their members would interleave. It never
+///   orders groups whose barycenters differ, so the opaque id stays opaque.
+///
+/// With no groups the key collapses to `(own, None, own)`, which makes exactly
+/// the comparisons the ungrouped sort made; the sort is stable, so the result
+/// is unchanged.
 fn sort_by_barycenter(
     layer: &[usize],
     neighbors: &[Vec<usize>],
     positions: &[Option<usize>],
+    groups: &[Option<u32>],
 ) -> Vec<usize> {
-    let mut with_bc: Vec<(usize, f32)> = layer
+    // (node, own barycenter, group)
+    let with_bc: Vec<(usize, f32, Option<u32>)> = layer
         .iter()
         .map(|&u| {
             let neighbor_pos: Vec<f32> = neighbors
@@ -319,12 +366,44 @@ fn sort_by_barycenter(
             } else {
                 neighbor_pos.iter().sum::<f32>() / neighbor_pos.len() as f32
             };
-            (u, bc)
+            (u, bc, group_of(groups, u))
         })
         .collect();
 
-    with_bc.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    with_bc.into_iter().map(|(u, _)| u).collect()
+    // Group barycenters: summed in layer order, held in a BTreeMap so nothing
+    // here depends on hash iteration order.
+    let mut group_sums: BTreeMap<u32, (f32, usize)> = BTreeMap::new();
+    for &(_, bc, group) in &with_bc {
+        if let Some(g) = group {
+            let entry = group_sums.entry(g).or_insert((0.0, 0));
+            entry.0 += bc;
+            entry.1 += 1;
+        }
+    }
+
+    // Materialise the full key per node so the comparator stays cheap and the
+    // group barycenter is computed once.
+    let mut keyed: Vec<(f32, Option<u32>, f32, usize)> = with_bc
+        .into_iter()
+        .map(|(u, bc, group)| {
+            let group_bc = match group {
+                Some(g) => {
+                    let (sum, count) = group_sums[&g];
+                    sum / count as f32
+                }
+                None => bc,
+            };
+            (group_bc, group, bc, u)
+        })
+        .collect();
+
+    keyed.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    keyed.into_iter().map(|(_, _, _, u)| u).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -694,6 +773,14 @@ mod tests {
     use super::*;
     use crate::dag::Dag;
 
+    /// The ungrouped layout, as `LayoutEngine::compute_dag` reaches it.
+    fn compute_sugiyama<T>(
+        dag: &Dag<T>,
+        config: &LayoutConfig,
+    ) -> Result<LayoutResult, LayoutError> {
+        compute_sugiyama_grouped(dag, config, &[])
+    }
+
     #[test]
     fn remove_cycles_linear_chain_no_back_edges() {
         // 0 → 1 → 2: no cycles
@@ -741,7 +828,7 @@ mod tests {
         // 0 at layer 0, 1 at layer 2 → span = 2, needs 1 dummy
         let fwd = vec![(0, 1)];
         let layers = vec![0, 2];
-        let sg = insert_dummy_nodes(2, &layers, &fwd);
+        let sg = insert_dummy_nodes(2, &layers, &fwd, &[]);
 
         // 3 nodes total: 0, 1, dummy
         assert_eq!(sg.positions.len(), 3);
@@ -870,5 +957,304 @@ mod tests {
         for &mid in &[1usize, 2, 3] {
             assert_eq!(result.position(mid).unwrap().x, level_sep);
         }
+    }
+    // -----------------------------------------------------------------------
+    // Group-aware ordering
+    // -----------------------------------------------------------------------
+
+    /// Nodes of `ids` in their final top-to-bottom order within a layer.
+    fn order_by_y(result: &LayoutResult, ids: &[usize]) -> Vec<usize> {
+        let mut ids = ids.to_vec();
+        ids.sort_by(|&a, &b| {
+            let ay = result.position(a).unwrap().y;
+            let by_ = result.position(b).unwrap().y;
+            ay.partial_cmp(&by_).unwrap()
+        });
+        ids
+    }
+
+    /// True when no group id appears in more than one run of `order`.
+    fn is_contiguous(order: &[usize], groups: &[Option<u32>]) -> bool {
+        let mut seen: Vec<u32> = Vec::new();
+        let mut prev: Option<u32> = None;
+        for &u in order {
+            let g = groups[u];
+            if g != prev {
+                if let Some(g) = g {
+                    if seen.contains(&g) {
+                        return false;
+                    }
+                    seen.push(g);
+                }
+                prev = g;
+            }
+        }
+        true
+    }
+
+    /// Pairs of edges whose endpoints sit in opposite vertical order at the two
+    /// ends, i.e. edges that cross, taken from the final real-node positions.
+    fn count_crossings(
+        result: &LayoutResult,
+        edges: &[(usize, usize)],
+        config: &LayoutConfig,
+    ) -> usize {
+        let layer = |u: usize| (result.position(u).unwrap().x / config.level_separation).round();
+        let y = |u: usize| result.position(u).unwrap().y;
+        let mut crossings = 0;
+        for (i, &(u1, v1)) in edges.iter().enumerate() {
+            for &(u2, v2) in &edges[i + 1..] {
+                if u1 == u2 || v1 == v2 {
+                    continue;
+                }
+                if layer(u1) != layer(u2) || layer(v1) != layer(v2) {
+                    continue;
+                }
+                if (y(u1) - y(u2)) * (y(v1) - y(v2)) < 0.0 {
+                    crossings += 1;
+                }
+            }
+        }
+        crossings
+    }
+
+    /// A root fanning out to `n` parents, each with one child in the next layer:
+    /// the children's order is driven entirely by their parents' order.
+    fn paired_layers(n: usize) -> (Dag<u32>, Vec<usize>, Vec<usize>) {
+        let mut dag: Dag<u32> = Dag::new();
+        let parents: Vec<usize> = (0..n).map(|i| dag.add_node(i as u32)).collect();
+        let children: Vec<usize> = (0..n).map(|i| dag.add_node((n + i) as u32)).collect();
+        for i in 0..n {
+            dag.add_edge(parents[i], children[i]).unwrap();
+        }
+        (dag, parents, children)
+    }
+
+    #[test]
+    fn empty_groups_reproduce_the_ungrouped_layout() {
+        // The regression guard: the grouped entry point with nothing grouped
+        // must return the same bits as the ungrouped one, edge routing included.
+        let mut dag: Dag<u32> = Dag::new();
+        for i in 0..12 {
+            dag.add_node(i);
+        }
+        // A shape with a fan-out, a re-join and a long-span edge (dummy nodes).
+        for &(u, v) in &[
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 4),
+            (2, 4),
+            (3, 5),
+            (4, 6),
+            (5, 6),
+            (0, 7),
+            (7, 8),
+            (8, 9),
+            (6, 9),
+            (2, 10),
+            (10, 11),
+            (0, 11),
+        ] {
+            dag.add_edge(u, v).unwrap();
+        }
+
+        let config = LayoutConfig::new();
+        let plain = compute_sugiyama(&dag, &config).unwrap();
+        let none_groups = vec![None; dag.len()];
+        let grouped = compute_sugiyama_grouped(&dag, &config, &none_groups).unwrap();
+        let empty = compute_sugiyama_grouped(&dag, &config, &[]).unwrap();
+
+        for other in [&grouped, &empty] {
+            assert_eq!(plain.positions().len(), other.positions().len());
+            for (a, b) in plain.positions().iter().zip(other.positions()) {
+                // Compare bit patterns: identical, not merely close.
+                assert_eq!(a.x.to_bits(), b.x.to_bits());
+                assert_eq!(a.y.to_bits(), b.y.to_bits());
+            }
+            assert_eq!(plain.bounds(), other.bounds());
+            for (a, b) in [
+                (plain.edges(), other.edges()),
+                (plain.cross_edges(), other.cross_edges()),
+                (plain.merged_edges(), other.merged_edges()),
+                (plain.merge_trunks(), other.merge_trunks()),
+            ] {
+                assert_eq!(a.len(), b.len());
+                for (pa, pb) in a.iter().zip(b) {
+                    assert_eq!(pa.parent_id, pb.parent_id);
+                    assert_eq!(pa.child_id, pb.child_id);
+                    assert_eq!(pa.segments, pb.segments);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn interleaved_groups_come_out_contiguous() {
+        // Structure interleaves the two groups: parents alternate A, B, A, B…
+        // so without the group term the layer would read A B A B A B.
+        let (dag, _parents, children) = paired_layers(6);
+        let mut groups = vec![None; dag.len()];
+        for (i, &c) in children.iter().enumerate() {
+            groups[c] = Some(if i % 2 == 0 { 10 } else { 20 });
+        }
+
+        let config = LayoutConfig::new();
+        let plain = compute_sugiyama(&dag, &config).unwrap();
+        assert!(
+            !is_contiguous(&order_by_y(&plain, &children), &groups),
+            "test is pointless unless the ungrouped layout interleaves"
+        );
+
+        let grouped = compute_sugiyama_grouped(&dag, &config, &groups).unwrap();
+        let order = order_by_y(&grouped, &children);
+        assert!(is_contiguous(&order, &groups), "layer order: {order:?}");
+    }
+
+    #[test]
+    fn group_contiguity_survives_repeated_passes() {
+        // Contiguity must be a property of every pass, not just the first —
+        // each pass re-sorts from the previous pass's positions.
+        let mut dag: Dag<u32> = Dag::new();
+        let roots: Vec<usize> = (0..6).map(|i| dag.add_node(i)).collect();
+        let mid: Vec<usize> = (0..6).map(|i| dag.add_node(6 + i)).collect();
+        let leaves: Vec<usize> = (0..6).map(|i| dag.add_node(12 + i)).collect();
+        for i in 0..6 {
+            dag.add_edge(roots[i], mid[i]).unwrap();
+            // Cross-wire the last layer (a permutation, so every leaf keeps
+            // exactly one parent) so later passes keep churning.
+            dag.add_edge(mid[i], leaves[(i * 5 + 1) % 6]).unwrap();
+        }
+        let mut groups = vec![None; dag.len()];
+        for i in 0..6 {
+            groups[mid[i]] = Some(if i % 2 == 0 { 3 } else { 8 });
+            groups[leaves[i]] = Some(if i < 3 { 3 } else { 8 });
+        }
+
+        for passes in 1..=6 {
+            let mut config = LayoutConfig::new();
+            config.crossing_minimization_passes = Some(passes);
+            let result = compute_sugiyama_grouped(&dag, &config, &groups).unwrap();
+            for layer in [&mid, &leaves] {
+                let order = order_by_y(&result, layer);
+                assert!(
+                    is_contiguous(&order, &groups),
+                    "passes={passes} order={order:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ungrouped_node_can_sort_between_two_groups() {
+        // Group A pulls to the top, group B to the bottom, and the ungrouped
+        // node's own barycenter puts it in between — it must stay there rather
+        // than being flushed to one end of the layer.
+        let (dag, _parents, children) = paired_layers(5);
+        let mut groups = vec![None; dag.len()];
+        groups[children[0]] = Some(1);
+        groups[children[1]] = Some(1);
+        groups[children[3]] = Some(2);
+        groups[children[4]] = Some(2);
+
+        let config = LayoutConfig::new();
+        let result = compute_sugiyama_grouped(&dag, &config, &groups).unwrap();
+        let order = order_by_y(&result, &children);
+
+        assert!(is_contiguous(&order, &groups), "layer order: {order:?}");
+        let ungrouped_at = order.iter().position(|&u| u == children[2]).unwrap();
+        assert_eq!(
+            ungrouped_at, 2,
+            "ungrouped node should sit between the groups, order: {order:?}"
+        );
+    }
+
+    #[test]
+    fn dummy_inherits_group_only_within_one_group() {
+        // 0 → 1 stays inside group 7; 2 → 3 leaves group 7 for group 9.
+        // Both span three layers, so each gets two dummies.
+        let fwd = vec![(0, 1), (2, 3)];
+        let layers = vec![0, 3, 0, 3];
+        let groups = vec![Some(7), Some(7), Some(7), Some(9)];
+        let sg = insert_dummy_nodes(4, &layers, &fwd, &groups);
+
+        assert_eq!(sg.groups.len(), 8);
+        assert_eq!(&sg.groups[..4], &groups[..]);
+        // Dummies of the intra-group edge inherit it …
+        assert_eq!(sg.groups[4], Some(7));
+        assert_eq!(sg.groups[5], Some(7));
+        // … those of the edge that crosses groups belong to neither, so they
+        // cannot split either group's run.
+        assert_eq!(sg.groups[6], None);
+        assert_eq!(sg.groups[7], None);
+    }
+
+    #[test]
+    fn dummy_of_edge_from_ungrouped_node_is_ungrouped() {
+        let fwd = vec![(0, 1)];
+        let layers = vec![0, 2];
+        let groups = vec![None, Some(4)];
+        let sg = insert_dummy_nodes(2, &layers, &fwd, &groups);
+        assert_eq!(sg.groups, vec![None, Some(4), None]);
+    }
+
+    #[test]
+    fn grouping_does_not_increase_crossings_when_it_matches_structure() {
+        // Two disconnected components, numbered so that neither is a
+        // contiguous block to begin with.  The grouping says exactly what the
+        // edges already say, so holding each group together costs nothing —
+        // here it removes two crossings the plain barycenter pass leaves.
+        let mut dag: Dag<u32> = Dag::new();
+        for i in 0..8 {
+            dag.add_node(i);
+        }
+        let edges = [(0, 3), (0, 2), (5, 7), (1, 3), (4, 6), (6, 7), (4, 5)];
+        for &(u, v) in &edges {
+            dag.add_edge(u, v).unwrap();
+        }
+        // Group = connected component.
+        let groups: Vec<Option<u32>> = (0..8).map(|i| Some(if i < 4 { 0 } else { 1 })).collect();
+
+        let config = LayoutConfig::new();
+        let plain = compute_sugiyama(&dag, &config).unwrap();
+        let grouped = compute_sugiyama_grouped(&dag, &config, &groups).unwrap();
+
+        let before = count_crossings(&plain, &edges, &config);
+        let after = count_crossings(&grouped, &edges, &config);
+        assert!(before > 0, "test is pointless without crossings to remove");
+        assert!(
+            after <= before,
+            "grouping added crossings: {before} -> {after}"
+        );
+
+        // Every layer of the grouped layout keeps its groups in one run.
+        let by_layer = |layer: f32| -> Vec<usize> {
+            (0..8)
+                .filter(|&u| grouped.position(u).unwrap().x == layer * config.level_separation)
+                .collect()
+        };
+        for layer in 0..3 {
+            let order = order_by_y(&grouped, &by_layer(layer as f32));
+            assert!(is_contiguous(&order, &groups), "layer {layer}: {order:?}");
+        }
+    }
+
+    #[test]
+    fn grouped_layout_is_deterministic() {
+        let (dag, _parents, children) = paired_layers(7);
+        let mut groups = vec![None; dag.len()];
+        for (i, &c) in children.iter().enumerate() {
+            groups[c] = Some([900u32, 3, 900, 17, 3, 17, 900][i]);
+        }
+        let config = LayoutConfig::new();
+        let first = compute_sugiyama_grouped(&dag, &config, &groups).unwrap();
+        for _ in 0..5 {
+            let again = compute_sugiyama_grouped(&dag, &config, &groups).unwrap();
+            for (a, b) in first.positions().iter().zip(again.positions()) {
+                assert_eq!(a.x.to_bits(), b.x.to_bits());
+                assert_eq!(a.y.to_bits(), b.y.to_bits());
+            }
+        }
+        assert!(is_contiguous(&order_by_y(&first, &children), &groups));
     }
 }
