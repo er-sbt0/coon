@@ -67,17 +67,27 @@ async fn main() {
     let mut symbols_done = false;
     let mut last_edges = 0usize;
     let mut settled_at = Instant::now();
+    // How many symbols the app's own warmup took responsibility for, against
+    // how many the graph ended up holding: the two diverging is the warmup
+    // leaving symbols edgeless, and so absent from the clustering.
+    let mut warmup_total = 0usize;
+    let mut late_symbols = 0usize;
     loop {
         for event in core.tick() {
-            if let ::core::AppEvent::LspProgress(phase) = event {
-                match phase {
-                    LspLoadPhase::Completed => symbols_done = true,
-                    LspLoadPhase::Failed(e) => {
-                        eprintln!("clangd failed: {e}");
-                        std::process::exit(1);
-                    }
-                    _ => {}
+            match event {
+                ::core::AppEvent::LspProgress(LspLoadPhase::Completed) => symbols_done = true,
+                ::core::AppEvent::LspProgress(LspLoadPhase::Failed(e)) => {
+                    eprintln!("clangd failed: {e}");
+                    std::process::exit(1);
                 }
+                ::core::AppEvent::ResolvingCalls { total, .. } => warmup_total = total,
+                // Symbols ingested from a *query* after clangd called the load
+                // finished — a discovery reply that landed late, or a refresh.
+                // These are the ones the old one-shot seeding stranded.
+                ::core::AppEvent::GraphSymbolsUpdated { count } if symbols_done => {
+                    late_symbols += count;
+                }
+                _ => {}
             }
         }
         let edges = core.call_graph.edge_count();
@@ -101,10 +111,13 @@ async fn main() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     eprintln!(
-        "[{:>4}s] symbols in: {} functions, {} calls",
+        "[{:>4}s] symbols in: {} functions, {} calls; the warmup claimed {}, \
+         of which {} arrived after clangd reported the load finished",
         started.elapsed().as_secs(),
         core.call_graph.node_count(),
-        core.call_graph.edge_count()
+        core.call_graph.edge_count(),
+        warmup_total,
+        late_symbols
     );
 
     // The loader streams at most `MAX_INITIAL_SYMBOLS`, so the function asked

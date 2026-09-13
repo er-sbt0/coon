@@ -80,14 +80,23 @@ pub struct CoreApp {
     /// a heap of isolated nodes: Louvain drops isolated symbols, the clustering
     /// comes out empty, and the cluster map the app opens on has nothing to
     /// draw. Asking for each symbol's callees up front turns that heap into a
-    /// graph. Seeded once from the initial symbols and deliberately not
-    /// cascaded into the callees it discovers — following those would walk the
-    /// whole program.
+    /// graph.
+    ///
+    /// Fed by every symbol the graph gains from a *symbol query* — the loader's
+    /// stream, a discovery reply that lands after it, a refresh — and
+    /// deliberately not by the callees a call-hierarchy reply discovers:
+    /// following those would walk the whole program.
     edge_warmup: VecDeque<SymbolId>,
-    /// Whether the warmup queue has been seeded. Once, per load.
+    /// Whether the queue has opened. Until it has, arriving symbols are left to
+    /// the seeding sweep; after it, each one queues itself as it lands.
     warmup_seeded: bool,
-    /// How many symbols the warmup was seeded with, so progress can be reported
-    /// as a fraction rather than a countdown from an unknown start.
+    /// How many symbols the warmup has queued in total, so progress can be
+    /// reported as a fraction rather than a countdown from an unknown start.
+    ///
+    /// Grows when symbols arrive late. The denominator moving is the honest
+    /// reading — the work really did get bigger — and beats the alternative of
+    /// resolving those symbols silently, outside the number the status bar is
+    /// showing.
     warmup_total: usize,
     /// Whether the closing `ResolvingCalls { done: total, .. }` has gone out.
     /// Without it the end would be announced on every tick thereafter, since
@@ -230,7 +239,7 @@ impl CoreApp {
                 symbol.qualified_name.clone(),
                 symbol.location.clone(),
             );
-            self.call_graph.add_function(function);
+            self.ingest_symbol(function);
         }
         if symbol_count > 0 {
             self.mark_graph_changed();
@@ -369,7 +378,7 @@ impl CoreApp {
                 self.lsp.take_pending(&request_id);
                 let count = symbols.len();
                 for symbol in symbols {
-                    self.call_graph.add_function(symbol);
+                    self.ingest_symbol(symbol);
                 }
                 if count > 0 {
                     self.mark_graph_changed();
@@ -814,6 +823,33 @@ impl CoreApp {
             && (!self.edge_warmup.is_empty() || !self.lsp.pending_requests.is_empty())
     }
 
+    /// Add a function that came from a symbol query, and queue its edges.
+    ///
+    /// The queue used to be a snapshot taken the instant clangd reported
+    /// `Completed`, which is not the instant symbols stop arriving. The loader
+    /// gives up waiting for its discovery query after `INITIAL_SYMBOL_TIMEOUT`
+    /// and a late reply is forwarded here instead; `Command::Refresh` brings a
+    /// fresh set whenever the user asks for one. Either way those symbols
+    /// landed in the graph after the one sweep that would have resolved them,
+    /// so they sat there with no edges and no way to ever get any — isolated,
+    /// which is precisely what `logic::cluster` drops.
+    ///
+    /// Only symbol queries come through here. A callee discovered by a
+    /// call-hierarchy reply is added straight to the graph, because queueing
+    /// those would cascade the warmup through the whole program — which is why
+    /// a loaded project holds far more functions than the warmup ever claims.
+    fn ingest_symbol(&mut self, function: FunctionNode) -> SymbolId {
+        let known = self.call_graph.get_function(&function.id).is_some();
+        let id = self.call_graph.add_function(function);
+        // Before the queue opens the seeding sweep takes everything in the
+        // graph, so queueing here as well would ask about it twice.
+        if self.warmup_seeded && !known {
+            self.edge_warmup.push_back(id);
+            self.warmup_total += 1;
+        }
+        id
+    }
+
     /// Fetch call hierarchies for the symbols the initial load handed us, so the
     /// graph has edges before anything tries to cluster or draw it.
     ///
@@ -821,8 +857,10 @@ impl CoreApp {
     /// follow up for calls — so every response lands in the handlers that
     /// already know how to turn it into edges.
     fn pump_edge_warmup(&mut self) -> Vec<AppEvent> {
-        // Seed once the symbol stream is done and the bridge is live: before
-        // that the graph is still growing and there is nothing to send on.
+        // Open the queue once the symbol stream is done and the bridge is
+        // live: before that there is nothing to send on. Everything already in
+        // the graph goes in here; everything arriving after queues itself
+        // through `ingest_symbol`.
         if !self.warmup_seeded
             && matches!(self.lsp.status, LspLoadPhase::Completed)
             && self.lsp.request_tx.is_some()
@@ -1208,6 +1246,103 @@ mod tests {
             std::iter::from_fn(|| rx.try_recv().ok()).count(),
             WARMUP_IN_FLIGHT
         );
+    }
+
+    /// The symbol stream does not stop when clangd says `Completed`.
+    ///
+    /// The loader gives up waiting for its discovery query after 30s and the
+    /// late reply arrives here instead. Seeding the queue once left those
+    /// symbols in the graph with no edges for good: isolated, so dropped by
+    /// the clustering, so missing from the map that is the first thing the
+    /// app shows.
+    #[test]
+    fn a_symbol_that_lands_after_the_queue_opens_is_asked_about_too() {
+        let (mut app, mut rx) = loaded_app(1);
+        app.tick();
+        assert_eq!(
+            std::iter::from_fn(|| rx.try_recv().ok()).count(),
+            1,
+            "the symbol the load started with"
+        );
+        assert_eq!(app.warmup_total, 1);
+
+        // A discovery reply landing after the loader stopped waiting for it.
+        app.handle_lsp_response(LspResponse::WorkspaceSymbols {
+            request_id: "late".to_string(),
+            symbols: vec![FunctionNode::new(
+                "late".to_string(),
+                "late".to_string(),
+                Location::new("/src/late.c".to_string(), 1, 1),
+            )],
+        });
+
+        assert_eq!(app.warmup_total, 2, "the work grew, and says so");
+        app.lsp.pending_requests.clear();
+        app.tick();
+        assert_eq!(
+            std::iter::from_fn(|| rx.try_recv().ok()).count(),
+            1,
+            "the late symbol is asked about as well"
+        );
+        assert!(app.edge_warmup.is_empty());
+    }
+
+    /// clangd answers overlapping symbol queries with overlapping results, so
+    /// the same function arrives repeatedly. Queueing it each time would inflate
+    /// the total the status bar is reporting against.
+    #[test]
+    fn a_symbol_that_arrives_again_is_not_queued_again() {
+        let (mut app, _rx) = loaded_app(1);
+        app.tick();
+        assert_eq!(app.warmup_total, 1);
+
+        let repeat = FunctionNode::new(
+            "f0".to_string(),
+            "f0".to_string(),
+            Location::new("/src/test.c".to_string(), 1, 1),
+        );
+        for _ in 0..3 {
+            app.handle_lsp_response(LspResponse::WorkspaceSymbols {
+                request_id: "again".to_string(),
+                symbols: vec![repeat.clone()],
+            });
+        }
+
+        assert_eq!(app.warmup_total, 1, "one symbol, one place in the queue");
+        assert!(app.edge_warmup.is_empty());
+    }
+
+    /// The warmup resolves the symbols clangd listed. It must not follow what
+    /// their replies turn up: that is the whole program, one round trip at a
+    /// time.
+    #[test]
+    fn the_callees_a_reply_discovers_are_not_queued() {
+        let (mut app, _rx) = loaded_app(1);
+        app.tick();
+        assert!(app.edge_warmup.is_empty(), "the one symbol went out");
+        let caller = *app
+            .call_graph
+            .function_ids()
+            .next()
+            .expect("the loaded symbol");
+
+        app.process_call_entry(
+            caller,
+            &call_item("callee", Some("callee"), "/src/other.c", 7),
+            &[],
+            true,
+        );
+
+        assert_eq!(
+            app.call_graph.node_count(),
+            2,
+            "the callee joined the graph"
+        );
+        assert!(
+            app.edge_warmup.is_empty(),
+            "but the warmup does not chase it"
+        );
+        assert_eq!(app.warmup_total, 1);
     }
 
     /// A call-hierarchy item shaped the way clangd actually sends them.
