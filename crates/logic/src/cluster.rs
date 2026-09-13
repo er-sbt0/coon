@@ -568,11 +568,19 @@ fn build_clustering(
 
 /// Pick the member that best serves as the cluster's front door.
 ///
-/// The useful label for a group of functions is the one callers outside the
-/// group actually go through, so the gateway is the member with the most
-/// incoming calls from outside. A cluster nothing calls into — the one holding
-/// `main`, typically — has no such member, and we fall back to whichever member
-/// reaches the most of the others from inside.
+/// A front door is entered from outside *and* leads inward, and it is the
+/// second half that carries the label. Ranking purely by incoming calls from
+/// outside sounds right and is not: the most-called member of almost any
+/// cluster is a shared leaf. It labelled this project's networking community
+/// `log_write` and its startup community `parse_integer` — both genuinely the
+/// most-called members, both read as the wrong subsystem entirely.
+///
+/// So the ranking is how much of the cluster a member reaches from inside,
+/// among the members that outside callers can actually enter through. A
+/// cluster nothing calls into — the one holding `main`, typically — drops the
+/// qualifier and ranks every member. Incoming calls break ties, which is where
+/// that count belongs: it separates two equally central members rather than
+/// choosing between a hub and a leaf.
 fn choose_entry_point(graph: &CallGraph, members: &[SymbolId]) -> Option<SymbolId> {
     if members.is_empty() {
         return None;
@@ -581,7 +589,7 @@ fn choose_entry_point(graph: &CallGraph, members: &[SymbolId]) -> Option<SymbolI
     let inside: HashSet<SymbolId> = members.iter().copied().collect();
 
     // Multiplicity matters: five calls into a function from outside make it more
-    // of a front door than one does.
+    // of an entrance than one does.
     let external: Vec<usize> = members
         .iter()
         .map(|member| {
@@ -593,9 +601,9 @@ fn choose_entry_point(graph: &CallGraph, members: &[SymbolId]) -> Option<SymbolI
         })
         .collect();
 
-    let scores = if external.iter().any(|&score| score > 0) {
-        external
-    } else if members.len() > REACHABILITY_MEMBER_LIMIT {
+    // Above the limit a BFS per member gets expensive, and how many members a
+    // function calls directly stands in well enough for how much it fronts.
+    let dominance: Vec<usize> = if members.len() > REACHABILITY_MEMBER_LIMIT {
         members
             .iter()
             .map(|member| {
@@ -613,15 +621,33 @@ fn choose_entry_point(graph: &CallGraph, members: &[SymbolId]) -> Option<SymbolI
             .collect()
     };
 
-    let best_score = scores.iter().copied().max().unwrap_or(0);
+    // A function nothing calls anywhere is a front door by definition — `main`,
+    // a thread body, a callback the runtime invokes. It has no incoming calls to
+    // rank it by, so it would otherwise be filtered out of its own cluster's
+    // naming, which is how the community holding `main` came to be labelled
+    // `parse_integer`.
+    let unreached: Vec<bool> = members
+        .iter()
+        .map(|member| graph.get_callers(member).is_empty())
+        .collect();
+
+    let entered_from_outside = external.iter().any(|&count| count > 0);
+
     members
         .iter()
-        .zip(&scores)
-        .filter(|(_, &score)| score == best_score)
-        .map(|(member, _)| *member)
-        // Definition order is the tie-break a reader would use themselves; the
-        // uuid behind it only exists so the answer is never ambiguous.
-        .min_by(|a, b| tie_break_key(graph, a).cmp(&tie_break_key(graph, b)))
+        .enumerate()
+        .filter(|(i, _)| !entered_from_outside || external[*i] > 0 || unreached[*i])
+        .max_by(|(i, left), (j, right)| {
+            dominance[*i]
+                .cmp(&dominance[*j])
+                .then(external[*i].cmp(&external[*j]))
+                // Definition order is the tie-break a reader would use
+                // themselves, so the lower one has to rank higher — hence the
+                // reversed comparison against a `max_by`. The uuid behind it
+                // only exists so the answer is never ambiguous.
+                .then_with(|| tie_break_key(graph, right).cmp(&tie_break_key(graph, left)))
+        })
+        .map(|(_, member)| *member)
 }
 
 /// How many other members this one reaches, following calls that stay inside
@@ -839,6 +865,52 @@ mod tests {
             .unwrap();
         assert_eq!(cluster.entry_point, Some(right[0]));
         assert_eq!(cluster.label, "right_a");
+    }
+
+    /// The rule these two exercise is easier to pin down directly than through
+    /// `compute`, where it would ride on whichever communities Louvain happened
+    /// to form.
+    #[test]
+    fn a_popular_leaf_does_not_outrank_the_member_that_fronts_the_cluster() {
+        let mut graph = CallGraph::new();
+        let outside = add(&mut graph, "outside", 1);
+        let hub = add(&mut graph, "hub", 2);
+        let first = add(&mut graph, "first", 3);
+        let second = add(&mut graph, "second", 4);
+        let helper = add(&mut graph, "helper", 5);
+
+        // `hub` is the way in, called once. `helper` is a shared leaf called
+        // five times from outside — more popular, and the wrong label.
+        call(&mut graph, outside, hub, 100);
+        for line in 200..205 {
+            call(&mut graph, outside, helper, line);
+        }
+        call(&mut graph, hub, first, 300);
+        call(&mut graph, first, second, 301);
+        call(&mut graph, second, helper, 302);
+
+        let members = [hub, first, second, helper];
+        assert_eq!(choose_entry_point(&graph, &members), Some(hub));
+    }
+
+    #[test]
+    fn a_member_nothing_calls_can_still_name_its_cluster() {
+        let mut graph = CallGraph::new();
+        let outside = add(&mut graph, "outside", 1);
+        let root = add(&mut graph, "root", 2);
+        let middle = add(&mut graph, "middle", 3);
+        let popular = add(&mut graph, "popular", 4);
+
+        // Nothing calls `root` at all, the way nothing calls `main`. Ranking by
+        // incoming calls alone would hand the cluster to `popular`.
+        call(&mut graph, root, middle, 100);
+        call(&mut graph, middle, popular, 101);
+        for line in 200..203 {
+            call(&mut graph, outside, popular, line);
+        }
+
+        let members = [root, middle, popular];
+        assert_eq!(choose_entry_point(&graph, &members), Some(root));
     }
 
     #[test]
