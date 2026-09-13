@@ -184,7 +184,7 @@ body.is-desktop #window-controls { display: flex; }
 .pill.inactive:hover { border-color: var(--border-strong); color: var(--text-muted); }
 
 /* ── Main row: sidebar dock + canvas ────────────────────────────────────── */
-#main { display: flex; flex: 1; min-height: 0; position: relative; }
+#main { display: flex; flex: 1; min-height: 0; }
 
 #sidebar {
   width: var(--w-sidebar);
@@ -275,82 +275,6 @@ body.sidebar-collapsed #dock-handle { display: none; }
 body.resizing { cursor: col-resize; user-select: none; }
 
 #cy { flex: 1; min-width: 0; background: var(--bg); position: relative; }
-
-/* ── Load progress ───────────────────────────────────────────────────────────
- *
- * A quiet strip over the canvas, not a modal: the graph is usable the whole
- * time it loads, so this never takes the pointer and never covers the middle.
- */
-#load-overlay {
-  position: absolute;
-  top: var(--sp-3);
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 5;
-  pointer-events: none;
-  display: flex;
-  align-items: center;
-  gap: var(--sp-2);
-  padding: var(--sp-2) var(--sp-3);
-  background: var(--surface-raised);
-  border: 1px solid var(--border);
-  border-radius: var(--r-full);
-  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.28);
-  font: var(--fs-sm)/var(--lh-tight) var(--font-ui);
-  color: var(--text);
-  max-width: calc(100% - var(--sp-6));
-}
-
-/* `display: flex` above would otherwise beat the `hidden` attribute's UA rule,
- * leaving the strip on screen over a finished graph. */
-#load-overlay[hidden] { display: none; }
-
-#load-label { white-space: nowrap; }
-
-#load-count {
-  color: var(--text-muted);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-#load-count:empty { display: none; }
-
-.load-spinner {
-  width: 11px;
-  height: 11px;
-  flex-shrink: 0;
-  border: 2px solid var(--accent-soft);
-  border-top-color: var(--accent);
-  border-radius: 50%;
-  animation: spin 720ms linear infinite;
-}
-
-/* The bar carries the fraction; it is hidden for the phases clangd reports no
- * total for, where a bar would have to either sit still or lie. */
-#load-bar {
-  width: 96px;
-  height: 3px;
-  flex-shrink: 0;
-  background: var(--accent-soft);
-  border-radius: var(--r-full);
-  overflow: hidden;
-}
-#load-bar[hidden] { display: none; }
-
-#load-bar-fill {
-  display: block;
-  height: 100%;
-  width: 0;
-  background: var(--accent);
-  border-radius: inherit;
-  transition: width var(--t-med);
-}
-
-@keyframes spin { to { transform: rotate(360deg); } }
-
-@media (prefers-reduced-motion: reduce) {
-  .load-spinner { animation: none; }
-  #load-bar-fill { transition: none; }
-}
 
 /* Floating expand affordance on graph nodes. */
 #expand-btn {

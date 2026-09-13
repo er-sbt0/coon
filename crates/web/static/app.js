@@ -203,11 +203,6 @@ const tabsEl     = $('tabs');
 const crumbEl    = $('breadcrumb');
 const statSymbolsEl = $('stat-symbols');
 const statNodesEl   = $('stat-nodes');
-const loadOverlayEl = $('load-overlay');
-const loadLabelEl   = $('load-label');
-const loadCountEl   = $('load-count');
-const loadBarEl     = $('load-bar');
-const loadFillEl    = $('load-bar-fill');
 
 if (CoonTransport.isDesktop) document.body.classList.add('is-desktop');
 
@@ -760,10 +755,10 @@ function setStatus(text, state) {
 
 // ── Load progress ────────────────────────────────────────────────────────────
 //
-// One state object behind every surface that says "still loading": the canvas
-// overlay, the footer readout and the sidebar's empty row. Each used to read
-// the events on its own and they disagreed — a call-hierarchy reply would set
-// the footer to "Ready" while the project was still halfway through indexing.
+// Loading is reported in the status bar and nowhere else, so this exists to
+// keep that one line honest rather than to drive several surfaces. Without it
+// the transient events fought over the line: a call-hierarchy reply would set
+// it to "Ready" while the project was still halfway through indexing.
 //
 // It has two stages, because loading a project has two. Clangd hands over the
 // symbols first (`LspProgress`), and only then are their call edges fetched
@@ -792,23 +787,17 @@ const PHASE_LABEL = {
 
 function loading() { return load.symbols || load.edges; }
 
-/// Push `load` to the overlay, the footer and its dot.
+/// Push `load` to the status bar.
+///
+/// A stage with a total reads as a fraction; one without reads as a running
+/// count, because clangd streams workspace symbols without ever saying how
+/// many are coming.
 function renderLoad() {
-  if (!loading()) {
-    loadOverlayEl.hidden = true;
-    return;
-  }
+  if (!loading()) return;
 
-  const pct = load.total > 0 ? Math.min(100, Math.round((load.done / load.total) * 100)) : 0;
   const counts = load.total > 0
     ? `${load.done.toLocaleString()} / ${load.total.toLocaleString()}`
     : (load.count != null ? load.count.toLocaleString() : '');
-
-  loadLabelEl.textContent = load.label;
-  loadCountEl.textContent = counts;
-  loadBarEl.hidden = load.total === 0;
-  loadFillEl.style.width = `${pct}%`;
-  loadOverlayEl.hidden = false;
 
   setStatus(counts ? `${load.label} ${counts}` : load.label, 'busy');
 }
@@ -845,9 +834,6 @@ function updateStatusFromEvent(key, payload) {
       }
     }
     renderLoad();
-    // The sidebar's empty row says "loading" rather than "none" while this
-    // runs, and it is rendered from a snapshot that may not come for a while.
-    if (Object.keys(allFunctions).length === 0) renderSidebar(searchEl.value);
   } else if (key === 'ResolvingCalls') {
     const { done, total } = payload || {};
     load.edges = total > 0 && done < total;
@@ -898,9 +884,7 @@ function renderSidebar(filter) {
   if (ids.length === 0) {
     const li = document.createElement('li');
     li.className = 'empty';
-    li.textContent = Object.keys(allFunctions).length > 0 ? 'No matches'
-      : loading() ? 'Loading symbols…'
-      : 'No symbols loaded yet';
+    li.textContent = Object.keys(allFunctions).length === 0 ? 'No symbols loaded yet' : 'No matches';
     fnListEl.appendChild(li);
     return;
   }
