@@ -1,7 +1,15 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Core permissions for the COON window: event listen/emit plus app-level invoke.",
-  "windows": ["main"],
-  "permissions": ["core:default"]
+  "description": "Core permissions for the COON window: event listen/emit, app-level invoke, and the window controls our custom titlebar provides.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-close",
+    "core:window:allow-start-dragging"
+  ]
 }

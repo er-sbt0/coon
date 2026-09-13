@@ -1,0 +1,150 @@
+/* ── Design tokens ───────────────────────────────────────────────────────────
+ *
+ * The rule that matters most: sans for chrome, mono for code. Function names
+ * and namespaces are code and get the mono stack; every label, button, tab and
+ * status readout is chrome and gets the UI stack. Reaching for mono everywhere
+ * is what made this read as a terminal rather than an editor.
+ *
+ * Font stacks are system fonts on purpose — no webfont fetch, because the
+ * desktop app must render correctly offline.
+ */
+
+:root {
+  /* Typography */
+  --font-ui: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+             "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "IBM Plex Mono",
+               Menlo, Consolas, "DejaVu Sans Mono", monospace;
+
+  /* Type scale — deliberately tight; this is a dense tool, not a document. */
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-md: 13px;
+  --fs-lg: 15px;
+
+  --lh-tight: 1.2;
+  --lh-normal: 1.45;
+
+  /* Spacing — 4px grid, used for every gap, pad and inset. */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+
+  /* Radii */
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-full: 999px;
+
+  /* Fixed shell metrics */
+  --h-titlebar: 36px;
+  --h-breadcrumb: 30px;
+  --h-status: 24px;
+  --h-row: 24px;
+  --w-sidebar: 240px;
+
+  /* Motion — fast enough to feel instant, present enough to read as intent. */
+  --t-fast: 90ms ease;
+  --t-med: 150ms ease;
+}
+
+/* ── Dark (default) ─────────────────────────────────────────────────────────
+ * Three surface layers plus one accent. Chrome stays quiet so the graph is the
+ * brightest thing on screen.
+ */
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #16171a;            /* deepest: the graph canvas */
+  --surface: #1c1e21;       /* panels: sidebar, status bar */
+  --surface-raised: #24262b;/* elevated: active tab, inputs, popovers */
+  --surface-hover: #2a2d33;
+
+  --border: #2b2e34;
+  --border-strong: #3a3e46;
+
+  --text: #dcdfe4;          /* primary  */
+  --text-muted: #9ba1ab;    /* secondary */
+  --text-dim: #6b7079;      /* tertiary  */
+
+  --accent: #74ade8;
+  --accent-hover: #8cbdf0;
+  --accent-soft: rgba(116, 173, 232, 0.15);
+  --accent-border: rgba(116, 173, 232, 0.45);
+
+  --ok: #7fb88a;
+  --warn: #d9b26a;
+  --err: #e0788a;
+
+  --node-bg: #23262c;
+  --node-border: #373b43;
+  --edge: #3d424b;
+  --edge-arrow: #545a65;
+}
+
+/* ── Light ───────────────────────────────────────────────────────────────── */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg: #ffffff;
+  --surface: #f6f7f8;
+  --surface-raised: #ffffff;
+  --surface-hover: #ebedef;
+
+  --border: #e2e4e8;
+  --border-strong: #cbcfd6;
+
+  --text: #24262a;
+  --text-muted: #5c6169;
+  --text-dim: #8a8f98;
+
+  --accent: #3f7fc1;
+  --accent-hover: #35699f;
+  --accent-soft: rgba(63, 127, 193, 0.12);
+  --accent-border: rgba(63, 127, 193, 0.45);
+
+  --ok: #3f8a52;
+  --warn: #9a7320;
+  --err: #c0435a;
+
+  --node-bg: #ffffff;
+  --node-border: #d4d8de;
+  --edge: #c2c7ce;
+  --edge-arrow: #9aa1aa;
+}
+
+/* Follow the OS when the user hasn't pinned a theme. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+
+    --bg: #ffffff;
+    --surface: #f6f7f8;
+    --surface-raised: #ffffff;
+    --surface-hover: #ebedef;
+
+    --border: #e2e4e8;
+    --border-strong: #cbcfd6;
+
+    --text: #24262a;
+    --text-muted: #5c6169;
+    --text-dim: #8a8f98;
+
+    --accent: #3f7fc1;
+    --accent-hover: #35699f;
+    --accent-soft: rgba(63, 127, 193, 0.12);
+    --accent-border: rgba(63, 127, 193, 0.45);
+
+    --ok: #3f8a52;
+    --warn: #9a7320;
+    --err: #c0435a;
+
+    --node-bg: #ffffff;
+    --node-border: #d4d8de;
+    --edge: #c2c7ce;
+    --edge-arrow: #9aa1aa;
+  }
+}

@@ -65,6 +65,23 @@
   }
 
   const isTauri = typeof window.__TAURI__ !== 'undefined';
+
   window.CoonTransport = isTauri ? tauriTransport() : websocketTransport();
+  window.CoonTransport.isDesktop = isTauri;
+
+  // Window management is the one genuinely desktop-only surface. It lives here
+  // rather than in app.js so __TAURI__ is touched in exactly one file; in the
+  // browser these are no-ops and the controls stay hidden.
+  window.CoonHost = isTauri
+    ? (() => {
+        const win = window.__TAURI__.window.getCurrentWindow();
+        return {
+          minimize: () => win.minimize(),
+          toggleMaximize: () => win.toggleMaximize(),
+          close: () => win.close(),
+        };
+      })()
+    : { minimize() {}, toggleMaximize() {}, close() {} };
+
   console.log(`[coon] transport: ${window.CoonTransport.name}`);
 })();

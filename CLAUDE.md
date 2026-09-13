@@ -53,9 +53,27 @@ COON is a Rust workspace that visualizes C/C++ call graphs, using `clangd` as th
 | Web | `coon --web <PORT>` | JSON over WebSocket |
 | Desktop | `coon-desktop` | The same JSON over Tauri IPC |
 
-The web and desktop frontends **share one JavaScript client** (`crates/web/static`). They differ only in `transport.js`, which feature-detects `window.__TAURI__` and picks either a WebSocket or Tauri `invoke`/`listen`. Because both backends emit identical `core::protocol::ServerMsg` shapes, `app.js` needs no knowledge of which one it is talking to. Keep it that way: put shared behaviour in `app.js`, and anything pipe-specific in `transport.js`.
+The web and desktop frontends **share one JavaScript client** (`crates/web/static`). They differ only in `transport.js`, which feature-detects `window.__TAURI__` and picks either a WebSocket or Tauri `invoke`/`listen`. Because both backends emit identical `core::protocol::ServerMsg` shapes, `app.js` needs no knowledge of which one it is talking to. Keep it that way: put shared behaviour in `app.js`, and anything pipe-specific (including window management, via `CoonHost`) in `transport.js`.
 
 Client assets are vendored, not CDN-loaded (`static/vendor/cytoscape.min.js`), because the desktop app must work offline.
+
+### Client files
+
+| File | Holds |
+|---|---|
+| `theme.css` | Design tokens only — colours, type scale, 4px spacing grid, shell metrics. Light and dark. |
+| `app.css` | Component styles. Reads tokens; defines no raw colours. |
+| `transport.js` | The pipe (WebSocket vs Tauri IPC) and `CoonHost` window controls. The only file that touches `__TAURI__`. |
+| `app.js` | Everything else: tabs, graph, sidebar, breadcrumb, status bar, keybindings. |
+
+Design rules worth keeping:
+
+- **Sans for chrome, mono for code.** Function names and namespaces get `--font-mono`; every label, tab and button gets `--font-ui`. Reaching for monospace everywhere is what made this read as a terminal.
+- **One accent.** State is carried by accent strength and a left/top accent bar, not by a different hue per state.
+- **Nodes sit on a fixed grid.** `core::compute_layout` emits column/row indices at a fixed pitch, so graph nodes use a fixed `NODE_W` with truncated labels. Label-sized nodes overlap their neighbours as soon as a C++ symbol name gets long.
+- Graph styles are read from the CSS custom properties at startup, so the canvas and the chrome stay on one palette.
+
+The desktop window is **undecorated** (`decorations: false`); `#titlebar` is the titlebar and carries the drag region, workspace tabs and window controls. To go back to native decorations, flip that flag in `tauri.conf.json` and the `is-desktop` window controls will hide themselves.
 
 ### Data Flow
 

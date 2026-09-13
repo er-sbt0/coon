@@ -26,6 +26,10 @@ pub enum ServerMsg {
         graph: CallGraph,
         layout: HashMap<SymbolId, NodePos>,
         workspaces: Vec<WorkspaceInfo>,
+        /// Index into `workspaces` of the active tab. The workspace commands
+        /// (`SwitchWorkspace`, `CloseWorkspace`, `RenameWorkspace`) address
+        /// tabs by index, so the client needs the index, not the id.
+        active_workspace: usize,
         selected: Option<SymbolId>,
     },
     /// A single `AppEvent` forwarded verbatim for status display.
@@ -77,6 +81,7 @@ pub fn snapshot_of(core: &CoreApp) -> ServerMsg {
         graph: core.call_graph.clone(),
         layout,
         workspaces: workspace_infos(core),
+        active_workspace: core.workspaces.current_index,
         selected: core.selected_function,
     }
 }
@@ -153,6 +158,18 @@ impl EventRouter {
                     log::info!("[protocol] {:?} — scheduling resnapshot", event);
                     resnapshot = true;
                 }
+                // Switching, creating or closing a tab changes the root the
+                // layout is anchored to, but `CoreApp` emits no LayoutDirty for
+                // it. Resnapshot so the client re-lays out, and forward the
+                // event too so the status line can report it.
+                AppEvent::WorkspaceCreated { .. }
+                | AppEvent::WorkspaceSwitched { .. }
+                | AppEvent::WorkspaceClosed
+                | AppEvent::WorkspaceRenamed { .. } => {
+                    log::info!("[protocol] {:?} — workspace change, resnapshot", event);
+                    resnapshot = true;
+                    forward.push(event.clone());
+                }
                 _ => forward.push(event.clone()),
             }
         }
@@ -167,7 +184,7 @@ impl EventRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model::SymbolId;
+    use model::{CallGraph, SymbolId};
 
     fn sym() -> SymbolId {
         SymbolId::from_content("test::fn", "src/test.cpp", 1)
@@ -235,6 +252,79 @@ mod tests {
 
         assert_eq!(routed.forward.len(), 2, "progress drives the status line");
         assert!(!routed.resnapshot);
+    }
+
+    /// Every command shape the JavaScript client sends, verbatim.
+    ///
+    /// The client builds these by hand as JSON, so serde's enum representation
+    /// is a real contract between the two. A rename of a `Command` variant
+    /// compiles fine and silently breaks the UI; this catches that.
+    #[test]
+    fn client_command_shapes_deserialize() {
+        let id = format!("\"{}\"", sym().0);
+        let cases = [
+            format!("{{\"SelectFunction\":{id}}}"),
+            format!("{{\"ExpandFunction\":{id}}}"),
+            format!("{{\"StartGraphFromFunction\":{id}}}"),
+            "{\"CloseWorkspace\":0}".to_string(),
+            "{\"SwitchWorkspace\":2}".to_string(),
+            "{\"RenameWorkspace\":[0,\"renamed\"]}".to_string(),
+            "\"NewWorkspace\"".to_string(),
+            "\"NextWorkspace\"".to_string(),
+            "\"PreviousWorkspace\"".to_string(),
+            "\"ToggleCallDirection\"".to_string(),
+            "\"Refresh\"".to_string(),
+        ];
+
+        for case in cases {
+            serde_json::from_str::<Command>(&case)
+                .unwrap_or_else(|e| panic!("client sends {case}, which no longer parses: {e}"));
+        }
+    }
+
+    /// The client reads `msg.type`, `msg.active_workspace` and `msg.workspaces`
+    /// off the snapshot; pin those names.
+    #[test]
+    fn snapshot_wire_shape_is_stable() {
+        let core = CoreApp::new(CallGraph::new());
+        let json = serde_json::to_value(snapshot_of(&core)).expect("snapshot serialises");
+
+        assert_eq!(json["type"], "snapshot");
+        assert_eq!(json["active_workspace"], 0);
+        assert!(json["workspaces"].is_array());
+        assert!(json.get("graph").is_some());
+        assert!(json.get("layout").is_some());
+
+        let ws = &json["workspaces"][0];
+        for field in ["id", "name", "direction", "selected"] {
+            assert!(ws.get(field).is_some(), "workspace field `{field}` is read by the client");
+        }
+    }
+
+    #[test]
+    fn workspace_changes_resnapshot_and_forward() {
+        for event in [
+            AppEvent::WorkspaceCreated {
+                id: 2,
+                name: "Graph 2".to_string(),
+            },
+            AppEvent::WorkspaceSwitched {
+                id: 1,
+                name: "Graph 1".to_string(),
+            },
+            AppEvent::WorkspaceClosed,
+            AppEvent::WorkspaceRenamed {
+                name: "renamed".to_string(),
+            },
+        ] {
+            let mut router = EventRouter::new();
+            let routed = router.route(std::slice::from_ref(&event));
+            assert!(
+                routed.resnapshot,
+                "{event:?} changes the displayed graph and must resnapshot"
+            );
+            assert_eq!(routed.forward.len(), 1, "{event:?} should still be reported");
+        }
     }
 
     #[test]

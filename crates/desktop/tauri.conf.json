@@ -15,7 +15,9 @@
         "height": 900,
         "minWidth": 800,
         "minHeight": 500,
-        "resizable": true
+        "resizable": true,
+        "decorations": false,
+        "transparent": false
       }
     ],
     "security": {
@@ -24,7 +26,10 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["deb", "appimage"],
+    "targets": [
+      "deb",
+      "appimage"
+    ],
     "category": "DeveloperTool",
     "shortDescription": "C/C++ call graph visualizer",
     "icon": [

@@ -1,0 +1,334 @@
+/* ── Reset ──────────────────────────────────────────────────────────────── */
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: var(--fs-md);
+  line-height: var(--lh-normal);
+  height: 100vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  -webkit-font-smoothing: antialiased;
+}
+
+button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+/* ── Titlebar: wordmark, workspace tabs, window controls ────────────────── */
+#titlebar {
+  height: var(--h-titlebar);
+  flex-shrink: 0;
+  display: flex;
+  align-items: stretch;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+}
+
+#brand {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-3);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+#brand .dot { width: 7px; height: 7px; border-radius: var(--r-full); background: var(--accent); }
+
+/* Tabs */
+#tabs {
+  display: flex;
+  align-items: stretch;
+  /* Shrink-to-fit so #tab-new sits beside the last tab; the spacer after it
+     absorbs the remaining width and doubles as the window drag region. */
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+#tabs::-webkit-scrollbar { display: none; }
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-2) 0 var(--sp-3);
+  max-width: 200px;
+  border-right: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: var(--fs-sm);
+  white-space: nowrap;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+.tab:hover { background: var(--surface-hover); color: var(--text-muted); }
+
+/* The active tab is lifted to the canvas colour and marked with an accent rule,
+ * so the eye tracks one signal rather than a different border colour per state. */
+.tab.active {
+  background: var(--bg);
+  color: var(--text);
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+
+.tab-name { overflow: hidden; text-overflow: ellipsis; }
+.tab-name[contenteditable="true"] {
+  outline: 1px solid var(--accent);
+  border-radius: 2px;
+  padding: 0 2px;
+  cursor: text;
+}
+
+.tab-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: var(--r-sm);
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1;
+  opacity: 0;
+  transition: opacity var(--t-fast), background var(--t-fast);
+}
+.tab:hover .tab-close, .tab.active .tab-close { opacity: 1; }
+.tab-close:hover { background: var(--surface-hover); color: var(--text); }
+
+#tab-new {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  color: var(--text-dim);
+  font-size: 15px;
+  flex-shrink: 0;
+}
+#tab-new:hover { background: var(--surface-hover); color: var(--text); }
+
+/* Window controls — desktop only; hidden in the browser. */
+#window-controls { display: none; align-items: stretch; flex-shrink: 0; }
+body.is-desktop #window-controls { display: flex; }
+.wc {
+  width: 42px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  transition: background var(--t-fast), color var(--t-fast);
+}
+.wc:hover { background: var(--surface-hover); color: var(--text); }
+.wc.close:hover { background: #c0392b; color: #fff; }
+
+/* ── Breadcrumb ─────────────────────────────────────────────────────────── */
+#breadcrumb-bar {
+  height: var(--h-breadcrumb);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-3);
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+
+#breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-size: var(--fs-sm);
+  white-space: nowrap;
+}
+#breadcrumb .crumb {
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  padding: 1px var(--sp-1);
+  border-radius: var(--r-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#breadcrumb .crumb:hover { background: var(--surface-hover); color: var(--text); }
+#breadcrumb .crumb.current { color: var(--text); }
+#breadcrumb .sep { color: var(--text-dim); flex-shrink: 0; }
+#breadcrumb .placeholder { color: var(--text-dim); font-family: var(--font-ui); }
+
+.pill {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  height: 22px;
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  background: var(--surface-raised);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: border-color var(--t-fast), color var(--t-fast);
+}
+.pill:hover { border-color: var(--accent-border); color: var(--text); }
+
+/* ── Main row: sidebar dock + canvas ────────────────────────────────────── */
+#main { display: flex; flex: 1; min-height: 0; }
+
+#sidebar {
+  width: var(--w-sidebar);
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  min-width: 0;
+}
+body.sidebar-collapsed #sidebar,
+body.sidebar-collapsed #dock-handle { display: none; }
+
+#sidebar-header {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3) var(--sp-1);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+#fn-count { font-weight: 400; letter-spacing: 0; }
+
+#search {
+  margin: 0 var(--sp-2) var(--sp-2);
+  padding: var(--sp-1) var(--sp-2);
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: var(--fs-sm);
+  outline: none;
+  transition: border-color var(--t-fast);
+}
+#search::placeholder { color: var(--text-dim); }
+#search:focus { border-color: var(--accent-border); }
+
+#fn-list { flex: 1; overflow-y: auto; list-style: none; padding-bottom: var(--sp-2); }
+
+#fn-list li {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: var(--h-row);
+  padding: 0 var(--sp-3);
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: default;
+  /* A left accent bar carries selection state, so hover and selection never
+   * fight over the same border colour. */
+  border-left: 2px solid transparent;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+#fn-list li:hover { background: var(--surface-hover); color: var(--text); }
+#fn-list li.selected {
+  background: var(--accent-soft);
+  border-left-color: var(--accent);
+  color: var(--text);
+}
+#fn-list .empty {
+  font-family: var(--font-ui);
+  color: var(--text-dim);
+  font-style: italic;
+  height: auto;
+  padding: var(--sp-3);
+}
+#fn-list .empty:hover { background: none; color: var(--text-dim); }
+
+/* Drag handle for the dock. A 5px hit area over a 1px visual line. */
+#dock-handle {
+  width: 5px;
+  margin-left: -3px;
+  flex-shrink: 0;
+  cursor: col-resize;
+  background: transparent;
+  z-index: 5;
+  transition: background var(--t-med);
+}
+#dock-handle:hover, #dock-handle.dragging { background: var(--accent-border); }
+body.resizing { cursor: col-resize; user-select: none; }
+
+#cy { flex: 1; min-width: 0; background: var(--bg); position: relative; }
+
+/* Floating expand affordance on graph nodes. */
+#expand-btn {
+  position: fixed;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: var(--r-full);
+  background: var(--accent);
+  color: var(--bg);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  z-index: 100;
+  user-select: none;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+  transition: background var(--t-fast), transform var(--t-fast);
+}
+#expand-btn:hover { background: var(--accent-hover); transform: scale(1.12); }
+
+/* ── Status bar ─────────────────────────────────────────────────────────── */
+#status-bar {
+  height: var(--h-status);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: 0 var(--sp-3);
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+  user-select: none;
+}
+.status-item { display: flex; align-items: center; gap: var(--sp-1); white-space: nowrap; }
+.status-item.right { margin-left: auto; }
+.status-item b { font-weight: 600; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+
+#lsp-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-full);
+  background: var(--text-dim);
+  flex-shrink: 0;
+}
+#lsp-dot.busy { background: var(--warn); animation: pulse 1.1s ease-in-out infinite; }
+#lsp-dot.ready { background: var(--ok); }
+#lsp-dot.error { background: var(--err); }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+#info { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; }
+
+/* ── Scrollbars ─────────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--r-full);
+  border: 3px solid var(--surface);
+}
+::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
