@@ -56,6 +56,8 @@ pub enum LspRequest {
         request_id: String,
         document_uris: Vec<Url>,
     },
+    /// Close every document the server currently has open.
+    CloseDocuments,
     SetProjectFiles {
         project_files: Vec<String>,
     },
@@ -246,6 +248,16 @@ impl LspService {
                 document_uris,
             })
             .await?;
+        Ok(())
+    }
+
+    /// Close every open document, freeing the server's per-document state.
+    ///
+    /// Fire-and-forget: `didClose` is a notification, and the request travels
+    /// the same channel as everything after it, so a reopen queued later cannot
+    /// overtake it.
+    pub async fn close_documents(&self) -> Result<()> {
+        self.request_tx.send(LspRequest::CloseDocuments).await?;
         Ok(())
     }
 

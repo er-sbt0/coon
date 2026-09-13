@@ -235,6 +235,17 @@ pub async fn lsp_loader_task(
         }
     }
 
+    // The preload above exists to make clangd load the compilation database and
+    // index the project; once the symbols are in, it has done its job. Holding
+    // every document open past this point costs a live AST worker and a
+    // resident preamble each — on a 217-file tree that is the difference
+    // between hundreds of megabytes and several gigabytes — and buys nothing:
+    // `workspace/symbol` is answered from the index, and every position-based
+    // request reopens its own file through `ensure_document_opened`.
+    if let Err(e) = lsp_service.close_documents().await {
+        log::warn!("Failed to close documents after the symbol sweep: {}", e);
+    }
+
     ui_tx.send(LspUiMessage::Progress(LspLoadPhase::Completed))?;
 
     info!("LSP loader: starting lazy-loading TUI bridge");
@@ -304,6 +315,11 @@ async fn run_tui_lsp_bridge(
                         LspRequest::PreloadDocuments { request_id, document_uris } =>
                             forward_lsp!(request_id.clone(),
                                 lsp_service.request_preload_documents(request_id, document_uris).await),
+                        LspRequest::CloseDocuments => {
+                            if let Err(e) = lsp_service.close_documents().await {
+                                log::error!("Failed to forward close documents: {}", e);
+                            }
+                        }
                         LspRequest::SetProjectFiles { project_files } => {
                             if let Err(e) = lsp_service.set_project_files(project_files).await {
                                 log::error!("Failed to forward set project files: {}", e);

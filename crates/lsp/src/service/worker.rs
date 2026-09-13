@@ -1,6 +1,6 @@
+use super::document::OpenDocuments;
 use super::{LspRequest, LspResponse};
 use crate::LspClient;
-use lsp_types::Url;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
@@ -25,7 +25,7 @@ pub(super) struct LspWorkerState {
     pub(super) client: LspClient,
     pub(super) service_requests: HashMap<i64, String>,
     pub(super) request_types: HashMap<i64, RequestType>,
-    pub(super) opened_documents: HashSet<Url>,
+    pub(super) opened_documents: OpenDocuments,
     pub(super) project_files: HashSet<String>,
     pub(super) pending_enhanced_requests: HashMap<String, EnhancedRequestInfo>,
     pub(super) enhanced_lsp_requests: HashSet<i64>,
@@ -64,7 +64,7 @@ pub(super) async fn run_loop(
         client,
         service_requests: HashMap::new(),
         request_types: HashMap::new(),
-        opened_documents: HashSet::new(),
+        opened_documents: OpenDocuments::default(),
         project_files: HashSet::new(),
         pending_enhanced_requests: HashMap::new(),
         enhanced_lsp_requests: HashSet::new(),
@@ -97,6 +97,9 @@ pub(super) async fn run_loop(
                     }
                     Some(LspRequest::PreloadDocuments { request_id, document_uris }) => {
                         super::request::handle_preload_documents(&mut state, &response_tx, request_id, document_uris).await;
+                    }
+                    Some(LspRequest::CloseDocuments) => {
+                        super::document::close_all_documents(&mut state).await;
                     }
                     Some(LspRequest::SetProjectFiles { project_files }) => {
                         state.project_files = project_files.into_iter().collect();

@@ -1,6 +1,79 @@
 use super::worker::LspWorkerState;
 use anyhow::Result;
 use lsp_types::Url;
+use std::collections::VecDeque;
+
+/// How many documents clangd is allowed to hold open at once.
+///
+/// Every open document costs clangd a live AST worker and a resident preamble
+/// index, so the set of open documents — not the project's size — is what
+/// dominates the server's memory. Opening a whole compilation database and
+/// leaving it open runs to gigabytes on a 217-file tree like jemalloc.
+///
+/// The floor is `core`'s warmup concurrency: evicting a document with a request
+/// still in flight would answer it against a file clangd no longer has. Anything
+/// in flight was touched within the last few requests, so it sits at the recent
+/// end of the queue, and a limit several times that concurrency is enough.
+const OPEN_DOCUMENT_LIMIT: usize = 32;
+
+/// The documents clangd currently has open, least-recently-used first.
+///
+/// A `VecDeque` rather than a set: at this size the linear scan is cheaper than
+/// keeping a second structure in step, and the order *is* the eviction policy.
+#[derive(Debug, Default)]
+pub(super) struct OpenDocuments {
+    lru: VecDeque<Url>,
+}
+
+impl OpenDocuments {
+    pub(super) fn contains(&self, uri: &Url) -> bool {
+        self.lru.contains(uri)
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.lru.len()
+    }
+
+    /// Mark `uri` as the most recently used document.
+    fn touch(&mut self, uri: &Url) {
+        if let Some(idx) = self.lru.iter().position(|open| open == uri) {
+            let uri = self.lru.remove(idx).expect("index came from the same deque");
+            self.lru.push_back(uri);
+        }
+    }
+
+    fn insert(&mut self, uri: Url) {
+        self.lru.push_back(uri);
+    }
+
+    /// The next document to close, or `None` once the set is within its limit.
+    fn evict_overflow(&mut self) -> Option<Url> {
+        (self.lru.len() > OPEN_DOCUMENT_LIMIT)
+            .then(|| self.lru.pop_front())
+            .flatten()
+    }
+
+    /// Forget every open document and hand them back to be closed.
+    fn take_all(&mut self) -> Vec<Url> {
+        self.lru.drain(..).collect()
+    }
+}
+
+/// Close every document clangd has open.
+///
+/// Used once the initial symbol sweep is in: the preload exists to make clangd
+/// index the project, and from then on `workspace/symbol` is served from that
+/// index while anything position-based reopens its own file below.
+pub(super) async fn close_all_documents(state: &mut LspWorkerState) {
+    let uris = state.opened_documents.take_all();
+    log::info!("Closing {} open document(s)", uris.len());
+
+    for uri in uris {
+        if let Err(e) = state.client.did_close(uri.clone()).await {
+            log::warn!("Failed to close document {}: {}", uri, e);
+        }
+    }
+}
 
 pub(super) async fn ensure_document_opened(
     state: &mut LspWorkerState,
@@ -8,6 +81,7 @@ pub(super) async fn ensure_document_opened(
 ) -> Result<()> {
     if state.opened_documents.contains(document_uri) {
         log::debug!("Document already opened: {}", document_uri);
+        state.opened_documents.touch(document_uri);
         return Ok(());
     }
 
@@ -57,6 +131,13 @@ pub(super) async fn ensure_document_opened(
         document_uri,
         state.opened_documents.len()
     );
+
+    while let Some(evicted) = state.opened_documents.evict_overflow() {
+        log::debug!("Closing least-recently-used document: {}", evicted);
+        if let Err(e) = state.client.did_close(evicted.clone()).await {
+            log::warn!("Failed to close document {}: {}", evicted, e);
+        }
+    }
 
     Ok(())
 }
@@ -273,5 +354,53 @@ mod tests {
             character: 0,
         };
         assert!(find_containing_symbol_path(&document(), &position).is_empty());
+    }
+
+    fn uri(n: usize) -> Url {
+        Url::parse(&format!("file:///tmp/file_{n}.c")).unwrap()
+    }
+
+    fn fill(count: usize) -> OpenDocuments {
+        let mut open = OpenDocuments::default();
+        for n in 0..count {
+            open.insert(uri(n));
+        }
+        open
+    }
+
+    #[test]
+    fn stays_within_its_limit_by_dropping_the_oldest() {
+        let mut open = fill(OPEN_DOCUMENT_LIMIT + 3);
+
+        let evicted: Vec<Url> = std::iter::from_fn(|| open.evict_overflow()).collect();
+
+        assert_eq!(evicted, vec![uri(0), uri(1), uri(2)]);
+        assert_eq!(open.len(), OPEN_DOCUMENT_LIMIT);
+        assert!(open.contains(&uri(OPEN_DOCUMENT_LIMIT + 2)));
+    }
+
+    #[test]
+    fn a_touched_document_outlives_the_ones_opened_after_it() {
+        let mut open = fill(OPEN_DOCUMENT_LIMIT);
+        open.touch(&uri(0));
+        open.insert(uri(OPEN_DOCUMENT_LIMIT));
+
+        assert_eq!(open.evict_overflow(), Some(uri(1)));
+        assert!(open.contains(&uri(0)), "the touched document should survive");
+    }
+
+    #[test]
+    fn nothing_is_evicted_below_the_limit() {
+        let mut open = fill(OPEN_DOCUMENT_LIMIT);
+        assert_eq!(open.evict_overflow(), None);
+    }
+
+    #[test]
+    fn taking_all_leaves_the_set_empty() {
+        let mut open = fill(3);
+
+        assert_eq!(open.take_all(), vec![uri(0), uri(1), uri(2)]);
+        assert_eq!(open.len(), 0);
+        assert!(!open.contains(&uri(0)));
     }
 }
