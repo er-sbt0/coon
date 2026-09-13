@@ -395,6 +395,7 @@ mod tests {
         let cases = [
             format!("{{\"SelectFunction\":{id}}}"),
             format!("{{\"ExpandFunction\":{id}}}"),
+            format!("{{\"FocusFunction\":{id}}}"),
             format!("{{\"StartGraphFromFunction\":{id}}}"),
             "{\"CloseWorkspace\":0}".to_string(),
             "{\"SwitchWorkspace\":2}".to_string(),

@@ -233,6 +233,7 @@ impl CoreApp {
             Command::StartGraphFromFunction(id) => self.cmd_start_graph_from_function(id),
             Command::SearchSelectFunction(id) => self.cmd_search_select_function(id),
             Command::ExpandFunction(id) => self.cmd_expand_function(id),
+            Command::FocusFunction(id) => self.cmd_focus_function(id),
         };
         // Any command can be the one that changes which map is wanted — a tab
         // switch, a direction toggle, a new scope — so the cache is squared up
@@ -732,6 +733,21 @@ impl CoreApp {
 
     fn cmd_search_select_function(&mut self, id: SymbolId) -> Vec<AppEvent> {
         self.cmd_select_function(id)
+    }
+
+    /// Point at a function: no new root, no layout, no fetch.
+    ///
+    /// Deliberately emits nothing. Every event routes to a fresh snapshot, and
+    /// a snapshot makes the client tear the canvas down and build it again —
+    /// for a click that changed one node's border. The client draws the
+    /// selection itself and sends this so the next snapshot, whenever something
+    /// else causes one, agrees with what is on screen.
+    fn cmd_focus_function(&mut self, id: SymbolId) -> Vec<AppEvent> {
+        self.selected_function = Some(id);
+        if let Some(ws) = self.workspaces.current_mut() {
+            ws.touch();
+        }
+        vec![]
     }
 
     fn cmd_expand_function(&mut self, id: SymbolId) -> Vec<AppEvent> {
@@ -1235,6 +1251,44 @@ mod tests {
             assert!(after.contains(id), "everything on screen stayed on screen");
         }
         assert!(after.contains(&leaf), "and the fetched callee was appended");
+    }
+
+    #[test]
+    fn focusing_a_node_moves_the_selection_and_nothing_else() {
+        let mut graph = CallGraph::new();
+        let root = add(&mut graph, "root", 1);
+        let mid = add(&mut graph, "mid", 2);
+        let leaf = add(&mut graph, "leaf", 3);
+        call(&mut graph, root, mid, 100);
+        call(&mut graph, mid, leaf, 101);
+
+        let mut app = CoreApp::new(graph);
+        app.dispatch(Command::SelectFunction(root));
+        app.dispatch(Command::SetGraphDepth(1));
+        let before = placed(&app);
+
+        let events = app.dispatch(Command::FocusFunction(mid));
+
+        assert!(
+            events.is_empty(),
+            "a click must not cost a snapshot: the client draws the border itself"
+        );
+        assert_eq!(app.selected_function, Some(mid), "the selection moved");
+        assert_eq!(
+            app.workspaces.current().and_then(|ws| ws.root_symbol),
+            Some(root),
+            "the root did not"
+        );
+        let after = placed(&app);
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "and the graph is the one that was already on screen"
+        );
+        assert!(
+            !after.contains(&leaf),
+            "pointing at a node does not load it"
+        );
     }
 
     /// Pretend the settling period has already elapsed, rather than sleeping

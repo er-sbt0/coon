@@ -76,4 +76,13 @@ pub enum Command {
     /// Load call hierarchy for a specific function without changing the graph root.
     /// Used by the web frontend to expand a node in-place.
     ExpandFunction(SymbolId),
+
+    /// Move the selection to this function and do nothing else.
+    ///
+    /// Not `SelectFunction`, which re-roots the tree, and not `ExpandFunction`,
+    /// which fetches its callees: clicking a node is how the user points at
+    /// one, and pointing must not redraw what they are pointing at. The
+    /// selection is what the breadcrumb and the "cluster this" scope read, so
+    /// it still belongs to `CoreApp` rather than living in one frontend.
+    FocusFunction(SymbolId),
 }

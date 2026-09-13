@@ -448,7 +448,10 @@ function renderBreadcrumb() {
     addCrumb(allFunctions[id]?.name ?? id, {
       title: allFunctions[id]?.qualified_name ?? '',
       current: i === path.length - 1,
-      run: () => expandNode(id),
+      // A crumb is a place on the path, so clicking one goes back to it — the
+      // same gesture as clicking the node, with the same non-effect on the
+      // graph.
+      run: () => focusNode(id),
     });
   });
 }
@@ -1018,6 +1021,24 @@ function selectRoot(id) {
   sendCommand({ SelectFunction: id });
 }
 
+/// Point at a node: light its border and let the breadcrumb follow. Nothing is
+/// fetched and nothing is laid out again, and the canvas is deliberately not
+/// rebuilt — a click is how the user says "this one", and a redraw at that
+/// moment loses their place. Loading a node's calls is the `+` button's job.
+function focusNode(id) {
+  if (selectedNodeId === id) return;
+  selectedNodeId = id;
+  cy.nodes().removeClass('focused');
+  // The root carries the stronger accent of the two already; a second border
+  // on top of it would read as a different state rather than the same one.
+  if (id !== rootNodeId) cy.$id(id).addClass('focused');
+  markPathToSelection();
+  renderBreadcrumb();
+  // `core` keeps the selection so the breadcrumb and the cluster scope agree
+  // with the canvas the next time something else sends a snapshot.
+  sendCommand({ FocusFunction: id });
+}
+
 // Expand a node in place: load its children without changing the root.
 function expandNode(id) {
   infoEl.textContent = `Expanding ${allFunctions[id]?.name ?? id}`;
@@ -1033,7 +1054,7 @@ function openInNewGraph(id) {
 
 cy.on('tap', 'node', (e) => {
   if (currentView === 'ClusterMap') { clusterTap(e.target); return; }
-  expandNode(e.target.id());
+  focusNode(e.target.id());
 });
 cy.on('dbltap', 'node', (e) => {
   e.preventDefault?.();
