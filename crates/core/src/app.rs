@@ -3,6 +3,7 @@ use model::{CallDirection, CallGraph, FunctionNode, Location, SymbolId};
 
 use crate::command::Command;
 use crate::events::AppEvent;
+use crate::layout::LayoutOrientation;
 use crate::lsp_bridge::{LoadingState, LspBridge};
 use crate::workspace::CoreWorkspaceManager;
 
@@ -61,7 +62,7 @@ impl CoreApp {
             Command::ToggleCallDirection => self.cmd_toggle_call_direction(),
             Command::SetGraphDepth(depth) => self.cmd_set_graph_depth(depth),
             Command::ToggleCollapsed(id) => self.cmd_toggle_collapsed(id),
-            Command::ToggleGraphOrientation => self.cmd_toggle_graph_orientation(),
+            Command::SetGraphOrientation(o) => self.cmd_set_graph_orientation(o),
             Command::NewWorkspace => self.cmd_new_workspace(),
             Command::CloseWorkspace(index) => self.cmd_close_workspace(index),
             Command::NextWorkspace => self.cmd_next_workspace(),
@@ -349,12 +350,19 @@ impl CoreApp {
         vec![AppEvent::LayoutDirty]
     }
 
-    fn cmd_toggle_graph_orientation(&mut self) -> Vec<AppEvent> {
-        if let Some(ws) = self.workspaces.current_mut() {
-            let orientation = ws.toggle_orientation();
-            log::info!("CoreApp: graph orientation toggled to {orientation:?}");
+    fn cmd_set_graph_orientation(&mut self, orientation: LayoutOrientation) -> Vec<AppEvent> {
+        // Only redraw on a real change; the segmented control can re-send the
+        // orientation already on screen.
+        let changed = self
+            .workspaces
+            .current_mut()
+            .is_some_and(|ws| ws.set_orientation(orientation));
+        if changed {
+            log::info!("CoreApp: graph orientation set to {orientation:?}");
+            vec![AppEvent::LayoutDirty]
+        } else {
+            vec![]
         }
-        vec![AppEvent::LayoutDirty]
     }
 
     fn cmd_set_graph_depth(&mut self, depth: usize) -> Vec<AppEvent> {

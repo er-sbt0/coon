@@ -44,15 +44,6 @@ pub enum LayoutOrientation {
     TopDown,
 }
 
-impl LayoutOrientation {
-    pub fn toggled(self) -> Self {
-        match self {
-            Self::LeftRight => Self::TopDown,
-            Self::TopDown => Self::LeftRight,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct NodePos {
     pub x: f32,

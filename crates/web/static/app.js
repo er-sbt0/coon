@@ -122,7 +122,8 @@ const searchEl   = $('search');
 const fnListEl   = $('fn-list');
 const fnCountEl  = $('fn-count');
 const dirToggleEl = $('dir-toggle');
-const orientToggleEl = $('orient-toggle');
+const orientLrEl = $('orient-lr');
+const orientTdEl = $('orient-td');
 const tabsEl     = $('tabs');
 const crumbEl    = $('breadcrumb');
 const statSymbolsEl = $('stat-symbols');
@@ -675,14 +676,23 @@ function updateDirToggle() {
 
 function updateOrientToggle() {
   const leftRight = currentOrientation === 'LeftRight';
-  orientToggleEl.textContent = leftRight ? '→ Left-right' : '↓ Top-down';
-  orientToggleEl.title = leftRight
-    ? 'Graph flows left to right — click for top to bottom'
-    : 'Graph flows top to bottom — click for left to right';
+  orientLrEl.setAttribute('aria-pressed', String(leftRight));
+  orientTdEl.setAttribute('aria-pressed', String(!leftRight));
+}
+
+/// Pick an orientation. Absolute, not a flip: the segment names the layout it
+/// produces, so pressing the one already lit is a no-op rather than a surprise.
+function setOrientation(next) {
+  if (next === currentOrientation) return;
+  // Reflect it immediately; the snapshot that follows confirms it.
+  currentOrientation = next;
+  updateOrientToggle();
+  sendCommand({ SetGraphOrientation: next });
 }
 
 dirToggleEl.addEventListener('click', () => sendCommand('ToggleCallDirection'));
-orientToggleEl.addEventListener('click', () => sendCommand('ToggleGraphOrientation'));
+orientLrEl.addEventListener('click', () => setOrientation('LeftRight'));
+orientTdEl.addEventListener('click', () => setOrientation('TopDown'));
 $('refresh-btn').addEventListener('click', () => sendCommand('Refresh'));
 
 // ── Sidebar dock: collapse and drag-resize ────────────────────────────────────
@@ -762,7 +772,7 @@ function buildCommands() {
 
     { id: 'view.sidebar', label: 'View: Toggle Sidebar', hint: 'Ctrl+B', run: toggleSidebar },
     { id: 'view.direction', label: 'View: Toggle Call Direction', hint: 'Ctrl+D', run: () => sendCommand('ToggleCallDirection') },
-    { id: 'view.orientation', label: 'View: Toggle Graph Orientation', hint: 'Ctrl+Shift+D', run: () => sendCommand('ToggleGraphOrientation') },
+    { id: 'view.orientation', label: 'View: Toggle Graph Orientation', hint: 'Ctrl+Shift+D', run: () => setOrientation(currentOrientation === 'LeftRight' ? 'TopDown' : 'LeftRight') },
     { id: 'view.fit', label: 'View: Fit Graph to Screen', disabled: cy.nodes().length === 0, run: fitGraph },
     { id: 'view.deeper', label: 'View: Show More Levels', hint: 'Ctrl+]', disabled: graphDepth >= DEPTH_MAX, run: () => setDepth(graphDepth + 1) },
     { id: 'view.shallower', label: 'View: Show Fewer Levels', hint: 'Ctrl+[', disabled: graphDepth <= DEPTH_MIN, run: () => setDepth(graphDepth - 1) },
@@ -849,7 +859,7 @@ document.addEventListener('keydown', (e) => {
   }
   else if (key === 'f') { e.preventDefault(); searchEl.focus(); searchEl.select(); }
   else if (key === 'r') { e.preventDefault(); sendCommand('Refresh'); }
-  else if (key === 'd' && e.shiftKey) { e.preventDefault(); sendCommand('ToggleGraphOrientation'); }
+  else if (key === 'd' && e.shiftKey) { e.preventDefault(); setOrientation(currentOrientation === 'LeftRight' ? 'TopDown' : 'LeftRight'); }
   else if (key === 'd') { e.preventDefault(); sendCommand('ToggleCallDirection'); }
   else if (key === ']') { e.preventDefault(); setDepth(graphDepth + 1); }
   else if (key === '[') { e.preventDefault(); setDepth(graphDepth - 1); }

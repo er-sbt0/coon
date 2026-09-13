@@ -56,7 +56,10 @@
       <button id="depth-inc" aria-label="Show more levels">+</button>
     </div>
     <button class="pill" id="dir-toggle" title="Toggle call direction">→ Outgoing</button>
-    <button class="pill" id="orient-toggle" title="Toggle graph orientation">→ Left-right</button>
+    <div class="pill segmented" id="orient-control" role="group" aria-label="Graph orientation">
+      <button id="orient-lr" aria-pressed="true" title="Lay the graph out left to right" aria-label="Left to right">→</button>
+      <button id="orient-td" aria-pressed="false" title="Lay the graph out top to bottom" aria-label="Top to bottom">↓</button>
+    </div>
     <button class="pill" id="refresh-btn" title="Refresh workspace symbols">Refresh</button>
   </div>
 

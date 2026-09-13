@@ -1,4 +1,6 @@
 use model::SymbolId;
+
+use crate::layout::LayoutOrientation;
 use serde::{Deserialize, Serialize};
 
 /// Domain commands dispatched to `CoreApp`.
@@ -23,8 +25,10 @@ pub enum Command {
     SetGraphDepth(usize),
     /// Collapse or re-expand one node's children. The node stays visible.
     ToggleCollapsed(SymbolId),
-    /// Flip the graph between left-to-right and top-down.
-    ToggleGraphOrientation,
+    /// Lay the graph out left-to-right or top-down. Absolute rather than a
+    /// toggle, because the control naming it names one orientation, not "the
+    /// other one" — the same reason `SetGraphDepth` takes a level.
+    SetGraphOrientation(LayoutOrientation),
 
     // ---- Workspace management ----
     NewWorkspace,

@@ -67,11 +67,15 @@ impl CoreWorkspace {
         changed
     }
 
-    /// Flip between a left-to-right and a top-down graph. Returns the new one.
-    pub fn toggle_orientation(&mut self) -> LayoutOrientation {
-        self.orientation = self.orientation.toggled();
-        self.touch();
-        self.orientation
+    /// Lay the graph out left-to-right or top-down.
+    /// Returns true when the value actually changed.
+    pub fn set_orientation(&mut self, orientation: LayoutOrientation) -> bool {
+        let changed = orientation != self.orientation;
+        self.orientation = orientation;
+        if changed {
+            self.touch();
+        }
+        changed
     }
 
     /// Collapse or re-expand a node's children. Returns true if now collapsed.
@@ -284,11 +288,16 @@ mod tests {
     }
 
     #[test]
-    fn orientation_toggles_between_the_two_directions() {
+    fn orientation_is_set_absolutely_and_reports_real_changes() {
         let mut ws = CoreWorkspace::new(1, "w".to_string());
         assert_eq!(ws.orientation, LayoutOrientation::LeftRight);
-        assert_eq!(ws.toggle_orientation(), LayoutOrientation::TopDown);
-        assert_eq!(ws.toggle_orientation(), LayoutOrientation::LeftRight);
+
+        assert!(ws.set_orientation(LayoutOrientation::TopDown));
+        assert_eq!(ws.orientation, LayoutOrientation::TopDown);
+        assert!(
+            !ws.set_orientation(LayoutOrientation::TopDown),
+            "re-picking the orientation already shown is not a change"
+        );
     }
 
     #[test]

@@ -357,6 +357,24 @@ body.resizing { cursor: col-resize; user-select: none; }
   font-variant-numeric: tabular-nums;
 }
 
+/* A two-position view setting, shown as both options at once rather than a
+   button whose label has to double as a verb: you click the one you want. */
+.pill.segmented { gap: 0; padding: 0; overflow: hidden; }
+.pill.segmented button {
+  width: 24px;
+  height: 100%;
+  color: var(--text-dim);
+  font-size: var(--fs-sm);
+  line-height: 1;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+.pill.segmented button:hover { background: var(--surface-hover); color: var(--text); }
+/* One accent at full strength marks the live orientation. */
+.pill.segmented button[aria-pressed="true"] {
+  background: var(--surface-hover);
+  color: var(--accent);
+}
+
 #palette { position: fixed; inset: 0; z-index: 1000; }
 #palette[hidden] { display: none; }
 

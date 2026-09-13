@@ -297,7 +297,8 @@ mod tests {
             "\"Refresh\"".to_string(),
             "{\"SetGraphDepth\":4}".to_string(),
             format!("{{\"ToggleCollapsed\":{id}}}"),
-            "\"ToggleGraphOrientation\"".to_string(),
+            "{\"SetGraphOrientation\":\"TopDown\"}".to_string(),
+            "{\"SetGraphOrientation\":\"LeftRight\"}".to_string(),
         ];
 
         for case in cases {
