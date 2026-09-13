@@ -13,6 +13,20 @@ use model::lsp_status::{LspLoadPhase, LspUiMessage};
 /// Maximum number of workspace symbols to load during initial discovery.
 const MAX_INITIAL_SYMBOLS: usize = 200;
 
+/// How long to wait for the initial `workspace/symbol` reply before giving up
+/// and wiring the bridge anyway.
+///
+/// clangd answers this one only once its background index has caught up, so the
+/// wait scales with the project: a 217-file tree (jemalloc) takes ~6 s on a warm
+/// machine, and a cold index is slower still. The old 2 s budget expired first
+/// on anything bigger than a toy, and the frontend came up with an empty graph.
+///
+/// Blocking here costs nothing the user can feel — there are no symbols to click
+/// until this lands. If the deadline does expire, the reply is not lost: it is
+/// forwarded to the frontend through the bridge below, which ingests workspace
+/// symbols whether or not it issued the request.
+const INITIAL_SYMBOL_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+
 /// Runs the full LSP initialization sequence in the background:
 ///
 /// 1. Spawns and initializes clangd
@@ -180,7 +194,7 @@ pub async fn lsp_loader_task(
         LspLoadPhase::LoadingWorkspaceSymbols { loaded: 0 },
     ))?;
 
-    let symbol_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(2000);
+    let symbol_deadline = tokio::time::Instant::now() + INITIAL_SYMBOL_TIMEOUT;
     let mut loaded_count: usize = 0;
 
     'symbol_wait: loop {
@@ -209,7 +223,15 @@ pub async fn lsp_loader_task(
                 break 'symbol_wait;
             }
             Ok(Some(_)) => continue, // response for a different request, keep waiting
-            Ok(None) | Err(_) => break, // channel closed or deadline exceeded
+            Ok(None) => break,       // channel closed
+            Err(_) => {
+                log::warn!(
+                    "Initial workspace symbols did not arrive within {:?}; continuing. \
+                     A late reply will still reach the frontend via the bridge.",
+                    INITIAL_SYMBOL_TIMEOUT
+                );
+                break;
+            }
         }
     }
 

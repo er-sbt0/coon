@@ -270,16 +270,20 @@ impl CoreApp {
                 request_id,
                 symbols,
             } => {
-                if let Some(_pending) = self.lsp.take_pending(&request_id) {
-                    let count = symbols.len();
-                    for symbol in symbols {
-                        self.call_graph.add_function(symbol);
-                    }
-                    if count > 0 {
-                        self.mark_graph_changed();
-                    }
-                    events.push(AppEvent::GraphSymbolsUpdated { count });
+                // Ingest whether or not we issued the request. The initial
+                // discovery query is sent by the LSP loader under its own id, and
+                // if clangd answers after the loader's wait expires the reply is
+                // forwarded here instead — gating on a pending entry we never
+                // registered would drop the whole workspace on the floor.
+                self.lsp.take_pending(&request_id);
+                let count = symbols.len();
+                for symbol in symbols {
+                    self.call_graph.add_function(symbol);
                 }
+                if count > 0 {
+                    self.mark_graph_changed();
+                }
+                events.push(AppEvent::GraphSymbolsUpdated { count });
             }
             LspResponse::DocumentSymbols { request_id, .. } => {
                 self.lsp.take_pending(&request_id);
@@ -835,6 +839,31 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, AppEvent::ClusteringUpdated { .. })));
+    }
+
+    #[test]
+    fn workspace_symbols_land_even_when_we_never_asked_for_them() {
+        // The loader issues the initial discovery query under its own request id.
+        // When clangd answers after the loader's wait expires, the reply is
+        // forwarded to us with an id we have no pending entry for — and it still
+        // has to populate the graph, or the frontend comes up empty.
+        let mut app = CoreApp::new(CallGraph::new());
+        assert!(app.lsp.pending_requests.is_empty());
+
+        let events = app.handle_lsp_response(LspResponse::WorkspaceSymbols {
+            request_id: "issued-by-the-loader".to_string(),
+            symbols: vec![FunctionNode::new(
+                "alpha".to_string(),
+                "alpha".to_string(),
+                Location::new("test.c".to_string(), 1, 0),
+            )],
+        });
+
+        assert_eq!(app.call_graph.function_ids().count(), 1);
+        assert!(app.clustering_dirty);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AppEvent::GraphSymbolsUpdated { count: 1 })));
     }
 
     #[test]

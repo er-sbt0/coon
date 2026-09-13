@@ -100,37 +100,42 @@ impl App {
                 request_id,
                 symbols,
             } => {
-                if let Some(_pending) = self.core.lsp.take_pending(&request_id) {
-                    self.status_message = StatusMessage::WorkspaceSymbolsLoaded {
-                        count: symbols.len(),
-                    };
-                    log::info!("Successfully loaded {} workspace symbols", symbols.len());
+                // Ingest whether or not we issued the request. The initial
+                // discovery query is sent by the LSP loader under its own id, and
+                // if clangd answers after the loader's wait expires the reply is
+                // forwarded here instead — gating on a pending entry we never
+                // registered would drop the whole workspace on the floor.
+                self.core.lsp.take_pending(&request_id);
 
-                    // Add the function symbols to the call graph
-                    let mut function_count = 0;
-                    for symbol in symbols {
-                        log::info!(
-                            "Adding function to call graph: '{}' (qualified: '{}') from {}:{}:{}",
-                            symbol.name,
-                            symbol.qualified_name,
-                            symbol.definition_location.file_path,
-                            symbol.definition_location.line,
-                            symbol.definition_location.column
-                        );
+                self.status_message = StatusMessage::WorkspaceSymbolsLoaded {
+                    count: symbols.len(),
+                };
+                log::info!("Successfully loaded {} workspace symbols", symbols.len());
 
-                        self.core.call_graph.add_function(symbol);
-                        function_count += 1;
-                    }
-
+                // Add the function symbols to the call graph
+                let mut function_count = 0;
+                for symbol in symbols {
                     log::info!(
-                        "Added {} functions to call graph from workspace symbols",
-                        function_count
+                        "Adding function to call graph: '{}' (qualified: '{}') from {}:{}:{}",
+                        symbol.name,
+                        symbol.qualified_name,
+                        symbol.definition_location.file_path,
+                        symbol.definition_location.line,
+                        symbol.definition_location.column
                     );
 
-                    self.status_message = StatusMessage::FunctionsLoadedFromWorkspace {
-                        count: function_count,
-                    };
+                    self.core.call_graph.add_function(symbol);
+                    function_count += 1;
                 }
+
+                log::info!(
+                    "Added {} functions to call graph from workspace symbols",
+                    function_count
+                );
+
+                self.status_message = StatusMessage::FunctionsLoadedFromWorkspace {
+                    count: function_count,
+                };
             }
             LspResponse::Error { request_id, error } => {
                 if let Some(pending) = self.core.lsp.take_pending(&request_id) {
