@@ -22,7 +22,7 @@
 
 use model::{CallGraph, SymbolId};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 /// Modularity differences below this are summation noise, not real gains, and
 /// treating them as improvements makes the level count depend on floating-point
@@ -119,6 +119,17 @@ pub struct Clustering {
     /// so [`Clustering::by_key`] is a lookup rather than a scan over every
     /// cluster at the level.
     anchors: Vec<HashMap<SymbolId, ClusterId>>,
+    /// What Louvain decided before [`make_convex`] cut it up, kept only to seed
+    /// the next recompute.
+    ///
+    /// Seeding with the *finished* clusters instead is what the obvious reading
+    /// of "start from last time" gives, and it destroys the stability it exists
+    /// to provide: the repaired partition is not a partition local moving would
+    /// have settled on, so Louvain immediately moves functions out of it and
+    /// the whole clustering lands somewhere new on a graph that never changed.
+    /// Louvain's own output is a fixed point, so seeding with that reproduces
+    /// it exactly, and the repair — deterministic — reproduces the rest.
+    seed: HashMap<SymbolId, usize>,
 }
 
 impl Clustering {
@@ -175,13 +186,27 @@ impl Clustering {
             return Self::default();
         }
 
-        let seed = previous.map(|prev| seed_partition(&symbols, prev));
-        let dendrogram = build_dendrogram(base, seed);
-        if dendrogram.is_empty() {
-            return Self::default();
-        }
+        // Louvain's first pass, and only its first pass. The coarser levels it
+        // would go on to build by aggregating this one are never used: they
+        // group an undirected copy of the call graph, so they straddle its
+        // direction, and `make_convex` builds the hierarchy above the finest
+        // level for itself — under the constraint, rather than repairing
+        // groupings that were made in ignorance of it.
+        let start = previous
+            .map(|prev| seed_partition(&symbols, prev))
+            .unwrap_or_else(|| (0..base.node_count()).collect());
+        let (finest, _) = renumber(&local_moving(&base, start));
 
-        build_clustering(graph, &symbols, &dendrogram)
+        let seed: HashMap<SymbolId, usize> = symbols.iter().copied().zip(finest.clone()).collect();
+
+        // Modularity is blind to direction. Restoring the direction afterwards
+        // is what keeps the cluster map readable as flow rather than as a knot
+        // of mutual arrows.
+        let dendrogram = make_convex(graph, &symbols, finest);
+
+        let mut clustering = build_clustering(graph, &symbols, &dendrogram);
+        clustering.seed = seed;
+        clustering
     }
 
     pub fn is_empty(&self) -> bool {
@@ -360,13 +385,13 @@ fn build_base_graph(
 /// Symbols the previous run grouped together share a fresh community index;
 /// symbols it never saw start on their own.
 fn seed_partition(symbols: &[SymbolId], previous: &Clustering) -> Vec<usize> {
-    let mut mapping: HashMap<ClusterId, usize> = HashMap::new();
+    let mut mapping: HashMap<usize, usize> = HashMap::new();
     let mut next = 0usize;
     let mut communities = Vec::with_capacity(symbols.len());
 
     for symbol in symbols {
-        let community = match previous.cluster_of(symbol) {
-            Some(old) => *mapping.entry(old).or_insert_with(|| {
+        let community = match previous.seed.get(symbol) {
+            Some(&old) => *mapping.entry(old).or_insert_with(|| {
                 let assigned = next;
                 next += 1;
                 assigned
@@ -477,33 +502,6 @@ fn renumber(communities: &[usize]) -> (Vec<usize>, usize) {
     (compacted, next)
 }
 
-fn modularity(graph: &WeightedGraph, communities: &[usize], count: usize) -> f64 {
-    let m2 = graph.total_degree;
-    if m2 <= 0.0 {
-        return 0.0;
-    }
-
-    let mut internal = vec![0.0f64; count];
-    let mut total = vec![0.0f64; count];
-    for (node, &community) in communities.iter().enumerate() {
-        total[community] += graph.degrees[node];
-        internal[community] += 2.0 * graph.self_loops[node];
-        for &(neighbour, weight) in &graph.adj[node] {
-            if communities[neighbour] == community {
-                // Each undirected edge is walked from both ends, which is exactly
-                // the doubling the formula wants.
-                internal[community] += weight;
-            }
-        }
-    }
-
-    internal
-        .iter()
-        .zip(&total)
-        .map(|(inside, degree)| inside / m2 - (degree / m2) * (degree / m2))
-        .sum()
-}
-
 /// Phase two: collapse each community into a single node.
 fn aggregate(graph: &WeightedGraph, communities: &[usize], count: usize) -> WeightedGraph {
     let mut adj_maps: Vec<HashMap<usize, f64>> = vec![HashMap::new(); count];
@@ -525,38 +523,752 @@ fn aggregate(graph: &WeightedGraph, communities: &[usize], count: usize) -> Weig
     WeightedGraph::new(adj_maps, self_loops)
 }
 
-/// Run Louvain to exhaustion, returning one partition per level.
+// ---------------------------------------------------------------------------
+// Convexity
+// ---------------------------------------------------------------------------
+
+/// Make every community *convex*: if two of its members are joined by a call
+/// path, everything on that path is a member too.
 ///
-/// `levels[0]` maps base nodes to level-0 communities; `levels[l]` maps level
-/// `l - 1` communities to level `l` communities.
-fn build_dendrogram(base: WeightedGraph, seed: Option<Vec<usize>>) -> Vec<Vec<usize>> {
-    let mut levels: Vec<Vec<usize>> = Vec::new();
-    let mut current = base;
-    let mut initial = seed.unwrap_or_else(|| (0..current.node_count()).collect());
+/// Modularity has no notion of direction — `build_base_graph` hands Louvain an
+/// undirected copy of the call graph — so a community is free to straddle a
+/// one-way chain. Group `a` and `c` but not the `b` between them and the
+/// aggregate the cluster map draws carries both `A -> B` and `B -> A`, which
+/// reads as "these two call each other" over code where nothing of the sort
+/// happens. Measured on jemalloc's `test_malloc_conf_2` neighbourhood, that was
+/// three quarters of the edges on the map, against a call graph that is a DAG
+/// apart from a single component: 91% of the calls behind those back edges ran
+/// one way only.
+///
+/// Convex communities are exactly the communities whose quotient graph is
+/// acyclic, which is why this is the thing to fix rather than the drawing. Two
+/// consequences follow, and neither is a choice:
+///
+/// * Mutually recursive functions share a community. A strongly-connected
+///   component split between two communities makes those two call each other by
+///   definition, so no acyclic map can separate them.
+/// * A community that straddles a path is split. The split follows a
+///   topological order that prefers to stay inside one community, so a
+///   community that straddles nothing comes through whole.
+///
+/// Every level is repaired, coarsest last, each over the quotient of the level
+/// below — so the hierarchy stays a refinement and drilling in never uncovers a
+/// cycle the level above had hidden.
+fn make_convex(graph: &CallGraph, symbols: &[SymbolId], mut finest: Vec<usize>) -> Vec<Vec<usize>> {
+    let succ = directed_edges(graph, symbols);
+    let (component, component_count) = strongly_connected(&succ);
 
-    let mut best_modularity = f64::NEG_INFINITY;
-    loop {
-        let (communities, count) = renumber(&local_moving(&current, initial));
-        let quality = modularity(&current, &communities, count);
+    // Mutual recursion first: whatever Louvain decided, the members of one
+    // component have to end up together. They go where most of them already
+    // were, which keeps the most of Louvain's judgement; ties go to the lowest
+    // community, so the answer does not depend on hash order.
+    let mut votes: Vec<HashMap<usize, usize>> = vec![HashMap::new(); component_count];
+    for (node, &comp) in component.iter().enumerate() {
+        *votes[comp].entry(finest[node]).or_insert(0) += 1;
+    }
+    let component_community: Vec<usize> = votes
+        .into_iter()
+        .map(|tally| {
+            tally
+                .into_iter()
+                .max_by_key(|&(of, count)| (count, std::cmp::Reverse(of)))
+                .expect("every component has at least one member")
+                .0
+        })
+        .collect();
 
-        // Level 0 is recorded whatever it looks like: the contract is that every
-        // connected symbol has a finest cluster, even on a graph Louvain cannot
-        // improve. Coarser levels have to earn their place.
-        if !levels.is_empty() && quality <= best_modularity + MODULARITY_EPSILON {
-            break;
-        }
-        levels.push(communities.clone());
-        best_modularity = quality;
-
-        if count == current.node_count() {
-            // Nothing merged, so aggregating would reproduce the same graph.
-            break;
-        }
-        current = aggregate(&current, &communities, count);
-        initial = (0..count).collect();
+    // Level 0 is repaired over the condensation — the finest DAG there is.
+    let condensation = quotient(&succ, &component, component_count);
+    let (label_of_component, _) = repair_partition(&condensation, &component_community);
+    for (node, &comp) in component.iter().enumerate() {
+        finest[node] = label_of_component[comp];
     }
 
-    levels
+    // The coarser levels are rebuilt rather than repaired. Louvain found them
+    // by aggregating the partition it had *before* the repair, over the same
+    // undirected copy that lost the direction in the first place, so repairing
+    // them means cutting groupings that were formed across the cuts just made:
+    // on jemalloc that left 289 communities coarsening to 103 and then to 70, a
+    // hierarchy that barely coarsens and a map of seventy boxes. Merging up from
+    // the repaired level instead keeps the constraint in front of the decision
+    // rather than behind it.
+    let mut levels = vec![finest];
+    let mut units = level_graph(graph, symbols, &levels[0]);
+    let mut unit_dag = quotient(&succ, &levels[0], units.node_count());
+    loop {
+        let (merged, count) = agglomerate_acyclically(&units, &unit_dag);
+        if count == units.node_count() {
+            break;
+        }
+        units = aggregate(&units, &merged, count);
+        unit_dag = quotient(&unit_dag, &merged, count);
+        levels.push(merged);
+    }
+    let dendrogram = levels;
+
+    debug_assert!(
+        dendrogram
+            .iter()
+            .skip(1)
+            .all(|level| level.iter().copied().max().map_or(0, |m| m + 1) < level.len()),
+        "a level that merged nothing is never recorded"
+    );
+
+    dendrogram
+}
+
+/// The weighted graph one level up: communities as nodes, the calls between
+/// them as weights.
+///
+/// Built the same way [`build_base_graph`] builds the bottom one — a call adds
+/// its weight in both directions, an internal one lands on the community's
+/// self-loop — so that `modularity` means the same thing at every level.
+fn level_graph(graph: &CallGraph, symbols: &[SymbolId], community: &[usize]) -> WeightedGraph {
+    let count = community.iter().copied().max().map_or(0, |m| m + 1);
+    let position: HashMap<SymbolId, usize> =
+        symbols.iter().enumerate().map(|(i, s)| (*s, i)).collect();
+
+    let mut adj_maps: Vec<HashMap<usize, f64>> = vec![HashMap::new(); count];
+    let mut self_loops = vec![0.0f64; count];
+    for (i, symbol) in symbols.iter().enumerate() {
+        for callee in graph.get_callees(symbol) {
+            let Some(&j) = position.get(&callee.id) else {
+                continue;
+            };
+            if i == j {
+                continue;
+            }
+            let (a, b) = (community[i], community[j]);
+            if a == b {
+                self_loops[a] += 1.0;
+            } else {
+                *adj_maps[a].entry(b).or_insert(0.0) += 1.0;
+                *adj_maps[b].entry(a).or_insert(0.0) += 1.0;
+            }
+        }
+    }
+
+    WeightedGraph::new(adj_maps, self_loops)
+}
+
+/// Build one coarser level by merging communities in pairs, best modularity
+/// gain first, refusing any merge that would put a cycle back.
+///
+/// This stands in for Louvain's own aggregation at every level above the first.
+/// Local moving cannot be constrained the same way — it moves one node at a
+/// time between communities that are already fixed, so a move that breaks
+/// acyclicity is only visible after the fact — whereas a merge either keeps the
+/// quotient a DAG or does not, and the test is cheap: `a` and `b` can join
+/// unless some third community sits on a path between them.
+///
+/// Greedy pairwise merging is weaker than local moving at finding communities,
+/// and that is the trade. What it buys is a hierarchy whose every level can be
+/// drawn as flow.
+fn agglomerate_acyclically(graph: &WeightedGraph, dag: &[Vec<usize>]) -> (Vec<usize>, usize) {
+    let n = graph.node_count();
+    let mut community: Vec<usize> = (0..n).collect();
+    if n < 2 || graph.total_degree <= 0.0 {
+        return (community, n);
+    }
+
+    // Live communities, their degree, and the weight between them. Merging
+    // folds one into the other and leaves the empty one behind.
+    let mut degree = graph.degrees.clone();
+    let mut between: Vec<HashMap<usize, f64>> = vec![HashMap::new(); n];
+    for (node, neighbours) in graph.adj.iter().enumerate() {
+        for &(other, weight) in neighbours {
+            between[node].insert(other, weight);
+        }
+    }
+    let mut alive: Vec<bool> = vec![true; n];
+    let total = graph.total_degree;
+
+    loop {
+        let live = dag_of_alive(dag, &community, n);
+        let reaches = Reachability::of(&live);
+        let backwards = Reachability::of(&reversed(&live));
+
+        // Candidates, best first: the modularity gain of joining two
+        // communities, in the usual agglomerative form — the weight they
+        // already share, less the weight they would share if the edges were
+        // thrown at random.
+        let mut candidates: Vec<(f64, usize, usize)> = Vec::new();
+        for a in 0..n {
+            if !alive[a] {
+                continue;
+            }
+            for (&b, &weight) in &between[a] {
+                if b <= a || !alive[b] {
+                    continue;
+                }
+                // dQ = 2 * (e_ab/2m - a_a*a_b), with `total` standing for 2m.
+                let gain = 2.0 * (weight / total - (degree[a] * degree[b]) / (total * total));
+                if gain > MODULARITY_EPSILON {
+                    candidates.push((gain, a, b));
+                }
+            }
+        }
+        // Lowest pair wins a tie, so the same graph merges the same way.
+        candidates.sort_by(|x, y| {
+            y.0.partial_cmp(&x.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| (x.1, x.2).cmp(&(y.1, y.2)))
+        });
+
+        let mut chosen: Option<Vec<usize>> = None;
+        for (gain, a, b) in candidates {
+            let group = between_closure(&reaches, &backwards, &alive, a, b);
+            if group.len() == 2 {
+                chosen = Some(group);
+                break;
+            }
+            // Blocked: something sits on a path between the two. Joining them
+            // alone would put a cycle back, but joining them *with whatever is
+            // between them* cannot — and is the merge Louvain would have made
+            // by moving nodes one at a time, which pairwise merging cannot see.
+            // Worth it only if the whole set still gains.
+            let _ = gain;
+            if set_gain(&group, &between, &degree, total) > MODULARITY_EPSILON {
+                chosen = Some(group);
+                break;
+            }
+        }
+
+        let Some(group) = chosen else { break };
+        let keep = *group.iter().min().expect("a merge joins at least two");
+        for &gone in group.iter().filter(|&&g| g != keep) {
+            alive[gone] = false;
+            degree[keep] += degree[gone];
+            for member in community.iter_mut() {
+                if *member == gone {
+                    *member = keep;
+                }
+            }
+            let folded: Vec<(usize, f64)> = between[gone].iter().map(|(&o, &w)| (o, w)).collect();
+            for (other, weight) in folded {
+                between[other].remove(&gone);
+                if other == keep {
+                    continue;
+                }
+                *between[keep].entry(other).or_insert(0.0) += weight;
+                *between[other].entry(keep).or_insert(0.0) += weight;
+            }
+            between[keep].remove(&gone);
+            between[gone].clear();
+        }
+    }
+
+    let (dense, count) = renumber(&community);
+    (dense, count)
+}
+
+/// The smallest set containing `a` and `b` that is closed under "lies on a path
+/// between two members".
+///
+/// Merging exactly this set is the smallest merge involving both that keeps the
+/// quotient acyclic: anything left on a path between two of its members would
+/// be a cycle through the merged community. Comes back as just `[a, b]` when
+/// nothing is in the way, which is the common case.
+fn between_closure(
+    reaches: &Reachability,
+    backwards: &Reachability,
+    alive: &[bool],
+    a: usize,
+    b: usize,
+) -> Vec<usize> {
+    let words = alive.len().div_ceil(64);
+    let mut group: BTreeSet<usize> = [a, b].into_iter().collect();
+    loop {
+        let mut mask = vec![0u64; words];
+        for &member in &group {
+            mask[member / 64] |= 1 << (member % 64);
+        }
+
+        // In a DAG, "something in the group reaches y and y reaches something
+        // in the group" is enough: the two cannot be the same node, or the
+        // group member would reach itself.
+        let mut grew = false;
+        for (candidate, _) in alive.iter().enumerate().filter(|(_, &live)| live) {
+            if group.contains(&candidate) {
+                continue;
+            }
+            if backwards.reaches_any(candidate, &mask) && reaches.reaches_any(candidate, &mask) {
+                group.insert(candidate);
+                grew = true;
+            }
+        }
+        if !grew {
+            return group.into_iter().collect();
+        }
+    }
+}
+
+/// The same graph with every edge turned round.
+fn reversed(dag: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let mut out = vec![Vec::new(); dag.len()];
+    for (node, targets) in dag.iter().enumerate() {
+        for &target in targets {
+            out[target].push(node);
+        }
+    }
+    out
+}
+
+/// The modularity gain of merging a whole set at once.
+///
+/// The pairwise formula generalised: everything the members already share,
+/// less what a random graph with the same degrees would have given them.
+fn set_gain(group: &[usize], between: &[HashMap<usize, f64>], degree: &[f64], total: f64) -> f64 {
+    let mut shared = 0.0;
+    let mut degree_sum = 0.0;
+    let mut degree_squares = 0.0;
+    for (i, &u) in group.iter().enumerate() {
+        degree_sum += degree[u];
+        degree_squares += degree[u] * degree[u];
+        for &v in &group[i + 1..] {
+            shared += between[u].get(&v).copied().unwrap_or(0.0);
+        }
+    }
+    2.0 * shared / total - (degree_sum * degree_sum - degree_squares) / (total * total)
+}
+
+/// The directed graph over live communities, for the acyclicity test.
+fn dag_of_alive(dag: &[Vec<usize>], community: &[usize], n: usize) -> Vec<Vec<usize>> {
+    let mut out: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
+    for (node, targets) in dag.iter().enumerate() {
+        let from = community[node];
+        for &target in targets {
+            let to = community[target];
+            if from != to {
+                out[from].insert(to);
+            }
+        }
+    }
+    out.into_iter()
+        .map(|set| set.into_iter().collect())
+        .collect()
+}
+
+/// The call graph's edges in the index space the clustering works in.
+///
+/// Unlike `build_base_graph` this keeps the direction, which is the whole point
+/// of it: the undirected copy is what loses the property being restored here.
+fn directed_edges(graph: &CallGraph, symbols: &[SymbolId]) -> Vec<Vec<usize>> {
+    let position: HashMap<SymbolId, usize> =
+        symbols.iter().enumerate().map(|(i, s)| (*s, i)).collect();
+    symbols
+        .iter()
+        .map(|symbol| {
+            let mut targets: Vec<usize> = graph
+                .get_callees(symbol)
+                .iter()
+                .filter_map(|callee| position.get(&callee.id).copied())
+                .collect();
+            targets.sort_unstable();
+            targets.dedup();
+            targets
+        })
+        .enumerate()
+        .map(|(i, targets)| targets.into_iter().filter(|&j| j != i).collect())
+        .collect()
+}
+
+/// Tarjan's strongly-connected components, iteratively: the recursion depth
+/// here is the call depth of the project being read, which is not ours to bound.
+///
+/// Returns each node's component and how many there are. Components are what
+/// convexity has to treat as indivisible.
+fn strongly_connected(succ: &[Vec<usize>]) -> (Vec<usize>, usize) {
+    let n = succ.len();
+    let (mut index, mut low) = (vec![usize::MAX; n], vec![0usize; n]);
+    let mut on_stack = vec![false; n];
+    let mut component = vec![usize::MAX; n];
+    let (mut stack, mut next_index, mut next_component) = (Vec::new(), 0usize, 0usize);
+
+    for start in 0..n {
+        if index[start] != usize::MAX {
+            continue;
+        }
+        // Each frame is a node and how far through its successors we are.
+        let mut work: Vec<(usize, usize)> = vec![(start, 0)];
+        while let Some((node, resume)) = work.last().copied() {
+            if resume == 0 {
+                index[node] = next_index;
+                low[node] = next_index;
+                next_index += 1;
+                stack.push(node);
+                on_stack[node] = true;
+            }
+
+            let mut descended = false;
+            for (offset, &next) in succ[node].iter().enumerate().skip(resume) {
+                work.last_mut().expect("the frame we are working on").1 = offset + 1;
+                if index[next] == usize::MAX {
+                    work.push((next, 0));
+                    descended = true;
+                    break;
+                } else if on_stack[next] {
+                    low[node] = low[node].min(index[next]);
+                }
+            }
+            if descended {
+                continue;
+            }
+
+            work.pop();
+            if let Some(&(parent, _)) = work.last() {
+                low[parent] = low[parent].min(low[node]);
+            }
+            if low[node] == index[node] {
+                while let Some(member) = stack.pop() {
+                    on_stack[member] = false;
+                    component[member] = next_component;
+                    if member == node {
+                        break;
+                    }
+                }
+                next_component += 1;
+            }
+        }
+    }
+
+    (component, next_component)
+}
+
+/// Collapse a graph onto one node per group: the edges between groups, with
+/// duplicates and self-loops dropped.
+fn quotient(succ: &[Vec<usize>], group: &[usize], group_count: usize) -> Vec<Vec<usize>> {
+    let mut out: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); group_count];
+    for (node, targets) in succ.iter().enumerate() {
+        let from = group[node];
+        for &target in targets {
+            let to = group[target];
+            if from != to {
+                out[from].insert(to);
+            }
+        }
+    }
+    out.into_iter()
+        .map(|set| set.into_iter().collect())
+        .collect()
+}
+
+/// Split only the communities that actually form cycles, and only against each
+/// other.
+///
+/// Every cycle in the quotient graph lies inside one of its strongly-connected
+/// components, so the communities outside those components are already convex
+/// enough and are left exactly as they are — which matters, because splitting a
+/// community that was not the problem costs a box on the map for nothing.
+///
+/// Within one tangled component the fix is to cut its communities into the
+/// maximal runs of a topological order. A run occupies consecutive positions of
+/// that order and every edge runs forward, so nothing can sit on a path between
+/// two of its members: ordering the runs by position topologically sorts what
+/// was a knot. A community the order never has to leave and come back to yields
+/// one run and survives whole, which is why the order is greedy about staying
+/// put.
+///
+/// No path between two members of a tangled component can leave it and come
+/// back — that would put whatever it passed through on a cycle, and so inside
+/// the component — which is what lets each component be repaired against the
+/// subgraph it induces, in ignorance of everything else.
+///
+/// Returns the new community of each unit, and for each new community the one
+/// it was cut from.
+fn repair_partition(succ: &[Vec<usize>], community: &[usize]) -> (Vec<usize>, Vec<usize>) {
+    let community_count = community.iter().copied().max().map_or(0, |m| m + 1);
+    let quotient_graph = quotient(succ, community, community_count);
+    let (tangle, _) = strongly_connected(&quotient_graph);
+
+    let mut tangle_size: HashMap<usize, usize> = HashMap::new();
+    for &of in &tangle {
+        *tangle_size.entry(of).or_insert(0) += 1;
+    }
+    let tangled = |of: usize| tangle_size.get(&tangle[of]).copied().unwrap_or(0) > 1;
+
+    let mut label = vec![usize::MAX; succ.len()];
+    let mut origin: Vec<usize> = Vec::new();
+
+    // Untangled communities keep their membership; only their numbering moves.
+    // Taken in community order so the result does not depend on hash order.
+    let mut kept: HashMap<usize, usize> = HashMap::new();
+    for of in 0..community_count {
+        if !tangled(of) {
+            kept.insert(of, origin.len());
+            origin.push(of);
+        }
+    }
+    for (unit, &of) in community.iter().enumerate() {
+        if let Some(&new) = kept.get(&of) {
+            label[unit] = new;
+        }
+    }
+
+    // Each tangled component is cut against the subgraph it induces.
+    let mut components: Vec<usize> = (0..community_count).filter(|&of| tangled(of)).collect();
+    components.sort_unstable_by_key(|&of| tangle[of]);
+    let mut done: HashSet<usize> = HashSet::new();
+    for of in components {
+        if !done.insert(tangle[of]) {
+            continue;
+        }
+        let inside: Vec<usize> = (0..succ.len())
+            .filter(|&unit| tangle[community[unit]] == tangle[of])
+            .collect();
+        let local: HashMap<usize, usize> =
+            inside.iter().enumerate().map(|(i, &u)| (u, i)).collect();
+        let induced: Vec<Vec<usize>> = inside
+            .iter()
+            .map(|unit| {
+                succ[*unit]
+                    .iter()
+                    .filter_map(|target| local.get(target).copied())
+                    .collect()
+            })
+            .collect();
+        let inner_community: Vec<usize> = inside.iter().map(|&unit| community[unit]).collect();
+
+        let order = clustered_topological_order(&induced, &inner_community);
+        let mut run_of: Vec<usize> = vec![usize::MAX; inside.len()];
+        let mut run_origin: Vec<usize> = Vec::new();
+        let mut current: Option<usize> = None;
+        for &local_unit in &order {
+            let was = inner_community[local_unit];
+            if current != Some(was) {
+                run_origin.push(was);
+                current = Some(was);
+            }
+            run_of[local_unit] = run_origin.len() - 1;
+        }
+
+        let representative = merge_severed_runs(&induced, &run_of, &run_origin);
+
+        // Number the surviving runs in the order they were cut, so the output
+        // does not depend on which pairs the merge happened to consider first.
+        let mut numbered: HashMap<usize, usize> = HashMap::new();
+        for &rep in representative.iter() {
+            numbered.entry(rep).or_insert_with(|| {
+                origin.push(run_origin[rep]);
+                origin.len() - 1
+            });
+        }
+        for (local_unit, &run) in run_of.iter().enumerate() {
+            label[inside[local_unit]] = numbered[&representative[run]];
+        }
+    }
+
+    // Unreachable while every caller hands in a DAG, which they do. Left total
+    // rather than panicking: a cycle here costs one map its acyclicity, and
+    // taking the whole clustering down with it helps nobody.
+    debug_assert!(
+        label.iter().all(|&l| l != usize::MAX),
+        "a DAG orders all of its nodes"
+    );
+    for unit in 0..succ.len() {
+        if label[unit] == usize::MAX {
+            origin.push(community[unit]);
+            label[unit] = origin.len() - 1;
+        }
+    }
+
+    (label, origin)
+}
+
+/// Put back the cuts that were not holding anything up.
+///
+/// The run split is blunt on purpose — it cuts a community every time the
+/// topological order has to step outside it — but the order is one order among
+/// many, and most of those steps are an artefact of the one it picked rather
+/// than something the call graph insists on. On the demo project the blunt cut
+/// alone turned 14 top-level communities into 16, over half of them holding a
+/// single group.
+///
+/// So two runs of the same community are rejoined whenever that cannot put a
+/// cycle back: when no *third* run sits on a path between them. Runs that
+/// neither reaches pass trivially, which is the common case and the one that
+/// recovers most of the damage.
+///
+/// Returns each run's representative — itself, if nothing merged into it.
+fn merge_severed_runs(
+    induced: &[Vec<usize>],
+    run_of: &[usize],
+    run_origin: &[usize],
+) -> Vec<usize> {
+    let count = run_origin.len();
+    let mut representative: Vec<usize> = (0..count).collect();
+
+    loop {
+        let edges = quotient(
+            induced,
+            &run_of_representative(run_of, &representative),
+            count,
+        );
+        let reaches = Reachability::of(&edges);
+
+        // Lowest pair first, so the merges happen in a fixed order.
+        let mut merged = None;
+        'pairs: for a in 0..count {
+            if representative[a] != a {
+                continue;
+            }
+            for b in (a + 1)..count {
+                if representative[b] != b || run_origin[a] != run_origin[b] {
+                    continue;
+                }
+                let between = (0..count).filter(|&y| representative[y] == y).any(|y| {
+                    y != a
+                        && y != b
+                        && ((reaches.reaches(a, y) && reaches.reaches(y, b))
+                            || (reaches.reaches(b, y) && reaches.reaches(y, a)))
+                });
+                if !between {
+                    merged = Some((a, b));
+                    break 'pairs;
+                }
+            }
+        }
+
+        let Some((keep, gone)) = merged else {
+            return representative;
+        };
+        for rep in representative.iter_mut() {
+            if *rep == gone {
+                *rep = keep;
+            }
+        }
+    }
+}
+
+/// Each unit's run, as its representative — the grouping `quotient` needs while
+/// runs are being merged.
+fn run_of_representative(run_of: &[usize], representative: &[usize]) -> Vec<usize> {
+    run_of.iter().map(|&run| representative[run]).collect()
+}
+
+/// Who can reach whom, one bit per node.
+///
+/// A `Vec<Vec<bool>>` filled by a traversal per node is the obvious shape and
+/// was far too slow to ship: this gets recomputed after every merge, and at a
+/// few hundred communities that is hundreds of full sweeps — 3s to cluster a
+/// 2000-function project, against 12ms before any of this. The input is always
+/// a DAG, so reachability instead falls out of a single reverse topological
+/// pass in which each node ORs together what its successors reach, over rows of
+/// machine words rather than bytes.
+struct Reachability {
+    rows: Vec<Vec<u64>>,
+}
+
+impl Reachability {
+    fn of(dag: &[Vec<usize>]) -> Self {
+        let n = dag.len();
+        let words = n.div_ceil(64);
+        let mut rows = vec![vec![0u64; words]; n];
+        // A node's reach is known once every successor's is, which is what
+        // walking the topological order backwards guarantees.
+        for &node in plain_topological_order(dag).iter().rev() {
+            let mut reached = vec![0u64; words];
+            for &next in &dag[node] {
+                reached[next / 64] |= 1 << (next % 64);
+                for (word, other) in reached.iter_mut().zip(&rows[next]) {
+                    *word |= other;
+                }
+            }
+            rows[node] = reached;
+        }
+        Self { rows }
+    }
+
+    fn reaches(&self, from: usize, to: usize) -> bool {
+        self.rows[from][to / 64] >> (to % 64) & 1 == 1
+    }
+
+    /// Whether `node` reaches anything in `mask`.
+    fn reaches_any(&self, node: usize, mask: &[u64]) -> bool {
+        self.rows[node]
+            .iter()
+            .zip(mask)
+            .any(|(reached, wanted)| reached & wanted != 0)
+    }
+}
+
+/// Kahn's algorithm, taking whatever is ready in index order.
+fn plain_topological_order(dag: &[Vec<usize>]) -> Vec<usize> {
+    let mut waiting_on = vec![0usize; dag.len()];
+    for targets in dag {
+        for &target in targets {
+            waiting_on[target] += 1;
+        }
+    }
+    let mut ready: Vec<usize> = (0..dag.len()).filter(|&n| waiting_on[n] == 0).collect();
+    let mut order = Vec::with_capacity(dag.len());
+    while let Some(node) = ready.pop() {
+        order.push(node);
+        for &target in &dag[node] {
+            waiting_on[target] -= 1;
+            if waiting_on[target] == 0 {
+                ready.push(target);
+            }
+        }
+    }
+    order
+}
+
+/// Topologically order a DAG, staying inside one community for as long as the
+/// edges allow.
+///
+/// Kahn's algorithm, with the ready set kept per community so that "carry on
+/// with the community we are already in" is a lookup rather than a scan. When
+/// the current community runs dry it starts the largest run available, because
+/// the number of runs is what this is trying to keep down. Ties go to the lowest
+/// community, then the lowest unit, so the same graph always orders the same way.
+fn clustered_topological_order(succ: &[Vec<usize>], community: &[usize]) -> Vec<usize> {
+    let mut waiting_on = vec![0usize; succ.len()];
+    for targets in succ {
+        for &target in targets {
+            waiting_on[target] += 1;
+        }
+    }
+
+    let mut ready: HashMap<usize, BTreeSet<usize>> = HashMap::new();
+    for (unit, &count) in waiting_on.iter().enumerate() {
+        if count == 0 {
+            ready.entry(community[unit]).or_default().insert(unit);
+        }
+    }
+
+    let mut order = Vec::with_capacity(succ.len());
+    let mut current: Option<usize> = None;
+    while !ready.is_empty() {
+        let pick = match current.filter(|of| ready.contains_key(of)) {
+            Some(of) => of,
+            None => {
+                *ready
+                    .iter()
+                    .max_by_key(|(of, units)| (units.len(), std::cmp::Reverse(**of)))
+                    .expect("the loop runs only while something is ready")
+                    .0
+            }
+        };
+
+        let units = ready.get_mut(&pick).expect("just picked");
+        let unit = *units.iter().next().expect("empty sets are never kept");
+        units.remove(&unit);
+        if units.is_empty() {
+            ready.remove(&pick);
+        }
+        current = Some(pick);
+        order.push(unit);
+
+        for &target in &succ[unit] {
+            waiting_on[target] -= 1;
+            if waiting_on[target] == 0 {
+                ready.entry(community[target]).or_default().insert(target);
+            }
+        }
+    }
+
+    order
 }
 
 // ---------------------------------------------------------------------------
@@ -680,6 +1392,9 @@ fn build_clustering(
         levels,
         index,
         anchors,
+        // Filled in by the caller, which is the only place that still has the
+        // partition Louvain produced before it was made convex.
+        seed: HashMap::new(),
     }
 }
 
@@ -1212,6 +1927,16 @@ mod tests {
 
     /// Four triangles, paired tightly and the pairs joined loosely, so Louvain
     /// has something to merge on a second pass.
+    /// Four triangles in a chain, with one of them mutually recursive.
+    ///
+    /// The chain is what gives the fixture a hierarchy to have levels of: four
+    /// groups that a coarser level can pair up. It runs one way on purpose.
+    /// Wiring the triangles to call each other *back* — which this fixture used
+    /// to do — makes the whole chain one strongly-connected component, and a
+    /// component cannot be split across clusters without those clusters calling
+    /// each other, so the clustering has no choice but to return it as one
+    /// lump. The recursion inside `t2` keeps that path covered at a size that
+    /// leaves the rest of the structure intact.
     fn layered_graph() -> CallGraph {
         let mut graph = CallGraph::new();
         let t1 = triangle(&mut graph, "t1", 10);
@@ -1219,21 +1944,187 @@ mod tests {
         let t3 = triangle(&mut graph, "t3", 70);
         let t4 = triangle(&mut graph, "t4", 100);
 
-        for (i, (from, to)) in [(t1[1], t2[0]), (t1[2], t2[1]), (t2[2], t1[0])]
-            .into_iter()
-            .enumerate()
+        // Triangles paired tightly, pairs joined by a single call: that is what
+        // gives Louvain a second level to find — triangles below, pairs above.
+        for (i, (from, to)) in [
+            (t1[1], t2[0]),
+            (t1[2], t2[1]),
+            (t1[0], t2[2]),
+            (t3[1], t4[0]),
+            (t3[2], t4[1]),
+            (t3[0], t4[2]),
+        ]
+        .into_iter()
+        .enumerate()
         {
             call(&mut graph, from, to, 600 + i as u32);
         }
-        for (i, (from, to)) in [(t3[1], t4[0]), (t3[2], t4[1]), (t4[2], t3[0])]
-            .into_iter()
-            .enumerate()
-        {
-            call(&mut graph, from, to, 700 + i as u32);
-        }
         call(&mut graph, t2[2], t3[0], 800);
+        // t2 calls itself in a circle: a -> b -> c -> a.
+        call(&mut graph, t2[2], t2[0], 900);
 
         graph
+    }
+
+    // ---- Convexity ----
+
+    /// A chain whose two ends are called together often enough that modularity
+    /// wants them in one community — with four functions in between that it
+    /// does not want. Grouping the ends and not the middle is exactly the
+    /// straddle that puts a mutual arrow on the map.
+    fn straddling_graph() -> CallGraph {
+        let mut graph = CallGraph::new();
+        let chain: Vec<SymbolId> = (0..6)
+            .map(|i| add(&mut graph, &format!("step{i}"), 10 + i))
+            .collect();
+        for (i, pair) in chain.windows(2).enumerate() {
+            call(&mut graph, pair[0], pair[1], 100 + i as u32);
+        }
+        // The ends, tied together by repeated calls.
+        for line in 0..5 {
+            call(&mut graph, chain[0], chain[5], 200 + line);
+        }
+        graph
+    }
+
+    /// Which cluster each clustered symbol sits in at `level`.
+    fn owners_at(clustering: &Clustering, level: usize) -> HashMap<SymbolId, ClusterId> {
+        clustering
+            .level(level)
+            .iter()
+            .flat_map(|id| {
+                let cluster = clustering.cluster(*id).expect("listed at its level");
+                cluster.members.iter().map(move |m| (*m, cluster.id))
+            })
+            .collect()
+    }
+
+    /// Whether the clusters at `level` call each other in a circle.
+    fn level_has_a_cycle(graph: &CallGraph, clustering: &Clustering, level: usize) -> bool {
+        let owner = owners_at(clustering, level);
+        let mut edges: HashMap<ClusterId, HashSet<ClusterId>> = HashMap::new();
+        for caller in graph.function_ids() {
+            let Some(&from) = owner.get(caller) else {
+                continue;
+            };
+            for callee in graph.get_callees(caller) {
+                if let Some(&to) = owner.get(&callee.id) {
+                    if from != to {
+                        edges.entry(from).or_default().insert(to);
+                    }
+                }
+            }
+        }
+
+        // Depth-first, colouring grey on the way down: an edge back into the
+        // grey set is a cycle.
+        let mut black: HashSet<ClusterId> = HashSet::new();
+        for start in clustering.level(level) {
+            let mut grey: HashSet<ClusterId> = HashSet::new();
+            let mut stack = vec![(*start, false)];
+            while let Some((node, leaving)) = stack.pop() {
+                if leaving {
+                    grey.remove(&node);
+                    black.insert(node);
+                    continue;
+                }
+                if black.contains(&node) {
+                    continue;
+                }
+                if !grey.insert(node) {
+                    return true;
+                }
+                stack.push((node, true));
+                for next in edges.get(&node).into_iter().flatten() {
+                    if grey.contains(next) {
+                        return true;
+                    }
+                    stack.push((*next, false));
+                }
+            }
+        }
+        false
+    }
+
+    /// The guarantee the whole convexity pass exists to provide: whatever level
+    /// the map is drawn at, the arrows between boxes run one way. Two boxes
+    /// pointing at each other says "these call each other" over code where, in a
+    /// call graph that is a DAG, nothing of the sort happens.
+    #[test]
+    fn no_level_draws_a_cycle_between_clusters() {
+        for (name, graph) in [
+            ("a straddling chain", straddling_graph()),
+            ("layered triangles", layered_graph()),
+            ("two triangles", two_triangles().0),
+        ] {
+            let clustering = Clustering::compute(&graph);
+            assert!(!clustering.is_empty(), "{name}: nothing clustered");
+            for level in 0..clustering.level_count() {
+                assert!(
+                    !level_has_a_cycle(&graph, &clustering, level),
+                    "{name}: the clusters at level {level} call each other in a circle"
+                );
+            }
+        }
+    }
+
+    /// A scoped map is drawn from its own clustering and needs the same of it.
+    #[test]
+    fn a_scoped_clustering_draws_as_flow_too() {
+        let graph = straddling_graph();
+        let scope: HashSet<SymbolId> = graph.function_ids().copied().collect();
+        let clustering = Clustering::compute_within(&graph, &scope, None);
+
+        for level in 0..clustering.level_count() {
+            assert!(!level_has_a_cycle(&graph, &clustering, level));
+        }
+    }
+
+    /// Functions that call each other in a circle cannot be told apart by a map
+    /// that runs one way, so they have to share a cluster — splitting them is
+    /// precisely what would make two clusters call each other.
+    #[test]
+    fn mutually_recursive_functions_share_a_cluster() {
+        let mut graph = CallGraph::new();
+        let ring: Vec<SymbolId> = (0..4)
+            .map(|i| add(&mut graph, &format!("ring{i}"), 10 + i))
+            .collect();
+        for (i, pair) in ring.windows(2).enumerate() {
+            call(&mut graph, pair[0], pair[1], 100 + i as u32);
+        }
+        call(&mut graph, ring[3], ring[0], 150);
+        // Something else for the clustering to prefer, so that keeping the ring
+        // together is not simply the only option on the table.
+        let other = triangle(&mut graph, "other", 200);
+        call(&mut graph, ring[2], other[0], 300);
+
+        let clustering = Clustering::compute(&graph);
+        let home = clustering
+            .cluster_of(&ring[0])
+            .expect("a function in a cycle is not isolated");
+        for member in &ring {
+            assert_eq!(
+                clustering.cluster_of(member),
+                Some(home),
+                "the ring was split across clusters"
+            );
+        }
+    }
+
+    /// The straddle itself: the repair has to move something, and what it moves
+    /// must stay a partition of the same functions.
+    #[test]
+    fn repairing_a_straddle_still_covers_every_connected_symbol() {
+        let graph = straddling_graph();
+        let clustering = Clustering::compute(&graph);
+
+        let connected: HashSet<SymbolId> = graph
+            .function_ids()
+            .filter(|id| !graph.get_callers(id).is_empty() || !graph.get_callees(id).is_empty())
+            .copied()
+            .collect();
+        let covered: HashSet<SymbolId> = owners_at(&clustering, 0).into_keys().collect();
+        assert_eq!(covered, connected);
     }
 
     // ---- Clustering one corner of the graph ----

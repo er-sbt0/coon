@@ -264,6 +264,17 @@ fn report(graph: &CallGraph, root: SymbolId, target: &str) {
     println!("== scope: {target} ==");
     println!("reachable functions: {}", reachable.len());
 
+    // The app reclusters the whole graph on a timer, so how long that takes is
+    // part of whether any of this is shippable.
+    let whole = Instant::now();
+    let everything = Clustering::compute(graph);
+    println!(
+        "whole-graph clustering: {} functions in {:?} ({} top-level)",
+        graph.node_count(),
+        whole.elapsed(),
+        everything.top_level().len()
+    );
+
     let baseline = measure(graph, &reachable);
     println!("\n-- baseline: cluster everything reachable --");
     baseline.summarise();
@@ -343,6 +354,10 @@ impl Measured {
     }
 
     fn summarise(&self) {
+        let per_level: Vec<usize> = (0..self.clustering.level_count())
+            .map(|l| self.clustering.level(l).len())
+            .collect();
+        println!("clusters per level:  {per_level:?} (finest first)");
         println!("top-level clusters:  {}", self.clusters);
         println!("cluster edges drawn: {}", self.edges);
         println!(
