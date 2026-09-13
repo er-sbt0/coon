@@ -75,19 +75,24 @@ function graphStyle() {
         'color': css('--accent'),
       }
     },
+    { selector: 'node.hovered', style: { 'background-color': css('--surface-hover') } },
+    // The selected node, and there is only ever one. It is the only thing on
+    // the canvas with a filled ground: a ring in the one accent is what the
+    // root already wears, and two near-identical rings read as two selected
+    // nodes. Declared after `hovered` so that running the pointer over the
+    // selection does not wash it out.
     {
       selector: 'node.focused',
       style: {
-        'border-color': css('--accent-border'),
+        'border-color': css('--accent'),
         'border-width': 2,
+        'background-color': css('--accent-soft'),
       }
     },
-    { selector: 'node.hovered', style: { 'background-color': css('--surface-hover') } },
     // A node with children it isn't showing gets a dashed edge — the same
     // signal whether the user collapsed it or the depth limit cut it off.
     { selector: 'node.has-hidden', style: { 'border-style': 'dashed' } },
-    // On the path from the root to the selected node.
-    { selector: 'node.on-path', style: { 'border-color': css('--accent-border') } },
+    // The path from the root to the selected node, drawn on the edges only.
     { selector: 'edge.on-path', style: { 'line-color': css('--accent-border'), 'target-arrow-color': css('--accent-border'), 'width': 1.5 } },
     // Transient hover focus: everything not adjacent recedes.
     { selector: '.faded', style: { 'opacity': 0.18 } },
@@ -527,7 +532,10 @@ function rebuildGraph(graph, layout) {
   }
 
   if (rootNodeId) cy.$id(rootNodeId).addClass('root');
-  if (selectedNodeId && selectedNodeId !== rootNodeId) cy.$id(selectedNodeId).addClass('focused');
+  // Including when the selection *is* the root: the two say different things —
+  // where the tree grows from, and which node the user last pointed at — and a
+  // click on the root that lit nothing would read as a click that missed.
+  if (selectedNodeId) cy.$id(selectedNodeId).addClass('focused');
   markPathToSelection();
 
   // Only auto-fit when the tree itself changes — a new root, the other
@@ -734,15 +742,15 @@ function hiddenChildCount(id, layout) {
   return kids.filter((k) => !(k in layout)).length;
 }
 
-/// Highlight the root→selection path so a dense graph still shows the route
-/// the breadcrumb is describing.
+/// Light the edges from the root down to the selected node, so a dense graph
+/// still shows the route the breadcrumb is describing. The nodes along it are
+/// deliberately left alone: only the selected one wears the selection.
 function markPathToSelection() {
   cy.elements().removeClass('on-path');
   if (!rootNodeId || !selectedNodeId || selectedNodeId === rootNodeId) return;
 
   const path = pathFromRoot(rootNodeId, selectedNodeId);
   path.forEach((id, i) => {
-    cy.$id(id).addClass('on-path');
     if (i > 0) {
       cy.$id(`${path[i - 1]}=>${id}`).addClass('on-path');
       cy.$id(`${id}=>${path[i - 1]}`).addClass('on-path');
@@ -1028,10 +1036,9 @@ function selectRoot(id) {
 function focusNode(id) {
   if (selectedNodeId === id) return;
   selectedNodeId = id;
+  // Exactly one node wears the selection, so the old one gives it up first.
   cy.nodes().removeClass('focused');
-  // The root carries the stronger accent of the two already; a second border
-  // on top of it would read as a different state rather than the same one.
-  if (id !== rootNodeId) cy.$id(id).addClass('focused');
+  cy.$id(id).addClass('focused');
   markPathToSelection();
   renderBreadcrumb();
   // `core` keeps the selection so the breadcrumb and the cluster scope agree
