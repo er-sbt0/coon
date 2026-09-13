@@ -3,8 +3,6 @@ use log::error;
 use std::path::Path;
 use tui::LayoutSettings;
 
-mod demo;
-mod logging;
 mod runner;
 
 #[derive(Parser)]
@@ -40,7 +38,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    logging::init_logging().map_err(|e| format!("Failed to initialize logging: {}", e))?;
+    ::core::logging::init_logging().map_err(|e| format!("Failed to initialize logging: {}", e))?;
 
     let args = Args::parse();
 

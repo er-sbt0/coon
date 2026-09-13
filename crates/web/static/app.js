@@ -71,27 +71,22 @@ const fnListEl    = document.getElementById('fn-list');
 const fnCountEl   = document.getElementById('fn-count');
 const dirToggleEl = document.getElementById('dir-toggle');
 
-// ── WebSocket ────────────────────────────────────────────────────────────────
+// ── Transport ────────────────────────────────────────────────────────────────
+// Supplied by transport.js — WebSocket in the browser, Tauri IPC on the desktop.
 
-const ws = new WebSocket(`ws://${location.host}/ws`);
-ws.onopen  = () => { statusEl.textContent = 'Connected'; };
-ws.onclose = () => {
-  statusEl.textContent = 'Disconnected — reconnecting…';
-  setTimeout(() => location.reload(), 2000);
-};
-ws.onerror = () => { statusEl.textContent = 'Error'; };
-
-ws.onmessage = (e) => {
-  const msg = JSON.parse(e.data);
-  if (msg.type === 'snapshot') {
-    handleSnapshot(msg);
-  } else if (msg.type === 'layout') {
-    // Layout-only: use the cached graph structure with new positions.
-    rebuildGraph(currentGraph, msg.layout);
-  } else if (msg.type === 'event') {
-    handleEvent(msg.event);
-  }
-};
+CoonTransport.connect({
+  onStatus: (text) => { statusEl.textContent = text; },
+  onMessage: (msg) => {
+    if (msg.type === 'snapshot') {
+      handleSnapshot(msg);
+    } else if (msg.type === 'layout') {
+      // Layout-only: use the cached graph structure with new positions.
+      rebuildGraph(currentGraph, msg.layout);
+    } else if (msg.type === 'event') {
+      handleEvent(msg.event);
+    }
+  },
+});
 
 // ── Message handlers ─────────────────────────────────────────────────────────
 
@@ -232,7 +227,7 @@ searchEl.addEventListener('input', () => renderSidebar(searchEl.value));
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 function sendCommand(command) {
-  ws.send(JSON.stringify({ type: 'command', command }));
+  CoonTransport.send(command);
 }
 
 // Sidebar click: change the graph root to this function.

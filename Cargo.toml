@@ -8,7 +8,8 @@ members = [
     "crates/core",
     "crates/tui",
     "crates/grid",
-    "crates/web"
+    "crates/web",
+    "crates/desktop"
 ]
 
 [workspace.dependencies]
@@ -35,4 +36,5 @@ lsp = { path = "crates/lsp" }
 tui = { path = "crates/tui" }
 grid = { path = "crates/grid" }
 web = { path = "crates/web" }
+desktop = { path = "crates/desktop" }
 axum = { version = "0.7", features = ["ws"] }

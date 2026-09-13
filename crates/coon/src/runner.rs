@@ -1,4 +1,4 @@
-use ::core::{CoreApp, LspBridge};
+use ::core::{create_demo_call_graph, spawn_lsp_bridge, CoreApp};
 use log::{error, info};
 use tokio::sync::{mpsc, oneshot};
 
@@ -11,7 +11,7 @@ pub async fn run_with_demo_data(
     settings: LayoutSettings,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Creating demo call graph...");
-    let call_graph = crate::demo::create_demo_call_graph();
+    let call_graph = create_demo_call_graph();
 
     info!(
         "Demo call graph created with {} functions and {} call relationships",
@@ -86,14 +86,7 @@ async fn run_tui_async_lsp(
 }
 
 pub async fn run_web(port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    let call_graph = crate::demo::create_demo_call_graph();
-    let app_core = CoreApp::new(call_graph);
-    let state = web::AppState::new(app_core);
-    let app = web::router(state);
-    let addr = format!("0.0.0.0:{port}");
-    info!("Web server listening on http://{addr}");
-    axum::serve(tokio::net::TcpListener::bind(&addr).await?, app).await?;
-    Ok(())
+    serve_web(CoreApp::new(create_demo_call_graph()), port).await
 }
 
 pub async fn run_web_with_lsp(
@@ -101,26 +94,12 @@ pub async fn run_web_with_lsp(
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting LSP loader for web server on {}...", project_path);
+    let lsp = spawn_lsp_bridge(project_path);
+    serve_web(CoreApp::new_with_lsp(CallGraph::new(), lsp), port).await
+}
 
-    let (ui_msg_tx, ui_msg_rx) = mpsc::unbounded_channel::<LspUiMessage>();
-    let (lsp_channels_tx, lsp_channels_rx) = oneshot::channel::<(
-        mpsc::UnboundedReceiver<LspResponse>,
-        mpsc::UnboundedSender<LspRequest>,
-    )>();
-
-    let project_path_string = project_path.to_string();
-    tokio::spawn(async move {
-        if let Err(e) =
-            lsp::loader::lsp_loader_task(&project_path_string, ui_msg_tx, lsp_channels_tx).await
-        {
-            error!("LSP loader task failed: {}", e);
-        }
-    });
-
-    let lsp = LspBridge::new_with_loader(ui_msg_rx, lsp_channels_rx);
-    let app_core = CoreApp::new_with_lsp(CallGraph::new(), lsp);
-    let state = web::AppState::new(app_core);
-    let app = web::router(state);
+async fn serve_web(app_core: CoreApp, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    let app = web::router(web::AppState::new(app_core));
     let addr = format!("0.0.0.0:{port}");
     info!("Web server listening on http://{addr}");
     axum::serve(tokio::net::TcpListener::bind(&addr).await?, app).await?;

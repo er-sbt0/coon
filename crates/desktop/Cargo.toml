@@ -1,0 +1,24 @@
+[package]
+name = "desktop"
+version = "0.1.0"
+edition = "2021"
+description = "COON desktop frontend (Tauri)"
+
+[[bin]]
+name = "coon-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Aliased: the workspace crate named `core` would otherwise shadow Rust's
+# built-in `core`, which Tauri's macros expand to (`::core::option::Option`).
+coon_core = { package = "core", path = "../core" }
+model.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+clap = { version = "4", features = ["derive"] }
+tauri = { version = "2", features = [] }

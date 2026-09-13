@@ -10,12 +10,17 @@ cargo build
 cargo build --release
 
 # Run
-cargo run                        # Demo mode (no clangd needed)
-cargo run -- /path/to/project   # LSP mode (analyzes a real C/C++ project via clangd)
+cargo run                             # TUI, demo mode (no clangd needed)
+cargo run -- /path/to/project          # TUI, LSP mode (real C/C++ project via clangd)
+cargo run -- --web 8080                # Web frontend, demo mode
+cargo run -- /path/to/project --web 8080   # Web frontend, LSP mode
+
+cargo run -p desktop                   # Desktop app, demo mode
+cargo run -p desktop -- /path/to/project   # Desktop app, LSP mode
 
 # Test
 cargo test                       # All tests
-cargo test -p lsp              # LSP crate only (requires clangd in PATH)
+cargo test -p lsp                # LSP crate only (requires clangd in PATH)
 cargo test -p logic              # Graph logic only
 cargo test <test_name>           # Single test by name pattern
 ```
@@ -26,25 +31,55 @@ Logs are written to `logs/` directory.
 
 ## Architecture
 
-COON is a Rust workspace (4 crates) that visualizes C/C++ call graphs in a TUI, using `clangd` as the analysis backend.
+COON is a Rust workspace that visualizes C/C++ call graphs, using `clangd` as the analysis backend. It ships **three frontends** over one shared application core.
 
 ### Crates
 
 - **`model`** — Shared types: `CallGraph`, `FunctionNode`, `CallEdge`, `SymbolId`, LSP progress/status enums.
 - **`lsp`** — All clangd communication: `LspClient` (raw protocol), `LspService` (higher-level async service with request/response handling, document caching, symbol resolution).
 - **`logic`** — Pure graph algorithms (BFS traversal, path-finding, reachability) operating on `CallGraph`.
-- **`tui`** — Ratatui TUI: `TuiApp` (main state/event loop), `GraphView`/`GraphViewState` (tree rendering via the external `grid` crate), search bar, workspace management.
+- **`core`** — Frontend-agnostic application core. `CoreApp` (owns `CallGraph`, `LspBridge`, `CoreWorkspaceManager`) exposes `dispatch(Command) -> Vec<AppEvent>` and `tick() -> Vec<AppEvent>`. Also holds `layout::compute_layout` (node positions), `protocol` (the shared wire format), `boot::spawn_lsp_bridge`, `demo`, and `logging`.
+- **`grid`** — Tree/DAG layout algorithm (a workspace crate, used by `core::layout` and the TUI).
+- **`coon`** — The `coon` binary: CLI parsing, and the TUI + web runners.
+- **`tui`** — Ratatui TUI: `TuiApp` (main state/event loop), `GraphView`/`GraphViewState`, search bar, workspace management.
+- **`web`** — Axum server: WebSocket at `/ws`, client assets embedded via `rust-embed`.
+- **`desktop`** — The `coon-desktop` binary: Tauri v2 shell hosting the same client as `web`.
+
+### Frontends
+
+| Frontend | Entry point | Transport to `CoreApp` |
+|---|---|---|
+| TUI | `coon` (default) | Direct calls — no serialisation |
+| Web | `coon --web <PORT>` | JSON over WebSocket |
+| Desktop | `coon-desktop` | The same JSON over Tauri IPC |
+
+The web and desktop frontends **share one JavaScript client** (`crates/web/static`). They differ only in `transport.js`, which feature-detects `window.__TAURI__` and picks either a WebSocket or Tauri `invoke`/`listen`. Because both backends emit identical `core::protocol::ServerMsg` shapes, `app.js` needs no knowledge of which one it is talking to. Keep it that way: put shared behaviour in `app.js`, and anything pipe-specific in `transport.js`.
+
+Client assets are vendored, not CDN-loaded (`static/vendor/cytoscape.min.js`), because the desktop app must work offline.
 
 ### Data Flow
 
 `main.rs` has two paths:
 
 1. **Demo mode** (`cargo run`): builds a synthetic `CallGraph` and passes it directly to `run_tui`.
-2. **LSP mode** (`cargo run -- <path>`): spins up a background `lsp_loader_task` that connects to clangd, opens all source files, and builds a `CallGraph` via workspace symbol queries. The TUI starts immediately while loading proceeds asynchronously. A Tokio MPSC bridge forwards `LspRequest` messages from the TUI to `LspService` and returns `LspResponse`/`LspUiMessage` results back.
+2. **LSP mode** (`cargo run -- <path>`): spins up a background `lsp_loader_task` that connects to clangd, opens all source files, and builds a `CallGraph` via workspace symbol queries. The frontend starts immediately while loading proceeds asynchronously. A Tokio MPSC bridge forwards `LspRequest` messages to `LspService` and returns `LspResponse`/`LspUiMessage` results back. `core::boot::spawn_lsp_bridge` performs this wiring for every frontend.
+
+The web and desktop backends both poll `CoreApp::tick()` every 100ms and translate the resulting events through `core::protocol::EventRouter`, which decides what to forward verbatim and when to push a fresh snapshot.
 
 ### Key Design Patterns
 
 - **Async message passing**: Tokio MPSC channels connect the LSP loader, the LSP service worker, and the TUI — they never share mutable state directly.
 - **`CallGraphAdapter`**: Wraps `CallGraph` to abstract call direction (incoming vs. outgoing) so graph traversal and rendering are direction-agnostic.
 - **Lazy call hierarchy**: Initial load fetches workspace symbols; per-function call hierarchy is fetched on demand when the user selects a function.
-- **`grid` crate** (sibling at `../grid`): external dependency providing the tree layout algorithm used by `GraphView`.
+- **`grid` crate**: provides the tree layout algorithm used by `GraphView` and by `core::layout::compute_layout`.
+- **One protocol, many pipes**: `core::protocol` is the single definition of what a frontend sees. Adding a fourth frontend should mean writing a transport, not a protocol.
+
+### Gotcha: the crate named `core`
+
+The workspace crate `core` shadows Rust's built-in `core`. Crates that use macros expanding to `::core::…` paths (Tauri does) must alias it:
+
+```toml
+coon_core = { package = "core", path = "../core" }
+```
+
+`crates/desktop` does this. Others refer to it as `::core::`.

@@ -4,7 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>COON — Call Graph</title>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.29.2/cytoscape.min.js"></script>
+  <!-- Vendored, not CDN: the desktop frontend embeds these and must work offline. -->
+  <script src="vendor/cytoscape.min.js"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { background: #0d1117; color: #e0e0e0; font-family: monospace; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
@@ -138,6 +139,7 @@
     <div id="expand-btn" title="Expand node (+)">+</div>
   </div>
   <div id="info">Click a function in the sidebar to explore its call graph.</div>
+  <script src="transport.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
