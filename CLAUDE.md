@@ -69,11 +69,25 @@ Client assets are vendored, not CDN-loaded (`static/vendor/cytoscape.min.js`), b
 
 `Ctrl+Shift+P` opens the command palette, `Ctrl+P` the symbol finder. **New user-facing actions belong in `buildCommands()` in `app.js`, not as another toolbar button** — that's how the commands `core` exposes stay reachable without the chrome growing a control each time.
 
+### Readability at scale
+
+A whole call graph is unreadable by default: rooting at `main` in the demo reaches 56 nodes. Three mechanisms keep it legible, and they are the first things to reach for before adding more visual weight:
+
+| Mechanism | Where |
+|---|---|
+| **Depth limit** (`Command::SetGraphDepth`, per workspace, default 3) | `core::layout` stops the BFS |
+| **Collapse** (`Command::ToggleCollapsed`, per workspace) | `core::layout` stops descending; client drops the node's outgoing edges |
+| **Hover focus** — fade everything non-adjacent | `app.js`, transient |
+
+Nodes hiding children are dashed and labelled `+N`. Auto-fit is clamped at both ends (`MAX_FIT_ZOOM` / `MIN_FIT_ZOOM`): a small graph must not render at cartoon size, and a large one must not shrink past readable — below the floor it holds the zoom and anchors on the focused node so the user pans.
+
 Design rules worth keeping:
 
 - **Sans for chrome, mono for code.** Function names and namespaces get `--font-mono`; every label, tab and button gets `--font-ui`. Reaching for monospace everywhere is what made this read as a terminal.
 - **One accent.** State is carried by accent strength and a left/top accent bar, not by a different hue per state.
-- **Nodes sit on a fixed grid.** `core::compute_layout` emits column/row indices at a fixed pitch, so graph nodes use a fixed `NODE_W` with truncated labels. Label-sized nodes overlap their neighbours as soon as a C++ symbol name gets long.
+- **Nodes sit on a fixed grid.** `core::compute_layout` lays out in the same pixels the canvas draws in and returns node **centres**, so the client uses positions verbatim. Graph nodes use a fixed `NODE_W` with truncated labels; label-sized nodes overlap their neighbours as soon as a C++ symbol name gets long. Keep `NODE_W`/`NODE_H` in `app.js` in step with `NODE_WIDTH`/`NODE_HEIGHT` in `crates/core/src/layout.rs`.
+- **`grid` spacing is pitch, not gutter.** `level_separation` and `node_separation` are full centre-to-centre distances, not gaps added to the node's size. `core::layout` derives them as `size + gutter` explicitly, because the crate's terminal defaults (`node_width: 20`, `level_separation: 4`) make the distinction easy to miss — and getting it wrong overlaps every node.
+- **This is a DAG, not a tree.** Collapsing a node does not necessarily remove its children from the canvas: another caller may still reach them. Collapse therefore also drops the edges *leaving* the collapsed node, client-side, so the action is always visible.
 - Graph styles are read from the CSS custom properties at startup, so the canvas and the chrome stay on one palette.
 
 The desktop window is **undecorated** (`decorations: false`); `#titlebar` is the titlebar and carries the drag region, workspace tabs and window controls. To go back to native decorations, flip that flag in `tauri.conf.json` and the `is-desktop` window controls will hide themselves.

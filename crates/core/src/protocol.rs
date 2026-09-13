@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::app::CoreApp;
 use crate::command::Command;
 use crate::events::AppEvent;
-use crate::layout::{compute_layout, NodePos};
+use crate::layout::{compute_layout, LayoutOptions, NodePos};
 
 /// Messages the backend sends to the client.
 #[derive(Debug, Serialize)]
@@ -53,6 +53,10 @@ pub struct WorkspaceInfo {
     pub name: String,
     pub direction: CallDirection,
     pub selected: Option<SymbolId>,
+    /// Levels of callees/callers currently shown.
+    pub depth: usize,
+    /// Nodes the user has collapsed, so the client can mark them.
+    pub collapsed: Vec<SymbolId>,
 }
 
 /// Build a full `ServerMsg::Snapshot` from current `CoreApp` state.
@@ -64,7 +68,7 @@ pub fn snapshot_of(core: &CoreApp) -> ServerMsg {
     // so the layout window shifts to the expanded node rather than staying
     // anchored to the workspace root.
     let layout_root = core.layout_focus.or(root);
-    let layout = compute_layout(&core.call_graph, layout_root, direction);
+    let layout = compute_layout(&core.call_graph, layout_root, direction, &layout_options(core));
 
     log::info!(
         "[protocol] snapshot: nodes={} edges={} layout_nodes={} root={:?} layout_focus={:?} direction={:?} selected={:?}",
@@ -92,7 +96,18 @@ pub fn layout_of(core: &CoreApp) -> ServerMsg {
     let root = ws.and_then(|w| w.root_symbol);
     let direction = ws.map(|w| w.direction).unwrap_or(CallDirection::Outgoing);
     ServerMsg::Layout {
-        layout: compute_layout(&core.call_graph, root, direction),
+        layout: compute_layout(&core.call_graph, root, direction, &layout_options(core)),
+    }
+}
+
+/// Layout options taken from the active workspace.
+fn layout_options(core: &CoreApp) -> LayoutOptions<'_> {
+    match core.workspaces.current() {
+        Some(ws) => LayoutOptions {
+            depth: ws.depth,
+            collapsed: &ws.collapsed,
+        },
+        None => LayoutOptions::default(),
     }
 }
 
@@ -105,6 +120,8 @@ pub fn workspace_infos(core: &CoreApp) -> Vec<WorkspaceInfo> {
             name: ws.name.clone(),
             direction: ws.direction,
             selected: ws.root_symbol,
+            depth: ws.depth,
+            collapsed: ws.collapsed.iter().copied().collect(),
         })
         .collect()
 }
@@ -274,6 +291,8 @@ mod tests {
             "\"PreviousWorkspace\"".to_string(),
             "\"ToggleCallDirection\"".to_string(),
             "\"Refresh\"".to_string(),
+            "{\"SetGraphDepth\":4}".to_string(),
+            format!("{{\"ToggleCollapsed\":{id}}}"),
         ];
 
         for case in cases {
@@ -296,7 +315,7 @@ mod tests {
         assert!(json.get("layout").is_some());
 
         let ws = &json["workspaces"][0];
-        for field in ["id", "name", "direction", "selected"] {
+        for field in ["id", "name", "direction", "selected", "depth", "collapsed"] {
             assert!(ws.get(field).is_some(), "workspace field `{field}` is read by the client");
         }
     }

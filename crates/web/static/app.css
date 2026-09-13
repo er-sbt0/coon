@@ -337,6 +337,26 @@ body.resizing { cursor: col-resize; user-select: none; }
  * Anchored near the top rather than centred: the list grows downward, so the
  * input stays put as results change instead of the whole dialog shifting.
  */
+/* Depth stepper — a pill with inline − / + controls. */
+.pill.stepper { gap: 0; padding: 0; overflow: hidden; }
+.pill.stepper button {
+  width: 20px;
+  height: 100%;
+  color: var(--text-dim);
+  font-size: var(--fs-md);
+  line-height: 1;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+.pill.stepper button:hover { background: var(--surface-hover); color: var(--text); }
+.pill.stepper button:disabled { opacity: 0.3; cursor: default; }
+.pill.stepper button:disabled:hover { background: none; color: var(--text-dim); }
+.pill.stepper .stepper-label { padding-left: var(--sp-1); }
+.pill.stepper b {
+  padding: 0 var(--sp-1) 0 3px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
 #palette { position: fixed; inset: 0; z-index: 1000; }
 #palette[hidden] { display: none; }
 

@@ -59,6 +59,8 @@ impl CoreApp {
             Command::FindReferences => self.cmd_find_references(),
             Command::Refresh => self.cmd_refresh(),
             Command::ToggleCallDirection => self.cmd_toggle_call_direction(),
+            Command::SetGraphDepth(depth) => self.cmd_set_graph_depth(depth),
+            Command::ToggleCollapsed(id) => self.cmd_toggle_collapsed(id),
             Command::NewWorkspace => self.cmd_new_workspace(),
             Command::CloseWorkspace(index) => self.cmd_close_workspace(index),
             Command::NextWorkspace => self.cmd_next_workspace(),
@@ -344,6 +346,30 @@ impl CoreApp {
             );
         }
         vec![AppEvent::LayoutDirty]
+    }
+
+    fn cmd_set_graph_depth(&mut self, depth: usize) -> Vec<AppEvent> {
+        // Only redraw when the value actually moved; the client sends this from
+        // a stepper that can be held at either end of the range.
+        let changed = self
+            .workspaces
+            .current_mut()
+            .is_some_and(|ws| ws.set_depth(depth));
+        if changed {
+            vec![AppEvent::LayoutDirty]
+        } else {
+            vec![]
+        }
+    }
+
+    fn cmd_toggle_collapsed(&mut self, id: SymbolId) -> Vec<AppEvent> {
+        match self.workspaces.current_mut() {
+            Some(ws) => {
+                ws.toggle_collapsed(id);
+                vec![AppEvent::LayoutDirty]
+            }
+            None => vec![],
+        }
     }
 
     fn cmd_new_workspace(&mut self) -> Vec<AppEvent> {

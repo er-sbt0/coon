@@ -1,6 +1,9 @@
+use std::collections::HashSet;
 use std::time::Instant;
 
 use model::{CallDirection, SymbolId};
+
+use crate::layout::{DEFAULT_DEPTH, MAX_DEPTH, MIN_DEPTH};
 
 use crate::events::AppEvent;
 
@@ -13,6 +16,10 @@ pub struct CoreWorkspace {
     pub name: String,
     pub root_symbol: Option<SymbolId>,
     pub direction: CallDirection,
+    /// Levels of callees/callers to show from the root.
+    pub depth: usize,
+    /// Nodes whose children the user has collapsed. The node stays visible.
+    pub collapsed: HashSet<SymbolId>,
     pub created_at: Instant,
     pub last_accessed: Instant,
 }
@@ -25,6 +32,8 @@ impl CoreWorkspace {
             name,
             root_symbol: None,
             direction: CallDirection::Outgoing,
+            depth: DEFAULT_DEPTH,
+            collapsed: HashSet::new(),
             created_at: now,
             last_accessed: now,
         }
@@ -38,7 +47,32 @@ impl CoreWorkspace {
 
     pub fn set_root(&mut self, symbol: SymbolId) {
         self.root_symbol = Some(symbol);
+        // Collapse state describes a particular tree; a new root is a new tree.
+        self.collapsed.clear();
         self.touch();
+    }
+
+    /// Set the traversal depth, clamped to the supported range.
+    /// Returns true when the value actually changed.
+    pub fn set_depth(&mut self, depth: usize) -> bool {
+        let next = depth.clamp(MIN_DEPTH, MAX_DEPTH);
+        let changed = next != self.depth;
+        self.depth = next;
+        if changed {
+            self.touch();
+        }
+        changed
+    }
+
+    /// Collapse or re-expand a node's children. Returns true if now collapsed.
+    pub fn toggle_collapsed(&mut self, symbol: SymbolId) -> bool {
+        self.touch();
+        if self.collapsed.remove(&symbol) {
+            false
+        } else {
+            self.collapsed.insert(symbol);
+            true
+        }
     }
 
     pub fn touch(&mut self) {
@@ -208,6 +242,35 @@ mod tests {
         assert_eq!(id, 2);
         assert_eq!(wm.workspaces.len(), 2);
         assert_eq!(wm.current_index, 1);
+    }
+
+    #[test]
+    fn depth_is_clamped_to_the_supported_range() {
+        let mut ws = CoreWorkspace::new(1, "w".to_string());
+        assert_eq!(ws.depth, DEFAULT_DEPTH);
+
+        assert!(ws.set_depth(0) || ws.depth == MIN_DEPTH);
+        assert_eq!(ws.depth, MIN_DEPTH, "0 clamps up to the minimum");
+
+        ws.set_depth(999);
+        assert_eq!(ws.depth, MAX_DEPTH, "large values clamp down");
+
+        assert!(!ws.set_depth(MAX_DEPTH), "setting the same depth is not a change");
+    }
+
+    #[test]
+    fn collapse_toggles_and_resets_with_the_root() {
+        let mut ws = CoreWorkspace::new(1, "w".to_string());
+        let sym = SymbolId::from_content("a", "a.c", 1);
+
+        assert!(ws.toggle_collapsed(sym), "first toggle collapses");
+        assert!(ws.collapsed.contains(&sym));
+        assert!(!ws.toggle_collapsed(sym), "second toggle expands");
+        assert!(ws.collapsed.is_empty());
+
+        ws.toggle_collapsed(sym);
+        ws.set_root(SymbolId::from_content("b", "b.c", 1));
+        assert!(ws.collapsed.is_empty(), "a new root starts with nothing collapsed");
     }
 
     #[test]

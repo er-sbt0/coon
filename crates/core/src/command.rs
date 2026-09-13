@@ -19,6 +19,10 @@ pub enum Command {
     Refresh,
     /// Toggle between outgoing and incoming call direction.
     ToggleCallDirection,
+    /// Set how many levels of callees/callers the view shows.
+    SetGraphDepth(usize),
+    /// Collapse or re-expand one node's children. The node stays visible.
+    ToggleCollapsed(SymbolId),
 
     // ---- Workspace management ----
     NewWorkspace,

@@ -11,12 +11,11 @@ try {
 
 const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 
-// Nodes sit on a fixed grid. core::compute_layout emits column/row indices on a
-// fixed pitch, so variable-width nodes overlap their neighbours as soon as a
-// symbol name gets long — routine for C++ with namespaces and templates.
-// A fixed width plus a truncated label keeps the grid honest; the full
-// qualified name is shown in the status bar on hover.
+// Node geometry mirrors core::layout — the server lays out in these exact
+// pixels and sends node centres, so positions are used verbatim here. Keep
+// these in step with NODE_WIDTH / NODE_HEIGHT in crates/core/src/layout.rs.
 const NODE_W = 150;
+const NODE_H = 32;
 const LABEL_MAX = 18;
 
 const truncate = (name) => (name.length > LABEL_MAX ? `${name.slice(0, LABEL_MAX - 1)}…` : name);
@@ -38,7 +37,7 @@ function graphStyle() {
         'text-valign': 'center',
         'text-halign': 'center',
         'width': NODE_W,
-        'height': 32,
+        'height': NODE_H,
         'shape': 'roundrectangle',
         'transition-property': 'border-color, background-color, opacity',
         'transition-duration': '90ms',
@@ -62,7 +61,14 @@ function graphStyle() {
       }
     },
     { selector: 'node.hovered', style: { 'background-color': css('--surface-hover') } },
-    { selector: '.dimmed', style: { 'opacity': 0.25 } },
+    // A node with children it isn't showing gets a dashed edge — the same
+    // signal whether the user collapsed it or the depth limit cut it off.
+    { selector: 'node.has-hidden', style: { 'border-style': 'dashed' } },
+    // On the path from the root to the selected node.
+    { selector: 'node.on-path', style: { 'border-color': css('--accent-border') } },
+    { selector: 'edge.on-path', style: { 'line-color': css('--accent-border'), 'target-arrow-color': css('--accent-border'), 'width': 1.5 } },
+    // Transient hover focus: everything not adjacent recedes.
+    { selector: '.faded', style: { 'opacity': 0.18 } },
     {
       selector: 'edge',
       style: {
@@ -96,10 +102,14 @@ let selectedNodeId   = null;                      // last focused node
 let currentDirection = 'Outgoing';
 let workspaces       = [];
 let activeWorkspace  = 0;
+let graphDepth       = 3;
+let collapsed        = new Set();
 let lastFitKey       = null;                      // refit only on root/direction change
 
 const MAX_FIT_ZOOM = 1.15;
-const MIN_FIT_ZOOM = 0.45;
+// Below roughly this scale a 12px label stops being readable, so auto-fit
+// stops zooming out and the user pans instead. Manual zoom is unbounded.
+const MIN_FIT_ZOOM = 0.7;
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 
@@ -150,6 +160,11 @@ function handleSnapshot(msg) {
 
   const active = workspaces[activeWorkspace];
   rootNodeId = active?.selected ?? null;
+  collapsed = new Set(active?.collapsed || []);
+  if (typeof active?.depth === 'number') {
+    graphDepth = active.depth;
+    updateDepthControl();
+  }
   if (active?.direction) {
     currentDirection = active.direction;
     updateDirToggle();
@@ -313,21 +328,33 @@ function rebuildGraph(graph, layout) {
   // Layout positions come from core::compute_layout in grid units; SPACING
   // converts them to pixels. Sized for the pointer-driven canvas rather than
   // inherited from the TUI's character cell.
-  const SPACING_X = 52;   // 4 grid units per level → 208px pitch, ~58px gutter
-  const SPACING_Y = 26;   // ~27px between sibling rows at 32px node height
-
+  // core::compute_layout works in the same pixels the canvas draws in and
+  // reports node centres, so positions go straight through.
   for (const [id, node] of Object.entries(graph.nodes || {})) {
     const pos = layout[id];
     if (!pos) continue;   // not part of the visible subgraph
+    const hidden = hiddenChildCount(id, layout);
     cy.add({
       group: 'nodes',
-      data: { id, label: truncate(node.name), full: node.qualified_name || node.name },
-      position: { x: pos.x * SPACING_X, y: pos.y * SPACING_Y },
+      data: {
+        id,
+        label: truncate(node.name) + (hidden > 0 ? `  +${hidden}` : ''),
+        full: node.qualified_name || node.name,
+      },
+      position: { x: pos.x, y: pos.y },
     });
+    if (hidden > 0) cy.$id(id).addClass('has-hidden');
   }
 
+  const outgoing = currentDirection === 'Outgoing';
   const edgesSeen = new Set();
   for (const edge of (graph.edges || [])) {
+    // Drop edges leaving a collapsed node. Without this, collapsing a node in a
+    // DAG is often invisible: its children stay on screen because other callers
+    // reach them, and the edges still point at them.
+    const parent = outgoing ? edge.caller : edge.callee;
+    if (collapsed.has(parent)) continue;
+
     const eid = `${edge.caller}=>${edge.callee}`;
     if (!edgesSeen.has(eid) && cy.$id(edge.caller).length && cy.$id(edge.callee).length) {
       edgesSeen.add(eid);
@@ -337,6 +364,7 @@ function rebuildGraph(graph, layout) {
 
   if (rootNodeId) cy.$id(rootNodeId).addClass('root');
   if (selectedNodeId && selectedNodeId !== rootNodeId) cy.$id(selectedNodeId).addClass('focused');
+  markPathToSelection();
 
   // Only auto-fit when the focused node or direction changes, so expanding a
   // node doesn't yank the viewport the user just positioned.
@@ -370,6 +398,74 @@ function fitGraph() {
     cy.center(anchor.length ? anchor : cy.nodes());
   }
 }
+
+
+// ── Graph relationships ───────────────────────────────────────────────────────
+// The client holds the whole call graph, not just the laid-out subset, so it
+// can answer "is there more below this node?" without another round trip.
+
+/// Children of `id` in the current direction, as ids.
+function childrenOf(id) {
+  const outgoing = currentDirection === 'Outgoing';
+  const out = [];
+  for (const edge of currentGraph.edges || []) {
+    if (outgoing && edge.caller === id) out.push(edge.callee);
+    else if (!outgoing && edge.callee === id) out.push(edge.caller);
+  }
+  return [...new Set(out)];
+}
+
+/// How many of a node's children are not shown *as its children* — because the
+/// user collapsed it, or because the depth limit stopped there.
+///
+/// A collapsed node counts all of them. This is a DAG, not a tree: a child may
+/// still be on screen because something else calls it, but it is no longer
+/// shown hanging off this node.
+function hiddenChildCount(id, layout) {
+  const kids = childrenOf(id);
+  if (kids.length === 0) return 0;
+  if (collapsed.has(id)) return kids.length;
+  return kids.filter((k) => !(k in layout)).length;
+}
+
+/// Highlight the root→selection path so a dense graph still shows the route
+/// the breadcrumb is describing.
+function markPathToSelection() {
+  cy.elements().removeClass('on-path');
+  if (!rootNodeId || !selectedNodeId || selectedNodeId === rootNodeId) return;
+
+  const path = pathFromRoot(rootNodeId, selectedNodeId);
+  path.forEach((id, i) => {
+    cy.$id(id).addClass('on-path');
+    if (i > 0) {
+      cy.$id(`${path[i - 1]}=>${id}`).addClass('on-path');
+      cy.$id(`${id}=>${path[i - 1]}`).addClass('on-path');
+    }
+  });
+}
+
+// ── Depth ─────────────────────────────────────────────────────────────────────
+
+const DEPTH_MIN = 1;
+const DEPTH_MAX = 8;
+
+function updateDepthControl() {
+  $('depth-value').textContent = graphDepth;
+  $('depth-dec').disabled = graphDepth <= DEPTH_MIN;
+  $('depth-inc').disabled = graphDepth >= DEPTH_MAX;
+}
+
+function setDepth(next) {
+  const clamped = Math.min(Math.max(next, DEPTH_MIN), DEPTH_MAX);
+  if (clamped === graphDepth) return;
+  // Reflect it immediately; the snapshot that follows confirms it.
+  graphDepth = clamped;
+  updateDepthControl();
+  sendCommand({ SetGraphDepth: clamped });
+}
+
+$('depth-dec').addEventListener('click', () => setDepth(graphDepth - 1));
+$('depth-inc').addEventListener('click', () => setDepth(graphDepth + 1));
 
 // ── Event handling ────────────────────────────────────────────────────────────
 
@@ -477,6 +573,10 @@ function expandNode(id) {
 }
 
 cy.on('tap', 'node', (e) => expandNode(e.target.id()));
+cy.on('dbltap', 'node', (e) => {
+  e.preventDefault?.();
+  toggleNode(e.target.id());
+});
 
 // Hover: highlight the node's own edges and dim the rest, so a dense graph
 // still reads at a glance.
@@ -484,6 +584,12 @@ cy.on('mouseover', 'node', (e) => {
   const node = e.target;
   node.addClass('hovered');
   node.connectedEdges().addClass('incident');
+
+  // Fade everything that isn't adjacent. At 50+ nodes this is the difference
+  // between reading a node's calls and squinting at a hairball.
+  const keep = node.closedNeighborhood();
+  cy.elements().difference(keep).addClass('faded');
+
   // The canvas has no tooltips, and the label may be truncated, so the status
   // bar carries the full qualified name.
   infoEl.textContent = node.data('full');
@@ -492,6 +598,7 @@ cy.on('mouseover', 'node', (e) => {
 cy.on('mouseout', 'node', (e) => {
   e.target.removeClass('hovered');
   cy.edges().removeClass('incident');
+  cy.elements().removeClass('faded');
   infoEl.textContent = '';
   hideExpandBtn();
 });
@@ -504,7 +611,17 @@ let hideTimer = null;
 
 function showExpandBtn(node) {
   clearTimeout(hideTimer);
-  expandTargetId = node.id();
+  const id = node.id();
+  expandTargetId = id;
+
+  // One affordance, three cases: collapse what's shown, re-expand what the
+  // user collapsed, or load children that were never fetched.
+  const hasVisibleChildren = node.outgoers('node').length > 0;
+  expandBtn.textContent = hasVisibleChildren ? '−' : '+';
+  expandBtn.title = hasVisibleChildren
+    ? 'Collapse children'
+    : (collapsed.has(id) ? 'Expand children' : 'Load calls for this function');
+
   const bb = node.renderedBoundingBox();
   const container = $('cy').getBoundingClientRect();
   // Positioned inside the node's top-right corner: no gap for the cursor to
@@ -512,6 +629,18 @@ function showExpandBtn(node) {
   expandBtn.style.left = `${container.left + bb.x2 - 21}px`;
   expandBtn.style.top  = `${container.top + bb.y1 + 5}px`;
   expandBtn.style.display = 'flex';
+}
+
+/// Collapse, re-expand, or load — whichever the node's current state calls for.
+function toggleNode(id) {
+  const node = cy.$id(id);
+  if (node.length && node.outgoers('node').length > 0) {
+    sendCommand({ ToggleCollapsed: id });          // hide what's shown
+  } else if (collapsed.has(id)) {
+    sendCommand({ ToggleCollapsed: id });          // show it again
+  } else {
+    expandNode(id);                                 // fetch from clangd
+  }
 }
 
 function hideExpandBtn() {
@@ -525,7 +654,7 @@ expandBtn.addEventListener('mouseenter', () => clearTimeout(hideTimer));
 expandBtn.addEventListener('mouseleave', () => hideExpandBtn());
 expandBtn.addEventListener('click', (e) => {
   e.stopPropagation();
-  if (expandTargetId) expandNode(expandTargetId);
+  if (expandTargetId) toggleNode(expandTargetId);
   expandBtn.style.display = 'none';
 });
 
@@ -619,6 +748,20 @@ function buildCommands() {
     { id: 'view.sidebar', label: 'View: Toggle Sidebar', hint: 'Ctrl+B', run: toggleSidebar },
     { id: 'view.direction', label: 'View: Toggle Call Direction', hint: 'Ctrl+D', run: () => sendCommand('ToggleCallDirection') },
     { id: 'view.fit', label: 'View: Fit Graph to Screen', disabled: cy.nodes().length === 0, run: fitGraph },
+    { id: 'view.deeper', label: 'View: Show More Levels', hint: 'Ctrl+]', disabled: graphDepth >= DEPTH_MAX, run: () => setDepth(graphDepth + 1) },
+    { id: 'view.shallower', label: 'View: Show Fewer Levels', hint: 'Ctrl+[', disabled: graphDepth <= DEPTH_MIN, run: () => setDepth(graphDepth - 1) },
+    {
+      id: 'view.collapse',
+      label: 'View: Collapse or Expand Selected Node',
+      disabled: !selectedNodeId,
+      run: () => selectedNodeId && toggleNode(selectedNodeId),
+    },
+    {
+      id: 'view.expandall',
+      label: 'View: Expand All Collapsed Nodes',
+      disabled: collapsed.size === 0,
+      run: () => collapsed.forEach((id) => sendCommand({ ToggleCollapsed: id })),
+    },
     { id: 'view.theme', label: 'View: Toggle Theme', run: toggleTheme },
 
     { id: 'lsp.refresh', label: 'LSP: Refresh Symbols', hint: 'Ctrl+R', run: () => sendCommand('Refresh') },
@@ -691,6 +834,8 @@ document.addEventListener('keydown', (e) => {
   else if (key === 'f') { e.preventDefault(); searchEl.focus(); searchEl.select(); }
   else if (key === 'r') { e.preventDefault(); sendCommand('Refresh'); }
   else if (key === 'd') { e.preventDefault(); sendCommand('ToggleCallDirection'); }
+  else if (key === ']') { e.preventDefault(); setDepth(graphDepth + 1); }
+  else if (key === '[') { e.preventDefault(); setDepth(graphDepth - 1); }
   else if (key === 'Tab') {
     e.preventDefault();
     sendCommand(e.shiftKey ? 'PreviousWorkspace' : 'NextWorkspace');
