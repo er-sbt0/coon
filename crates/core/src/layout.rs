@@ -28,7 +28,33 @@ pub const NODE_SEPARATION: f32 = NODE_HEIGHT + ROW_GUTTER;
 /// spread on — which is the vertical one left-to-right, the horizontal one
 /// top-down.
 pub const SUBTREE_SEPARATION: f32 = NODE_SEPARATION + ROW_GUTTER;
-pub const SUBTREE_SEPARATION_TOPDOWN: f32 = LEVEL_SEPARATION + COLUMN_GUTTER;
+
+// Top-down is a transpose of the layout, but *not* of the spacing. A node is
+// 150×32: left-to-right the graph advances along the node's long axis and
+// spreads along its short one, so the same two gutters give a shape that reads.
+// Transposed, levels advance along the 32px axis — reusing `NODE_SEPARATION` as
+// the level pitch stacks rows 58px apart while siblings sit 222px apart, and
+// the whole graph comes out as a wide, flat band that fits by its width and
+// leaves the rows almost touching. Top-down therefore gets its own pair:
+// generous between levels, because that axis is now doing the work of showing
+// depth, and tighter between siblings, because width is the axis under
+// pressure.
+pub const LEVEL_GUTTER_TOPDOWN: f32 = 96.0;
+pub const SIBLING_GUTTER_TOPDOWN: f32 = 40.0;
+pub const LEVEL_SEPARATION_TOPDOWN: f32 = NODE_HEIGHT + LEVEL_GUTTER_TOPDOWN;
+pub const NODE_SEPARATION_TOPDOWN: f32 = NODE_WIDTH + SIBLING_GUTTER_TOPDOWN;
+pub const SUBTREE_SEPARATION_TOPDOWN: f32 = NODE_SEPARATION_TOPDOWN + SIBLING_GUTTER_TOPDOWN;
+
+/// The bounding box a laid-out graph is pulled towards, as cross-axis extent
+/// over level-axis extent. A canvas is landscape, so a graph that is a little
+/// wider than it is tall reads well; a 5:1 stripe does not — and top-down is
+/// exactly that by construction, because siblings then spread along the node's
+/// 150px axis while levels advance along its 32px one.
+pub const TARGET_ASPECT: f32 = 1.6;
+/// How far `balance_aspect` may stretch the level axis. Spreading levels apart
+/// uses the empty half of the canvas, but past a point it only means the user
+/// pans further to follow one edge, so the stripe is improved, not abolished.
+pub const MAX_LEVEL_STRETCH: f32 = 2.5;
 
 /// How many levels of callees/callers to show by default.
 pub const DEFAULT_DEPTH: usize = 3;
@@ -76,8 +102,10 @@ impl Default for LayoutOptions<'_> {
 
 /// `grid` always advances levels along x and spreads siblings along y; its
 /// `TreeOrientation` is not honoured by the Sugiyama pass. A top-down graph is
-/// therefore the same layout transposed: the separations are swapped going in,
-/// and the coordinates swapped back coming out (see `to_centre`).
+/// therefore the same layout transposed: the node size and separations go in
+/// swapped, and the coordinates come back swapped (see `to_centre`). The
+/// separations are the orientation's own, not the left-to-right pair reordered
+/// — see the `*_TOPDOWN` constants.
 fn layout_config(orientation: LayoutOrientation) -> LayoutConfig {
     let (node_w, node_h, level_sep, node_sep, subtree_sep) = match orientation {
         LayoutOrientation::LeftRight => (
@@ -90,8 +118,8 @@ fn layout_config(orientation: LayoutOrientation) -> LayoutConfig {
         LayoutOrientation::TopDown => (
             NODE_HEIGHT,
             NODE_WIDTH,
-            NODE_SEPARATION,
-            LEVEL_SEPARATION,
+            LEVEL_SEPARATION_TOPDOWN,
+            NODE_SEPARATION_TOPDOWN,
             SUBTREE_SEPARATION_TOPDOWN,
         ),
     };
@@ -114,6 +142,60 @@ fn to_centre(pos: &grid::Position, orientation: LayoutOrientation) -> NodePos {
             x: pos.y + NODE_WIDTH / 2.0,
             y: pos.x + NODE_HEIGHT / 2.0,
         },
+    }
+}
+
+/// Spread the levels apart until the graph stops being a stripe.
+///
+/// `grid` packs each axis as tightly as its separations allow, which is right
+/// per-level and wrong overall: a wide fan of siblings gives a bounding box far
+/// wider than it is tall (top-down) or taller than wide (left-to-right), and
+/// fitting that to a canvas leaves half the screen empty while the levels sit
+/// almost on top of each other. Every node on a level shares its level-axis
+/// coordinate, so scaling that axis uniformly is exactly "use a bigger pitch" —
+/// no node moves relative to its own level, and no two nodes can collide.
+///
+/// Only ever a stretch, never a squash, and capped: see `MAX_LEVEL_STRETCH`.
+fn balance_aspect(positions: &mut HashMap<SymbolId, NodePos>, orientation: LayoutOrientation) {
+    if positions.len() < 2 {
+        return;
+    }
+    // The level axis is the one levels advance along; the cross axis is the one
+    // siblings spread on.
+    let (level, cross): (Vec<f32>, Vec<f32>) = match orientation {
+        LayoutOrientation::LeftRight => (
+            positions.values().map(|p| p.x).collect(),
+            positions.values().map(|p| p.y).collect(),
+        ),
+        LayoutOrientation::TopDown => (
+            positions.values().map(|p| p.y).collect(),
+            positions.values().map(|p| p.x).collect(),
+        ),
+    };
+    let extent = |v: &[f32]| {
+        let min = v.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        (min, max - min)
+    };
+    let (level_min, level_extent) = extent(&level);
+    let (_, cross_extent) = extent(&cross);
+
+    // A single level has nothing to spread apart.
+    if level_extent < 1.0 {
+        return;
+    }
+    let aspect = cross_extent / level_extent;
+    if aspect <= TARGET_ASPECT {
+        return;
+    }
+    let stretch = (aspect / TARGET_ASPECT).min(MAX_LEVEL_STRETCH);
+
+    for pos in positions.values_mut() {
+        let coord = match orientation {
+            LayoutOrientation::LeftRight => &mut pos.x,
+            LayoutOrientation::TopDown => &mut pos.y,
+        };
+        *coord = level_min + (*coord - level_min) * stretch;
     }
 }
 
@@ -188,14 +270,17 @@ pub fn compute_layout(
         Err(_) => return HashMap::new(),
     };
 
-    node_to_symbol
+    let mut positions: HashMap<SymbolId, NodePos> = node_to_symbol
         .iter()
         .filter_map(|(&node_idx, &symbol_id)| {
             layout
                 .position(node_idx)
                 .map(|pos| (symbol_id, to_centre(&pos, opts.orientation)))
         })
-        .collect()
+        .collect();
+
+    balance_aspect(&mut positions, opts.orientation);
+    positions
 }
 
 #[cfg(test)]
@@ -354,21 +439,118 @@ mod tests {
         let a = layout[&kids[0]];
         let b = layout[&kids[1]];
 
-        // Levels now advance down, and by a pitch that clears a node's height.
+        // Levels now advance down, by the top-down level pitch — which is
+        // deliberately much more than the node's 32px height, or the rows stack
+        // into an unreadable band.
         assert!(a.y > p.y && b.y > p.y, "children sit below the root");
         assert!(
-            (a.y - p.y).abs() >= NODE_HEIGHT + ROW_GUTTER,
+            (a.y - p.y).abs() >= LEVEL_SEPARATION_TOPDOWN,
             "level pitch {} must clear a {NODE_HEIGHT}px node plus its gutter",
             a.y - p.y
         );
         // Siblings spread sideways, clearing a full node width — the axis whose
         // pitch is easy to get wrong once the layout is transposed.
         assert!(
-            (b.x - a.x).abs() >= NODE_WIDTH + COLUMN_GUTTER,
+            (b.x - a.x).abs() >= NODE_SEPARATION_TOPDOWN,
             "sibling pitch {} must clear a {NODE_WIDTH}px node plus its gutter",
             b.x - a.x
         );
         assert!((a.y - b.y).abs() < 1.0, "siblings share a row");
+    }
+
+    /// A parent with `n` children, rooted at the parent.
+    fn fan(n: usize) -> (CallGraph, SymbolId) {
+        let mut graph = CallGraph::new();
+        let parent = FunctionNode::new(
+            "p".to_string(),
+            "p".to_string(),
+            Location::new("src/x.c".to_string(), 1, 0),
+        );
+        let parent_id = parent.id;
+        graph.add_function(parent);
+        for i in 0..n {
+            let f = FunctionNode::new(
+                format!("k{i}"),
+                format!("k{i}"),
+                Location::new("src/x.c".to_string(), 1, 0),
+            );
+            let id = f.id;
+            graph.add_function(f);
+            graph.add_call(parent_id, id, Location::new("src/x.c".to_string(), 1, 0));
+        }
+        (graph, parent_id)
+    }
+
+    fn extents(layout: &HashMap<SymbolId, NodePos>) -> (f32, f32) {
+        let span = |v: Vec<f32>| {
+            v.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+                - v.iter().cloned().fold(f32::INFINITY, f32::min)
+        };
+        (
+            span(layout.values().map(|p| p.x).collect()),
+            span(layout.values().map(|p| p.y).collect()),
+        )
+    }
+
+    #[test]
+    fn a_wide_top_down_fan_gets_its_levels_pushed_apart() {
+        let (graph, root) = fan(3);
+        let collapsed = HashSet::new();
+        let opts = LayoutOptions {
+            depth: 2,
+            collapsed: &collapsed,
+            orientation: LayoutOrientation::TopDown,
+        };
+        let layout = compute_layout(&graph, Some(root), CallDirection::Outgoing, &opts);
+        let (w, h) = extents(&layout);
+
+        // Siblings side by side are a stripe at the base pitch: the level axis
+        // stretches until the box is the shape a canvas actually is.
+        assert!(
+            h > LEVEL_SEPARATION_TOPDOWN,
+            "level pitch {h} should exceed the base {LEVEL_SEPARATION_TOPDOWN}"
+        );
+        assert!(
+            (w / h - TARGET_ASPECT).abs() < 0.05,
+            "aspect {} should land on the target {TARGET_ASPECT}",
+            w / h
+        );
+    }
+
+    #[test]
+    fn the_stretch_stops_at_the_cap() {
+        let (graph, root) = fan(20);
+        let collapsed = HashSet::new();
+        let opts = LayoutOptions {
+            depth: 2,
+            collapsed: &collapsed,
+            orientation: LayoutOrientation::TopDown,
+        };
+        let layout = compute_layout(&graph, Some(root), CallDirection::Outgoing, &opts);
+        let (_, h) = extents(&layout);
+
+        // Twenty siblings in a row can't be balanced without putting a screenful
+        // between one level and the next, so the stripe is improved, not cured.
+        assert!(
+            (h - LEVEL_SEPARATION_TOPDOWN * MAX_LEVEL_STRETCH).abs() < 1.0,
+            "level pitch {h} should be the base pitch times the {MAX_LEVEL_STRETCH}× cap"
+        );
+    }
+
+    #[test]
+    fn a_graph_that_already_reads_well_is_left_alone() {
+        let (graph, ids) = graph_with_chain(&["a", "b", "c", "d"]);
+        let collapsed = HashSet::new();
+        let opts = LayoutOptions { depth: MAX_DEPTH, collapsed: &collapsed, ..Default::default() };
+        let layout = compute_layout(&graph, Some(ids[0]), CallDirection::Outgoing, &opts);
+        let (w, _) = extents(&layout);
+
+        // A chain is all level axis and no cross axis: nothing to balance, so
+        // the pitch must come back exactly as configured.
+        assert!(
+            (w - LEVEL_SEPARATION * 3.0).abs() < 1.0,
+            "a straight chain keeps its {LEVEL_SEPARATION}px pitch, got {w}"
+        );
     }
 
     #[test]
@@ -378,3 +560,4 @@ mod tests {
         assert!(compute_layout(&graph, None, CallDirection::Outgoing, &opts).is_empty());
     }
 }
+
