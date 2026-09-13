@@ -134,7 +134,10 @@ async fn a_closed_document_is_reopened_on_demand() {
     let preload_id = service.preload_documents(uris.clone()).await.unwrap();
     match await_response(&mut service, &preload_id).await {
         LspResponse::PreloadComplete { loaded_count, .. } => {
-            assert_eq!(loaded_count, FILE_COUNT, "every document should have opened")
+            assert_eq!(
+                loaded_count, FILE_COUNT,
+                "every document should have opened"
+            )
         }
         other => panic!("expected PreloadComplete, got {other:?}"),
     }

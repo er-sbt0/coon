@@ -698,11 +698,7 @@ mod tests {
             })
             .collect();
         for pair in ids.windows(2) {
-            graph.add_call(
-                pair[0],
-                pair[1],
-                Location::new("src/x.c".to_string(), 1, 0),
-            );
+            graph.add_call(pair[0], pair[1], Location::new("src/x.c".to_string(), 1, 0));
         }
         (graph, ids)
     }
@@ -713,7 +709,11 @@ mod tests {
 
         for depth in [1usize, 2, 3] {
             let collapsed = HashSet::new();
-            let opts = LayoutOptions { depth, collapsed: &collapsed, ..Default::default() };
+            let opts = LayoutOptions {
+                depth,
+                collapsed: &collapsed,
+                ..Default::default()
+            };
             let layout = compute_layout(&graph, Some(ids[0]), CallDirection::Outgoing, &opts);
             assert_eq!(
                 layout.len(),
@@ -729,11 +729,18 @@ mod tests {
         let mut collapsed = HashSet::new();
         collapsed.insert(ids[1]);
 
-        let opts = LayoutOptions { depth: MAX_DEPTH, collapsed: &collapsed, ..Default::default() };
+        let opts = LayoutOptions {
+            depth: MAX_DEPTH,
+            collapsed: &collapsed,
+            ..Default::default()
+        };
         let layout = compute_layout(&graph, Some(ids[0]), CallDirection::Outgoing, &opts);
 
         assert!(layout.contains_key(&ids[0]), "root stays");
-        assert!(layout.contains_key(&ids[1]), "the collapsed node itself stays");
+        assert!(
+            layout.contains_key(&ids[1]),
+            "the collapsed node itself stays"
+        );
         assert!(!layout.contains_key(&ids[2]), "its children are dropped");
         assert!(!layout.contains_key(&ids[3]));
     }
@@ -742,7 +749,11 @@ mod tests {
     fn positions_are_node_centres_in_pixels() {
         let (graph, ids) = graph_with_chain(&["a", "b"]);
         let collapsed = HashSet::new();
-        let opts = LayoutOptions { depth: 2, collapsed: &collapsed, ..Default::default() };
+        let opts = LayoutOptions {
+            depth: 2,
+            collapsed: &collapsed,
+            ..Default::default()
+        };
         let layout = compute_layout(&graph, Some(ids[0]), CallDirection::Outgoing, &opts);
 
         let a = layout[&ids[0]];
@@ -783,7 +794,11 @@ mod tests {
         }
 
         let collapsed = HashSet::new();
-        let opts = LayoutOptions { depth: 2, collapsed: &collapsed, ..Default::default() };
+        let opts = LayoutOptions {
+            depth: 2,
+            collapsed: &collapsed,
+            ..Default::default()
+        };
         let layout = compute_layout(&graph, Some(parent_id), CallDirection::Outgoing, &opts);
 
         let mut ys: Vec<f32> = kids.iter().map(|k| layout[k].y).collect();
@@ -935,7 +950,11 @@ mod tests {
     fn a_graph_that_already_reads_well_is_left_alone() {
         let (graph, ids) = graph_with_chain(&["a", "b", "c", "d"]);
         let collapsed = HashSet::new();
-        let opts = LayoutOptions { depth: MAX_DEPTH, collapsed: &collapsed, ..Default::default() };
+        let opts = LayoutOptions {
+            depth: MAX_DEPTH,
+            collapsed: &collapsed,
+            ..Default::default()
+        };
         let layout = compute_layout(&graph, Some(ids[0]), CallDirection::Outgoing, &opts);
         let (w, _) = extents(&layout);
 

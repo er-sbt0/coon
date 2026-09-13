@@ -37,7 +37,10 @@ impl OpenDocuments {
     /// Mark `uri` as the most recently used document.
     fn touch(&mut self, uri: &Url) {
         if let Some(idx) = self.lru.iter().position(|open| open == uri) {
-            let uri = self.lru.remove(idx).expect("index came from the same deque");
+            let uri = self
+                .lru
+                .remove(idx)
+                .expect("index came from the same deque");
             self.lru.push_back(uri);
         }
     }
@@ -386,7 +389,10 @@ mod tests {
         open.insert(uri(OPEN_DOCUMENT_LIMIT));
 
         assert_eq!(open.evict_overflow(), Some(uri(1)));
-        assert!(open.contains(&uri(0)), "the touched document should survive");
+        assert!(
+            open.contains(&uri(0)),
+            "the touched document should survive"
+        );
     }
 
     #[test]

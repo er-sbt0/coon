@@ -446,7 +446,11 @@ mod tests {
     #[test]
     fn naming_a_root_is_asking_for_the_rooted_view() {
         let mut ws = CoreWorkspace::new(1, "w".to_string());
-        assert_eq!(ws.view, ViewMode::ClusterMap, "a fresh tab opens on the map");
+        assert_eq!(
+            ws.view,
+            ViewMode::ClusterMap,
+            "a fresh tab opens on the map"
+        );
 
         ws.set_root(SymbolId::from_content("a", "a.c", 1));
         assert_eq!(

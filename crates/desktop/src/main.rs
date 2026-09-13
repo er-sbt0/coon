@@ -140,7 +140,10 @@ fn main() {
                     interval.tick().await;
                     let backend = handle.state::<Backend>();
                     let events = { backend.core.lock().await.tick() };
-                    if events.iter().any(|e| !matches!(e, AppEvent::LspProgress(_))) {
+                    if events
+                        .iter()
+                        .any(|e| !matches!(e, AppEvent::LspProgress(_)))
+                    {
                         log::debug!("[desktop] tick produced {} event(s)", events.len());
                     }
                     backend.pump(&handle, events).await;

@@ -463,7 +463,11 @@ fn the_hierarchy_is_a_well_formed_partition_refinement() {
             "cluster '{}' is {}in top_level() but {}has a parent",
             cluster.label,
             if is_top { "" } else { "not " },
-            if cluster.parent.is_some() { "" } else { "does not " }
+            if cluster.parent.is_some() {
+                ""
+            } else {
+                "does not "
+            }
         );
     }
 
