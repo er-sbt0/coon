@@ -177,6 +177,12 @@ body.is-desktop #window-controls { display: flex; }
 }
 .pill:hover { border-color: var(--accent-border); color: var(--text); }
 
+/* A control that governs the other view — depth on a cluster map. It stays
+   visible, because hiding it makes the toolbar jump every time the view
+   changes, but it stops answering to the pointer. */
+.pill.inactive { opacity: 0.4; }
+.pill.inactive:hover { border-color: var(--border-strong); color: var(--text-muted); }
+
 /* ── Main row: sidebar dock + canvas ────────────────────────────────────── */
 #main { display: flex; flex: 1; min-height: 0; }
 

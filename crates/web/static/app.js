@@ -18,7 +18,29 @@ const NODE_W = 150;
 const NODE_H = 32;
 const LABEL_MAX = 18;
 
-const truncate = (name) => (name.length > LABEL_MAX ? `${name.slice(0, LABEL_MAX - 1)}…` : name);
+const truncateTo = (name, max) => (name.length > max ? `${name.slice(0, max - 1)}…` : name);
+const truncate = (name) => truncateTo(name, LABEL_MAX);
+
+// Room a group box leaves around its contents, and how far its label clears
+// the top border. Compound parents size themselves around their children, so
+// this padding is the only thing standing between a box's border and the first
+// node inside it. The label rides above the border rather than inside that
+// band: the band is exactly where every edge reaching a node inside the box
+// crosses, and edges are painted over a compound parent whatever z-index it is
+// given, so a name written in there gets struck through.
+const GROUP_PAD = 20;
+const GROUP_LABEL_LIFT = -6;
+
+// A cluster-map edge stands for however many calls actually cross between two
+// communities, so its width has to say "a hundred" differently from "one".
+// Log-scaled and capped, for two reasons: linear width would turn a hot
+// relation into a hundred pixels of ink, and past a few pixels a thicker line
+// stops reading as "more calls" and starts swallowing the arrowhead and the
+// nodes at either end. Six pixels against a 32px node is as far as that goes.
+const EDGE_W_MIN = 1;
+const EDGE_W_MAX = 6;
+const edgeWidth = (weight) =>
+  Math.min(EDGE_W_MAX, EDGE_W_MIN + Math.log2(Math.max(1, weight)));
 
 /// Built from the CSS custom properties, so the canvas and the chrome stay on
 /// one palette — and re-running it is all a theme switch needs.
@@ -83,6 +105,57 @@ function graphStyle() {
       }
     },
     { selector: 'edge.incident', style: { 'line-color': css('--accent'), 'target-arrow-color': css('--accent') } },
+
+    // ── Cluster map ──
+    // A community is named, not called: its label is prose about a group of
+    // functions rather than a symbol, so it takes the UI stack while the
+    // functions around it keep the mono one.
+    {
+      selector: 'node.community',
+      style: {
+        'font-family': css('--font-ui'),
+        'text-wrap': 'ellipsis',
+        'text-max-width': NODE_W - 16,
+      }
+    },
+    // An opened community: a compound parent, which sizes and places itself
+    // around whatever it turned into. Every box gets the same neutral tint —
+    // a hue per community would be a second signal fighting the accent, and
+    // there are no twenty hues that stay apart at twenty communities.
+    {
+      selector: 'node.group',
+      style: {
+        'background-color': css('--group-bg'),
+        'background-opacity': 1,
+        'border-color': css('--group-border'),
+        'border-width': 1,
+        'shape': 'roundrectangle',
+        'label': 'data(label)',
+        'color': css('--group-label'),
+        'font-family': css('--font-ui'),
+        'font-size': 11,
+        'text-valign': 'top',
+        'text-halign': 'center',
+        'text-margin-y': GROUP_LABEL_LIFT,
+        'padding': GROUP_PAD,
+        // Outside the box the name sits over open canvas, which on a crowded
+        // map is still somebody's edge; a halo in the box's own tint keeps it
+        // legible without drawing a second border around it.
+        'text-background-color': css('--group-bg'),
+        'text-background-opacity': 1,
+        'text-background-padding': 4,
+        'text-background-shape': 'roundrectangle',
+        // The label is the part of an open box a user can actually aim at:
+        // everything else inside it belongs to a child.
+        'text-events': 'yes',
+      }
+    },
+    // Hovering a box must not repaint it as a node — it is ground, not figure.
+    {
+      selector: 'node.group.hovered',
+      style: { 'background-color': css('--group-bg'), 'border-color': css('--accent-border') }
+    },
+    { selector: 'edge.aggregate', style: { 'width': 'data(width)' } },
   ];
 }
 
@@ -105,6 +178,8 @@ let workspaces       = [];
 let activeWorkspace  = 0;
 let graphDepth       = 3;
 let collapsed        = new Set();
+let currentView      = 'ClusterMap';  // or 'Rooted'; a workspace opens on the map
+let clusterMap       = null;          // the laid-out map, while one is showing
 let lastFitKey       = null;                      // refit only on root/direction change
 
 const MAX_FIT_ZOOM = 1.15;
@@ -140,8 +215,10 @@ CoonTransport.connect({
     if (msg.type === 'snapshot') {
       handleSnapshot(msg);
     } else if (msg.type === 'layout') {
-      // Layout-only: use the cached graph structure with new positions.
-      rebuildGraph(currentGraph, msg.layout);
+      // Layout-only: use the cached graph structure with new positions. These
+      // are the rooted view's positions and only ever those — the map arrives
+      // on a snapshot — so on the map this would redraw the other view.
+      if (currentView !== 'ClusterMap') rebuildGraph(currentGraph, msg.layout);
     } else if (msg.type === 'event') {
       handleEvent(msg.event);
     }
@@ -164,10 +241,12 @@ function handleSnapshot(msg) {
   const active = workspaces[activeWorkspace];
   rootNodeId = active?.selected ?? null;
   collapsed = new Set(active?.collapsed || []);
-  if (typeof active?.depth === 'number') {
-    graphDepth = active.depth;
-    updateDepthControl();
-  }
+  // The map rides along on the snapshot and is absent while the workspace is
+  // showing the call tree, so the two always agree about which view this is.
+  currentView = active?.view ?? 'Rooted';
+  clusterMap = msg.cluster_layout ?? null;
+  if (typeof active?.depth === 'number') graphDepth = active.depth;
+  updateDepthControl();
   if (active?.direction) {
     currentDirection = active.direction;
     updateDirToggle();
@@ -178,16 +257,28 @@ function handleSnapshot(msg) {
   }
 
   renderTabs();
-  rebuildGraph(currentGraph, msg.layout);
+  if (currentView === 'ClusterMap') {
+    // The map always rides along with this view, but an empty one is a real
+    // answer — before any symbols load there are no communities to draw.
+    rebuildClusterMap(clusterMap ?? {});
+  } else {
+    rebuildGraph(currentGraph, msg.layout);
+  }
   renderSidebar(searchEl.value);
   renderBreadcrumb();
 
   const n = Object.keys(allFunctions).length;
   fnCountEl.textContent = n ? `(${n})` : '';
   statSymbolsEl.textContent = n.toLocaleString();
-  statNodesEl.textContent = Object.keys(msg.layout || {}).length.toLocaleString();
+  // What is actually on the canvas. The rooted layout ships on every snapshot
+  // whether or not it is the view being drawn, so counting it on the map would
+  // report a number for a graph the user cannot see.
+  const placed = currentView === 'ClusterMap'
+    ? Object.keys(clusterMap?.nodes || {}).length
+    : Object.keys(msg.layout || {}).length;
+  statNodesEl.textContent = placed.toLocaleString();
 
-  if (n > 0 && Object.keys(msg.layout).length === 0) {
+  if (n > 0 && placed === 0) {
     infoEl.textContent = 'Ctrl+P to find a symbol · Ctrl+Shift+P for commands';
   }
 }
@@ -273,6 +364,27 @@ $('tab-new').addEventListener('click', () => sendCommand('NewWorkspace'));
 
 function renderBreadcrumb() {
   crumbEl.innerHTML = '';
+
+  // The map has no root and no path through it; what it has is a level of the
+  // hierarchy and however many boxes the user has opened on it.
+  if (currentView === 'ClusterMap') {
+    const here = document.createElement('button');
+    here.className = 'crumb current';
+    here.textContent = 'Cluster map';
+    here.title = 'Click a community to open it, double-click to drill into its call tree';
+    here.addEventListener('click', fitGraph);
+    crumbEl.appendChild(here);
+
+    const shown = (clusterMap?.metas?.length ?? 0) + (clusterMap?.groups?.length ?? 0);
+    const open = clusterMap?.groups?.length ?? 0;
+    const note = document.createElement('span');
+    note.className = 'placeholder';
+    note.textContent = shown === 0
+      ? 'No communities yet'
+      : `${shown} ${shown === 1 ? 'community' : 'communities'}${open ? ` · ${open} open` : ''}`;
+    crumbEl.appendChild(note);
+    return;
+  }
 
   if (!rootNodeId) {
     const span = document.createElement('span');
@@ -407,6 +519,146 @@ function fitGraph() {
 }
 
 
+// ── Cluster map ───────────────────────────────────────────────────────────────
+// What a workspace opens on: the communities the backend derived from call
+// structure, each standing in for everything inside it, with aggregated edges
+// for the calls that cross between them. Opening one replaces it with a
+// labelled box holding whatever is a level finer.
+//
+// One invariant does most of the work here: a cluster is either open — a box,
+// a compound parent, absent from `nodes` — or closed — a single node with a
+// position — and never both. `groups` says which were opened and `metas` which
+// were not, so neither list has to be reconciled against the other, and a
+// box's `members` are its *direct* children, which is exactly what cytoscape's
+// single `parent` field wants.
+
+/// The wire id for a cluster, matching `LayoutNodeId::Cluster`'s Display. Every
+/// other id arrives as a string already and is used verbatim as an element id.
+const clusterId = (key) => `cluster:${key.level}:${key.anchor}`;
+
+/// The bare symbol id inside a `fn:` layout node id — what the cached graph is
+/// keyed by, and what the symbol commands take.
+const symbolOf = (nodeId) => nodeId.slice(3);
+
+const functionsLabel = (n) => `${n} function${n === 1 ? '' : 's'}`;
+
+function rebuildClusterMap(map) {
+  cy.elements().remove();
+
+  // Whichever box lists an element is its parent. Nested boxes list the nested
+  // cluster's own id, so one pass over `groups` gives every link at every depth.
+  const groups = map.groups ?? [];
+  const parentOf = {};
+  for (const group of groups) {
+    const id = clusterId(group.key);
+    for (const member of group.members) parentOf[member] = id;
+  }
+  const depthOf = (id) => {
+    let depth = 0;
+    for (let at = parentOf[id]; at != null; at = parentOf[at]) depth += 1;
+    return depth;
+  };
+
+  // Boxes first, outermost first: cytoscape needs a parent to exist before
+  // anything names it, and a nested box is itself somebody's child.
+  for (const group of [...groups].sort((a, b) => depthOf(clusterId(a.key)) - depthOf(clusterId(b.key)))) {
+    const id = clusterId(group.key);
+    cy.add({
+      group: 'nodes',
+      data: {
+        id,
+        parent: parentOf[id],
+        key: group.key,
+        name: group.label,
+        label: `${truncate(group.label)} · ${group.count}`,
+        full: `${group.label} — ${functionsLabel(group.count)}, open`,
+      },
+    });
+    cy.$id(id).addClass('group');
+  }
+
+  const metas = new Map((map.metas ?? []).map((meta) => [clusterId(meta.key), meta]));
+  for (const [id, pos] of Object.entries(map.nodes || {})) {
+    const meta = metas.get(id);
+    const data = { id, parent: parentOf[id] };
+
+    if (meta) {
+      data.key = meta.key;
+      data.name = meta.label;
+      // The +N is the point of a closed community, so it gets its share of the
+      // label budget first and the name is cut to what is left — truncating the
+      // name alone leaves the count to be ellipsised away by the node's width.
+      const count = `  +${meta.count}`;
+      data.label = truncateTo(meta.label, LABEL_MAX - count.length) + count;
+      data.full = `${meta.label} — ${functionsLabel(meta.count)}, closed`;
+    } else {
+      const fn = allFunctions[symbolOf(id)];
+      data.symbol = symbolOf(id);
+      data.name = fn?.name ?? symbolOf(id);
+      data.label = truncate(data.name);
+      data.full = fn?.qualified_name || data.name;
+    }
+
+    // Positions are node centres in the pixels the canvas draws in, so they go
+    // straight through — no cytoscape layout runs over the map.
+    cy.add({ group: 'nodes', data, position: { x: pos.x, y: pos.y } });
+    // A closed community is hiding everything it stands for, which is the same
+    // thing a collapsed node in the rooted view is doing: dashed, plus the +N.
+    if (meta) cy.$id(id).addClass('community has-hidden');
+  }
+
+  for (const edge of map.edges || []) {
+    const id = `${edge.source}=>${edge.target}`;
+    cy.add({
+      group: 'edges',
+      data: { id, source: edge.source, target: edge.target, width: edgeWidth(edge.weight) },
+    });
+    cy.$id(id).addClass('aggregate');
+  }
+
+  // Opening or closing a box relays out everything, so the viewport the user
+  // had is about a map that no longer exists — refit. Which boxes are open is
+  // therefore part of the key, alongside what the rooted view keys on.
+  const open = groups.map((g) => clusterId(g.key)).sort().join(',');
+  const fitKey = `cluster:${currentDirection}:${currentOrientation}:${open}`;
+  if (cy.nodes().length > 0 && fitKey !== lastFitKey) {
+    lastFitKey = fitKey;
+    requestAnimationFrame(fitGraph);
+  }
+}
+
+// A double-click arrives as two clicks, so opening a community and drilling
+// into it would both fire on the way to a drill — and opening one relays out
+// the whole map. Hold the open for a beat and let the second click cancel it.
+const DRILL_WINDOW_MS = 250;
+let pendingOpen = null;
+
+/// One click on the map: open a closed community, or close an open one. Both
+/// are the same command, and a box is only clickable where no child covers it.
+function clusterTap(node) {
+  const key = node.data('key');
+  if (!key) return;                    // a function inside a box: nothing to open
+  clearTimeout(pendingOpen);
+  pendingOpen = setTimeout(() => {
+    infoEl.textContent = `${node.hasClass('group') ? 'Closing' : 'Opening'} ${node.data('name')}`;
+    sendCommand({ ToggleClusterExpanded: key });
+  }, DRILL_WINDOW_MS);
+}
+
+/// Two clicks: leave the map for the call tree. A community roots it at the
+/// entry point the clustering picked as its front door; a function, at itself.
+function clusterDrill(node) {
+  clearTimeout(pendingOpen);
+  const key = node.data('key');
+  if (key) {
+    infoEl.textContent = `Drilling into ${node.data('name')}`;
+    sendCommand({ DrillIntoCluster: key });
+    return;
+  }
+  const symbol = node.data('symbol');
+  if (symbol) selectRoot(symbol);
+}
+
 // ── Graph relationships ───────────────────────────────────────────────────────
 // The client holds the whole call graph, not just the laid-out subset, so it
 // can answer "is there more below this node?" without another round trip.
@@ -457,12 +709,22 @@ const DEPTH_MIN = 1;
 const DEPTH_MAX = 8;
 
 function updateDepthControl() {
+  // Depth is where the rooted view's BFS stops. The map is bounded by which
+  // boxes are open instead, so the stepper governs nothing here — and a live
+  // control that does nothing when pressed is worse than a quiet one.
+  const onMap = currentView === 'ClusterMap';
   $('depth-value').textContent = graphDepth;
-  $('depth-dec').disabled = graphDepth <= DEPTH_MIN;
-  $('depth-inc').disabled = graphDepth >= DEPTH_MAX;
+  $('depth-dec').disabled = onMap || graphDepth <= DEPTH_MIN;
+  $('depth-inc').disabled = onMap || graphDepth >= DEPTH_MAX;
+  const control = $('depth-control');
+  control.classList.toggle('inactive', onMap);
+  control.title = onMap
+    ? 'Depth applies to the call tree — open a community to get there'
+    : 'How many levels of calls to show';
 }
 
 function setDepth(next) {
+  if (currentView === 'ClusterMap') return;   // nothing on the map to deepen
   const clamped = Math.min(Math.max(next, DEPTH_MIN), DEPTH_MAX);
   if (clamped === graphDepth) return;
   // Reflect it immediately; the snapshot that follows confirms it.
@@ -519,6 +781,11 @@ function updateStatusFromEvent(key, payload) {
     infoEl.textContent = 'Cannot close the last graph';
   } else if (key === 'LspError') {
     setStatus(typeof payload === 'string' ? payload : 'LSP error', 'error');
+  } else if (key === 'ClusteringUpdated') {
+    // The map is about to redraw with different communities on it; say so,
+    // because a map shifting under the user unannounced reads as a bug.
+    const n = payload?.clusters;
+    infoEl.textContent = n ? `Regrouped into ${n} communities` : 'Communities regrouped';
   } else if (key === 'WorkspaceCreated' || key === 'WorkspaceSwitched') {
     infoEl.textContent = payload?.name ? `Graph: ${payload.name}` : '';
   }
@@ -554,7 +821,7 @@ function renderSidebar(filter) {
     li.addEventListener('click', () => selectRoot(id));
     // Middle-click opens the symbol in its own graph tab.
     li.addEventListener('mousedown', (e) => {
-      if (e.button === 1) { e.preventDefault(); sendCommand({ StartGraphFromFunction: id }); }
+      if (e.button === 1) { e.preventDefault(); openInNewGraph(id); }
     });
     fnListEl.appendChild(li);
   }
@@ -570,6 +837,8 @@ searchEl.addEventListener('keydown', (e) => {
 
 function selectRoot(id) {
   infoEl.textContent = `Exploring ${allFunctions[id]?.name ?? id}`;
+  // Naming a symbol is asking for its call tree, and `core` switches the
+  // workspace to the rooted view on its own — no need to pair the commands here.
   sendCommand({ SelectFunction: id });
 }
 
@@ -579,9 +848,20 @@ function expandNode(id) {
   sendCommand({ ExpandFunction: id });
 }
 
-cy.on('tap', 'node', (e) => expandNode(e.target.id()));
+/// Open a symbol in a tab of its own. A new workspace opens on the cluster map
+/// like any other, but this one was asked for by name and already has a root,
+/// so `core` starts it on the tree rather than making the user find it again.
+function openInNewGraph(id) {
+  sendCommand({ StartGraphFromFunction: id });
+}
+
+cy.on('tap', 'node', (e) => {
+  if (currentView === 'ClusterMap') { clusterTap(e.target); return; }
+  expandNode(e.target.id());
+});
 cy.on('dbltap', 'node', (e) => {
   e.preventDefault?.();
+  if (currentView === 'ClusterMap') { clusterDrill(e.target); return; }
   toggleNode(e.target.id());
 });
 
@@ -593,14 +873,19 @@ cy.on('mouseover', 'node', (e) => {
   node.connectedEdges().addClass('incident');
 
   // Fade everything that isn't adjacent. At 50+ nodes this is the difference
-  // between reading a node's calls and squinting at a hairball.
-  const keep = node.closedNeighborhood();
+  // between reading a node's calls and squinting at a hairball. A box and its
+  // contents count as one thing to the eye, so the compound relatives ride
+  // along: fading a community's members out from under a lit box around them
+  // reads as a rendering fault rather than as focus.
+  let keep = node.closedNeighborhood().union(node.ancestors());
+  if (node.isParent()) keep = keep.union(node.descendants());
   cy.elements().difference(keep).addClass('faded');
 
   // The canvas has no tooltips, and the label may be truncated, so the status
   // bar carries the full qualified name.
   infoEl.textContent = node.data('full');
-  showExpandBtn(node);
+  // The overlay loads or hides a function's callees; a community has neither.
+  if (currentView !== 'ClusterMap') showExpandBtn(node);
 });
 cy.on('mouseout', 'node', (e) => {
   e.target.removeClass('hovered');
@@ -754,6 +1039,12 @@ function toggleTheme() {
 // than growing a button per command.
 
 function buildCommands() {
+  // Half these commands drive the rooted view's BFS and mean nothing on a map
+  // bounded by which boxes are open, so they go grey there rather than
+  // silently changing a view the user is not looking at.
+  const onMap = currentView === 'ClusterMap';
+  const openGroups = onMap ? (clusterMap?.groups ?? []) : [];
+
   const cmds = [
     { id: 'goto', label: 'Go to Symbol\u2026', hint: 'Ctrl+P', run: openSymbolFinder },
 
@@ -768,24 +1059,35 @@ function buildCommands() {
     { id: 'graph.rename', label: 'Graph: Rename\u2026', run: renameActiveTab },
     { id: 'graph.next', label: 'Graph: Next', hint: 'Ctrl+Tab', disabled: workspaces.length <= 1, run: () => sendCommand('NextWorkspace') },
     { id: 'graph.prev', label: 'Graph: Previous', hint: 'Ctrl+Shift+Tab', disabled: workspaces.length <= 1, run: () => sendCommand('PreviousWorkspace') },
-    { id: 'graph.expand', label: 'Graph: Expand or Collapse Selected', disabled: !selectedNodeId, run: () => sendCommand('ExpandOrCollapse') },
+    { id: 'graph.expand', label: 'Graph: Expand or Collapse Selected', disabled: onMap || !selectedNodeId, run: () => sendCommand('ExpandOrCollapse') },
+
+    // The two views, named rather than toggled — the same reason the
+    // orientation control shows both segments instead of one that flips.
+    { id: 'view.clusters', label: 'View: Cluster Map', disabled: onMap, run: () => sendCommand('ZoomOutToClusters') },
+    { id: 'view.rooted', label: 'View: Rooted Graph', disabled: !onMap, run: () => sendCommand({ SetViewMode: 'Rooted' }) },
+    {
+      id: 'view.closeclusters',
+      label: 'View: Close All Open Communities',
+      disabled: !onMap || openGroups.length === 0,
+      run: () => openGroups.forEach((g) => sendCommand({ ToggleClusterExpanded: g.key })),
+    },
 
     { id: 'view.sidebar', label: 'View: Toggle Sidebar', hint: 'Ctrl+B', run: toggleSidebar },
     { id: 'view.direction', label: 'View: Toggle Call Direction', hint: 'Ctrl+D', run: () => sendCommand('ToggleCallDirection') },
     { id: 'view.orientation', label: 'View: Toggle Graph Orientation', hint: 'Ctrl+Shift+D', run: () => setOrientation(currentOrientation === 'LeftRight' ? 'TopDown' : 'LeftRight') },
     { id: 'view.fit', label: 'View: Fit Graph to Screen', disabled: cy.nodes().length === 0, run: fitGraph },
-    { id: 'view.deeper', label: 'View: Show More Levels', hint: 'Ctrl+]', disabled: graphDepth >= DEPTH_MAX, run: () => setDepth(graphDepth + 1) },
-    { id: 'view.shallower', label: 'View: Show Fewer Levels', hint: 'Ctrl+[', disabled: graphDepth <= DEPTH_MIN, run: () => setDepth(graphDepth - 1) },
+    { id: 'view.deeper', label: 'View: Show More Levels', hint: 'Ctrl+]', disabled: onMap || graphDepth >= DEPTH_MAX, run: () => setDepth(graphDepth + 1) },
+    { id: 'view.shallower', label: 'View: Show Fewer Levels', hint: 'Ctrl+[', disabled: onMap || graphDepth <= DEPTH_MIN, run: () => setDepth(graphDepth - 1) },
     {
       id: 'view.collapse',
       label: 'View: Collapse or Expand Selected Node',
-      disabled: !selectedNodeId,
+      disabled: onMap || !selectedNodeId,
       run: () => selectedNodeId && toggleNode(selectedNodeId),
     },
     {
       id: 'view.expandall',
       label: 'View: Expand All Collapsed Nodes',
-      disabled: collapsed.size === 0,
+      disabled: onMap || collapsed.size === 0,
       run: () => collapsed.forEach((id) => sendCommand({ ToggleCollapsed: id })),
     },
     { id: 'view.theme', label: 'View: Toggle Theme', run: toggleTheme },
@@ -829,7 +1131,7 @@ function openSymbolFinder() {
     items,
     altHint: 'Enter to focus \u00b7 Alt+Enter to open in a new graph',
     onPick: (item) => selectRoot(item.id),
-    onAltPick: (item) => sendCommand({ StartGraphFromFunction: item.id }),
+    onAltPick: (item) => openInNewGraph(item.id),
   });
 }
 

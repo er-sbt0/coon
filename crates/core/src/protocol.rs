@@ -127,8 +127,8 @@ pub fn layout_of(core: &CoreApp) -> ServerMsg {
 /// rooted call tree instead.
 ///
 /// Computing it is not free — it walks every call in the graph — so it is done
-/// only for the view that is actually on screen, and `ViewMode` still defaults
-/// to `Rooted`, so in practice nothing asks for it yet.
+/// only for the view that is actually on screen. A workspace the user has
+/// drilled out of is showing a call tree and pays nothing for the map.
 fn cluster_layout_of(core: &CoreApp) -> Option<GraphLayout> {
     let ws = core.workspaces.current()?;
     if ws.view != ViewMode::ClusterMap {
@@ -420,24 +420,13 @@ mod tests {
     /// The cluster map rides along on the snapshot rather than replacing the
     /// rooted layout, and only for the view that is actually showing.
     #[test]
-    fn the_cluster_map_is_absent_until_a_workspace_asks_for_it() {
+    fn the_cluster_map_rides_along_only_for_the_view_showing_it() {
         let mut core = CoreApp::new(crate::demo::create_demo_call_graph());
-
-        let json = serde_json::to_value(snapshot_of(&core)).expect("snapshot serialises");
-        assert!(
-            json.get("cluster_layout").is_none(),
-            "a rooted workspace must send exactly what it sent before"
-        );
-
-        core.workspaces
-            .current_mut()
-            .expect("a default workspace")
-            .set_view(ViewMode::ClusterMap);
 
         let json = serde_json::to_value(snapshot_of(&core)).expect("snapshot serialises");
         let map = json
             .get("cluster_layout")
-            .expect("the map view carries a map");
+            .expect("a fresh workspace opens on the map");
         assert!(
             map["nodes"].as_object().is_some_and(|n| !n.is_empty()),
             "and the map has the communities on it"
@@ -445,6 +434,17 @@ mod tests {
         assert!(
             json.get("layout").is_some(),
             "the rooted layout still ships"
+        );
+
+        core.workspaces
+            .current_mut()
+            .expect("a default workspace")
+            .set_view(ViewMode::Rooted);
+
+        let json = serde_json::to_value(snapshot_of(&core)).expect("snapshot serialises");
+        assert!(
+            json.get("cluster_layout").is_none(),
+            "a rooted workspace must send exactly what it sent before"
         );
     }
 

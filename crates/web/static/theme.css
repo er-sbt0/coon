@@ -83,6 +83,15 @@
   --node-border: #373b43;
   --edge: #3d424b;
   --edge-arrow: #545a65;
+
+  /* Cluster map: the box drawn around an opened community. One neutral tint
+   * for every group — a hue per community would be a second signal competing
+   * with the accent, and twenty communities have no twenty hues that stay
+   * apart. The tint sits between the canvas and a node, so the box reads as
+   * ground and what is inside it reads as figure. */
+  --group-bg: #1e2127;
+  --group-border: #3c414a;
+  --group-label: #8b919b;
 }
 
 /* ── Light ───────────────────────────────────────────────────────────────── */
@@ -114,6 +123,10 @@
   --node-border: #d4d8de;
   --edge: #c2c7ce;
   --edge-arrow: #9aa1aa;
+
+  --group-bg: #f1f3f5;
+  --group-border: #d2d7dd;
+  --group-label: #6f757e;
 }
 
 /* Follow the OS when the user hasn't pinned a theme. */
@@ -146,5 +159,9 @@
     --node-border: #d4d8de;
     --edge: #c2c7ce;
     --edge-arrow: #9aa1aa;
+
+    --group-bg: #f1f3f5;
+    --group-border: #d2d7dd;
+    --group-label: #6f757e;
   }
 }

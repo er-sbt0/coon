@@ -21,14 +21,13 @@ use crate::events::AppEvent;
 /// the way it already reads `depth` and `collapsed`, without owning it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ViewMode {
-    ClusterMap,
-    /// The default, for the moment. A workspace is meant to open on the cluster
-    /// map and have the user drill down from there, but `compute_layout` cannot
-    /// place cluster boxes until Phase 3 and every frontend draws exactly what
-    /// the layout hands it. Defaulting to a view the layout cannot yet serve
-    /// would open every tab on an empty canvas, so the default flips when the
-    /// layout that serves it lands, and not before.
+    /// The default. A workspace has no root until the user picks one, so a tab
+    /// that opened on the call tree opened on an empty canvas and left them to
+    /// guess which of a thousand functions to start from. The map is the answer
+    /// to the question a fresh workspace actually poses — what is in here — and
+    /// drilling into a community roots the tree for them.
     #[default]
+    ClusterMap,
     Rooted,
 }
 
@@ -80,7 +79,11 @@ impl CoreWorkspace {
 
     pub fn new_with_root(id: usize, name: String, symbol: SymbolId) -> Self {
         let mut ws = Self::new(id, name);
-        ws.root_symbol = Some(symbol);
+        // Through `set_root` rather than assigning the field, so a workspace
+        // opened on a named symbol starts on that symbol's tree. Otherwise it
+        // would open on the cluster map like any other new tab, and the root
+        // the caller just asked for would be invisible.
+        ws.set_root(symbol);
         ws
     }
 
@@ -91,6 +94,12 @@ impl CoreWorkspace {
         // Which clusters stood open describes a particular map, and for the
         // same reason it does not survive being pointed at a new root.
         self.expanded_clusters.clear();
+        // Naming a root *is* asking for the rooted view — the cluster map draws
+        // communities and has nowhere to put one. Doing it here rather than
+        // leaving each frontend to pair the two commands is what keeps a
+        // frontend a transport: the TUI, the web client and the desktop shell
+        // would otherwise each have to know this rule, and each could forget it.
+        self.view = ViewMode::Rooted;
         self.touch();
     }
 
@@ -372,14 +381,14 @@ mod tests {
         let mut ws = CoreWorkspace::new(1, "w".to_string());
         assert_eq!(
             ws.view,
-            ViewMode::Rooted,
-            "the map is the intended default, but only once Phase 3 can lay it out"
+            ViewMode::ClusterMap,
+            "a workspace with no root opens on the map, not on an empty tree"
         );
 
-        assert!(ws.set_view(ViewMode::ClusterMap));
-        assert_eq!(ws.view, ViewMode::ClusterMap);
+        assert!(ws.set_view(ViewMode::Rooted));
+        assert_eq!(ws.view, ViewMode::Rooted);
         assert!(
-            !ws.set_view(ViewMode::ClusterMap),
+            !ws.set_view(ViewMode::Rooted),
             "re-picking the view already shown is not a change"
         );
     }
@@ -402,6 +411,31 @@ mod tests {
         assert!(
             ws.expanded_clusters.is_empty(),
             "a new root starts with nothing opened"
+        );
+    }
+
+    #[test]
+    fn naming_a_root_is_asking_for_the_rooted_view() {
+        let mut ws = CoreWorkspace::new(1, "w".to_string());
+        assert_eq!(ws.view, ViewMode::ClusterMap, "a fresh tab opens on the map");
+
+        ws.set_root(SymbolId::from_content("a", "a.c", 1));
+        assert_eq!(
+            ws.view,
+            ViewMode::Rooted,
+            "the map has nowhere to draw a root, so every frontend would \
+             otherwise have to pair the two commands itself"
+        );
+
+        let opened = CoreWorkspace::new_with_root(
+            2,
+            "w2".to_string(),
+            SymbolId::from_content("b", "b.c", 1),
+        );
+        assert_eq!(
+            opened.view,
+            ViewMode::Rooted,
+            "a tab opened on a named symbol starts on that symbol"
         );
     }
 
