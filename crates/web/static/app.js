@@ -527,9 +527,11 @@ function rebuildGraph(graph, layout) {
   if (selectedNodeId && selectedNodeId !== rootNodeId) cy.$id(selectedNodeId).addClass('focused');
   markPathToSelection();
 
-  // Only auto-fit when the focused node or direction changes, so expanding a
-  // node doesn't yank the viewport the user just positioned.
-  const fitKey = `${selectedNodeId ?? rootNodeId}:${currentDirection}:${currentOrientation}`;
+  // Only auto-fit when the tree itself changes — a new root, the other
+  // direction, the other orientation. Expanding a node appends to this tree and
+  // must not yank the viewport the user just positioned, so the node they
+  // expanded is deliberately not part of the key.
+  const fitKey = `${rootNodeId}:${currentDirection}:${currentOrientation}`;
   if (cy.nodes().length > 0 && fitKey !== lastFitKey) {
     lastFitKey = fitKey;
     requestAnimationFrame(fitGraph);

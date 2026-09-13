@@ -44,6 +44,13 @@ pub struct CoreWorkspace {
     pub depth: usize,
     /// Nodes whose children the user has collapsed. The node stays visible.
     pub collapsed: HashSet<SymbolId>,
+    /// Nodes the user asked to load the calls of, so the layout walks one level
+    /// past the depth limit at each of them.
+    ///
+    /// The counterpart of `collapsed`: one says stop short of where the limit
+    /// would reach, the other says go one step further. Both describe this
+    /// tree, so both are cleared when the root moves.
+    pub expanded: HashSet<SymbolId>,
     /// Which way the graph flows on the canvas.
     pub orientation: LayoutOrientation,
     /// Which view this workspace is showing.
@@ -78,6 +85,7 @@ impl CoreWorkspace {
             direction: CallDirection::Outgoing,
             depth: DEFAULT_DEPTH,
             collapsed: HashSet::new(),
+            expanded: HashSet::new(),
             orientation: LayoutOrientation::default(),
             view: ViewMode::default(),
             expanded_clusters: HashSet::new(),
@@ -101,6 +109,8 @@ impl CoreWorkspace {
         self.root_symbol = Some(symbol);
         // Collapse state describes a particular tree; a new root is a new tree.
         self.collapsed.clear();
+        // And so does the set of nodes walked past the depth limit.
+        self.expanded.clear();
         // Which clusters stood open describes a particular map, and for the
         // same reason it does not survive being pointed at a new root.
         self.expanded_clusters.clear();
@@ -186,6 +196,19 @@ impl CoreWorkspace {
             self.collapsed.insert(symbol);
             true
         }
+    }
+
+    /// Walk one level past the depth limit at `symbol` from now on. Returns
+    /// true when that is news — a second click on the same node changes
+    /// nothing and needs no redraw.
+    ///
+    /// Re-expanding also un-collapses: the button that asks for a node's calls
+    /// is the same one that hid them, so leaving it collapsed would swallow the
+    /// click.
+    pub fn expand(&mut self, symbol: SymbolId) -> bool {
+        self.touch();
+        let uncollapsed = self.collapsed.remove(&symbol);
+        self.expanded.insert(symbol) || uncollapsed
     }
 
     pub fn touch(&mut self) {
@@ -389,6 +412,28 @@ mod tests {
         assert!(
             ws.collapsed.is_empty(),
             "a new root starts with nothing collapsed"
+        );
+    }
+
+    #[test]
+    fn expanding_is_idempotent_and_resets_with_the_root() {
+        let mut ws = CoreWorkspace::new(1, "w".to_string());
+        let sym = SymbolId::from_content("a", "a.c", 1);
+
+        assert!(ws.expand(sym), "the first ask widens the walk");
+        assert!(!ws.expand(sym), "asking again changes nothing to redraw");
+
+        ws.toggle_collapsed(sym);
+        assert!(
+            ws.expand(sym),
+            "asking for the calls of a collapsed node un-collapses it"
+        );
+        assert!(ws.collapsed.is_empty());
+
+        ws.set_root(SymbolId::from_content("b", "b.c", 1));
+        assert!(
+            ws.expanded.is_empty(),
+            "a new root starts with nothing expanded"
         );
     }
 

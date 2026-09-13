@@ -71,12 +71,13 @@ Client assets are vendored, not CDN-loaded (`static/vendor/cytoscape.min.js`), b
 
 ### Readability at scale
 
-A whole call graph is unreadable by default: rooting at `main` in the demo reaches 56 nodes. Three mechanisms keep it legible, and they are the first things to reach for before adding more visual weight:
+A whole call graph is unreadable by default: rooting at `main` in the demo reaches 56 nodes. Four mechanisms keep it legible, and they are the first things to reach for before adding more visual weight:
 
 | Mechanism | Where |
 |---|---|
 | **Depth limit** (`Command::SetGraphDepth`, per workspace, default 3) | `core::layout` stops the BFS |
 | **Collapse** (`Command::ToggleCollapsed`, per workspace) | `core::layout` stops descending; client drops the node's outgoing edges |
+| **Expand** (`Command::ExpandFunction`, per workspace) | `core::layout` walks one level *past* the limit at those nodes |
 | **Hover focus** — fade everything non-adjacent | `app.js`, transient |
 
 Nodes hiding children are dashed and labelled `+N`. Auto-fit is clamped at both ends (`MAX_FIT_ZOOM` / `MIN_FIT_ZOOM`): a small graph must not render at cartoon size, and a large one must not shrink past readable — below the floor it holds the zoom and anchors on the focused node so the user pans.
@@ -89,6 +90,7 @@ Design rules worth keeping:
 - **Orientation is a transpose, not a `grid` setting.** `grid::TreeOrientation` exists but the Sugiyama pass ignores it: levels always advance along x. `core::layout` gets top-down by swapping the node size going in and the coordinates coming out, so both orientations share one code path. The *spacing* is not transposed with it: a node is 150×32, so top-down advances levels along the short axis and spreads siblings along the long one, and reusing the left-to-right gutters gives a flat stripe. Top-down has its own pair (`*_TOPDOWN`) — generous between levels, tighter between siblings. Per workspace, via `Command::SetGraphOrientation`. The toolbar shows it as a segmented control — both options visible, the live one lit — because a single pill whose label is the current state reads as a command that does the opposite of what it says.
 - **Levels stretch to fill the canvas.** `grid` packs each axis as tightly as its separations allow, which leaves a wide sibling fan as a band with the levels almost touching and half the screen empty. `layout::balance_aspect` scales the level axis — uniformly, so it is just a bigger pitch and nothing can collide — until the bounding box reaches `TARGET_ASPECT`, capped at `MAX_LEVEL_STRETCH` because past a point spreading levels only means panning further to follow one edge.
 - **`grid` spacing is pitch, not gutter.** `level_separation` and `node_separation` are full centre-to-centre distances, not gaps added to the node's size. `core::layout` derives them as `size + gutter` explicitly, because the crate's terminal defaults (`node_width: 20`, `level_separation: 4`) make the distinction easy to miss — and getting it wrong overlaps every node.
+- **Expanding appends; it never re-roots.** Asking for one node's calls adds that node to the workspace's `expanded` set, and the layout BFS — still rooted where it was — walks one level further there. It used to move the BFS origin onto the expanded node instead, which redrew the whole graph around it and dropped every sibling branch. For the same reason the client's auto-fit key is the *root*, not the focused node: appending must not move the viewport the user positioned.
 - **This is a DAG, not a tree.** Collapsing a node does not necessarily remove its children from the canvas: another caller may still reach them. Collapse therefore also drops the edges *leaving* the collapsed node, client-side, so the action is always visible.
 - Graph styles are read from the CSS custom properties at startup, so the canvas and the chrome stay on one palette.
 

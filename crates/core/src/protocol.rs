@@ -86,24 +86,18 @@ pub fn snapshot_of(core: &CoreApp) -> ServerMsg {
     let ws = core.workspaces.current();
     let root = ws.and_then(|w| w.root_symbol);
     let direction = ws.map(|w| w.direction).unwrap_or(CallDirection::Outgoing);
-    // Use layout_focus (set by ExpandFunction) as the BFS origin when present,
-    // so the layout window shifts to the expanded node rather than staying
-    // anchored to the workspace root.
-    let layout_root = core.layout_focus.or(root);
-    let layout = compute_layout(
-        &core.call_graph,
-        layout_root,
-        direction,
-        &layout_options(core),
-    );
+    // The BFS origin is the workspace root and only ever that. Expanding a node
+    // does not move it — it widens the walk at that node (see
+    // `LayoutOptions::expanded`), so the graph grows rather than changing.
+    let layout = compute_layout(&core.call_graph, root, direction, &layout_options(core));
 
     log::info!(
-        "[protocol] snapshot: nodes={} edges={} layout_nodes={} root={:?} layout_focus={:?} direction={:?} selected={:?}",
+        "[protocol] snapshot: nodes={} edges={} layout_nodes={} root={:?} expanded={} direction={:?} selected={:?}",
         core.call_graph.node_count(),
         core.call_graph.edge_count(),
         layout.len(),
         root,
-        core.layout_focus,
+        ws.map_or(0, |w| w.expanded.len()),
         direction,
         core.selected_function,
     );
@@ -157,6 +151,7 @@ fn layout_options(core: &CoreApp) -> LayoutOptions<'_> {
         Some(ws) => LayoutOptions {
             depth: ws.depth,
             collapsed: &ws.collapsed,
+            expanded: &ws.expanded,
             orientation: ws.orientation,
         },
         None => LayoutOptions::default(),

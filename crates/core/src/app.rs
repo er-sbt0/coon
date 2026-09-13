@@ -58,11 +58,6 @@ const WARMUP_STALL_AFTER: Duration = Duration::from_secs(10);
 pub struct CoreApp {
     pub call_graph: CallGraph,
     pub selected_function: Option<SymbolId>,
-    /// The node used as the BFS root for layout computation in the web frontend.
-    /// Set to `Some(id)` when the user expands a node in-place (so the subgraph
-    /// is centred on that node). Cleared whenever the workspace root or direction
-    /// changes so the view resets to the normal root-anchored layout.
-    pub layout_focus: Option<SymbolId>,
     pub lsp: LspBridge,
     pub workspaces: CoreWorkspaceManager,
     /// Communities derived from the **whole** graph, cached.
@@ -152,7 +147,6 @@ impl CoreApp {
         Self {
             call_graph,
             selected_function: None,
-            layout_focus: None,
             lsp,
             workspaces: CoreWorkspaceManager::new(),
             clustering,
@@ -467,9 +461,7 @@ impl CoreApp {
 
     fn cmd_select_function(&mut self, id: SymbolId) -> Vec<AppEvent> {
         self.selected_function = Some(id);
-        // Changing the root resets the layout focus so the view is anchored to the new root.
-        self.layout_focus = None;
-        log::info!("CoreApp: root changed to {:?}, layout_focus cleared", id);
+        log::info!("CoreApp: root changed to {id:?}");
         // Also update the current workspace root
         if let Some(ws) = self.workspaces.current_mut() {
             ws.set_root(id);
@@ -524,15 +516,16 @@ impl CoreApp {
     }
 
     fn cmd_toggle_call_direction(&mut self) -> Vec<AppEvent> {
-        // Direction change resets the layout focus to the workspace root.
-        self.layout_focus = None;
         if let Some(ws) = self.workspaces.current_mut() {
             ws.direction = match ws.direction {
                 CallDirection::Outgoing => CallDirection::Incoming,
                 CallDirection::Incoming => CallDirection::Outgoing,
             };
+            // Reversing the arrows is a different tree; the nodes walked past
+            // the depth limit in the old one have nothing to say about it.
+            ws.expanded.clear();
             log::info!(
-                "CoreApp: direction toggled to {:?}, layout_focus cleared",
+                "CoreApp: direction toggled to {:?}, expansions cleared",
                 ws.direction
             );
         }
@@ -743,28 +736,29 @@ impl CoreApp {
 
     fn cmd_expand_function(&mut self, id: SymbolId) -> Vec<AppEvent> {
         self.selected_function = Some(id);
-        // Shift the layout BFS window to this node so its children become visible
-        // without changing the workspace root_symbol.
-        //
-        // If the user clicks the same already-loaded node again, layout_focus
-        // is unchanged and nothing needs to be done — avoid a redundant snapshot.
-        if self.layout_focus == Some(id) && self.lsp.is_function_loaded(&id) {
-            log::info!(
-                "CoreApp: expand in-place {:?} — already focused and loaded, no-op",
-                id
-            );
-            return vec![];
-        }
-        self.layout_focus = Some(id);
-        log::info!("CoreApp: expand in-place {:?}, layout_focus set", id);
-        // Unlike SelectFunction, do NOT change root_symbol — expand in place.
+        // Expanding is purely additive: the workspace root, and so the layout
+        // the user is looking at, does not move. All this does is let the BFS
+        // walk one level past the depth limit at this node, so its callees are
+        // appended to the graph on screen.
+        let changed = self
+            .workspaces
+            .current_mut()
+            .is_some_and(|ws| ws.expand(id));
+        log::info!("CoreApp: expand in-place {id:?}, layout changed: {changed}");
+
         if !self.lsp.is_function_loaded(&id) && !self.lsp.is_function_loading(&id) {
             self.lsp.set_loading_state(id, LoadingState::Loading);
             if let Some(ev) = self.lsp.send_call_hierarchy(&self.call_graph, &id) {
                 return vec![ev, AppEvent::LayoutDirty];
             }
         }
-        vec![AppEvent::LayoutDirty]
+        // A second click on a node already expanded and already loaded has
+        // nothing to redraw.
+        if changed {
+            vec![AppEvent::LayoutDirty]
+        } else {
+            vec![]
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -1200,6 +1194,47 @@ mod tests {
     fn key_of(app: &CoreApp, symbol: SymbolId) -> ClusterKey {
         let id = app.clustering().cluster_of(&symbol).expect("clustered");
         app.clustering().cluster(id).expect("a known id").key
+    }
+
+    /// The laid-out nodes of the current snapshot — what the canvas would draw.
+    fn placed(app: &CoreApp) -> Vec<SymbolId> {
+        match crate::protocol::snapshot_of(app) {
+            crate::protocol::ServerMsg::Snapshot { layout, .. } => layout.keys().copied().collect(),
+            other => panic!("snapshot_of returned {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expanding_a_node_adds_to_the_graph_without_moving_the_root() {
+        let mut graph = CallGraph::new();
+        let root = add(&mut graph, "root", 1);
+        let mid = add(&mut graph, "mid", 2);
+        let leaf = add(&mut graph, "leaf", 3);
+        let sibling = add(&mut graph, "sibling", 4);
+        call(&mut graph, root, mid, 100);
+        call(&mut graph, mid, leaf, 101);
+        call(&mut graph, root, sibling, 102);
+
+        let mut app = CoreApp::new(graph);
+        app.dispatch(Command::SelectFunction(root));
+        app.dispatch(Command::SetGraphDepth(1));
+
+        let before = placed(&app);
+        assert!(before.contains(&root) && before.contains(&mid) && before.contains(&sibling));
+        assert!(!before.contains(&leaf), "the depth limit stops at `mid`");
+
+        app.dispatch(Command::ExpandFunction(mid));
+
+        let after = placed(&app);
+        assert_eq!(
+            app.workspaces.current().and_then(|ws| ws.root_symbol),
+            Some(root),
+            "expanding does not re-root the workspace"
+        );
+        for id in &before {
+            assert!(after.contains(id), "everything on screen stayed on screen");
+        }
+        assert!(after.contains(&leaf), "and the fetched callee was appended");
     }
 
     /// Pretend the settling period has already elapsed, rather than sleeping

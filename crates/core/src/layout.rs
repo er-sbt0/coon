@@ -87,6 +87,10 @@ pub struct LayoutOptions<'a> {
     /// Nodes whose children the user has collapsed. The node itself stays
     /// visible; traversal stops there.
     pub collapsed: &'a HashSet<SymbolId>,
+    /// Nodes the user asked to load the calls of. Traversal walks one level
+    /// *past* `depth` at these, so the gesture appends the callees it fetched
+    /// to the graph already on screen instead of moving the window onto them.
+    pub expanded: &'a HashSet<SymbolId>,
     /// Which way levels advance.
     pub orientation: LayoutOrientation,
 }
@@ -97,6 +101,7 @@ impl Default for LayoutOptions<'_> {
         Self {
             depth: DEFAULT_DEPTH,
             collapsed: EMPTY.get_or_init(HashSet::new),
+            expanded: EMPTY.get_or_init(HashSet::new),
             orientation: LayoutOrientation::default(),
         }
     }
@@ -241,7 +246,13 @@ pub fn compute_layout(
     queue.push_back((root, 0));
 
     while let Some((symbol, depth)) = queue.pop_front() {
-        if depth >= max_depth {
+        // The depth limit is how far the layout reaches on its own. A node the
+        // user explicitly asked for the calls of is walked one level past it —
+        // its children arrive at `depth + 1` and stop there unless they were
+        // asked for too — so that gesture *adds* to what is on screen. Moving
+        // the window onto the expanded node instead, which is what this used to
+        // do, redrew the whole graph around a node the user only wanted more of.
+        if depth >= max_depth && !opts.expanded.contains(&symbol) {
             continue;
         }
         // A collapsed node stays on screen; its children simply aren't walked.
@@ -746,6 +757,105 @@ mod tests {
     }
 
     #[test]
+    fn expanding_a_node_appends_one_level_and_keeps_the_rest() {
+        let (graph, ids) = graph_with_chain(&["a", "b", "c", "d", "e"]);
+        let collapsed = HashSet::new();
+        let mut expanded = HashSet::new();
+        expanded.insert(ids[2]);
+
+        let opts = LayoutOptions {
+            depth: 2,
+            collapsed: &collapsed,
+            expanded: &expanded,
+            ..Default::default()
+        };
+        let layout = compute_layout(&graph, Some(ids[0]), CallDirection::Outgoing, &opts);
+
+        // Everything the depth limit already showed is still there — expanding
+        // adds, it does not re-root.
+        for (i, id) in ids.iter().take(3).enumerate() {
+            assert!(
+                layout.contains_key(id),
+                "{} is still on screen",
+                ["a", "b", "c"][i]
+            );
+        }
+        assert!(
+            layout.contains_key(&ids[3]),
+            "the expanded node's callee joins it"
+        );
+        assert!(
+            !layout.contains_key(&ids[4]),
+            "one level only: the callee's own callees wait to be asked for"
+        );
+    }
+
+    #[test]
+    fn expanding_a_node_off_the_root_path_leaves_the_root_tree_alone() {
+        // main → a → b, and main → z. Expanding `a` used to re-root the BFS
+        // there, which dropped `z` off the canvas; it has nothing to do with
+        // the node the user expanded and should not move.
+        let mut graph = CallGraph::new();
+        let ids: Vec<SymbolId> = ["main", "a", "b", "z"]
+            .iter()
+            .map(|name| {
+                let node = FunctionNode::new(
+                    name.to_string(),
+                    name.to_string(),
+                    Location::new("src/x.c".to_string(), 1, 0),
+                );
+                let id = node.id;
+                graph.add_function(node);
+                id
+            })
+            .collect();
+        let call = |g: &mut CallGraph, from: SymbolId, to: SymbolId| {
+            g.add_call(from, to, Location::new("src/x.c".to_string(), 1, 0));
+        };
+        call(&mut graph, ids[0], ids[1]);
+        call(&mut graph, ids[1], ids[2]);
+        call(&mut graph, ids[0], ids[3]);
+
+        let collapsed = HashSet::new();
+        let mut expanded = HashSet::new();
+        expanded.insert(ids[1]);
+
+        let opts = LayoutOptions {
+            depth: 1,
+            collapsed: &collapsed,
+            expanded: &expanded,
+            ..Default::default()
+        };
+        let layout = compute_layout(&graph, Some(ids[0]), CallDirection::Outgoing, &opts);
+
+        assert!(layout.contains_key(&ids[0]), "the root is still the root");
+        assert!(layout.contains_key(&ids[3]), "the sibling branch stays put");
+        assert!(layout.contains_key(&ids[2]), "and `a` gained its callee");
+    }
+
+    #[test]
+    fn collapsing_wins_over_expanding() {
+        let (graph, ids) = graph_with_chain(&["a", "b", "c"]);
+        let mut collapsed = HashSet::new();
+        collapsed.insert(ids[1]);
+        let mut expanded = HashSet::new();
+        expanded.insert(ids[1]);
+
+        let opts = LayoutOptions {
+            depth: MAX_DEPTH,
+            collapsed: &collapsed,
+            expanded: &expanded,
+            ..Default::default()
+        };
+        let layout = compute_layout(&graph, Some(ids[0]), CallDirection::Outgoing, &opts);
+
+        assert!(
+            !layout.contains_key(&ids[2]),
+            "a node collapsed after it was expanded is collapsed"
+        );
+    }
+
+    #[test]
     fn positions_are_node_centres_in_pixels() {
         let (graph, ids) = graph_with_chain(&["a", "b"]);
         let collapsed = HashSet::new();
@@ -841,6 +951,7 @@ mod tests {
             depth: 2,
             collapsed: &collapsed,
             orientation: LayoutOrientation::TopDown,
+            ..Default::default()
         };
         let layout = compute_layout(&graph, Some(parent_id), CallDirection::Outgoing, &opts);
 
@@ -909,6 +1020,7 @@ mod tests {
             depth: 2,
             collapsed: &collapsed,
             orientation: LayoutOrientation::TopDown,
+            ..Default::default()
         };
         let layout = compute_layout(&graph, Some(root), CallDirection::Outgoing, &opts);
         let (w, h) = extents(&layout);
@@ -934,6 +1046,7 @@ mod tests {
             depth: 2,
             collapsed: &collapsed,
             orientation: LayoutOrientation::TopDown,
+            ..Default::default()
         };
         let layout = compute_layout(&graph, Some(root), CallDirection::Outgoing, &opts);
         let (_, h) = extents(&layout);
@@ -1667,6 +1780,23 @@ mod tests {
     /// out flat, the way it was before `compute_dag_grouped`, has to come out
     /// split. Without that this test would pass on a layout that never had a
     /// problem.
+    #[test]
+    fn scratch_print_interleaving() {
+        let (graph, clustering, anchor) = interleaving_graph();
+        for level in 0..clustering.level_count() {
+            for id in clustering.level(level) {
+                let c = clustering.cluster(*id).expect("listed");
+                let names: Vec<String> = c
+                    .members
+                    .iter()
+                    .map(|m| graph.get_function(m).map(|f| f.name.clone()).unwrap_or_default())
+                    .collect();
+                eprintln!("L{level} cluster {:?}: {names:?}", c.id.0);
+            }
+        }
+        eprintln!("anchor cluster: {:?}", clustering.cluster_of(&anchor));
+    }
+
     #[test]
     fn an_open_clusters_members_land_side_by_side() {
         let (graph, clustering, anchor) = interleaving_graph();
