@@ -71,7 +71,20 @@
     <div class="status-item right" id="info"></div>
   </footer>
 
+  <!-- Command palette / symbol finder. One overlay, two callers. -->
+  <div id="palette" hidden>
+    <div id="palette-backdrop"></div>
+    <div id="palette-box" role="dialog" aria-modal="true" aria-label="Command palette">
+      <input id="palette-input" type="text" autocomplete="off" spellcheck="false"
+             aria-controls="palette-list" aria-autocomplete="list" />
+      <ul id="palette-list" role="listbox"></ul>
+      <div id="palette-empty" hidden>No matches</div>
+      <div id="palette-footer" hidden></div>
+    </div>
+  </div>
+
   <script src="transport.js"></script>
+  <script src="palette.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

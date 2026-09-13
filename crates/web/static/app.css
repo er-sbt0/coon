@@ -332,3 +332,96 @@ body.resizing { cursor: col-resize; user-select: none; }
   border: 3px solid var(--surface);
 }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+
+/* ── Command palette / symbol finder ────────────────────────────────────────
+ * Anchored near the top rather than centred: the list grows downward, so the
+ * input stays put as results change instead of the whole dialog shifting.
+ */
+#palette { position: fixed; inset: 0; z-index: 1000; }
+#palette[hidden] { display: none; }
+
+#palette-backdrop { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.45); }
+
+#palette-box {
+  position: relative;
+  width: min(640px, 92vw);
+  margin: 11vh auto 0;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  max-height: 70vh;
+}
+
+#palette-input {
+  padding: var(--sp-3) var(--sp-4);
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: var(--fs-lg);
+  outline: none;
+}
+#palette-input::placeholder { color: var(--text-dim); }
+
+#palette-list { list-style: none; overflow-y: auto; padding: var(--sp-1) 0; }
+
+.palette-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: 0 var(--sp-4);
+  height: 30px;
+  color: var(--text-muted);
+  border-left: 2px solid transparent;
+  cursor: default;
+}
+.palette-item.active {
+  background: var(--accent-soft);
+  border-left-color: var(--accent);
+  color: var(--text);
+}
+.palette-item.disabled { opacity: 0.4; }
+
+.palette-label { font-size: var(--fs-md); white-space: nowrap; flex-shrink: 0; }
+.palette-label.mono { font-family: var(--font-mono); font-size: var(--fs-sm); }
+/* Matched characters carry the accent as weight+colour, no highlight block. */
+.palette-label mark { background: none; color: var(--accent); font-weight: 600; }
+.palette-item.active .palette-label mark { color: var(--accent-hover); }
+
+.palette-detail {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+
+.palette-hint {
+  margin-left: auto;
+  padding: 1px var(--sp-1);
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  font-family: var(--font-ui);
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+#palette-empty, #palette-footer {
+  padding: var(--sp-3) var(--sp-4);
+  font-size: var(--fs-sm);
+  color: var(--text-dim);
+}
+#palette-footer {
+  border-top: 1px solid var(--border);
+  font-size: var(--fs-xs);
+  padding: var(--sp-2) var(--sp-4);
+}

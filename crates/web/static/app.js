@@ -2,6 +2,13 @@
 // Styles read from the CSS custom properties in theme.css so the graph and the
 // chrome stay on one palette, and a theme switch moves both together.
 
+// Restore a pinned theme before anything reads the palette. Without a pin we
+// leave the attribute off entirely so the OS preference wins.
+try {
+  const saved = localStorage.getItem('coon.theme');
+  if (saved) document.documentElement.dataset.theme = saved;
+} catch { /* private mode / blocked storage: fall back to the OS preference */ }
+
 const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 
 // Nodes sit on a fixed grid. core::compute_layout emits column/row indices on a
@@ -14,9 +21,10 @@ const LABEL_MAX = 18;
 
 const truncate = (name) => (name.length > LABEL_MAX ? `${name.slice(0, LABEL_MAX - 1)}…` : name);
 
-const cy = cytoscape({
-  container: document.getElementById('cy'),
-  style: [
+/// Built from the CSS custom properties, so the canvas and the chrome stay on
+/// one palette — and re-running it is all a theme switch needs.
+function graphStyle() {
+  return [
     {
       selector: 'node',
       style: {
@@ -69,7 +77,12 @@ const cy = cytoscape({
       }
     },
     { selector: 'edge.incident', style: { 'line-color': css('--accent'), 'target-arrow-color': css('--accent') } },
-  ],
+  ];
+}
+
+const cy = cytoscape({
+  container: document.getElementById('cy'),
+  style: graphStyle(),
   layout: { name: 'preset' },
   wheelSensitivity: 0.2,
 });
@@ -86,6 +99,7 @@ let activeWorkspace  = 0;
 let lastFitKey       = null;                      // refit only on root/direction change
 
 const MAX_FIT_ZOOM = 1.15;
+const MIN_FIT_ZOOM = 0.45;
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 
@@ -152,7 +166,7 @@ function handleSnapshot(msg) {
   statNodesEl.textContent = Object.keys(msg.layout || {}).length.toLocaleString();
 
   if (n > 0 && Object.keys(msg.layout).length === 0) {
-    infoEl.textContent = 'Pick a symbol to explore its call graph';
+    infoEl.textContent = 'Ctrl+P to find a symbol · Ctrl+Shift+P for commands';
   }
 }
 
@@ -329,18 +343,31 @@ function rebuildGraph(graph, layout) {
   const fitKey = `${selectedNodeId ?? rootNodeId}:${currentDirection}`;
   if (cy.nodes().length > 0 && fitKey !== lastFitKey) {
     lastFitKey = fitKey;
-    requestAnimationFrame(() => {
-      // Cytoscape caches the container size from init; without this the fit is
-      // computed against stale dimensions and the graph lands off-centre.
-      cy.resize();
-      cy.fit(cy.nodes(), 60);
-      // Fitting a handful of nodes to a large canvas magnifies them to a
-      // cartoon size. Cap the automatic zoom; manual zoom stays unbounded.
-      if (cy.zoom() > MAX_FIT_ZOOM) {
-        cy.zoom(MAX_FIT_ZOOM);
-        cy.center(cy.nodes());
-      }
-    });
+    requestAnimationFrame(fitGraph);
+  }
+}
+
+/// Frame the whole graph. Shared by auto-fit and the explicit command.
+function fitGraph() {
+  if (cy.nodes().length === 0) return;
+  // Cytoscape caches the container size from init; without this the fit is
+  // computed against stale dimensions and the graph lands off-centre.
+  cy.resize();
+  cy.fit(cy.nodes(), 60);
+
+  // Clamp the automatic zoom at both ends; manual zoom stays unbounded.
+  const zoom = cy.zoom();
+  if (zoom > MAX_FIT_ZOOM) {
+    // A handful of nodes fitted to a large canvas renders at a cartoon size.
+    cy.zoom(MAX_FIT_ZOOM);
+    cy.center(cy.nodes());
+  } else if (zoom < MIN_FIT_ZOOM) {
+    // Below this, labels stop being readable and a large graph is just a
+    // hairball. Keep text legible and start the user at the focused node so
+    // they pan outwards, rather than fitting everything illegibly.
+    cy.zoom(MIN_FIT_ZOOM);
+    const anchor = cy.$id(selectedNodeId ?? rootNodeId);
+    cy.center(anchor.length ? anchor : cy.nodes());
   }
 }
 
@@ -551,27 +578,125 @@ $('wc-min').addEventListener('click', () => CoonHost.minimize());
 $('wc-max').addEventListener('click', () => CoonHost.toggleMaximize());
 $('wc-close').addEventListener('click', () => CoonHost.close());
 
+
+// ── Theme ─────────────────────────────────────────────────────────────────────
+
+function currentTheme() {
+  return document.documentElement.dataset.theme
+    || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+}
+
+function toggleTheme() {
+  const next = currentTheme() === 'dark' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem('coon.theme', next); } catch { /* storage blocked */ }
+  // The graph reads its colours from the same tokens, so re-apply them.
+  cy.style(graphStyle());
+}
+
+// ── Command palette ───────────────────────────────────────────────────────────
+// Rebuilt on each open so enabled states and the workspace list are current.
+// This is where the commands core has always exposed become reachable, rather
+// than growing a button per command.
+
+function buildCommands() {
+  const cmds = [
+    { id: 'goto', label: 'Go to Symbol\u2026', hint: 'Ctrl+P', run: openSymbolFinder },
+
+    { id: 'graph.new', label: 'Graph: New', hint: 'Ctrl+T', run: () => sendCommand('NewWorkspace') },
+    {
+      id: 'graph.close',
+      label: 'Graph: Close',
+      hint: 'Ctrl+W',
+      disabled: workspaces.length <= 1,
+      run: () => sendCommand({ CloseWorkspace: activeWorkspace }),
+    },
+    { id: 'graph.rename', label: 'Graph: Rename\u2026', run: renameActiveTab },
+    { id: 'graph.next', label: 'Graph: Next', hint: 'Ctrl+Tab', disabled: workspaces.length <= 1, run: () => sendCommand('NextWorkspace') },
+    { id: 'graph.prev', label: 'Graph: Previous', hint: 'Ctrl+Shift+Tab', disabled: workspaces.length <= 1, run: () => sendCommand('PreviousWorkspace') },
+    { id: 'graph.expand', label: 'Graph: Expand or Collapse Selected', disabled: !selectedNodeId, run: () => sendCommand('ExpandOrCollapse') },
+
+    { id: 'view.sidebar', label: 'View: Toggle Sidebar', hint: 'Ctrl+B', run: toggleSidebar },
+    { id: 'view.direction', label: 'View: Toggle Call Direction', hint: 'Ctrl+D', run: () => sendCommand('ToggleCallDirection') },
+    { id: 'view.fit', label: 'View: Fit Graph to Screen', disabled: cy.nodes().length === 0, run: fitGraph },
+    { id: 'view.theme', label: 'View: Toggle Theme', run: toggleTheme },
+
+    { id: 'lsp.refresh', label: 'LSP: Refresh Symbols', hint: 'Ctrl+R', run: () => sendCommand('Refresh') },
+    { id: 'lsp.refs', label: 'LSP: Find References', disabled: !selectedNodeId, run: () => sendCommand('FindReferences') },
+  ];
+
+  workspaces.forEach((ws, index) => {
+    if (index === activeWorkspace) return;
+    cmds.push({
+      id: `graph.switch.${index}`,
+      label: `Graph: Switch to ${ws.name}`,
+      hint: index < 9 ? `Ctrl+${index + 1}` : '',
+      run: () => sendCommand({ SwitchWorkspace: index }),
+    });
+  });
+
+  return cmds;
+}
+
+function openCommandPalette() {
+  CoonPalette.show({
+    placeholder: 'Run a command\u2026',
+    items: buildCommands(),
+    onPick: (item) => item.run(),
+  });
+}
+
+function openSymbolFinder() {
+  const items = Object.entries(allFunctions).map(([id, fn]) => ({
+    id,
+    label: fn.name,
+    // Only worth showing when it adds something beyond the bare name.
+    detail: fn.qualified_name && fn.qualified_name !== fn.name ? fn.qualified_name : '',
+    mono: true,
+  }));
+
+  CoonPalette.show({
+    placeholder: 'Go to symbol\u2026',
+    items,
+    altHint: 'Enter to focus \u00b7 Alt+Enter to open in a new graph',
+    onPick: (item) => selectRoot(item.id),
+    onAltPick: (item) => sendCommand({ StartGraphFromFunction: item.id }),
+  });
+}
+
+function renameActiveTab() {
+  const nameEl = tabsEl.children[activeWorkspace]?.querySelector('.tab-name');
+  if (nameEl) beginRename(nameEl, activeWorkspace);
+}
+
 // ── Keybindings ───────────────────────────────────────────────────────────────
 
 document.addEventListener('keydown', (e) => {
+  if (CoonPalette.isOpen()) return;   // the palette handles its own keys
+
   const mod = e.ctrlKey || e.metaKey;
   if (!mod) return;
 
-  if (e.key === 'b') { e.preventDefault(); toggleSidebar(); }
-  else if (e.key === 't') { e.preventDefault(); sendCommand('NewWorkspace'); }
-  else if (e.key === 'w') {
+  // Shift reports letter keys uppercase; normalise so combos match either way.
+  const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+
+  if (key === 'p' && e.shiftKey) { e.preventDefault(); openCommandPalette(); }
+  else if (key === 'p') { e.preventDefault(); openSymbolFinder(); }
+  else if (key === 'b') { e.preventDefault(); toggleSidebar(); }
+  else if (key === 't') { e.preventDefault(); sendCommand('NewWorkspace'); }
+  else if (key === 'w') {
     e.preventDefault();
     if (workspaces.length > 1) sendCommand({ CloseWorkspace: activeWorkspace });
   }
-  else if (e.key === 'f') { e.preventDefault(); searchEl.focus(); searchEl.select(); }
-  else if (e.key === 'r') { e.preventDefault(); sendCommand('Refresh'); }
-  else if (e.key === 'd') { e.preventDefault(); sendCommand('ToggleCallDirection'); }
-  else if (e.key === 'Tab') {
+  else if (key === 'f') { e.preventDefault(); searchEl.focus(); searchEl.select(); }
+  else if (key === 'r') { e.preventDefault(); sendCommand('Refresh'); }
+  else if (key === 'd') { e.preventDefault(); sendCommand('ToggleCallDirection'); }
+  else if (key === 'Tab') {
     e.preventDefault();
     sendCommand(e.shiftKey ? 'PreviousWorkspace' : 'NextWorkspace');
   }
-  else if (e.key >= '1' && e.key <= '9') {
-    const index = Number(e.key) - 1;
+  else if (key >= '1' && key <= '9') {
+    const index = Number(key) - 1;
     if (index < workspaces.length) { e.preventDefault(); sendCommand({ SwitchWorkspace: index }); }
   }
 });

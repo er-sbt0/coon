@@ -64,7 +64,10 @@ Client assets are vendored, not CDN-loaded (`static/vendor/cytoscape.min.js`), b
 | `theme.css` | Design tokens only — colours, type scale, 4px spacing grid, shell metrics. Light and dark. |
 | `app.css` | Component styles. Reads tokens; defines no raw colours. |
 | `transport.js` | The pipe (WebSocket vs Tauri IPC) and `CoonHost` window controls. The only file that touches `__TAURI__`. |
-| `app.js` | Everything else: tabs, graph, sidebar, breadcrumb, status bar, keybindings. |
+| `palette.js` | The command palette / fuzzy picker. Generic: callers hand it items and get a pick callback. Knows nothing about commands or symbols. |
+| `app.js` | Everything else: tabs, graph, sidebar, breadcrumb, status bar, commands, keybindings. |
+
+`Ctrl+Shift+P` opens the command palette, `Ctrl+P` the symbol finder. **New user-facing actions belong in `buildCommands()` in `app.js`, not as another toolbar button** — that's how the commands `core` exposes stay reachable without the chrome growing a control each time.
 
 Design rules worth keeping:
 
