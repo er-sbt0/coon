@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use model::{CallDirection, SymbolId};
 
-use crate::layout::{DEFAULT_DEPTH, MAX_DEPTH, MIN_DEPTH};
+use crate::layout::{LayoutOrientation, DEFAULT_DEPTH, MAX_DEPTH, MIN_DEPTH};
 
 use crate::events::AppEvent;
 
@@ -20,6 +20,8 @@ pub struct CoreWorkspace {
     pub depth: usize,
     /// Nodes whose children the user has collapsed. The node stays visible.
     pub collapsed: HashSet<SymbolId>,
+    /// Which way the graph flows on the canvas.
+    pub orientation: LayoutOrientation,
     pub created_at: Instant,
     pub last_accessed: Instant,
 }
@@ -34,6 +36,7 @@ impl CoreWorkspace {
             direction: CallDirection::Outgoing,
             depth: DEFAULT_DEPTH,
             collapsed: HashSet::new(),
+            orientation: LayoutOrientation::default(),
             created_at: now,
             last_accessed: now,
         }
@@ -62,6 +65,13 @@ impl CoreWorkspace {
             self.touch();
         }
         changed
+    }
+
+    /// Flip between a left-to-right and a top-down graph. Returns the new one.
+    pub fn toggle_orientation(&mut self) -> LayoutOrientation {
+        self.orientation = self.orientation.toggled();
+        self.touch();
+        self.orientation
     }
 
     /// Collapse or re-expand a node's children. Returns true if now collapsed.
@@ -271,6 +281,14 @@ mod tests {
         ws.toggle_collapsed(sym);
         ws.set_root(SymbolId::from_content("b", "b.c", 1));
         assert!(ws.collapsed.is_empty(), "a new root starts with nothing collapsed");
+    }
+
+    #[test]
+    fn orientation_toggles_between_the_two_directions() {
+        let mut ws = CoreWorkspace::new(1, "w".to_string());
+        assert_eq!(ws.orientation, LayoutOrientation::LeftRight);
+        assert_eq!(ws.toggle_orientation(), LayoutOrientation::TopDown);
+        assert_eq!(ws.toggle_orientation(), LayoutOrientation::LeftRight);
     }
 
     #[test]

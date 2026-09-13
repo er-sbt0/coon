@@ -23,6 +23,8 @@ pub enum Command {
     SetGraphDepth(usize),
     /// Collapse or re-expand one node's children. The node stays visible.
     ToggleCollapsed(SymbolId),
+    /// Flip the graph between left-to-right and top-down.
+    ToggleGraphOrientation,
 
     // ---- Workspace management ----
     NewWorkspace,

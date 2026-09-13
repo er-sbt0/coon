@@ -100,6 +100,7 @@ let currentGraph     = { nodes: {}, edges: [] };  // cached full graph
 let rootNodeId       = null;                      // graph root (active workspace)
 let selectedNodeId   = null;                      // last focused node
 let currentDirection = 'Outgoing';
+let currentOrientation = 'LeftRight';   // or 'TopDown'; the server lays both out
 let workspaces       = [];
 let activeWorkspace  = 0;
 let graphDepth       = 3;
@@ -121,6 +122,7 @@ const searchEl   = $('search');
 const fnListEl   = $('fn-list');
 const fnCountEl  = $('fn-count');
 const dirToggleEl = $('dir-toggle');
+const orientToggleEl = $('orient-toggle');
 const tabsEl     = $('tabs');
 const crumbEl    = $('breadcrumb');
 const statSymbolsEl = $('stat-symbols');
@@ -168,6 +170,10 @@ function handleSnapshot(msg) {
   if (active?.direction) {
     currentDirection = active.direction;
     updateDirToggle();
+  }
+  if (active?.orientation) {
+    currentOrientation = active.orientation;
+    updateOrientToggle();
   }
 
   renderTabs();
@@ -368,7 +374,7 @@ function rebuildGraph(graph, layout) {
 
   // Only auto-fit when the focused node or direction changes, so expanding a
   // node doesn't yank the viewport the user just positioned.
-  const fitKey = `${selectedNodeId ?? rootNodeId}:${currentDirection}`;
+  const fitKey = `${selectedNodeId ?? rootNodeId}:${currentDirection}:${currentOrientation}`;
   if (cy.nodes().length > 0 && fitKey !== lastFitKey) {
     lastFitKey = fitKey;
     requestAnimationFrame(fitGraph);
@@ -667,7 +673,16 @@ function updateDirToggle() {
     : 'Showing callers of each function — click for callees';
 }
 
+function updateOrientToggle() {
+  const leftRight = currentOrientation === 'LeftRight';
+  orientToggleEl.textContent = leftRight ? '→ Left-right' : '↓ Top-down';
+  orientToggleEl.title = leftRight
+    ? 'Graph flows left to right — click for top to bottom'
+    : 'Graph flows top to bottom — click for left to right';
+}
+
 dirToggleEl.addEventListener('click', () => sendCommand('ToggleCallDirection'));
+orientToggleEl.addEventListener('click', () => sendCommand('ToggleGraphOrientation'));
 $('refresh-btn').addEventListener('click', () => sendCommand('Refresh'));
 
 // ── Sidebar dock: collapse and drag-resize ────────────────────────────────────
@@ -747,6 +762,7 @@ function buildCommands() {
 
     { id: 'view.sidebar', label: 'View: Toggle Sidebar', hint: 'Ctrl+B', run: toggleSidebar },
     { id: 'view.direction', label: 'View: Toggle Call Direction', hint: 'Ctrl+D', run: () => sendCommand('ToggleCallDirection') },
+    { id: 'view.orientation', label: 'View: Toggle Graph Orientation', hint: 'Ctrl+Shift+D', run: () => sendCommand('ToggleGraphOrientation') },
     { id: 'view.fit', label: 'View: Fit Graph to Screen', disabled: cy.nodes().length === 0, run: fitGraph },
     { id: 'view.deeper', label: 'View: Show More Levels', hint: 'Ctrl+]', disabled: graphDepth >= DEPTH_MAX, run: () => setDepth(graphDepth + 1) },
     { id: 'view.shallower', label: 'View: Show Fewer Levels', hint: 'Ctrl+[', disabled: graphDepth <= DEPTH_MIN, run: () => setDepth(graphDepth - 1) },
@@ -833,6 +849,7 @@ document.addEventListener('keydown', (e) => {
   }
   else if (key === 'f') { e.preventDefault(); searchEl.focus(); searchEl.select(); }
   else if (key === 'r') { e.preventDefault(); sendCommand('Refresh'); }
+  else if (key === 'd' && e.shiftKey) { e.preventDefault(); sendCommand('ToggleGraphOrientation'); }
   else if (key === 'd') { e.preventDefault(); sendCommand('ToggleCallDirection'); }
   else if (key === ']') { e.preventDefault(); setDepth(graphDepth + 1); }
   else if (key === '[') { e.preventDefault(); setDepth(graphDepth - 1); }

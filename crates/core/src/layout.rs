@@ -24,13 +24,34 @@ pub const ROW_GUTTER: f32 = 26.0;
 // every node overlapping its neighbour. So pitch = size + gutter, explicitly.
 pub const LEVEL_SEPARATION: f32 = NODE_WIDTH + COLUMN_GUTTER;
 pub const NODE_SEPARATION: f32 = NODE_HEIGHT + ROW_GUTTER;
-/// Extra breathing room between distinct subtrees.
+/// Extra breathing room between distinct subtrees, along the axis siblings
+/// spread on — which is the vertical one left-to-right, the horizontal one
+/// top-down.
 pub const SUBTREE_SEPARATION: f32 = NODE_SEPARATION + ROW_GUTTER;
+pub const SUBTREE_SEPARATION_TOPDOWN: f32 = LEVEL_SEPARATION + COLUMN_GUTTER;
 
 /// How many levels of callees/callers to show by default.
 pub const DEFAULT_DEPTH: usize = 3;
 pub const MIN_DEPTH: usize = 1;
 pub const MAX_DEPTH: usize = 8;
+
+/// Which way the graph flows: root on the left with callees to the right, or
+/// root on top with callees below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum LayoutOrientation {
+    #[default]
+    LeftRight,
+    TopDown,
+}
+
+impl LayoutOrientation {
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::LeftRight => Self::TopDown,
+            Self::TopDown => Self::LeftRight,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct NodePos {
@@ -47,6 +68,8 @@ pub struct LayoutOptions<'a> {
     /// Nodes whose children the user has collapsed. The node itself stays
     /// visible; traversal stops there.
     pub collapsed: &'a HashSet<SymbolId>,
+    /// Which way levels advance.
+    pub orientation: LayoutOrientation,
 }
 
 impl Default for LayoutOptions<'_> {
@@ -55,16 +78,52 @@ impl Default for LayoutOptions<'_> {
         Self {
             depth: DEFAULT_DEPTH,
             collapsed: EMPTY.get_or_init(HashSet::new),
+            orientation: LayoutOrientation::default(),
         }
     }
 }
 
-fn layout_config() -> LayoutConfig {
+/// `grid` always advances levels along x and spreads siblings along y; its
+/// `TreeOrientation` is not honoured by the Sugiyama pass. A top-down graph is
+/// therefore the same layout transposed: the separations are swapped going in,
+/// and the coordinates swapped back coming out (see `to_centre`).
+fn layout_config(orientation: LayoutOrientation) -> LayoutConfig {
+    let (node_w, node_h, level_sep, node_sep, subtree_sep) = match orientation {
+        LayoutOrientation::LeftRight => (
+            NODE_WIDTH,
+            NODE_HEIGHT,
+            LEVEL_SEPARATION,
+            NODE_SEPARATION,
+            SUBTREE_SEPARATION,
+        ),
+        LayoutOrientation::TopDown => (
+            NODE_HEIGHT,
+            NODE_WIDTH,
+            NODE_SEPARATION,
+            LEVEL_SEPARATION,
+            SUBTREE_SEPARATION_TOPDOWN,
+        ),
+    };
     LayoutConfig::new()
-        .with_node_size(NODE_WIDTH, NODE_HEIGHT)
-        .with_node_separation(NODE_SEPARATION)
-        .with_level_separation(LEVEL_SEPARATION)
-        .with_subtree_separation(SUBTREE_SEPARATION)
+        .with_node_size(node_w, node_h)
+        .with_node_separation(node_sep)
+        .with_level_separation(level_sep)
+        .with_subtree_separation(subtree_sep)
+}
+
+/// Turn one `grid` top-left corner into a canvas centre, undoing the transpose
+/// for a top-down layout.
+fn to_centre(pos: &grid::Position, orientation: LayoutOrientation) -> NodePos {
+    match orientation {
+        LayoutOrientation::LeftRight => NodePos {
+            x: pos.x + NODE_WIDTH / 2.0,
+            y: pos.y + NODE_HEIGHT / 2.0,
+        },
+        LayoutOrientation::TopDown => NodePos {
+            x: pos.y + NODE_WIDTH / 2.0,
+            y: pos.x + NODE_HEIGHT / 2.0,
+        },
+    }
 }
 
 /// Compute pixel positions for the subgraph rooted at `root`.
@@ -129,7 +188,7 @@ pub fn compute_layout(
         }
     }
 
-    let mut engine = match LayoutEngine::with_config(layout_config()) {
+    let mut engine = match LayoutEngine::with_config(layout_config(opts.orientation)) {
         Ok(e) => e,
         Err(_) => LayoutEngine::new(),
     };
@@ -141,15 +200,9 @@ pub fn compute_layout(
     node_to_symbol
         .iter()
         .filter_map(|(&node_idx, &symbol_id)| {
-            layout.position(node_idx).map(|pos| {
-                (
-                    symbol_id,
-                    NodePos {
-                        x: pos.x + NODE_WIDTH / 2.0,
-                        y: pos.y + NODE_HEIGHT / 2.0,
-                    },
-                )
-            })
+            layout
+                .position(node_idx)
+                .map(|pos| (symbol_id, to_centre(&pos, opts.orientation)))
         })
         .collect()
 }
@@ -190,7 +243,7 @@ mod tests {
 
         for depth in [1usize, 2, 3] {
             let collapsed = HashSet::new();
-            let opts = LayoutOptions { depth, collapsed: &collapsed };
+            let opts = LayoutOptions { depth, collapsed: &collapsed, ..Default::default() };
             let layout = compute_layout(&graph, Some(ids[0]), CallDirection::Outgoing, &opts);
             assert_eq!(
                 layout.len(),
@@ -206,7 +259,7 @@ mod tests {
         let mut collapsed = HashSet::new();
         collapsed.insert(ids[1]);
 
-        let opts = LayoutOptions { depth: MAX_DEPTH, collapsed: &collapsed };
+        let opts = LayoutOptions { depth: MAX_DEPTH, collapsed: &collapsed, ..Default::default() };
         let layout = compute_layout(&graph, Some(ids[0]), CallDirection::Outgoing, &opts);
 
         assert!(layout.contains_key(&ids[0]), "root stays");
@@ -219,7 +272,7 @@ mod tests {
     fn positions_are_node_centres_in_pixels() {
         let (graph, ids) = graph_with_chain(&["a", "b"]);
         let collapsed = HashSet::new();
-        let opts = LayoutOptions { depth: 2, collapsed: &collapsed };
+        let opts = LayoutOptions { depth: 2, collapsed: &collapsed, ..Default::default() };
         let layout = compute_layout(&graph, Some(ids[0]), CallDirection::Outgoing, &opts);
 
         let a = layout[&ids[0]];
@@ -260,7 +313,7 @@ mod tests {
         }
 
         let collapsed = HashSet::new();
-        let opts = LayoutOptions { depth: 2, collapsed: &collapsed };
+        let opts = LayoutOptions { depth: 2, collapsed: &collapsed, ..Default::default() };
         let layout = compute_layout(&graph, Some(parent_id), CallDirection::Outgoing, &opts);
 
         let mut ys: Vec<f32> = kids.iter().map(|k| layout[k].y).collect();
@@ -272,6 +325,59 @@ mod tests {
                 "sibling row pitch {gap} must clear a {NODE_HEIGHT}px node plus its gutter"
             );
         }
+    }
+
+    #[test]
+    fn top_down_advances_levels_downwards_and_spreads_siblings_across() {
+        let mut graph = CallGraph::new();
+        let parent = FunctionNode::new(
+            "p".to_string(),
+            "p".to_string(),
+            Location::new("src/x.c".to_string(), 1, 0),
+        );
+        let parent_id = parent.id;
+        graph.add_function(parent);
+
+        let mut kids = Vec::new();
+        for name in ["k1", "k2"] {
+            let f = FunctionNode::new(
+                name.to_string(),
+                name.to_string(),
+                Location::new("src/x.c".to_string(), 1, 0),
+            );
+            let id = f.id;
+            graph.add_function(f);
+            graph.add_call(parent_id, id, Location::new("src/x.c".to_string(), 1, 0));
+            kids.push(id);
+        }
+
+        let collapsed = HashSet::new();
+        let opts = LayoutOptions {
+            depth: 2,
+            collapsed: &collapsed,
+            orientation: LayoutOrientation::TopDown,
+        };
+        let layout = compute_layout(&graph, Some(parent_id), CallDirection::Outgoing, &opts);
+
+        let p = layout[&parent_id];
+        let a = layout[&kids[0]];
+        let b = layout[&kids[1]];
+
+        // Levels now advance down, and by a pitch that clears a node's height.
+        assert!(a.y > p.y && b.y > p.y, "children sit below the root");
+        assert!(
+            (a.y - p.y).abs() >= NODE_HEIGHT + ROW_GUTTER,
+            "level pitch {} must clear a {NODE_HEIGHT}px node plus its gutter",
+            a.y - p.y
+        );
+        // Siblings spread sideways, clearing a full node width — the axis whose
+        // pitch is easy to get wrong once the layout is transposed.
+        assert!(
+            (b.x - a.x).abs() >= NODE_WIDTH + COLUMN_GUTTER,
+            "sibling pitch {} must clear a {NODE_WIDTH}px node plus its gutter",
+            b.x - a.x
+        );
+        assert!((a.y - b.y).abs() < 1.0, "siblings share a row");
     }
 
     #[test]

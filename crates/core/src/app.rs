@@ -61,6 +61,7 @@ impl CoreApp {
             Command::ToggleCallDirection => self.cmd_toggle_call_direction(),
             Command::SetGraphDepth(depth) => self.cmd_set_graph_depth(depth),
             Command::ToggleCollapsed(id) => self.cmd_toggle_collapsed(id),
+            Command::ToggleGraphOrientation => self.cmd_toggle_graph_orientation(),
             Command::NewWorkspace => self.cmd_new_workspace(),
             Command::CloseWorkspace(index) => self.cmd_close_workspace(index),
             Command::NextWorkspace => self.cmd_next_workspace(),
@@ -344,6 +345,14 @@ impl CoreApp {
                 "CoreApp: direction toggled to {:?}, layout_focus cleared",
                 ws.direction
             );
+        }
+        vec![AppEvent::LayoutDirty]
+    }
+
+    fn cmd_toggle_graph_orientation(&mut self) -> Vec<AppEvent> {
+        if let Some(ws) = self.workspaces.current_mut() {
+            let orientation = ws.toggle_orientation();
+            log::info!("CoreApp: graph orientation toggled to {orientation:?}");
         }
         vec![AppEvent::LayoutDirty]
     }

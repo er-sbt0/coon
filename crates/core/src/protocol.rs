@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::app::CoreApp;
 use crate::command::Command;
 use crate::events::AppEvent;
-use crate::layout::{compute_layout, LayoutOptions, NodePos};
+use crate::layout::{compute_layout, LayoutOptions, LayoutOrientation, NodePos};
 
 /// Messages the backend sends to the client.
 #[derive(Debug, Serialize)]
@@ -57,6 +57,8 @@ pub struct WorkspaceInfo {
     pub depth: usize,
     /// Nodes the user has collapsed, so the client can mark them.
     pub collapsed: Vec<SymbolId>,
+    /// Which way the graph flows on the canvas.
+    pub orientation: LayoutOrientation,
 }
 
 /// Build a full `ServerMsg::Snapshot` from current `CoreApp` state.
@@ -106,6 +108,7 @@ fn layout_options(core: &CoreApp) -> LayoutOptions<'_> {
         Some(ws) => LayoutOptions {
             depth: ws.depth,
             collapsed: &ws.collapsed,
+            orientation: ws.orientation,
         },
         None => LayoutOptions::default(),
     }
@@ -122,6 +125,7 @@ pub fn workspace_infos(core: &CoreApp) -> Vec<WorkspaceInfo> {
             selected: ws.root_symbol,
             depth: ws.depth,
             collapsed: ws.collapsed.iter().copied().collect(),
+            orientation: ws.orientation,
         })
         .collect()
 }
@@ -293,6 +297,7 @@ mod tests {
             "\"Refresh\"".to_string(),
             "{\"SetGraphDepth\":4}".to_string(),
             format!("{{\"ToggleCollapsed\":{id}}}"),
+            "\"ToggleGraphOrientation\"".to_string(),
         ];
 
         for case in cases {
@@ -315,7 +320,7 @@ mod tests {
         assert!(json.get("layout").is_some());
 
         let ws = &json["workspaces"][0];
-        for field in ["id", "name", "direction", "selected", "depth", "collapsed"] {
+        for field in ["id", "name", "direction", "selected", "depth", "collapsed", "orientation"] {
             assert!(ws.get(field).is_some(), "workspace field `{field}` is read by the client");
         }
     }
