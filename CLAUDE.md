@@ -108,6 +108,7 @@ The web and desktop backends both poll `CoreApp::tick()` every 100ms and transla
 - **Async message passing**: Tokio MPSC channels connect the LSP loader, the LSP service worker, and the TUI — they never share mutable state directly.
 - **`CallGraphAdapter`**: Wraps `CallGraph` to abstract call direction (incoming vs. outgoing) so graph traversal and rendering are direction-agnostic.
 - **Lazy call hierarchy**: Initial load fetches workspace symbols; per-function call hierarchy is fetched on demand when the user selects a function.
+- **Edge warmup**: workspace symbols carry no edges, so a freshly loaded project is a heap of isolated nodes — and `logic::cluster` drops isolated symbols, so the clustering comes out empty and the cluster map the app opens on has nothing to draw. Once the load reports `Completed`, `CoreApp::pump_edge_warmup` walks the loaded symbols through the same prepare/follow-up path a manual expand uses, `WARMUP_IN_FLIGHT` at a time. It is not cascaded into the callees it discovers: following those would walk the whole program. While it runs, `maybe_recluster` drops back to the settling timer — `Completed` otherwise means "nothing more is coming", which during warmup would be a Louvain pass every tick.
 - **`grid` crate**: provides the tree layout algorithm used by `GraphView` and by `core::layout::compute_layout`.
 - **One protocol, many pipes**: `core::protocol` is the single definition of what a frontend sees. Adding a fourth frontend should mean writing a transport, not a protocol.
 

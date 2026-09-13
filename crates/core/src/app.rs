@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use logic::{ClusterKey, Clustering};
@@ -26,6 +27,14 @@ use crate::workspace::{CoreWorkspaceManager, ViewMode};
 /// the user is still looking at the place it belongs.
 const CLUSTERING_SETTLE: Duration = Duration::from_millis(300);
 
+/// How many call-hierarchy requests to keep in flight while warming up edges.
+///
+/// clangd serves these one at a time, so the ceiling is about not parking two
+/// hundred requests on a 30 s timeout behind a server that answers them at its
+/// own pace — not about parallelism. Eight keeps the pipe busy and leaves room
+/// for a request the user makes while the warmup is still running.
+const WARMUP_IN_FLIGHT: usize = 8;
+
 /// Frontend-agnostic application core.
 ///
 /// Owns the call graph, workspace state, and LSP bridge. Emits `AppEvent`
@@ -52,6 +61,18 @@ pub struct CoreApp {
     clustering_dirty: bool,
     /// When the graph last changed. The settling period is measured from here.
     graph_changed_at: Option<Instant>,
+    /// Functions still awaiting their first call-hierarchy fetch.
+    ///
+    /// clangd's workspace symbols carry no edges, so a freshly loaded project is
+    /// a heap of isolated nodes: Louvain drops isolated symbols, the clustering
+    /// comes out empty, and the cluster map the app opens on has nothing to
+    /// draw. Asking for each symbol's callees up front turns that heap into a
+    /// graph. Seeded once from the initial symbols and deliberately not
+    /// cascaded into the callees it discovers — following those would walk the
+    /// whole program.
+    edge_warmup: VecDeque<SymbolId>,
+    /// Whether the warmup queue has been seeded. Once, per load.
+    warmup_seeded: bool,
 }
 
 impl CoreApp {
@@ -81,6 +102,8 @@ impl CoreApp {
             clustering,
             clustering_dirty: false,
             graph_changed_at: None,
+            edge_warmup: VecDeque::new(),
+            warmup_seeded: false,
         }
     }
 
@@ -166,6 +189,10 @@ impl CoreApp {
         for response in responses {
             events.extend(self.handle_lsp_response(response));
         }
+
+        // Before reclustering: a warmup request sent now is what stops the
+        // recompute below from running against an edgeless graph.
+        events.extend(self.pump_edge_warmup());
 
         // Last, so a batch ingested on this very tick is counted before the
         // settling period is judged.
@@ -598,6 +625,50 @@ impl CoreApp {
         self.graph_changed_at = Some(Instant::now());
     }
 
+    /// Whether the initial edge warmup is still running.
+    fn warming_up(&self) -> bool {
+        self.warmup_seeded
+            && (!self.edge_warmup.is_empty() || !self.lsp.pending_requests.is_empty())
+    }
+
+    /// Fetch call hierarchies for the symbols the initial load handed us, so the
+    /// graph has edges before anything tries to cluster or draw it.
+    ///
+    /// Reuses the same request path as expanding a node by hand — prepare, then
+    /// follow up for calls — so every response lands in the handlers that
+    /// already know how to turn it into edges.
+    fn pump_edge_warmup(&mut self) -> Vec<AppEvent> {
+        // Seed once the symbol stream is done and the bridge is live: before
+        // that the graph is still growing and there is nothing to send on.
+        if !self.warmup_seeded
+            && matches!(self.lsp.status, LspLoadPhase::Completed)
+            && self.lsp.request_tx.is_some()
+        {
+            self.warmup_seeded = true;
+            self.edge_warmup = self.call_graph.function_ids().copied().collect();
+            log::info!(
+                "CoreApp: warming up call hierarchy for {} symbol(s)",
+                self.edge_warmup.len()
+            );
+        }
+
+        let mut events = Vec::new();
+        while self.lsp.pending_requests.len() < WARMUP_IN_FLIGHT {
+            let Some(id) = self.edge_warmup.pop_front() else {
+                break;
+            };
+            // The user may have expanded this one while the queue drained.
+            if self.lsp.is_function_loaded(&id) || self.lsp.is_function_loading(&id) {
+                continue;
+            }
+            self.lsp.set_loading_state(id, LoadingState::Loading);
+            if let Some(ev) = self.lsp.send_call_hierarchy(&self.call_graph, &id) {
+                events.push(ev);
+            }
+        }
+        events
+    }
+
     /// Recompute the cached clustering if the graph has changed and then gone
     /// quiet — or if clangd has already told us nothing more is coming.
     fn maybe_recluster(&mut self) -> Vec<AppEvent> {
@@ -613,7 +684,13 @@ impl CoreApp {
         // action is both affordable and the thing they just requested. It also
         // rescues a project whose symbols arrive in an unbroken stream, where
         // waiting for quiet would mean waiting until the very end anyway.
-        let load_finished = matches!(self.lsp.status, LspLoadPhase::Completed);
+        // The warmup below makes the graph grow on its own after the load
+        // reports Completed, so the "nothing more is coming" shortcut would fire
+        // on every tick for as long as it runs — a Louvain pass per 100 ms, each
+        // one free to move the map under the user. While it runs, fall back to
+        // the ordinary quiet rule; the shortcut returns once it drains.
+        let load_finished =
+            matches!(self.lsp.status, LspLoadPhase::Completed) && !self.warming_up();
         if !settled && !load_finished {
             return vec![];
         }
@@ -706,6 +783,7 @@ mod tests {
     use super::*;
     use crate::lsp_bridge::PendingRequest;
     use model::Location;
+    use tokio::sync::mpsc;
 
     /// Distinct lines keep the generated `SymbolId`s distinct.
     fn add(graph: &mut CallGraph, name: &str, line: u32) -> SymbolId {
@@ -839,6 +917,97 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, AppEvent::ClusteringUpdated { .. })));
+    }
+
+    /// A `CoreApp` whose bridge looks like a finished load: symbols in the
+    /// graph, status `Completed`, and a live request channel. Returns the
+    /// receiving end so a test can see what the warmup sent.
+    fn loaded_app(symbols: usize) -> (CoreApp, mpsc::UnboundedReceiver<lsp::LspRequest>) {
+        let mut graph = CallGraph::new();
+        for i in 0..symbols {
+            // Absolute: `Url::from_file_path` rejects a relative one, and every
+            // location clangd hands back is absolute.
+            graph.add_function(FunctionNode::new(
+                format!("f{i}"),
+                format!("f{i}"),
+                Location::new("/src/test.c".to_string(), i as u32 + 1, 1),
+            ));
+        }
+        let mut app = CoreApp::new(graph);
+        let (tx, rx) = mpsc::unbounded_channel();
+        app.lsp.request_tx = Some(tx);
+        app.lsp.status = LspLoadPhase::Completed;
+        (app, rx)
+    }
+
+    #[test]
+    fn a_finished_load_asks_for_the_edges_its_symbols_arrived_without() {
+        // clangd's workspace symbols carry no edges, so without this the graph
+        // is a heap of isolated nodes and the cluster map has nothing to draw.
+        let (mut app, mut rx) = loaded_app(3);
+        assert_eq!(app.call_graph.edge_count(), 0);
+
+        app.tick();
+
+        assert!(app.warmup_seeded);
+        let mut sent = 0;
+        while let Ok(req) = rx.try_recv() {
+            assert!(matches!(req, lsp::LspRequest::PrepareCallHierarchy { .. }));
+            sent += 1;
+        }
+        assert_eq!(sent, 3, "every loaded symbol is asked about");
+    }
+
+    #[test]
+    fn the_warmup_keeps_a_bounded_number_of_requests_in_flight() {
+        let (mut app, mut rx) = loaded_app(WARMUP_IN_FLIGHT * 3);
+
+        app.tick();
+
+        let first_pass = std::iter::from_fn(|| rx.try_recv().ok()).count();
+        assert_eq!(first_pass, WARMUP_IN_FLIGHT, "clangd is not flooded");
+        assert!(!app.edge_warmup.is_empty(), "the rest waits its turn");
+
+        // Answering them frees the slots for the next batch.
+        app.lsp.pending_requests.clear();
+        app.tick();
+        assert_eq!(
+            std::iter::from_fn(|| rx.try_recv().ok()).count(),
+            WARMUP_IN_FLIGHT
+        );
+    }
+
+    #[test]
+    fn reclustering_holds_off_until_the_warmup_drains() {
+        // `Completed` normally means "recluster now, nothing more is coming".
+        // The warmup makes that false: the graph keeps growing on its own, and
+        // honouring the shortcut would run Louvain on every 100ms tick.
+        let (mut app, _rx) = loaded_app(2);
+        app.tick();
+        assert!(app.warming_up());
+
+        app.clustering_dirty = true;
+        app.graph_changed_at = Some(Instant::now());
+        assert!(
+            app.maybe_recluster().is_empty(),
+            "no recompute while edges are still arriving"
+        );
+        assert!(app.clustering_dirty, "and the work is still owed");
+
+        // Drained: the shortcut comes back.
+        app.edge_warmup.clear();
+        app.lsp.pending_requests.clear();
+        assert!(!app.warming_up());
+    }
+
+    #[test]
+    fn demo_mode_never_warms_up() {
+        // No loader, so no `Completed`, so nothing to ask and nobody to ask.
+        let (graph, _, _) = two_triangles();
+        let mut app = CoreApp::new(graph);
+        app.tick();
+        assert!(!app.warmup_seeded);
+        assert!(app.edge_warmup.is_empty());
     }
 
     #[test]
