@@ -137,7 +137,40 @@ impl Clustering {
     /// keeps symbols that were grouped together grouped together unless the new
     /// edges actually argue otherwise.
     pub fn compute_seeded(graph: &CallGraph, previous: Option<&Clustering>) -> Self {
-        let (symbols, base) = build_base_graph(graph);
+        Self::compute_scoped(graph, None, previous)
+    }
+
+    /// Cluster one corner of the graph: only the functions in `scope`, with
+    /// every call that leaves it ignored.
+    ///
+    /// This is not a filter applied to the whole-program clustering, and could
+    /// not be. Louvain finds the seams where a graph is weakly connected, and
+    /// which seams those are depends on what else is in the graph: run over one
+    /// function's neighbourhood, the communities that come back are the parts
+    /// *of that neighbourhood* — the stages of a request path, say — where the
+    /// whole-program run would have shown the request path itself as one
+    /// undivided community. That is exactly the question a user asks by
+    /// pointing at a function, so it gets its own run rather than a view onto
+    /// the global one.
+    ///
+    /// Isolation is judged inside the scope too: a function whose only calls
+    /// leave it has no edges here, and is dropped like any other isolated
+    /// symbol. Entry points and labels still read the full graph, because being
+    /// called from outside the scope is what makes a member a front door.
+    pub fn compute_within(
+        graph: &CallGraph,
+        scope: &HashSet<SymbolId>,
+        previous: Option<&Clustering>,
+    ) -> Self {
+        Self::compute_scoped(graph, Some(scope), previous)
+    }
+
+    fn compute_scoped(
+        graph: &CallGraph,
+        scope: Option<&HashSet<SymbolId>>,
+        previous: Option<&Clustering>,
+    ) -> Self {
+        let (symbols, base) = build_base_graph(graph, scope);
         if symbols.is_empty() {
             return Self::default();
         }
@@ -265,8 +298,20 @@ impl WeightedGraph {
 /// the duplicates in that `Vec` are exactly the number of times the caller calls
 /// the callee, and counting them is how we get an edge weight out of an API that
 /// exposes no weights and no `edges()` accessor.
-fn build_base_graph(graph: &CallGraph) -> (Vec<SymbolId>, WeightedGraph) {
-    let mut all: Vec<SymbolId> = graph.function_ids().copied().collect();
+///
+/// `scope`, when given, is the set of functions to consider; everything else is
+/// left out, and so are the calls that would have reached it. Restricting the
+/// symbol list is enough to restrict the edges too, because a call whose other
+/// end has no index is skipped exactly as a call to an unknown symbol is.
+fn build_base_graph(
+    graph: &CallGraph,
+    scope: Option<&HashSet<SymbolId>>,
+) -> (Vec<SymbolId>, WeightedGraph) {
+    let mut all: Vec<SymbolId> = graph
+        .function_ids()
+        .filter(|id| scope.is_none_or(|s| s.contains(id)))
+        .copied()
+        .collect();
     // Every downstream ordering — community numbering, member lists, cluster ids —
     // descends from this sort, which is what makes two runs byte-identical.
     all.sort_unstable_by_key(|s| s.0);
@@ -1189,5 +1234,82 @@ mod tests {
         call(&mut graph, t2[2], t3[0], 800);
 
         graph
+    }
+
+    // ---- Clustering one corner of the graph ----
+
+    #[test]
+    fn a_scoped_clustering_holds_nothing_from_outside_the_scope() {
+        let (graph, left, right) = two_triangles();
+        let scope: HashSet<SymbolId> = left.iter().copied().collect();
+
+        let clustering = Clustering::compute_within(&graph, &scope, None);
+
+        assert!(!clustering.is_empty(), "the left triangle is connected");
+        for cluster in clustering.clusters() {
+            for member in &cluster.members {
+                assert!(
+                    scope.contains(member),
+                    "{member:?} is outside the scope and must not be clustered"
+                );
+            }
+        }
+        for symbol in right {
+            assert!(
+                clustering.cluster_of(&symbol).is_none(),
+                "a symbol the scope leaves out has no cluster to be in"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scope_can_split_what_the_whole_graph_kept_together() {
+        // Two tight triangles with a single call between them: over the whole
+        // graph Louvain has bigger seams to cut and leaves the pair alone at the
+        // top level, but scoped to just these six it is *the* seam.
+        let (graph, left, right) = two_triangles();
+        let scope: HashSet<SymbolId> = left.iter().chain(right.iter()).copied().collect();
+
+        let scoped = Clustering::compute_within(&graph, &scope, None);
+
+        let left_cluster = scoped.cluster_of(&left[0]).expect("clustered");
+        let right_cluster = scoped.cluster_of(&right[0]).expect("clustered");
+        assert_ne!(
+            left_cluster, right_cluster,
+            "the one call joining them is the weakest edge in the scope"
+        );
+    }
+
+    #[test]
+    fn a_function_whose_only_calls_leave_the_scope_is_isolated_within_it() {
+        let (graph, left, right) = two_triangles();
+        // Both of these have plenty of calls in the full graph; none of them
+        // has its other end in this scope.
+        let scope: HashSet<SymbolId> = [left[0], right[0]].into_iter().collect();
+
+        let clustering = Clustering::compute_within(&graph, &scope, None);
+
+        assert!(
+            clustering.is_empty(),
+            "a call whose other end is out of scope is no edge at all"
+        );
+    }
+
+    #[test]
+    fn scoping_to_everything_is_clustering_everything() {
+        let graph = layered_graph();
+        let scope: HashSet<SymbolId> = graph.function_ids().copied().collect();
+
+        assert_eq!(
+            fingerprint(&Clustering::compute_within(&graph, &scope, None)),
+            fingerprint(&Clustering::compute(&graph)),
+            "the scope is a restriction, and restricting to all of it is a no-op"
+        );
+    }
+
+    #[test]
+    fn an_empty_scope_clusters_nothing() {
+        let (graph, _, _) = two_triangles();
+        assert!(Clustering::compute_within(&graph, &HashSet::new(), None).is_empty());
     }
 }

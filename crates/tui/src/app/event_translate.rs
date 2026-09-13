@@ -29,6 +29,9 @@ pub fn app_event_to_status(event: &AppEvent, _graph: &CallGraph) -> Option<Statu
         }),
         AppEvent::FunctionHasNoCallees => Some(StatusMessage::FunctionHasNoCallees),
         AppEvent::LayoutDirty => None,
+        // Nothing in the TUI can ask for a map, scoped or otherwise, so nothing
+        // here can be told it was refused.
+        AppEvent::FunctionHasNoCommunities => None,
         // The TUI draws no cluster map; Phase 5 gives the map a canvas, and
         // until there is one a recount is nothing the status line can report.
         AppEvent::ClusteringUpdated { .. } => None,

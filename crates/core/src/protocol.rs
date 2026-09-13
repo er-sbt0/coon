@@ -74,6 +74,11 @@ pub struct WorkspaceInfo {
     /// These are the keys the client sends back, so they have to survive a
     /// recompute the client did not see.
     pub expanded_clusters: Vec<ClusterKey>,
+    /// The function this workspace's cluster map is drawn from, or `null` for
+    /// the whole program. The client shows it — a map of one function's
+    /// neighbourhood and a map of the project look identical otherwise — and
+    /// offers the way back out to the whole program.
+    pub map_scope: Option<SymbolId>,
 }
 
 /// Build a full `ServerMsg::Snapshot` from current `CoreApp` state.
@@ -129,6 +134,9 @@ pub fn layout_of(core: &CoreApp) -> ServerMsg {
 /// Computing it is not free — it walks every call in the graph — so it is done
 /// only for the view that is actually on screen. A workspace the user has
 /// drilled out of is showing a call tree and pays nothing for the map.
+///
+/// Which communities it draws is the workspace's own business: a map scoped to
+/// a function has its own clustering, and `clustering_for` is what knows which.
 fn cluster_layout_of(core: &CoreApp) -> Option<GraphLayout> {
     let ws = core.workspaces.current()?;
     if ws.view != ViewMode::ClusterMap {
@@ -136,7 +144,7 @@ fn cluster_layout_of(core: &CoreApp) -> Option<GraphLayout> {
     }
     Some(compute_cluster_layout(
         &core.call_graph,
-        core.clustering(),
+        core.clustering_for(ws),
         &ws.expanded_clusters,
         ws.direction,
         ws.orientation,
@@ -169,6 +177,7 @@ pub fn workspace_infos(core: &CoreApp) -> Vec<WorkspaceInfo> {
             orientation: ws.orientation,
             view: ws.view,
             expanded_clusters: ws.expanded_clusters.iter().copied().collect(),
+            map_scope: ws.map_scope,
         })
         .collect()
 }
@@ -374,6 +383,8 @@ mod tests {
             "{\"SetGraphOrientation\":\"LeftRight\"}".to_string(),
             "{\"SetViewMode\":\"ClusterMap\"}".to_string(),
             "{\"SetViewMode\":\"Rooted\"}".to_string(),
+            format!("{{\"SetMapScope\":{id}}}"),
+            "{\"SetMapScope\":null}".to_string(),
             format!("{{\"ToggleClusterExpanded\":{{\"level\":0,\"anchor\":{id}}}}}"),
             format!("{{\"DrillIntoCluster\":{{\"level\":2,\"anchor\":{id}}}}}"),
             "\"ZoomOutToClusters\"".to_string(),
@@ -409,6 +420,7 @@ mod tests {
             "orientation",
             "view",
             "expanded_clusters",
+            "map_scope",
         ] {
             assert!(
                 ws.get(field).is_some(),
@@ -446,6 +458,57 @@ mod tests {
             json.get("cluster_layout").is_none(),
             "a rooted workspace must send exactly what it sent before"
         );
+    }
+
+    /// A scoped map ships the same way the whole-program one does, drawn from
+    /// the clustering that workspace asked for.
+    #[test]
+    fn a_scoped_map_ships_only_the_neighbourhood_it_was_scoped_to() {
+        use crate::command::Command;
+
+        let mut core = CoreApp::new(crate::demo::create_demo_call_graph());
+        let scope = core
+            .call_graph
+            .find_function_by_name("handle_client")
+            .expect("the demo serves clients")
+            .id;
+        let reachable: std::collections::HashSet<SymbolId> =
+            logic::GraphTraversal::new(&core.call_graph)
+                .find_reachable_from(&scope)
+                .into_iter()
+                .collect();
+        assert!(
+            reachable.len() < core.call_graph.node_count(),
+            "a scope worth testing leaves something out"
+        );
+
+        core.dispatch(Command::SetMapScope(Some(scope)));
+        let json = serde_json::to_value(snapshot_of(&core)).expect("snapshot serialises");
+
+        assert_eq!(
+            json["workspaces"][0]["map_scope"],
+            serde_json::to_value(scope).expect("a symbol id serialises"),
+            "the client is told which map this is"
+        );
+
+        let map = json
+            .get("cluster_layout")
+            .expect("scoping the map is asking for the map");
+        let drawn = map["nodes"].as_object().expect("nodes is an object");
+        assert!(
+            !drawn.is_empty(),
+            "and the neighbourhood has communities in it"
+        );
+        for id in drawn.keys() {
+            let Some(symbol) = id.strip_prefix("fn:") else {
+                continue; // a closed community, named by its key
+            };
+            let symbol = SymbolId(symbol.parse().expect("a uuid"));
+            assert!(
+                reachable.contains(&symbol),
+                "{symbol:?} is not reachable from the scope and has no place on its map"
+            );
+        }
     }
 
     #[test]

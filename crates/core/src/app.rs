@@ -1,7 +1,7 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use logic::{ClusterKey, Clustering};
+use logic::{ClusterKey, Clustering, GraphTraversal};
 use lsp::LspResponse;
 use model::{CallDirection, CallGraph, FunctionNode, Location, LspLoadPhase, SymbolId};
 
@@ -9,7 +9,7 @@ use crate::command::Command;
 use crate::events::AppEvent;
 use crate::layout::LayoutOrientation;
 use crate::lsp_bridge::{LoadingState, LspBridge};
-use crate::workspace::{CoreWorkspaceManager, ViewMode};
+use crate::workspace::{CoreWorkspace, CoreWorkspaceManager, ViewMode};
 
 /// How long the call graph must go without gaining nodes or edges before the
 /// clustering is recomputed.
@@ -59,6 +59,19 @@ pub struct CoreApp {
     clustering: Clustering,
     /// Set whenever the graph gains nodes or edges; cleared by the recompute.
     clustering_dirty: bool,
+    /// The communities of one function's neighbourhood, for each scope a
+    /// workspace currently has its map pointed at.
+    ///
+    /// Cached here rather than on the workspace because two tabs scoped to the
+    /// same function in the same direction are asking for the same clustering,
+    /// and because this is where the recompute that keeps it current already
+    /// lives. Kept in step with the workspaces by `sync_scoped_clusterings`, so
+    /// that reading one — which every snapshot does — needs no `&mut`.
+    scoped: HashMap<(SymbolId, CallDirection), Clustering>,
+    /// Set when `scoped` is out of date with the graph: the entries are still
+    /// worth keeping as seeds, so this marks them stale rather than dropping
+    /// them and losing the grouping stability seeding buys.
+    scoped_dirty: bool,
     /// When the graph last changed. The settling period is measured from here.
     graph_changed_at: Option<Instant>,
     /// Functions still awaiting their first call-hierarchy fetch.
@@ -108,6 +121,8 @@ impl CoreApp {
             workspaces: CoreWorkspaceManager::new(),
             clustering,
             clustering_dirty: false,
+            scoped: HashMap::new(),
+            scoped_dirty: false,
             graph_changed_at: None,
             edge_warmup: VecDeque::new(),
             warmup_seeded: false,
@@ -119,6 +134,27 @@ impl CoreApp {
     /// The cached communities of the whole call graph.
     pub fn clustering(&self) -> &Clustering {
         &self.clustering
+    }
+
+    /// The communities the given workspace's map is drawn from: one function's
+    /// neighbourhood where it has been scoped to one, the whole program
+    /// otherwise.
+    ///
+    /// Falls back to the whole-program clustering if the scoped one is missing,
+    /// which `sync_scoped_clusterings` is there to make impossible — but the
+    /// honest answer to "which communities" is never a panic.
+    pub fn clustering_for(&self, ws: &CoreWorkspace) -> &Clustering {
+        ws.map_scope
+            .and_then(|scope| self.scoped.get(&(scope, ws.direction)))
+            .unwrap_or(&self.clustering)
+    }
+
+    /// The communities of the active workspace's map.
+    pub fn active_clustering(&self) -> &Clustering {
+        match self.workspaces.current() {
+            Some(ws) => self.clustering_for(ws),
+            None => &self.clustering,
+        }
     }
 
     /// How far the initial edge warmup has got, or `None` when it is not
@@ -150,6 +186,7 @@ impl CoreApp {
             Command::ToggleCollapsed(id) => self.cmd_toggle_collapsed(id),
             Command::SetGraphOrientation(o) => self.cmd_set_graph_orientation(o),
             Command::SetViewMode(view) => self.cmd_set_view_mode(view),
+            Command::SetMapScope(scope) => self.cmd_set_map_scope(scope),
             Command::ToggleClusterExpanded(key) => self.cmd_toggle_cluster_expanded(key),
             Command::DrillIntoCluster(key) => self.cmd_drill_into_cluster(key),
             Command::ZoomOutToClusters => self.cmd_zoom_out_to_clusters(),
@@ -163,6 +200,10 @@ impl CoreApp {
             Command::SearchSelectFunction(id) => self.cmd_search_select_function(id),
             Command::ExpandFunction(id) => self.cmd_expand_function(id),
         };
+        // Any command can be the one that changes which map is wanted — a tab
+        // switch, a direction toggle, a new scope — so the cache is squared up
+        // once, here, rather than in each handler that might have moved it.
+        self.sync_scoped_clusterings();
         log::info!(
             "CoreApp::dispatch result: {} event(s): {:?}",
             events.len(),
@@ -218,6 +259,8 @@ impl CoreApp {
         // Last, so a batch ingested on this very tick is counted before the
         // settling period is judged.
         events.extend(self.maybe_recluster());
+        // And after it, because that is what marks the scoped clusterings stale.
+        self.sync_scoped_clusterings();
 
         events
     }
@@ -510,6 +553,54 @@ impl CoreApp {
         }
     }
 
+    fn cmd_set_map_scope(&mut self, scope: Option<SymbolId>) -> Vec<AppEvent> {
+        // Widening back out to the whole program always has a map to land on —
+        // the same one every workspace starts at, empty or not.
+        let Some(symbol) = scope else {
+            let changed = self
+                .workspaces
+                .current_mut()
+                .is_some_and(|ws| ws.set_map_scope(None));
+            return if changed {
+                vec![AppEvent::LayoutDirty]
+            } else {
+                vec![]
+            };
+        };
+
+        let Some(ws) = self.workspaces.current() else {
+            return vec![];
+        };
+        if self.call_graph.get_function(&symbol).is_none() {
+            log::info!("CoreApp: map scope {symbol:?} ignored — no such function");
+            return vec![];
+        }
+
+        // Cluster first, switch second. A function with nothing around it —
+        // one whose callees are all leaves, or whose calls have not been
+        // resolved yet — has no communities to show, and landing the user on a
+        // blank map they then have to find their way off is worse than saying
+        // so and leaving them where they are.
+        let direction = ws.direction;
+        let clustering = self.cluster_within(symbol, direction, None);
+        if clustering.is_empty() {
+            log::info!("CoreApp: map scope {symbol:?} declined — nothing to group");
+            return vec![AppEvent::FunctionHasNoCommunities];
+        }
+        self.scoped.insert((symbol, direction), clustering);
+
+        let changed = self
+            .workspaces
+            .current_mut()
+            .is_some_and(|ws| ws.set_map_scope(Some(symbol)));
+        if changed {
+            log::info!("CoreApp: cluster map scoped to {symbol:?} ({direction:?})");
+            vec![AppEvent::LayoutDirty]
+        } else {
+            vec![]
+        }
+    }
+
     fn cmd_toggle_cluster_expanded(&mut self, key: ClusterKey) -> Vec<AppEvent> {
         match self.workspaces.current_mut() {
             Some(ws) => {
@@ -525,7 +616,11 @@ impl CoreApp {
         // that resolves to nothing is a click against a clustering whose anchor
         // has since moved. Either way the honest answer is to leave the view
         // where the user left it rather than root it somewhere arbitrary.
-        let Some(entry) = self.clustering.by_key(key).and_then(|c| c.entry_point) else {
+        let Some(entry) = self
+            .active_clustering()
+            .by_key(key)
+            .and_then(|c| c.entry_point)
+        else {
             log::info!("CoreApp: drill into {key:?} ignored — no entry point to root at");
             return vec![];
         };
@@ -646,6 +741,73 @@ impl CoreApp {
         self.graph_changed_at = Some(Instant::now());
     }
 
+    /// Bring the scoped clusterings in step with what the workspaces are asking
+    /// for: compute the ones that are missing or stale, drop the ones no tab
+    /// points at any more.
+    ///
+    /// Doing it here, once per dispatch and once per tick, is what lets
+    /// `clustering_for` be a lookup on `&self` — and so lets a snapshot, which
+    /// only ever holds `&CoreApp`, draw a scoped map at all.
+    fn sync_scoped_clusterings(&mut self) {
+        let wanted: HashSet<(SymbolId, CallDirection)> = self
+            .workspaces
+            .workspaces
+            .iter()
+            .filter_map(|ws| ws.map_scope.map(|scope| (scope, ws.direction)))
+            .collect();
+
+        // The overwhelmingly common case: no tab has scoped its map, and there
+        // is nothing to recompute however dirty the graph has got.
+        if wanted.is_empty() && self.scoped.is_empty() {
+            self.scoped_dirty = false;
+            return;
+        }
+
+        self.scoped.retain(|key, _| wanted.contains(key));
+
+        let stale = std::mem::take(&mut self.scoped_dirty);
+        for key in wanted {
+            if !stale && self.scoped.contains_key(&key) {
+                continue;
+            }
+            // Seeded from what this scope held before, for the reason the
+            // whole-program recompute is: a map that regroups itself under the
+            // user reads as the view breaking, not as new information.
+            let previous = self.scoped.remove(&key);
+            let clustering = self.cluster_within(key.0, key.1, previous.as_ref());
+            log::info!(
+                "CoreApp: clustered the neighbourhood of {:?} ({:?}): {} top-level cluster(s)",
+                key.0,
+                key.1,
+                clustering.top_level().len()
+            );
+            self.scoped.insert(key, clustering);
+        }
+    }
+
+    /// Cluster everything `scope` reaches, reading the graph the way the
+    /// workspace does.
+    fn cluster_within(
+        &self,
+        scope: SymbolId,
+        direction: CallDirection,
+        previous: Option<&Clustering>,
+    ) -> Clustering {
+        let traversal = GraphTraversal::new(&self.call_graph);
+        // Unbounded, unlike the rooted tree's BFS: depth is how much of a tree
+        // fits on a canvas, and the map exists precisely to stand in for more
+        // than fits. Cutting the neighbourhood at three levels would group the
+        // near half of a subsystem and call it the subsystem.
+        let reachable: HashSet<SymbolId> = match direction {
+            CallDirection::Outgoing => traversal.find_reachable_from(&scope),
+            CallDirection::Incoming => traversal.find_can_reach(&scope),
+        }
+        .into_iter()
+        .collect();
+
+        Clustering::compute_within(&self.call_graph, &reachable, previous)
+    }
+
     /// Whether the initial edge warmup is still running.
     fn warming_up(&self) -> bool {
         self.warmup_seeded
@@ -761,6 +923,11 @@ impl CoreApp {
         let next = Clustering::compute_seeded(&self.call_graph, Some(&self.clustering));
         self.clustering_dirty = false;
         self.graph_changed_at = None;
+        // Any scoped map is derived from the same graph and is now just as out
+        // of date — including when the grouping below turns out not to have
+        // moved, since a new edge can leave the whole program's communities
+        // alone and still redraw one function's neighbourhood.
+        self.scoped_dirty = true;
 
         if same_grouping(&self.clustering, &next) {
             return vec![];
@@ -1358,6 +1525,185 @@ mod tests {
                 .expanded_clusters
                 .is_empty(),
             "what stood open described the old view"
+        );
+    }
+
+    // ---- The map of one function's neighbourhood ----
+
+    /// The clustering the active workspace's map is drawn from.
+    fn active(app: &CoreApp) -> &Clustering {
+        app.clustering_for(app.workspaces.current().expect("a default workspace"))
+    }
+
+    #[test]
+    fn scoping_the_map_clusters_only_what_the_function_reaches() {
+        let (graph, left, right) = two_triangles();
+        let mut app = CoreApp::new(graph);
+
+        let events = app.dispatch(Command::SetMapScope(Some(right[0])));
+        assert!(events.iter().any(|e| matches!(e, AppEvent::LayoutDirty)));
+
+        let ws = app.workspaces.current().expect("a default workspace");
+        assert_eq!(ws.map_scope, Some(right[0]));
+        assert_eq!(
+            ws.view,
+            ViewMode::ClusterMap,
+            "naming what to draw a map from is asking to see that map"
+        );
+
+        for symbol in right {
+            assert!(
+                active(&app).cluster_of(&symbol).is_some(),
+                "the right triangle is what this function reaches"
+            );
+        }
+        for symbol in left {
+            assert!(
+                active(&app).cluster_of(&symbol).is_none(),
+                "nothing calls back into the left triangle from here"
+            );
+        }
+
+        assert!(
+            app.clustering().cluster_of(&left[0]).is_some(),
+            "and the whole-program clustering is untouched underneath it"
+        );
+    }
+
+    #[test]
+    fn the_scoped_map_reads_the_graph_the_way_the_workspace_does() {
+        let (graph, left, right) = two_triangles();
+        let mut app = CoreApp::new(graph);
+        app.dispatch(Command::ToggleCallDirection);
+
+        app.dispatch(Command::SetMapScope(Some(right[0])));
+
+        assert!(
+            active(&app).cluster_of(&left[0]).is_some(),
+            "reading callers, the neighbourhood is what reaches this function"
+        );
+        assert!(
+            active(&app).cluster_of(&right[2]).is_none(),
+            "and not what it reaches"
+        );
+    }
+
+    #[test]
+    fn a_function_with_nothing_around_it_is_declined_rather_than_shown_blank() {
+        let (graph, _, right) = two_triangles();
+        let mut app = CoreApp::new(graph);
+        // A leaf: it calls nothing, so its neighbourhood is itself.
+        app.dispatch(Command::SelectFunction(right[2]));
+
+        let events = app.dispatch(Command::SetMapScope(Some(right[2])));
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AppEvent::FunctionHasNoCommunities)),
+            "the refusal has to be reported, or the click looks broken"
+        );
+        let ws = app.workspaces.current().expect("a default workspace");
+        assert_eq!(ws.map_scope, None);
+        assert_eq!(
+            ws.view,
+            ViewMode::Rooted,
+            "and the user is left on the view they were already reading"
+        );
+    }
+
+    #[test]
+    fn widening_the_scope_goes_back_to_the_whole_program() {
+        let (graph, left, right) = two_triangles();
+        let mut app = CoreApp::new(graph);
+        app.dispatch(Command::SetMapScope(Some(right[0])));
+
+        app.dispatch(Command::SetMapScope(None));
+
+        assert_eq!(
+            app.workspaces.current().expect("a workspace").map_scope,
+            None
+        );
+        assert!(
+            active(&app).cluster_of(&left[0]).is_some(),
+            "the whole program is on the map again"
+        );
+        assert!(
+            app.scoped.is_empty(),
+            "and the clustering nothing points at any more is not kept around"
+        );
+    }
+
+    #[test]
+    fn drilling_resolves_against_the_map_that_is_showing() {
+        let (graph, left, right) = two_triangles();
+        let mut app = CoreApp::new(graph);
+        // A community that exists only on the whole-program map.
+        let elsewhere = key_of(&app, left[0]);
+
+        app.dispatch(Command::SetMapScope(Some(right[0])));
+        app.dispatch(Command::DrillIntoCluster(elsewhere));
+
+        assert_eq!(
+            app.workspaces.current().expect("a workspace").view,
+            ViewMode::ClusterMap,
+            "a key for a community not on this map roots nothing"
+        );
+
+        // Whereas a key from the map actually showing does.
+        let here = {
+            let clustering = active(&app);
+            let id = clustering.cluster_of(&right[0]).expect("clustered");
+            clustering.cluster(id).expect("a known id").key
+        };
+        app.dispatch(Command::DrillIntoCluster(here));
+
+        let ws = app.workspaces.current().expect("a workspace");
+        assert_eq!(ws.view, ViewMode::Rooted);
+        assert!(
+            ws.root_symbol.is_some_and(|root| right.contains(&root)),
+            "rooted at the front door of a community that is on this map"
+        );
+        assert_eq!(
+            ws.map_scope,
+            Some(right[0]),
+            "and the way back still leads to the map it was entered from"
+        );
+    }
+
+    #[test]
+    fn a_scoped_map_follows_the_graph_as_it_grows() {
+        let (graph, _, right) = two_triangles();
+        let mut app = CoreApp::new(graph);
+        app.dispatch(Command::SetMapScope(Some(right[0])));
+
+        let extra = add(&mut app.call_graph, "extra", 900);
+        call(&mut app.call_graph, right[2], extra, 901);
+        app.mark_graph_changed();
+        backdate(&mut app);
+        app.tick();
+
+        assert!(
+            active(&app).cluster_of(&extra).is_some(),
+            "a symbol the scope now reaches belongs on its map"
+        );
+    }
+
+    #[test]
+    fn only_the_scopes_in_use_are_kept_clustered() {
+        let (graph, _, right) = two_triangles();
+        let mut app = CoreApp::new(graph);
+        app.dispatch(Command::SetMapScope(Some(right[0])));
+        assert_eq!(app.scoped.len(), 1);
+
+        // A second tab, on the whole-program map like every new tab.
+        app.dispatch(Command::NewWorkspace);
+        assert_eq!(app.scoped.len(), 1, "the first tab still wants its map");
+
+        app.dispatch(Command::CloseWorkspace(0));
+        assert!(
+            app.scoped.is_empty(),
+            "closing the only tab that wanted it drops the clustering"
         );
     }
 }

@@ -37,6 +37,15 @@ pub enum Command {
     /// toggle, because the control naming it names one view, not "the other
     /// one" — the same reason `SetGraphOrientation` takes an orientation.
     SetViewMode(ViewMode),
+    /// Draw the cluster map from one function's neighbourhood instead of from
+    /// the whole program — or, with `None`, widen it back out.
+    ///
+    /// The whole-program map answers "what is in this project"; scoped to a
+    /// function it answers "what is *this* made of", which is the question the
+    /// user is already asking by having a function on screen. Absolute rather
+    /// than a toggle for the reason the view and orientation commands are:
+    /// what names the scope names one function, not "some other function".
+    SetMapScope(Option<SymbolId>),
     /// Open or close one cluster's contents on the map. The box stays visible.
     ///
     /// Named by [`ClusterKey`], not `ClusterId`: this arrives from a frontend

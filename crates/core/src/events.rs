@@ -31,6 +31,11 @@ pub enum AppEvent {
     },
     /// The selected function has no callees.
     FunctionHasNoCallees,
+    /// The function the user asked for a cluster map of has nothing to group:
+    /// whatever it reaches in this direction forms no community at all —
+    /// typically a leaf, or a function whose calls clangd has not resolved yet.
+    /// The view stays where it was rather than switching to a blank map.
+    FunctionHasNoCommunities,
     /// The graph layout must be recomputed (e.g. new calls loaded).
     LayoutDirty,
     /// The cached clustering was recomputed and the grouping moved. Carries the

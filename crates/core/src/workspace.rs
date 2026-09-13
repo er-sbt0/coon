@@ -55,6 +55,15 @@ pub struct CoreWorkspace {
     /// recomputed, and the ids are handed out afresh. A key goes on naming the
     /// community the user opened; an id would quietly start naming another one.
     pub expanded_clusters: HashSet<ClusterKey>,
+    /// The function whose neighbourhood the cluster map is drawn from, or
+    /// `None` for the whole program.
+    ///
+    /// Separate from `root_symbol`, and deliberately not cleared when the root
+    /// moves: the map is where a rooted tree was entered *from*, and the way
+    /// back has to lead to the map the user was actually looking at. Rooting at
+    /// a function found inside one function's map and then going back to "the
+    /// cluster map" should not silently land on the whole program's.
+    pub map_scope: Option<SymbolId>,
     pub created_at: Instant,
     pub last_accessed: Instant,
 }
@@ -72,6 +81,7 @@ impl CoreWorkspace {
             orientation: LayoutOrientation::default(),
             view: ViewMode::default(),
             expanded_clusters: HashSet::new(),
+            map_scope: None,
             created_at: now,
             last_accessed: now,
         }
@@ -131,6 +141,25 @@ impl CoreWorkspace {
     pub fn set_view(&mut self, view: ViewMode) -> bool {
         let changed = view != self.view;
         self.view = view;
+        if changed {
+            self.touch();
+        }
+        changed
+    }
+
+    /// Point the cluster map at one function's neighbourhood, or at the whole
+    /// program with `None`. Returns true when the value actually changed.
+    ///
+    /// Switches to the map for the same reason [`Self::set_root`] switches away
+    /// from it: naming what a map should be drawn from *is* asking to see that
+    /// map, and leaving each frontend to pair the two commands is how a
+    /// frontend stops being a transport. The open boxes go with the old scope —
+    /// they name communities of a clustering this one has nothing to do with.
+    pub fn set_map_scope(&mut self, scope: Option<SymbolId>) -> bool {
+        let changed = scope != self.map_scope || self.view != ViewMode::ClusterMap;
+        self.map_scope = scope;
+        self.expanded_clusters.clear();
+        self.view = ViewMode::ClusterMap;
         if changed {
             self.touch();
         }
@@ -436,6 +465,53 @@ mod tests {
             opened.view,
             ViewMode::Rooted,
             "a tab opened on a named symbol starts on that symbol"
+        );
+    }
+
+    #[test]
+    fn a_map_scope_switches_to_the_map_and_survives_a_new_root() {
+        let mut ws = CoreWorkspace::new(1, "w".to_string());
+        let scope = SymbolId::from_content("handle_request", "req.c", 1);
+        ws.set_root(SymbolId::from_content("a", "a.c", 1));
+        assert_eq!(ws.view, ViewMode::Rooted);
+
+        assert!(ws.set_map_scope(Some(scope)));
+        assert_eq!(ws.map_scope, Some(scope));
+        assert_eq!(
+            ws.view,
+            ViewMode::ClusterMap,
+            "naming what a map is drawn from is asking for that map"
+        );
+        assert!(
+            !ws.set_map_scope(Some(scope)),
+            "re-picking the map already shown is not a change"
+        );
+
+        ws.set_root(SymbolId::from_content("b", "b.c", 1));
+        assert_eq!(
+            ws.map_scope,
+            Some(scope),
+            "the scope is where the tree was entered from, and the way back \
+             must lead there rather than to the whole program"
+        );
+
+        assert!(ws.set_map_scope(None));
+        assert_eq!(ws.map_scope, None);
+    }
+
+    #[test]
+    fn a_new_scope_starts_with_nothing_opened() {
+        let mut ws = CoreWorkspace::new(1, "w".to_string());
+        ws.toggle_cluster_expanded(ClusterKey {
+            level: 1,
+            anchor: SymbolId::from_content("anchor", "test.c", 1),
+        });
+
+        ws.set_map_scope(Some(SymbolId::from_content("scope", "s.c", 1)));
+
+        assert!(
+            ws.expanded_clusters.is_empty(),
+            "an open box names a community of the clustering it came from"
         );
     }
 

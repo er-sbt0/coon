@@ -180,6 +180,7 @@ let graphDepth       = 3;
 let collapsed        = new Set();
 let currentView      = 'ClusterMap';  // or 'Rooted'; a workspace opens on the map
 let clusterMap       = null;          // the laid-out map, while one is showing
+let mapScope         = null;          // the function the map is drawn from, or null for all of it
 let lastFitKey       = null;                      // refit only on root/direction change
 
 const MAX_FIT_ZOOM = 1.15;
@@ -245,6 +246,7 @@ function handleSnapshot(msg) {
   // showing the call tree, so the two always agree about which view this is.
   currentView = active?.view ?? 'Rooted';
   clusterMap = msg.cluster_layout ?? null;
+  mapScope = active?.map_scope ?? null;
   if (typeof active?.depth === 'number') graphDepth = active.depth;
   updateDepthControl();
   if (active?.direction) {
@@ -362,18 +364,57 @@ $('tab-new').addEventListener('click', () => sendCommand('NewWorkspace'));
 // Shows the path from the workspace root to the node currently in focus, which
 // is the question the graph answers and the toolbar never did.
 
+/// One crumb, appended with the separator every entry but the first needs.
+function addCrumb(label, { title, current, run }) {
+  if (crumbEl.children.length > 0) {
+    const sep = document.createElement('span');
+    sep.className = 'sep';
+    sep.textContent = '›';
+    crumbEl.appendChild(sep);
+  }
+  const crumb = document.createElement('button');
+  crumb.className = 'crumb' + (current ? ' current' : '');
+  crumb.textContent = label;
+  if (title) crumb.title = title;
+  crumb.addEventListener('click', run);
+  crumbEl.appendChild(crumb);
+  return crumb;
+}
+
+/// The maps this view sits under: the whole program's, and — when the map has
+/// been scoped to a function — that function's.
+///
+/// Two crumbs rather than one because there are now two maps to go back to,
+/// and which of them 'Cluster map' means is exactly what a single crumb could
+/// not say. The scope crumb is the head of the path whether the user is
+/// looking at that map or at a tree entered from it, so the lineage reads the
+/// same from either.
+function renderMapCrumbs() {
+  const onMap = currentView === 'ClusterMap';
+  addCrumb('Cluster map', {
+    title: mapScope ? 'Out to the whole project' : 'Back to the cluster map (Ctrl+M)',
+    current: onMap && !mapScope,
+    // Widening is a different map, so it is a scope command and not a view one;
+    // on the whole-program map already, this is just a refit.
+    run: () => (mapScope ? sendCommand({ SetMapScope: null }) : showClusterMap()),
+  }).classList.add('view');
+
+  if (!mapScope) return;
+  const name = allFunctions[mapScope]?.name ?? mapScope;
+  addCrumb(name, {
+    title: `Communities under ${allFunctions[mapScope]?.qualified_name ?? name}`,
+    current: onMap,
+    run: () => (onMap ? fitGraph() : sendCommand({ SetMapScope: mapScope })),
+  }).classList.add('view');
+}
+
 function renderBreadcrumb() {
   crumbEl.innerHTML = '';
 
   // The map has no root and no path through it; what it has is a level of the
   // hierarchy and however many boxes the user has opened on it.
   if (currentView === 'ClusterMap') {
-    const here = document.createElement('button');
-    here.className = 'crumb view current';
-    here.textContent = 'Cluster map';
-    here.title = 'Click a community to open it, double-click to drill into its call tree';
-    here.addEventListener('click', fitGraph);
-    crumbEl.appendChild(here);
+    renderMapCrumbs();
 
     const shown = (clusterMap?.metas?.length ?? 0) + (clusterMap?.groups?.length ?? 0);
     const open = clusterMap?.groups?.length ?? 0;
@@ -390,12 +431,7 @@ function renderBreadcrumb() {
   // gesture that left it, so the way back belongs at the head of the path and
   // not only in the palette. Shown even with no root, where it is the only
   // thing there is to do from here.
-  const toMap = document.createElement('button');
-  toMap.className = 'crumb view';
-  toMap.textContent = 'Cluster map';
-  toMap.title = 'Back to the cluster map (Ctrl+M)';
-  toMap.addEventListener('click', showClusterMap);
-  crumbEl.appendChild(toMap);
+  renderMapCrumbs();
 
   if (!rootNodeId) {
     const span = document.createElement('span');
@@ -405,20 +441,15 @@ function renderBreadcrumb() {
     return;
   }
 
+  // The map crumbs precede the whole path, so every entry has something to its
+  // left to be separated from.
   const path = pathFromRoot(rootNodeId, selectedNodeId);
-  path.forEach((id) => {
-    // Always: the map crumb precedes the whole path, so every entry has
-    // something to its left to be separated from.
-    const sep = document.createElement('span');
-    sep.className = 'sep';
-    sep.textContent = '›';
-    crumbEl.appendChild(sep);
-    const crumb = document.createElement('button');
-    crumb.className = 'crumb' + (id === path[path.length - 1] ? ' current' : '');
-    crumb.textContent = allFunctions[id]?.name ?? id;
-    crumb.title = allFunctions[id]?.qualified_name ?? '';
-    crumb.addEventListener('click', () => expandNode(id));
-    crumbEl.appendChild(crumb);
+  path.forEach((id, i) => {
+    addCrumb(allFunctions[id]?.name ?? id, {
+      title: allFunctions[id]?.qualified_name ?? '',
+      current: i === path.length - 1,
+      run: () => expandNode(id),
+    });
   });
 }
 
@@ -631,7 +662,7 @@ function rebuildClusterMap(map) {
   // had is about a map that no longer exists — refit. Which boxes are open is
   // therefore part of the key, alongside what the rooted view keys on.
   const open = groups.map((g) => clusterId(g.key)).sort().join(',');
-  const fitKey = `cluster:${currentDirection}:${currentOrientation}:${open}`;
+  const fitKey = `cluster:${mapScope ?? 'all'}:${currentDirection}:${currentOrientation}:${open}`;
   if (cy.nodes().length > 0 && fitKey !== lastFitKey) {
     lastFitKey = fitKey;
     requestAnimationFrame(fitGraph);
@@ -718,6 +749,30 @@ function markPathToSelection() {
 
 function showClusterMap() {
   if (currentView !== 'ClusterMap') sendCommand('ZoomOutToClusters');
+}
+
+/// Which function a 'cluster this' gesture is about: the node in focus, or the
+/// root of the tree when nothing has been touched since it opened.
+function scopeTarget() {
+  return selectedNodeId ?? rootNodeId;
+}
+
+/// Redraw the map from one function's neighbourhood rather than the whole
+/// project — the same communities, found again over what this function
+/// reaches, which is a different question and usually a different answer.
+///
+/// The backend declines a function with nothing to group and says so, so there
+/// is nothing to check for here.
+function clusterThisFunction() {
+  // A map has no function in focus to be about, and the node the tree left
+  // selected is not on it — so from here this is a request with no subject.
+  const id = currentView === 'ClusterMap' ? null : scopeTarget();
+  if (!id) {
+    infoEl.textContent = 'Open a call tree first — this groups what a function reaches';
+    return;
+  }
+  infoEl.textContent = `Grouping what ${allFunctions[id]?.name ?? id} reaches`;
+  sendCommand({ SetMapScope: id });
 }
 
 /// Ctrl+M. A toggle rather than two bindings because a key has no label to
@@ -880,6 +935,9 @@ function updateStatusFromEvent(key, payload) {
     if (!loading()) setStatus(`Loading ${(payload?.direction || '').toLowerCase()} calls`, 'busy');
   } else if (key === 'FunctionHasNoCallees') {
     infoEl.textContent = 'No callees in this direction';
+  } else if (key === 'FunctionHasNoCommunities') {
+    // The view deliberately did not change, so without this the key looks dead.
+    infoEl.textContent = 'Nothing to group here — this function reaches too little';
   } else if (key === 'OutgoingCallsLoaded' || key === 'IncomingCallsLoaded') {
     // Not "Ready" mid-load: the warmup answers hundreds of these while the
     // graph is still filling in, and each one used to declare the wait over.
@@ -1173,6 +1231,19 @@ function buildCommands() {
     // The two views, named rather than toggled — the same reason the
     // orientation control shows both segments instead of one that flips.
     { id: 'view.clusters', label: 'View: Cluster Map', hint: 'Ctrl+M', disabled: onMap, run: showClusterMap },
+    {
+      id: 'view.clusterfn',
+      label: 'View: Cluster Map of This Function',
+      hint: 'Ctrl+Shift+M',
+      disabled: onMap || !scopeTarget(),
+      run: clusterThisFunction,
+    },
+    {
+      id: 'view.clusterall',
+      label: 'View: Cluster Map of the Whole Project',
+      disabled: !mapScope,
+      run: () => sendCommand({ SetMapScope: null }),
+    },
     { id: 'view.rooted', label: 'View: Rooted Graph', hint: 'Ctrl+M', disabled: !onMap || !rootNodeId, run: () => sendCommand({ SetViewMode: 'Rooted' }) },
     {
       id: 'view.closeclusters',
@@ -1270,6 +1341,7 @@ document.addEventListener('keydown', (e) => {
   }
   else if (key === 'f') { e.preventDefault(); searchEl.focus(); searchEl.select(); }
   else if (key === 'r') { e.preventDefault(); sendCommand('Refresh'); }
+  else if (key === 'm' && e.shiftKey) { e.preventDefault(); clusterThisFunction(); }
   else if (key === 'm') { e.preventDefault(); toggleView(); }
   else if (key === 'd' && e.shiftKey) { e.preventDefault(); setOrientation(currentOrientation === 'LeftRight' ? 'TopDown' : 'LeftRight'); }
   else if (key === 'd') { e.preventDefault(); sendCommand('ToggleCallDirection'); }
