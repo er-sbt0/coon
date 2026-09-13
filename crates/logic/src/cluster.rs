@@ -1768,6 +1768,90 @@ mod tests {
         }
     }
 
+    /// The partition at one level, as sorted names — readable enough to assert
+    /// against literally, so a test failure says which functions moved.
+    fn grouping_at(graph: &CallGraph, clustering: &Clustering, level: usize) -> Vec<Vec<String>> {
+        let mut groups: Vec<Vec<String>> = clustering
+            .level(level)
+            .iter()
+            .map(|id| {
+                let mut names: Vec<String> = clustering
+                    .cluster(*id)
+                    .unwrap()
+                    .members
+                    .iter()
+                    .map(|m| graph.get_function(m).unwrap().name.clone())
+                    .collect();
+                names.sort();
+                names
+            })
+            .collect();
+        groups.sort();
+        groups
+    }
+
+    /// Pins the exact hierarchy of a fixture small enough to read, because the
+    /// properties the other tests assert — every level partitions the symbols,
+    /// ancestry is a chain — hold just as well for a grouping that has silently
+    /// changed.
+    ///
+    /// Asserted as names rather than as a hash of something larger: the merge
+    /// decisions behind this turn on `f64` comparisons, so a fixture big enough
+    /// to need hashing is a fixture that could come out differently under a
+    /// different instruction selection, and a test that only fails on somebody
+    /// else's machine is worse than no test at all.
+    ///
+    /// What that size buys and what it costs, measured by mutation rather than
+    /// assumed: dropping the convexity repair at level 0 fails this test, but
+    /// disabling the blocked-set merge in `agglomerate_acyclically`, skipping
+    /// `merge_severed_runs`, and coarsening `MODULARITY_EPSILON` all leave it
+    /// green. Those branches need a graph with enough communities to wedge one
+    /// between two others, and every fixture that small merges nothing at all.
+    /// So this guards the repair, not the agglomeration — the gap is real and
+    /// is left here in writing rather than implied away.
+    #[test]
+    fn the_hierarchy_of_a_known_graph_does_not_drift() {
+        let graph = layered_graph();
+        let clustering = Clustering::compute(&graph);
+        assert_eq!(clustering.level_count(), 2);
+
+        // Level 0 is Louvain's, repaired for convexity — which is why `t3` and
+        // `t4` come out as interleaved pairs with a singleton at each end
+        // rather than as two clean triangles: the order has to leave `t3` and
+        // come back, and what it leaves behind cannot rejoin without putting a
+        // cycle back on the map.
+        assert_eq!(
+            grouping_at(&graph, &clustering, 0),
+            vec![
+                vec!["t1_a", "t1_b", "t1_c"],
+                vec!["t2_a", "t2_b", "t2_c"],
+                vec!["t3_a"],
+                vec!["t3_b", "t4_a"],
+                vec!["t3_c", "t4_b"],
+                vec!["t4_c"],
+            ]
+        );
+
+        // Level 1 is `agglomerate_acyclically`'s own: the pairs, merged back up
+        // under the constraint into the two halves the fixture is built from.
+        assert_eq!(
+            grouping_at(&graph, &clustering, 1),
+            vec![
+                vec!["t1_a", "t1_b", "t1_c", "t2_a", "t2_b", "t2_c"],
+                vec!["t3_a", "t3_b", "t3_c", "t4_a", "t4_b", "t4_c"],
+            ]
+        );
+
+        // The front doors come with the grouping and are just as easy to move
+        // by accident.
+        let labels: HashSet<&str> = clustering
+            .top_level()
+            .iter()
+            .map(|id| clustering.cluster(*id).unwrap().label.as_str())
+            .collect();
+        assert_eq!(labels, HashSet::from(["t1_a", "t3_a"]));
+    }
+
     #[test]
     fn recomputing_gives_identical_output() {
         let (graph, _, _) = two_triangles();
