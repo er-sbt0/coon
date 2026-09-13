@@ -793,8 +793,15 @@ impl CoreApp {
             other_range.start.line + 1,
             other_range.start.character + 1,
         );
+        // clangd's `detail` on a call-hierarchy item is the symbol's own
+        // qualified name — "outer::inner::Widget::draw", not the scope around
+        // it — so it is the qualified name, not a prefix for one. Building
+        // "…::draw::draw" here gave the same function a different name from
+        // the one the workspace-symbol path produced, and since `SymbolId`
+        // hashes the qualified name it arrived in the graph as a second node:
+        // one function, listed twice in the sidebar.
         let qualified_name = match other_detail {
-            Some(detail) if !detail.is_empty() => format!("{}::{}", detail, other_name),
+            Some(detail) if !detail.is_empty() => detail.to_string(),
             _ => other_name.clone(),
         };
         let other_id =
@@ -1034,6 +1041,79 @@ mod tests {
             std::iter::from_fn(|| rx.try_recv().ok()).count(),
             WARMUP_IN_FLIGHT
         );
+    }
+
+    /// A call-hierarchy item shaped the way clangd actually sends them.
+    fn call_item(
+        name: &str,
+        detail: Option<&str>,
+        file: &str,
+        line: u32,
+    ) -> lsp_types::CallHierarchyItem {
+        let pos = lsp_types::Position {
+            line: line - 1,
+            character: 5,
+        };
+        let range = lsp_types::Range {
+            start: pos,
+            end: pos,
+        };
+        lsp_types::CallHierarchyItem {
+            name: name.to_string(),
+            kind: lsp_types::SymbolKind::FUNCTION,
+            tags: None,
+            detail: detail.map(|d| d.to_string()),
+            uri: lsp_types::Url::from_file_path(file).expect("absolute path"),
+            range,
+            selection_range: range,
+            data: None,
+        }
+    }
+
+    /// The two ways a function reaches the graph must agree on its name.
+    ///
+    /// Workspace symbols arrive with a container; call-hierarchy items arrive
+    /// with clangd's `detail`, which is the symbol's *own* qualified name. When
+    /// those disagreed the same function got two `SymbolId`s, so it sat in the
+    /// graph twice and the sidebar listed it twice.
+    #[test]
+    fn a_function_found_both_ways_is_one_node() {
+        for (name, container, detail) in [
+            // A free function: clangd sends an empty container for it.
+            ("globalFn", "", "globalFn"),
+            // A method: the container is the scope, the detail is scope + name.
+            ("draw", "outer::inner::Widget", "outer::inner::Widget::draw"),
+        ] {
+            let mut app = CoreApp::new(CallGraph::new());
+
+            // Path 1 — the workspace-symbol load.
+            let qualified = lsp::make_qualified_name(&Some(container.to_string()), name);
+            let caller = app.call_graph.add_function(FunctionNode::new(
+                "caller".to_string(),
+                "caller".to_string(),
+                Location::new("/src/main.cpp".to_string(), 1, 1),
+            ));
+            app.call_graph.add_function(FunctionNode::new(
+                name.to_string(),
+                qualified,
+                Location::new("/src/main.cpp".to_string(), 7, 6),
+            ));
+            assert_eq!(app.call_graph.node_count(), 2);
+
+            // Path 2 — the same function, reached as somebody's callee.
+            app.process_call_entry(
+                caller,
+                &call_item(name, Some(detail), "/src/main.cpp", 7),
+                &[],
+                true,
+            );
+
+            assert_eq!(
+                app.call_graph.node_count(),
+                2,
+                "`{name}` was found twice and must still be one node"
+            );
+        }
     }
 
     #[test]

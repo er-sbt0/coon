@@ -43,11 +43,15 @@ pub struct IncomingCallsResponse {
 }
 
 /// Compute a qualified name from an optional container and a symbol name.
+///
+/// An empty container is global scope, not a container called "". clangd sends
+/// `container_name: ""` for every free function, and `::foo` is a different
+/// string from `foo` — which matters because `SymbolId` is a hash of this name:
+/// two spellings are two identities for one function.
 pub fn make_qualified_name(container_name: &Option<String>, name: &str) -> String {
-    if let Some(container) = container_name {
-        format!("{}::{}", container, name)
-    } else {
-        name.to_string()
+    match container_name {
+        Some(container) if !container.is_empty() => format!("{container}::{name}"),
+        _ => name.to_string(),
     }
 }
 
@@ -151,5 +155,22 @@ mod tests {
         assert_eq!(core_location.line, 21);
         assert_eq!(core_location.column, 9);
         assert_eq!(core_location.length, None);
+    }
+
+    #[test]
+    fn a_symbol_at_global_scope_is_not_named_with_a_leading_separator() {
+        // clangd reports `container_name: ""` for every free function. Spelling
+        // that `::foo` made it a different symbol from the `foo` the call
+        // hierarchy reports, and the graph held both.
+        assert_eq!(make_qualified_name(&Some(String::new()), "foo"), "foo");
+        assert_eq!(make_qualified_name(&None, "foo"), "foo");
+    }
+
+    #[test]
+    fn a_contained_symbol_keeps_its_scope() {
+        assert_eq!(
+            make_qualified_name(&Some("outer::inner::Widget".to_string()), "draw"),
+            "outer::inner::Widget::draw"
+        );
     }
 }
