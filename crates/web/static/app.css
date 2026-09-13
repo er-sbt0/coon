@@ -249,6 +249,22 @@ body.sidebar-collapsed #dock-handle { display: none; }
   border-left: 2px solid transparent;
   transition: background var(--t-fast), color var(--t-fast);
 }
+/* The name gives up width first; the location it is being told apart by is the
+   part that must survive, so it never shrinks. */
+#fn-list li .fn-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#fn-list li .fn-where {
+  margin-left: auto;
+  flex: none;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+}
+#fn-list li:hover .fn-where,
+#fn-list li.selected .fn-where { color: var(--text-muted); }
+
 #fn-list li:hover { background: var(--surface-hover); color: var(--text); }
 #fn-list li.selected {
   background: var(--accent-soft);

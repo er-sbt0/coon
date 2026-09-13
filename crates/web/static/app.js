@@ -981,14 +981,50 @@ function updateStatusFromEvent(key, payload) {
 
 // ── Sidebar ───────────────────────────────────────────────────────────────────
 
+/// Where a symbol is defined, as `file.c:12`.
+///
+/// The basename alone is not enough: C++ overloads share a file, and a name
+/// that repeats within one file is exactly the case the caller is trying to
+/// tell apart.
+function symbolWhere(fn) {
+  const loc = fn && fn.definition_location;
+  if (!loc || !loc.file_path) return '';
+  const base = loc.file_path.split('/').pop();
+  return loc.line ? `${base}:${loc.line}` : base;
+}
+
+/// Names that more than one symbol answers to.
+///
+/// Nothing is duplicated when this is non-empty — C gives every `static`
+/// function file-local linkage, so jemalloc's test suite really does define
+/// nine different `thd_start`s, and a C++ overload set is several functions
+/// with one name. They are distinct symbols with distinct call graphs, so the
+/// list must keep all of them; what it must not do is draw them identically.
+function ambiguousNames(fns) {
+  const seen = new Set();
+  const dup = new Set();
+  for (const id in fns) {
+    const name = fns[id].name;
+    if (seen.has(name)) dup.add(name);
+    else seen.add(name);
+  }
+  return dup;
+}
+
 function renderSidebar(filter) {
   const q = (filter || '').toLowerCase();
+  const ambiguous = ambiguousNames(allFunctions);
   const ids = Object.keys(allFunctions)
     .filter(id => {
       const n = allFunctions[id];
       return !q || n.name.toLowerCase().includes(q) || (n.qualified_name || '').toLowerCase().includes(q);
     })
-    .sort((a, b) => allFunctions[a].name.localeCompare(allFunctions[b].name));
+    .sort((a, b) => {
+      const byName = allFunctions[a].name.localeCompare(allFunctions[b].name);
+      // Same name: keep the group in a stable, readable order rather than
+      // whatever the id hash happened to give.
+      return byName || symbolWhere(allFunctions[a]).localeCompare(symbolWhere(allFunctions[b]));
+    });
 
   fnListEl.innerHTML = '';
 
@@ -1002,9 +1038,25 @@ function renderSidebar(filter) {
 
   for (const id of ids) {
     const node = allFunctions[id];
+    const where = symbolWhere(node);
     const li = document.createElement('li');
-    li.textContent = node.name;
-    li.title = node.qualified_name || node.name;
+
+    const nameEl = document.createElement('span');
+    nameEl.className = 'fn-name';
+    nameEl.textContent = node.name;
+    li.appendChild(nameEl);
+
+    // Only the rows that need telling apart carry their file. Stamping every
+    // row with one would cost the 2,500 unique names half the sidebar's width
+    // to say nothing.
+    if (where && ambiguous.has(node.name)) {
+      const whereEl = document.createElement('span');
+      whereEl.className = 'fn-where';
+      whereEl.textContent = where;
+      li.appendChild(whereEl);
+    }
+
+    li.title = [node.qualified_name || node.name, where].filter(Boolean).join('  ');
     if (id === rootNodeId) li.classList.add('selected');
     li.addEventListener('click', () => selectRoot(id));
     // Middle-click opens the symbol in its own graph tab.
@@ -1336,11 +1388,16 @@ function openCommandPalette() {
 }
 
 function openSymbolFinder() {
+  const ambiguous = ambiguousNames(allFunctions);
   const items = Object.entries(allFunctions).map(([id, fn]) => ({
     id,
     label: fn.name,
-    // Only worth showing when it adds something beyond the bare name.
-    detail: fn.qualified_name && fn.qualified_name !== fn.name ? fn.qualified_name : '',
+    // Only worth showing when it adds something beyond the bare name — and
+    // where the name is not the symbol's own, the location is what picks one
+    // `thd_start` out of nine.
+    detail: fn.qualified_name && fn.qualified_name !== fn.name
+      ? fn.qualified_name
+      : (ambiguous.has(fn.name) ? symbolWhere(fn) : ''),
     mono: true,
   }));
 
