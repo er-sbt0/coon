@@ -682,11 +682,22 @@ fn agglomerate_acyclically(graph: &WeightedGraph, dag: &[Vec<usize>]) -> (Vec<us
     }
     let mut alive: Vec<bool> = vec![true; n];
     let total = graph.total_degree;
+    // Reused by every candidate pair of every sweep. See `BetweenScratch`.
+    let mut scratch = BetweenScratch::new(n.div_ceil(64));
 
     loop {
         let live = dag_of_alive(dag, &community, n);
         let reaches = Reachability::of(&live);
         let backwards = Reachability::of(&reversed(&live));
+        // One bitset for the whole sweep below. Nothing dies until a merge is
+        // chosen, and building this per candidate pair would cost exactly the
+        // per-node pass `between_closure` no longer makes.
+        let mut alive_mask = vec![0u64; n.div_ceil(64)];
+        for (index, &is_alive) in alive.iter().enumerate() {
+            if is_alive {
+                alive_mask[index / 64] |= 1 << (index % 64);
+            }
+        }
 
         // Candidates, best first: the modularity gain of joining two
         // communities, in the usual agglomerative form — the weight they
@@ -717,9 +728,9 @@ fn agglomerate_acyclically(graph: &WeightedGraph, dag: &[Vec<usize>]) -> (Vec<us
 
         let mut chosen: Option<Vec<usize>> = None;
         for (gain, a, b) in candidates {
-            let group = between_closure(&reaches, &backwards, &alive, a, b);
+            let group = between_closure(&mut scratch, &reaches, &backwards, &alive_mask, a, b);
             if group.len() == 2 {
-                chosen = Some(group);
+                chosen = Some(group.to_vec());
                 break;
             }
             // Blocked: something sits on a path between the two. Joining them
@@ -728,8 +739,8 @@ fn agglomerate_acyclically(graph: &WeightedGraph, dag: &[Vec<usize>]) -> (Vec<us
             // by moving nodes one at a time, which pairwise merging cannot see.
             // Worth it only if the whole set still gains.
             let _ = gain;
-            if set_gain(&group, &between, &degree, total) > MODULARITY_EPSILON {
-                chosen = Some(group);
+            if set_gain(group, &between, &degree, total) > MODULARITY_EPSILON {
+                chosen = Some(group.to_vec());
                 break;
             }
         }
@@ -768,37 +779,119 @@ fn agglomerate_acyclically(graph: &WeightedGraph, dag: &[Vec<usize>]) -> (Vec<us
 /// Merging exactly this set is the smallest merge involving both that keeps the
 /// quotient acyclic: anything left on a path between two of its members would
 /// be a cycle through the merged community. Comes back as just `[a, b]` when
-/// nothing is in the way, which is the common case.
-fn between_closure(
+/// nothing is in the way — which is *not* the common case, and it is worth
+/// being plain about that: over a 10,000-function project only 1,186 of the
+/// 182,332 pairs asked about came back unblocked, and two thirds came back with
+/// fifteen or more communities wedged between them. The caller's `set_gain`
+/// then has to price all of them, which is why that, and not this, is where the
+/// sweep now spends its time.
+///
+/// In a DAG, "something in the group reaches y and y reaches something in the
+/// group" is enough to place `y` between two members: the two cannot be the
+/// same node, or that member would reach itself.
+///
+/// Asked of every candidate at once rather than one at a time, because this
+/// runs once per candidate pair per merge and testing each live community in
+/// turn made it the cost of the entire clustering — 18s to cluster a
+/// 10,000-function project. Both halves of the test are unions of rows the two
+/// closures already hold: `reaches.row(m)` *is* `{y : m reaches y}`, and
+/// `backwards.row(m)` *is* `{y : y reaches m}`, so the communities between the
+/// group are
+///
+/// ```text
+/// (⋃ reaches.row(m)) & (⋃ backwards.row(m)) & alive & !group
+/// ```
+///
+/// which is a word-wise AND over `n/64` words instead of a pass over `n`
+/// communities. Neither union ever shrinks — the group only grows — so a round
+/// ORs in the rows of what the last round added and nothing else.
+///
+/// The unions describe the group as it stood when the round began, never as it
+/// grows mid-scan. That is deliberate and matches what the per-candidate form
+/// did: widening the target while testing against it would make the result
+/// depend on the order candidates happened to be visited.
+fn between_closure<'s>(
+    scratch: &'s mut BetweenScratch,
     reaches: &Reachability,
     backwards: &Reachability,
-    alive: &[bool],
+    alive: &[u64],
     a: usize,
     b: usize,
-) -> Vec<usize> {
-    let words = alive.len().div_ceil(64);
-    let mut group: BTreeSet<usize> = [a, b].into_iter().collect();
+) -> &'s [usize] {
+    let words = alive.len();
+    let BetweenScratch {
+        forward,
+        backward,
+        inside,
+        added,
+        group,
+    } = scratch;
+    forward.fill(0);
+    backward.fill(0);
+    inside.fill(0);
+    group.clear();
+    group.extend([a, b]);
+    // The members whose rows are not folded into the unions yet.
+    added.clear();
+    added.extend([a, b]);
+
     loop {
-        let mut mask = vec![0u64; words];
-        for &member in &group {
-            mask[member / 64] |= 1 << (member % 64);
+        for &member in added.iter() {
+            inside[member / 64] |= 1 << (member % 64);
+            for (word, row) in forward.iter_mut().zip(reaches.row(member)) {
+                *word |= row;
+            }
+            for (word, row) in backward.iter_mut().zip(backwards.row(member)) {
+                *word |= row;
+            }
         }
 
-        // In a DAG, "something in the group reaches y and y reaches something
-        // in the group" is enough: the two cannot be the same node, or the
-        // group member would reach itself.
-        let mut grew = false;
-        for (candidate, _) in alive.iter().enumerate().filter(|(_, &live)| live) {
-            if group.contains(&candidate) {
-                continue;
-            }
-            if backwards.reaches_any(candidate, &mask) && reaches.reaches_any(candidate, &mask) {
-                group.insert(candidate);
-                grew = true;
+        added.clear();
+        for word in 0..words {
+            let mut between = forward[word] & backward[word] & alive[word] & !inside[word];
+            while between != 0 {
+                added.push(word * 64 + between.trailing_zeros() as usize);
+                between &= between - 1;
             }
         }
-        if !grew {
-            return group.into_iter().collect();
+        if added.is_empty() {
+            // Ascending, as the `BTreeSet` this used to be gave it. The order
+            // reaches the caller's fold of `between[gone]` into `between[keep]`,
+            // and that is a sum of floats — so it is part of the answer, not a
+            // presentational detail.
+            group.sort_unstable();
+            return group;
+        }
+        group.extend(added.iter().copied());
+    }
+}
+
+/// Reusable buffers for [`between_closure`].
+///
+/// One per merge sweep rather than one per call, because the sweep asks about
+/// every candidate pair — 182,000 of them on a 10,000-function project. Three
+/// bitsets and a `BTreeSet` allocated and dropped per question came to 2.1s of
+/// a 5s clustering, an order of magnitude more than the word math they carried.
+struct BetweenScratch {
+    /// Everything the group reaches.
+    forward: Vec<u64>,
+    /// Everything that reaches the group.
+    backward: Vec<u64>,
+    /// The group itself.
+    inside: Vec<u64>,
+    /// Members found by the round in progress, not yet folded into the unions.
+    added: Vec<usize>,
+    group: Vec<usize>,
+}
+
+impl BetweenScratch {
+    fn new(words: usize) -> Self {
+        Self {
+            forward: vec![0u64; words],
+            backward: vec![0u64; words],
+            inside: vec![0u64; words],
+            added: Vec::new(),
+            group: Vec::new(),
         }
     }
 }
@@ -1155,40 +1248,51 @@ fn run_of_representative(run_of: &[usize], representative: &[usize]) -> Vec<usiz
 /// a DAG, so reachability instead falls out of a single reverse topological
 /// pass in which each node ORs together what its successors reach, over rows of
 /// machine words rather than bytes.
+///
+/// Rows are handed out whole ([`Reachability::row`]) as well as probed one bit
+/// at a time, because the caller that dominates this — [`between_closure`] —
+/// wants the union of several nodes' reach rather than an answer about any one
+/// of them, and a union of rows is an OR over `n/64` words.
 struct Reachability {
-    rows: Vec<Vec<u64>>,
+    /// Row-major and flat: node `i`'s row is `rows[i * words..][..words]`. A
+    /// `Vec<Vec<u64>>` is the same bits in `n` separate allocations, and this is
+    /// rebuilt twice per merge — on a 10,000-function project that was twelve
+    /// million allocations spent on the shape of the container.
+    rows: Vec<u64>,
+    words: usize,
 }
 
 impl Reachability {
     fn of(dag: &[Vec<usize>]) -> Self {
         let n = dag.len();
         let words = n.div_ceil(64);
-        let mut rows = vec![vec![0u64; words]; n];
+        let mut rows = vec![0u64; n * words];
+        // One scratch row for the whole pass. A node's row cannot be built in
+        // place: it is read from as its successors' rows are ORed in, which is
+        // the same borrow.
+        let mut reached = vec![0u64; words];
         // A node's reach is known once every successor's is, which is what
         // walking the topological order backwards guarantees.
         for &node in plain_topological_order(dag).iter().rev() {
-            let mut reached = vec![0u64; words];
+            reached.fill(0);
             for &next in &dag[node] {
                 reached[next / 64] |= 1 << (next % 64);
-                for (word, other) in reached.iter_mut().zip(&rows[next]) {
+                for (word, other) in reached.iter_mut().zip(&rows[next * words..][..words]) {
                     *word |= other;
                 }
             }
-            rows[node] = reached;
+            rows[node * words..][..words].copy_from_slice(&reached);
         }
-        Self { rows }
+        Self { rows, words }
     }
 
     fn reaches(&self, from: usize, to: usize) -> bool {
-        self.rows[from][to / 64] >> (to % 64) & 1 == 1
+        self.rows[from * self.words + to / 64] >> (to % 64) & 1 == 1
     }
 
-    /// Whether `node` reaches anything in `mask`.
-    fn reaches_any(&self, node: usize, mask: &[u64]) -> bool {
-        self.rows[node]
-            .iter()
-            .zip(mask)
-            .any(|(reached, wanted)| reached & wanted != 0)
+    /// Everything `node` reaches, as a bitset — one bit per node, `n/64` words.
+    fn row(&self, node: usize) -> &[u64] {
+        &self.rows[node * self.words..][..self.words]
     }
 }
 
