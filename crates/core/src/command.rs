@@ -1,6 +1,8 @@
+use logic::ClusterId;
 use model::SymbolId;
 
 use crate::layout::LayoutOrientation;
+use crate::workspace::ViewMode;
 use serde::{Deserialize, Serialize};
 
 /// Domain commands dispatched to `CoreApp`.
@@ -29,6 +31,19 @@ pub enum Command {
     /// toggle, because the control naming it names one orientation, not "the
     /// other one" — the same reason `SetGraphDepth` takes a level.
     SetGraphOrientation(LayoutOrientation),
+
+    // ---- Clustering ----
+    /// Show the cluster map or the rooted call tree. Absolute rather than a
+    /// toggle, because the control naming it names one view, not "the other
+    /// one" — the same reason `SetGraphOrientation` takes an orientation.
+    SetViewMode(ViewMode),
+    /// Open or close one cluster's contents on the map. The box stays visible.
+    ToggleClusterExpanded(ClusterId),
+    /// Leave the map for the call tree rooted at this cluster's entry point —
+    /// the member the clustering picked as its front door.
+    DrillIntoCluster(ClusterId),
+    /// Leave the call tree and go back to the map.
+    ZoomOutToClusters,
 
     // ---- Workspace management ----
     NewWorkspace,

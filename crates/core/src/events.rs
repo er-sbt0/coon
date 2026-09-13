@@ -33,6 +33,12 @@ pub enum AppEvent {
     FunctionHasNoCallees,
     /// The graph layout must be recomputed (e.g. new calls loaded).
     LayoutDirty,
+    /// The cached clustering was recomputed and the grouping moved. Carries the
+    /// number of top-level clusters, which is what a frontend showing the map
+    /// would report; the grouping itself is read from `CoreApp::clustering`.
+    ClusteringUpdated {
+        clusters: usize,
+    },
 
     // ---- LSP lifecycle ----
     LspProgress(LspLoadPhase),

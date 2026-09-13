@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 
+use logic::ClusterId;
 use model::{CallDirection, CallGraph, LspLoadPhase, SymbolId};
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +17,7 @@ use crate::app::CoreApp;
 use crate::command::Command;
 use crate::events::AppEvent;
 use crate::layout::{compute_layout, LayoutOptions, LayoutOrientation, NodePos};
+use crate::workspace::ViewMode;
 
 /// Messages the backend sends to the client.
 #[derive(Debug, Serialize)]
@@ -35,9 +37,7 @@ pub enum ServerMsg {
     /// A single `AppEvent` forwarded verbatim for status display.
     Event { event: AppEvent },
     /// New positions only, reusing the client's cached graph structure.
-    Layout {
-        layout: HashMap<SymbolId, NodePos>,
-    },
+    Layout { layout: HashMap<SymbolId, NodePos> },
 }
 
 /// Messages the client sends to the backend.
@@ -59,6 +59,10 @@ pub struct WorkspaceInfo {
     pub collapsed: Vec<SymbolId>,
     /// Which way the graph flows on the canvas.
     pub orientation: LayoutOrientation,
+    /// Which view this workspace is showing — the cluster map or a rooted tree.
+    pub view: ViewMode,
+    /// Clusters the user has opened on the map, so the client can mark them.
+    pub expanded_clusters: Vec<ClusterId>,
 }
 
 /// Build a full `ServerMsg::Snapshot` from current `CoreApp` state.
@@ -70,7 +74,12 @@ pub fn snapshot_of(core: &CoreApp) -> ServerMsg {
     // so the layout window shifts to the expanded node rather than staying
     // anchored to the workspace root.
     let layout_root = core.layout_focus.or(root);
-    let layout = compute_layout(&core.call_graph, layout_root, direction, &layout_options(core));
+    let layout = compute_layout(
+        &core.call_graph,
+        layout_root,
+        direction,
+        &layout_options(core),
+    );
 
     log::info!(
         "[protocol] snapshot: nodes={} edges={} layout_nodes={} root={:?} layout_focus={:?} direction={:?} selected={:?}",
@@ -126,6 +135,8 @@ pub fn workspace_infos(core: &CoreApp) -> Vec<WorkspaceInfo> {
             depth: ws.depth,
             collapsed: ws.collapsed.iter().copied().collect(),
             orientation: ws.orientation,
+            view: ws.view,
+            expanded_clusters: ws.expanded_clusters.iter().copied().collect(),
         })
         .collect()
 }
@@ -252,7 +263,10 @@ mod tests {
         let mut router = EventRouter::new();
 
         let first = router.route(&[AppEvent::LspProgress(LspLoadPhase::Completed)]);
-        assert!(first.resnapshot, "the transition to Completed must snapshot");
+        assert!(
+            first.resnapshot,
+            "the transition to Completed must snapshot"
+        );
 
         // The phase stays Completed forever, so every later tick repeats the
         // event. Without the gate this would resnapshot at 10 Hz indefinitely.
@@ -299,6 +313,11 @@ mod tests {
             format!("{{\"ToggleCollapsed\":{id}}}"),
             "{\"SetGraphOrientation\":\"TopDown\"}".to_string(),
             "{\"SetGraphOrientation\":\"LeftRight\"}".to_string(),
+            "{\"SetViewMode\":\"ClusterMap\"}".to_string(),
+            "{\"SetViewMode\":\"Rooted\"}".to_string(),
+            "{\"ToggleClusterExpanded\":3}".to_string(),
+            "{\"DrillIntoCluster\":3}".to_string(),
+            "\"ZoomOutToClusters\"".to_string(),
         ];
 
         for case in cases {
@@ -321,8 +340,21 @@ mod tests {
         assert!(json.get("layout").is_some());
 
         let ws = &json["workspaces"][0];
-        for field in ["id", "name", "direction", "selected", "depth", "collapsed", "orientation"] {
-            assert!(ws.get(field).is_some(), "workspace field `{field}` is read by the client");
+        for field in [
+            "id",
+            "name",
+            "direction",
+            "selected",
+            "depth",
+            "collapsed",
+            "orientation",
+            "view",
+            "expanded_clusters",
+        ] {
+            assert!(
+                ws.get(field).is_some(),
+                "workspace field `{field}` is read by the client"
+            );
         }
     }
 
@@ -348,7 +380,11 @@ mod tests {
                 routed.resnapshot,
                 "{event:?} changes the displayed graph and must resnapshot"
             );
-            assert_eq!(routed.forward.len(), 1, "{event:?} should still be reported");
+            assert_eq!(
+                routed.forward.len(),
+                1,
+                "{event:?} should still be reported"
+            );
         }
     }
 

@@ -1,11 +1,36 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
+use logic::ClusterId;
 use model::{CallDirection, SymbolId};
+use serde::{Deserialize, Serialize};
 
 use crate::layout::{LayoutOrientation, DEFAULT_DEPTH, MAX_DEPTH, MIN_DEPTH};
 
 use crate::events::AppEvent;
+
+/// Which of the two views a workspace is showing.
+///
+/// `ClusterMap` draws the top-level communities as boxes and lets the user open
+/// them; `Rooted` is the familiar call tree grown out of one function.
+///
+/// It lives beside the workspace rather than beside `LayoutOrientation` in
+/// `layout` because it is not a layout parameter. Orientation says how to draw
+/// a view; the view mode says which view there is to draw at all, and the
+/// workspace is the thing that remembers it. Layout will read it in Phase 3,
+/// the way it already reads `depth` and `collapsed`, without owning it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ViewMode {
+    ClusterMap,
+    /// The default, for the moment. A workspace is meant to open on the cluster
+    /// map and have the user drill down from there, but `compute_layout` cannot
+    /// place cluster boxes until Phase 3 and every frontend draws exactly what
+    /// the layout hands it. Defaulting to a view the layout cannot yet serve
+    /// would open every tab on an empty canvas, so the default flips when the
+    /// layout that serves it lands, and not before.
+    #[default]
+    Rooted,
+}
 
 /// Domain state of a single graph workspace (tab).
 ///
@@ -22,6 +47,10 @@ pub struct CoreWorkspace {
     pub collapsed: HashSet<SymbolId>,
     /// Which way the graph flows on the canvas.
     pub orientation: LayoutOrientation,
+    /// Which view this workspace is showing.
+    pub view: ViewMode,
+    /// Clusters the user has opened on the map. Everything else stays a box.
+    pub expanded_clusters: HashSet<ClusterId>,
     pub created_at: Instant,
     pub last_accessed: Instant,
 }
@@ -37,6 +66,8 @@ impl CoreWorkspace {
             depth: DEFAULT_DEPTH,
             collapsed: HashSet::new(),
             orientation: LayoutOrientation::default(),
+            view: ViewMode::default(),
+            expanded_clusters: HashSet::new(),
             created_at: now,
             last_accessed: now,
         }
@@ -52,6 +83,9 @@ impl CoreWorkspace {
         self.root_symbol = Some(symbol);
         // Collapse state describes a particular tree; a new root is a new tree.
         self.collapsed.clear();
+        // Which clusters stood open describes a particular map, and for the
+        // same reason it does not survive being pointed at a new root.
+        self.expanded_clusters.clear();
         self.touch();
     }
 
@@ -76,6 +110,28 @@ impl CoreWorkspace {
             self.touch();
         }
         changed
+    }
+
+    /// Show the cluster map or a rooted call tree.
+    /// Returns true when the value actually changed.
+    pub fn set_view(&mut self, view: ViewMode) -> bool {
+        let changed = view != self.view;
+        self.view = view;
+        if changed {
+            self.touch();
+        }
+        changed
+    }
+
+    /// Open or close one cluster on the map. Returns true if now expanded.
+    pub fn toggle_cluster_expanded(&mut self, cluster: ClusterId) -> bool {
+        self.touch();
+        if self.expanded_clusters.remove(&cluster) {
+            false
+        } else {
+            self.expanded_clusters.insert(cluster);
+            true
+        }
     }
 
     /// Collapse or re-expand a node's children. Returns true if now collapsed.
@@ -269,7 +325,10 @@ mod tests {
         ws.set_depth(999);
         assert_eq!(ws.depth, MAX_DEPTH, "large values clamp down");
 
-        assert!(!ws.set_depth(MAX_DEPTH), "setting the same depth is not a change");
+        assert!(
+            !ws.set_depth(MAX_DEPTH),
+            "setting the same depth is not a change"
+        );
     }
 
     #[test]
@@ -284,7 +343,10 @@ mod tests {
 
         ws.toggle_collapsed(sym);
         ws.set_root(SymbolId::from_content("b", "b.c", 1));
-        assert!(ws.collapsed.is_empty(), "a new root starts with nothing collapsed");
+        assert!(
+            ws.collapsed.is_empty(),
+            "a new root starts with nothing collapsed"
+        );
     }
 
     #[test]
@@ -297,6 +359,41 @@ mod tests {
         assert!(
             !ws.set_orientation(LayoutOrientation::TopDown),
             "re-picking the orientation already shown is not a change"
+        );
+    }
+
+    #[test]
+    fn the_view_is_set_absolutely_and_reports_real_changes() {
+        let mut ws = CoreWorkspace::new(1, "w".to_string());
+        assert_eq!(
+            ws.view,
+            ViewMode::Rooted,
+            "the map is the intended default, but only once Phase 3 can lay it out"
+        );
+
+        assert!(ws.set_view(ViewMode::ClusterMap));
+        assert_eq!(ws.view, ViewMode::ClusterMap);
+        assert!(
+            !ws.set_view(ViewMode::ClusterMap),
+            "re-picking the view already shown is not a change"
+        );
+    }
+
+    #[test]
+    fn cluster_expansion_toggles_and_resets_with_the_root() {
+        let mut ws = CoreWorkspace::new(1, "w".to_string());
+        let cluster = ClusterId(7);
+
+        assert!(ws.toggle_cluster_expanded(cluster), "first toggle opens");
+        assert!(ws.expanded_clusters.contains(&cluster));
+        assert!(!ws.toggle_cluster_expanded(cluster), "second toggle closes");
+        assert!(ws.expanded_clusters.is_empty());
+
+        ws.toggle_cluster_expanded(cluster);
+        ws.set_root(SymbolId::from_content("b", "b.c", 1));
+        assert!(
+            ws.expanded_clusters.is_empty(),
+            "a new root starts with nothing opened"
         );
     }
 
