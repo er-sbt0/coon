@@ -18,6 +18,25 @@ pub struct LspClient {
     pub(crate) pending_requests: HashMap<i64, String>,
 }
 
+/// Re-log one line of clangd's stderr at the level clangd gave it.
+///
+/// clangd prefixes each line with its own severity — `I[12:00:00.000]`,
+/// `E[...]`, `V[...]` — and logging the lot as an error buried the app's own
+/// errors in tens of thousands of routine index messages. Keeping the level
+/// means `grep ERROR` finds clangd actually failing, while the running
+/// commentary (which requests it received, which it replied to, and how long
+/// each took) stays available a level down.
+fn log_clangd_line(line: &str) {
+    match line.as_bytes().first() {
+        Some(b'E') => log::error!("clangd: {line}"),
+        Some(b'W') => log::warn!("clangd: {line}"),
+        // `I` is where clangd logs the request/reply traffic that pairs with the
+        // ids `LspWorkerState::track_request` writes out.
+        Some(b'I') => log::debug!("clangd: {line}"),
+        _ => log::trace!("clangd: {line}"),
+    }
+}
+
 impl LspClient {
     /// Create a new LspClient with a custom clangd path
     pub async fn with_path(tx: mpsc::Sender<Value>, clangd_path: &str) -> Result<Self> {
@@ -78,7 +97,7 @@ impl LspClient {
                 match stderr_reader.read_line(&mut line).await {
                     Ok(0) => break,
                     Ok(_) => {
-                        log::error!("LSP stderr: {}", line.trim());
+                        log_clangd_line(line.trim());
                         line.clear();
                     }
                     Err(e) => {

@@ -112,91 +112,116 @@ pub(super) async fn handle_lsp_message(
     state: &mut LspWorkerState,
     response_tx: &mpsc::Sender<LspResponse>,
 ) {
-    if let Some(id) = message.get("id").and_then(|i| i.as_i64()) {
-        if let Some(request_id) = state.service_requests.remove(&id) {
-            let request_type = state.request_types.remove(&id);
+    let Some(id) = message.get("id").and_then(|i| i.as_i64()) else {
+        // A notification: diagnostics, progress, a log message. Nothing waits
+        // on these, so they are only interesting in full-trace mode.
+        log::trace!(
+            "LSP notification: {}",
+            message
+                .get("method")
+                .and_then(|m| m.as_str())
+                .unwrap_or("?")
+        );
+        return;
+    };
 
-            match request_type {
-                Some(RequestType::PrepareCallHierarchy) => {
-                    call_hierarchy::handle_prepare_call_hierarchy_response(
-                        message,
-                        request_id,
-                        state,
-                        response_tx,
-                    )
-                    .await;
-                }
-                Some(RequestType::OutgoingCalls) => {
-                    call_hierarchy::handle_outgoing_calls_response(
-                        message,
-                        request_id,
-                        state,
-                        response_tx,
-                    )
-                    .await;
-                }
-                Some(RequestType::IncomingCalls) => {
-                    call_hierarchy::handle_incoming_calls_response(
-                        message,
-                        request_id,
-                        state,
-                        response_tx,
-                    )
-                    .await;
-                }
-                Some(RequestType::References) => {
-                    references::handle_references_response(message, request_id, state, response_tx)
-                        .await;
-                }
-                Some(RequestType::ReferencesWithSymbols) => {
-                    references::handle_references_with_symbols_response(
-                        message,
-                        request_id,
-                        state,
-                        response_tx,
-                    )
-                    .await;
-                }
-                Some(RequestType::DocumentSymbols) => {
-                    symbols::handle_document_symbols_response(
-                        message,
-                        request_id,
-                        state,
-                        response_tx,
-                    )
-                    .await;
-                }
-                Some(RequestType::DocumentSymbolsForEnhancedRefs { base_request_id }) => {
-                    symbols::handle_document_symbols_for_enhanced_refs(
-                        message,
-                        base_request_id,
-                        state,
-                        response_tx,
-                    )
-                    .await;
-                }
-                Some(RequestType::WorkspaceSymbols) => {
-                    symbols::handle_workspace_symbols_response(
-                        message,
-                        request_id,
-                        state,
-                        response_tx,
-                    )
-                    .await;
-                }
-                None => {
-                    log::warn!("No request type tracked for LSP request {}, falling back to content detection", id);
-                    legacy::handle_legacy_response_detection(
-                        message,
-                        request_id,
-                        state,
-                        response_tx,
-                    )
-                    .await;
-                }
+    if let Some(request_id) = state.service_requests.remove(&id) {
+        let waited = state.finish_request(id);
+        let request_type = state.request_types.remove(&id);
+        log::info!(
+            "LSP worker: clangd answered request {} after {:?}: type={:?}, service_id={} ({} still outstanding)",
+            id,
+            waited.unwrap_or_default(),
+            request_type,
+            request_id,
+            state.service_requests.len()
+        );
+
+        match request_type {
+            Some(RequestType::PrepareCallHierarchy) => {
+                call_hierarchy::handle_prepare_call_hierarchy_response(
+                    message,
+                    request_id,
+                    state,
+                    response_tx,
+                )
+                .await;
             }
+            Some(RequestType::OutgoingCalls) => {
+                call_hierarchy::handle_outgoing_calls_response(
+                    message,
+                    request_id,
+                    state,
+                    response_tx,
+                )
+                .await;
+            }
+            Some(RequestType::IncomingCalls) => {
+                call_hierarchy::handle_incoming_calls_response(
+                    message,
+                    request_id,
+                    state,
+                    response_tx,
+                )
+                .await;
+            }
+            Some(RequestType::References) => {
+                references::handle_references_response(message, request_id, state, response_tx)
+                    .await;
+            }
+            Some(RequestType::ReferencesWithSymbols) => {
+                references::handle_references_with_symbols_response(
+                    message,
+                    request_id,
+                    state,
+                    response_tx,
+                )
+                .await;
+            }
+            Some(RequestType::DocumentSymbols) => {
+                symbols::handle_document_symbols_response(message, request_id, state, response_tx)
+                    .await;
+            }
+            Some(RequestType::DocumentSymbolsForEnhancedRefs { base_request_id }) => {
+                symbols::handle_document_symbols_for_enhanced_refs(
+                    message,
+                    base_request_id,
+                    state,
+                    response_tx,
+                )
+                .await;
+            }
+            Some(RequestType::WorkspaceSymbols) => {
+                symbols::handle_workspace_symbols_response(message, request_id, state, response_tx)
+                    .await;
+            }
+            None => {
+                log::warn!(
+                    "No request type tracked for LSP request {}, falling back to content detection",
+                    id
+                );
+                legacy::handle_legacy_response_detection(message, request_id, state, response_tx)
+                    .await;
+            }
+        }
 
-            state.enhanced_lsp_requests.remove(&id);
+        state.enhanced_lsp_requests.remove(&id);
+    } else {
+        // Either clangd is answering something we have already given up on,
+        // or it is asking *us* something (configuration, a work-done token)
+        // that this loop silently drops. Both look like a lost reply from
+        // upstream, so say which one happened.
+        state.finish_request(id);
+        match message.get("method").and_then(|m| m.as_str()) {
+            Some(method) => log::info!(
+                "LSP worker: server-initiated request {} ({}), not answered",
+                id,
+                method
+            ),
+            None => log::warn!(
+                "LSP worker: reply to untracked request {} — dropped (was it already retired?)",
+                id
+            ),
         }
     }
 }

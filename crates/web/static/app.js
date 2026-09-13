@@ -856,6 +856,7 @@ const load = {
   done: 0,          // determinate progress…
   total: 0,         // …or 0 when this stage reports no total
   count: null,      // a bare running count, for stages that have no end in sight
+  stage: null,      // which stage the numbers above describe
   symbols: false,   // stage 1: clangd still has symbols to hand over
   edges: false,     // stage 2: those symbols still need their calls
 };
@@ -881,6 +882,11 @@ function loading() { return load.symbols || load.edges; }
 /// many are coming.
 function renderLoad() {
   if (!loading()) return;
+  // The numbers belong to whichever stage last set them, and a finished stage's
+  // numbers are a lie: painting them is what leaves "Resolving calls 15 / 19" on
+  // screen after every call has in fact been resolved.
+  if (load.stage === 'edges' && !load.edges) return;
+  if (load.stage === 'symbols' && !load.symbols) return;
 
   const counts = load.total > 0
     ? `${load.done.toLocaleString()} / ${load.total.toLocaleString()}`
@@ -896,19 +902,20 @@ function updateStatusFromEvent(key, payload) {
 
     if (phase === 'PreloadingDocuments' && body) {
       Object.assign(load, {
-        symbols: true, label: PHASE_LABEL[phase],
+        symbols: true, stage: 'symbols', label: PHASE_LABEL[phase],
         done: body.done, total: body.total, count: null,
       });
     } else if (phase === 'LoadingWorkspaceSymbols' && body) {
       // No total: clangd streams symbols without saying how many are coming,
       // so this stage shows a running count and no bar.
       Object.assign(load, {
-        symbols: true, label: PHASE_LABEL[phase],
+        symbols: true, stage: 'symbols', label: PHASE_LABEL[phase],
         done: 0, total: 0, count: body.loaded,
       });
     } else if (PHASE_LABEL[phase]) {
       Object.assign(load, {
-        symbols: true, label: PHASE_LABEL[phase], done: 0, total: 0, count: null,
+        symbols: true, stage: 'symbols', label: PHASE_LABEL[phase],
+        done: 0, total: 0, count: null,
       });
     } else {
       // Completed, NotStarted or Failed — stage 1 is over either way. Whether
@@ -925,7 +932,7 @@ function updateStatusFromEvent(key, payload) {
     const { done, total } = payload || {};
     load.edges = total > 0 && done < total;
     if (load.edges) {
-      Object.assign(load, { label: 'Resolving calls', done, total, count: null });
+      Object.assign(load, { stage: 'edges', label: 'Resolving calls', done, total, count: null });
     }
     renderLoad();
     if (!loading()) setStatus('Ready', 'ready');

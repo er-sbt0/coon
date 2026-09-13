@@ -25,6 +25,26 @@ pub enum LoadingState {
 pub struct PendingRequest {
     pub symbol_id: Option<SymbolId>,
     pub timestamp: Instant,
+    /// What was asked for, in words, so a log line about a stuck request says
+    /// which symbol it is stuck on rather than only a uuid. Carried on the
+    /// request because by the time the wait is interesting the caller that knew
+    /// the name is long gone.
+    pub label: String,
+}
+
+impl PendingRequest {
+    pub fn new(symbol_id: Option<SymbolId>, label: impl Into<String>) -> Self {
+        Self {
+            symbol_id,
+            timestamp: Instant::now(),
+            label: label.into(),
+        }
+    }
+
+    /// How long this request has been outstanding.
+    pub fn age(&self) -> std::time::Duration {
+        self.timestamp.elapsed()
+    }
 }
 
 /// Manages all LSP communication channels and request tracking.
@@ -171,6 +191,16 @@ impl LspBridge {
 
         for (request_id, pending) in timed_out {
             self.pending_requests.remove(&request_id);
+            // The one place a request disappears without clangd ever answering.
+            // Silent until now, which made a warmup that crawled at the timeout
+            // interval look identical to one that was simply slow.
+            log::warn!(
+                "core::LspBridge request timed out after {:?}: {} (request_id={}, {} still in flight)",
+                pending.age(),
+                pending.label,
+                request_id,
+                self.pending_requests.len()
+            );
             if let Some(symbol_id) = pending.symbol_id {
                 self.loading_states.insert(
                     symbol_id,
@@ -197,11 +227,23 @@ impl LspBridge {
                     function.name.clone(),
                 )
             } else {
+                // The caller has already taken this symbol off whatever queue it
+                // came from, so a silent return leaves it unresolved forever.
+                log::warn!(
+                    "core::LspBridge no call hierarchy for {:?}: not in the call graph",
+                    function_id
+                );
                 return None;
             }
         };
 
-        let request_tx = self.request_tx.as_ref()?.clone();
+        let Some(request_tx) = self.request_tx.clone() else {
+            log::warn!(
+                "core::LspBridge no call hierarchy for {}: LSP channel not wired up yet",
+                _name
+            );
+            return None;
+        };
 
         let document_uri = match lsp_types::Url::from_file_path(&file_path) {
             Ok(uri) => uri,
@@ -223,10 +265,20 @@ impl LspBridge {
 
         self.pending_requests.insert(
             request_id.clone(),
-            PendingRequest {
-                symbol_id: Some(*function_id),
-                timestamp: Instant::now(),
-            },
+            PendingRequest::new(
+                Some(*function_id),
+                format!("prepare {} ({}:{})", _name, file_path, line),
+            ),
+        );
+
+        log::info!(
+            "core::LspBridge prepare call hierarchy: request_id={} symbol={} at {}:{}:{} ({} in flight)",
+            request_id,
+            _name,
+            file_path,
+            line,
+            column,
+            self.pending_requests.len()
         );
 
         let request = LspRequest::PrepareCallHierarchy {
@@ -286,10 +338,7 @@ impl LspBridge {
 
         self.pending_requests.insert(
             request_id.clone(),
-            PendingRequest {
-                symbol_id: Some(*function_id),
-                timestamp: Instant::now(),
-            },
+            PendingRequest::new(Some(*function_id), format!("references {}", name)),
         );
 
         let request = LspRequest::FindReferencesWithSymbols {
@@ -316,10 +365,7 @@ impl LspBridge {
 
         self.pending_requests.insert(
             request_id.clone(),
-            PendingRequest {
-                symbol_id: None,
-                timestamp: Instant::now(),
-            },
+            PendingRequest::new(None, "workspace symbols"),
         );
 
         let request = LspRequest::GetWorkspaceSymbols {
@@ -351,10 +397,14 @@ impl LspBridge {
 
         self.pending_requests.insert(
             request_id.clone(),
-            PendingRequest {
-                symbol_id: Some(*symbol_id),
-                timestamp: Instant::now(),
-            },
+            PendingRequest::new(
+                Some(*symbol_id),
+                format!(
+                    "{} calls {}",
+                    if outgoing { "outgoing" } else { "incoming" },
+                    item.name
+                ),
+            ),
         );
 
         let request_tx = match self.request_tx.as_ref() {
@@ -402,7 +452,39 @@ impl LspBridge {
 
     /// Remove and return a pending request by ID.
     pub fn take_pending(&mut self, request_id: &str) -> Option<PendingRequest> {
-        self.pending_requests.remove(request_id)
+        let pending = self.pending_requests.remove(request_id);
+        match &pending {
+            Some(p) => log::debug!(
+                "core::LspBridge answered after {:?}: {} ({} still in flight)",
+                p.age(),
+                p.label,
+                self.pending_requests.len()
+            ),
+            // A reply nobody is waiting for: either it already timed out, or it
+            // belongs to a request the loader issued under its own id. Both are
+            // worth seeing when the warmup stops moving.
+            None => log::warn!(
+                "core::LspBridge response for unknown request_id={} ({} in flight)",
+                request_id,
+                self.pending_requests.len()
+            ),
+        }
+        pending
+    }
+
+    /// Everything currently outstanding, oldest first, as one line per request.
+    ///
+    /// The warmup only sends while there is room under its in-flight ceiling,
+    /// so when it stalls this list *is* the reason: whatever is in here is what
+    /// the queue is waiting behind.
+    pub fn pending_summary(&self) -> String {
+        let mut pending: Vec<_> = self.pending_requests.iter().collect();
+        pending.sort_by_key(|(_, p)| p.timestamp);
+        pending
+            .iter()
+            .map(|(id, p)| format!("{} [{}ms, {}]", p.label, p.age().as_millis(), id))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     // ---- Query helpers ----

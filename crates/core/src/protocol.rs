@@ -198,6 +198,14 @@ pub struct Routed {
 #[derive(Debug, Default)]
 pub struct EventRouter {
     lsp_completed_sent: bool,
+    /// The last warmup fraction handed to the client.
+    ///
+    /// Kept only so the log can record what the status bar was actually told:
+    /// `ResolvingCalls` goes out on every tick, so without this the log would
+    /// either say nothing or say it ten times a second — and the question a
+    /// stuck "Resolving calls 15/19" raises is precisely whether the client was
+    /// ever sent anything past 15.
+    last_resolving: Option<(usize, usize)>,
 }
 
 impl EventRouter {
@@ -216,11 +224,22 @@ impl EventRouter {
                 AppEvent::LayoutDirty => {
                     resnapshot = true;
                 }
+                // Forwarded exactly once, and that once matters: the client
+                // treats every phase before `Completed` as "stage 1 is still
+                // running", so a client that never sees it keeps a loading
+                // stage open forever — and the status line goes on painting the
+                // last fraction it was given long after the load has finished.
+                // Once, not every tick, because the phase latches: re-sending it
+                // ten times a second would stamp "Ready" over anything else the
+                // status line had to say.
                 AppEvent::LspProgress(LspLoadPhase::Completed) => {
                     if !self.lsp_completed_sent {
-                        log::info!("[protocol] LspProgress(Completed) — one-time resnapshot");
+                        log::info!(
+                            "[protocol] LspProgress(Completed) — forwarded once, with a resnapshot"
+                        );
                         self.lsp_completed_sent = true;
                         resnapshot = true;
+                        forward.push(event.clone());
                     }
                 }
                 // Graph is now fully populated — resnapshot so the client can
@@ -252,6 +271,13 @@ impl EventRouter {
                 | AppEvent::WorkspaceRenamed { .. } => {
                     log::info!("[protocol] {:?} — workspace change, resnapshot", event);
                     resnapshot = true;
+                    forward.push(event.clone());
+                }
+                AppEvent::ResolvingCalls { done, total } => {
+                    if self.last_resolving != Some((*done, *total)) {
+                        self.last_resolving = Some((*done, *total));
+                        log::info!("[protocol] ResolvingCalls {done}/{total} — sent to client");
+                    }
                     forward.push(event.clone());
                 }
                 _ => forward.push(event.clone()),
@@ -334,6 +360,12 @@ mod tests {
         assert!(
             first.resnapshot,
             "the transition to Completed must snapshot"
+        );
+        assert_eq!(
+            first.forward.len(),
+            1,
+            "the client needs this one to close its loading stage — without it \
+             the status line never leaves the last fraction it was given"
         );
 
         // The phase stays Completed forever, so every later tick repeats the

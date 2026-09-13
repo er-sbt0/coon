@@ -35,6 +35,21 @@ const CLUSTERING_SETTLE: Duration = Duration::from_millis(300);
 /// for a request the user makes while the warmup is still running.
 const WARMUP_IN_FLIGHT: usize = 8;
 
+/// How often the edge warmup writes its state to the log while it runs.
+///
+/// The status bar shows a fraction and nothing else, so a warmup that has
+/// stopped moving looks exactly like one that is merely slow. This is the log's
+/// answer to "stuck on what?" — often enough to catch a stall as it happens,
+/// rare enough not to bury the log under ten lines a second.
+const WARMUP_LOG_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How long the warmup fraction may sit still before the log says so out loud.
+///
+/// Longer than any single call-hierarchy round trip on a warm index, shorter
+/// than the 30s request timeout in `LspBridge` — so a request clangd is never
+/// going to answer is named here before the timeout quietly retires it.
+const WARMUP_STALL_AFTER: Duration = Duration::from_secs(10);
+
 /// Frontend-agnostic application core.
 ///
 /// Owns the call graph, workspace state, and LSP bridge. Emits `AppEvent`
@@ -102,6 +117,18 @@ pub struct CoreApp {
     /// Without it the end would be announced on every tick thereafter, since
     /// "the queue is empty" stays true forever.
     warmup_finish_reported: bool,
+    /// The fraction the warmup last reported, and when it last changed.
+    ///
+    /// Only here for the log: a stall is not a state the app acts on, it is a
+    /// thing the user notices in the status bar and then has to explain, so what
+    /// the log needs is the moment progress stopped and what was outstanding
+    /// then.
+    warmup_last_done: usize,
+    warmup_last_moved: Option<Instant>,
+    /// When the warmup opened, so the log can say how long the whole sweep took.
+    warmup_started_at: Option<Instant>,
+    /// When the warmup last wrote its state out, for throttling.
+    warmup_last_logged: Option<Instant>,
 }
 
 impl CoreApp {
@@ -137,6 +164,10 @@ impl CoreApp {
             warmup_seeded: false,
             warmup_total: 0,
             warmup_finish_reported: false,
+            warmup_last_done: 0,
+            warmup_last_moved: None,
+            warmup_started_at: None,
+            warmup_last_logged: None,
         }
     }
 
@@ -868,29 +899,97 @@ impl CoreApp {
             self.warmup_seeded = true;
             self.edge_warmup = self.call_graph.function_ids().copied().collect();
             self.warmup_total = self.edge_warmup.len();
+            self.warmup_last_moved = Some(Instant::now());
+            self.warmup_started_at = Some(Instant::now());
             log::info!(
-                "CoreApp: warming up call hierarchy for {} symbol(s)",
-                self.edge_warmup.len()
+                "CoreApp: warming up call hierarchy for {} symbol(s), {} in flight, {} node(s) in the graph",
+                self.edge_warmup.len(),
+                self.lsp.pending_requests.len(),
+                self.call_graph.node_count()
             );
         }
 
         let mut events = Vec::new();
+        let mut sent = 0usize;
+        let mut skipped = 0usize;
         while self.lsp.pending_requests.len() < WARMUP_IN_FLIGHT {
             let Some(id) = self.edge_warmup.pop_front() else {
                 break;
             };
             // The user may have expanded this one while the queue drained.
             if self.lsp.is_function_loaded(&id) || self.lsp.is_function_loading(&id) {
+                skipped += 1;
                 continue;
             }
             self.lsp.set_loading_state(id, LoadingState::Loading);
+            sent += 1;
             if let Some(ev) = self.lsp.send_call_hierarchy(&self.call_graph, &id) {
                 events.push(ev);
             }
         }
+        if sent > 0 || skipped > 0 {
+            log::debug!(
+                "CoreApp: warmup pump sent {} request(s), skipped {} already-loaded, {} queued",
+                sent,
+                skipped,
+                self.edge_warmup.len()
+            );
+        }
 
+        self.trace_warmup();
         events.extend(self.report_warmup_progress());
         events
+    }
+
+    /// Write the warmup's state to the log: how far it has got, what it is
+    /// waiting on, and — the point of the whole thing — how long the fraction
+    /// has been standing still.
+    ///
+    /// The warmup only sends while it is under `WARMUP_IN_FLIGHT`, so a
+    /// fraction that stops moving means the requests listed here are the ones
+    /// nothing has answered. Logging the ages alongside them is what separates
+    /// "clangd is slow" from "clangd will never reply to this one".
+    fn trace_warmup(&mut self) {
+        if !self.warmup_seeded || self.warmup_total == 0 {
+            return;
+        }
+
+        let done = self.warmup_total.saturating_sub(self.edge_warmup.len());
+        if done != self.warmup_last_done {
+            self.warmup_last_done = done;
+            self.warmup_last_moved = Some(Instant::now());
+        }
+        if !self.warming_up() {
+            return;
+        }
+
+        let due = self
+            .warmup_last_logged
+            .is_none_or(|at| at.elapsed() >= WARMUP_LOG_INTERVAL);
+        if !due {
+            return;
+        }
+        self.warmup_last_logged = Some(Instant::now());
+
+        let still = self
+            .warmup_last_moved
+            .map(|at| at.elapsed())
+            .unwrap_or_default();
+        let summary = format!(
+            "CoreApp: edge warmup {}/{} — {} queued, {}/{} in flight, unchanged for {:.1}s; waiting on: {}",
+            done,
+            self.warmup_total,
+            self.edge_warmup.len(),
+            self.lsp.pending_requests.len(),
+            WARMUP_IN_FLIGHT,
+            still.as_secs_f32(),
+            self.lsp.pending_summary()
+        );
+        if still >= WARMUP_STALL_AFTER {
+            log::warn!("{summary}");
+        } else {
+            log::info!("{summary}");
+        }
     }
 
     /// Report how far the edge warmup has got, so a frontend can say the graph
@@ -919,8 +1018,13 @@ impl CoreApp {
         }
         self.warmup_finish_reported = true;
         log::info!(
-            "CoreApp: edge warmup drained, {} symbol(s) resolved",
-            self.warmup_total
+            "CoreApp: edge warmup drained, {} symbol(s) resolved in {:.1}s — graph has {} node(s), {} edge(s)",
+            self.warmup_total,
+            self.warmup_started_at
+                .map(|at| at.elapsed().as_secs_f32())
+                .unwrap_or_default(),
+            self.call_graph.node_count(),
+            self.call_graph.edge_count(),
         );
         vec![AppEvent::ResolvingCalls {
             done: self.warmup_total,
@@ -1535,10 +1639,7 @@ mod tests {
 
         app.lsp.pending_requests.insert(
             "symbols".to_string(),
-            PendingRequest {
-                symbol_id: None,
-                timestamp: Instant::now(),
-            },
+            PendingRequest::new(None, "workspace symbols"),
         );
         app.handle_lsp_response(LspResponse::WorkspaceSymbols {
             request_id: "symbols".to_string(),
@@ -1554,10 +1655,7 @@ mod tests {
         let caller = *app.call_graph.function_ids().next().expect("one symbol");
         app.lsp.pending_requests.insert(
             "calls".to_string(),
-            PendingRequest {
-                symbol_id: Some(caller),
-                timestamp: Instant::now(),
-            },
+            PendingRequest::new(Some(caller), "outgoing calls"),
         );
         app.handle_lsp_response(LspResponse::OutgoingCalls {
             request_id: "calls".to_string(),
