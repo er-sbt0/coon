@@ -222,6 +222,17 @@ impl EventRouter {
                     log::info!("[protocol] {:?} — scheduling resnapshot", event);
                     resnapshot = true;
                 }
+                // A regrouping changes what the cluster map is made of — which
+                // communities exist, what they are called, how many functions
+                // each stands for. None of that is derivable from the graph the
+                // client already holds, so it has to come down in a snapshot.
+                // Forwarded as well, so the status line can say the map moved
+                // rather than leaving it to redraw unannounced.
+                AppEvent::ClusteringUpdated { .. } => {
+                    log::info!("[protocol] {event:?} — regrouped, resnapshot");
+                    resnapshot = true;
+                    forward.push(event.clone());
+                }
                 // Switching, creating or closing a tab changes the root the
                 // layout is anchored to, but `CoreApp` emits no LayoutDirty for
                 // it. Resnapshot so the client re-lays out, and forward the
@@ -288,6 +299,22 @@ mod tests {
             "the snapshot supersedes the event; sending both can leave the client inconsistent"
         );
         assert!(routed.resnapshot);
+    }
+
+    #[test]
+    fn a_regrouping_snapshots_and_says_so() {
+        let mut router = EventRouter::new();
+        let routed = router.route(&[AppEvent::ClusteringUpdated { clusters: 6 }]);
+
+        assert!(
+            routed.resnapshot,
+            "which communities exist is not derivable from the graph the client holds"
+        );
+        assert_eq!(
+            routed.forward.len(),
+            1,
+            "unlike a symbol refresh, the map moving under the user is worth reporting"
+        );
     }
 
     #[test]
