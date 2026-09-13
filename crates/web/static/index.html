@@ -72,6 +72,17 @@
     <div id="dock-handle" role="separator" aria-orientation="vertical" aria-label="Resize sidebar"></div>
     <div id="cy"></div>
     <div id="expand-btn" title="Expand node">+</div>
+
+    <!-- Load progress. It sits over the canvas because that is where the user
+         is looking while the graph fills in — the footer readout alone left a
+         long clangd index looking like an app that had simply come up empty.
+         Never blocks the canvas: the graph stays usable while it loads. -->
+    <div id="load-overlay" role="status" aria-live="polite" hidden>
+      <span class="load-spinner" aria-hidden="true"></span>
+      <span id="load-label">Loading</span>
+      <span id="load-count"></span>
+      <div id="load-bar"><i id="load-bar-fill"></i></div>
+    </div>
   </div>
 
   <footer id="status-bar">

@@ -73,6 +73,13 @@ pub struct CoreApp {
     edge_warmup: VecDeque<SymbolId>,
     /// Whether the warmup queue has been seeded. Once, per load.
     warmup_seeded: bool,
+    /// How many symbols the warmup was seeded with, so progress can be reported
+    /// as a fraction rather than a countdown from an unknown start.
+    warmup_total: usize,
+    /// Whether the closing `ResolvingCalls { done: total, .. }` has gone out.
+    /// Without it the end would be announced on every tick thereafter, since
+    /// "the queue is empty" stays true forever.
+    warmup_finish_reported: bool,
 }
 
 impl CoreApp {
@@ -104,12 +111,26 @@ impl CoreApp {
             graph_changed_at: None,
             edge_warmup: VecDeque::new(),
             warmup_seeded: false,
+            warmup_total: 0,
+            warmup_finish_reported: false,
         }
     }
 
     /// The cached communities of the whole call graph.
     pub fn clustering(&self) -> &Clustering {
         &self.clustering
+    }
+
+    /// How far the initial edge warmup has got, or `None` when it is not
+    /// running. For frontends that read state directly instead of following
+    /// `AppEvent::ResolvingCalls`.
+    pub fn warmup_progress(&self) -> Option<(usize, usize)> {
+        self.warming_up().then(|| {
+            (
+                self.warmup_total.saturating_sub(self.edge_warmup.len()),
+                self.warmup_total,
+            )
+        })
     }
 
     // -------------------------------------------------------------------------
@@ -646,6 +667,7 @@ impl CoreApp {
         {
             self.warmup_seeded = true;
             self.edge_warmup = self.call_graph.function_ids().copied().collect();
+            self.warmup_total = self.edge_warmup.len();
             log::info!(
                 "CoreApp: warming up call hierarchy for {} symbol(s)",
                 self.edge_warmup.len()
@@ -666,7 +688,44 @@ impl CoreApp {
                 events.push(ev);
             }
         }
+
+        events.extend(self.report_warmup_progress());
         events
+    }
+
+    /// Report how far the edge warmup has got, so a frontend can say the graph
+    /// is still filling in rather than leaving `LspProgress(Completed)` to
+    /// claim it is ready.
+    ///
+    /// Counts symbols taken off the queue, in-flight ones included: they have
+    /// been asked for, and the alternative — waiting for each response — makes
+    /// the number lag the work by a whole round trip for no gain.
+    fn report_warmup_progress(&mut self) -> Vec<AppEvent> {
+        if !self.warmup_seeded || self.warmup_total == 0 {
+            return vec![];
+        }
+
+        if self.warming_up() {
+            self.warmup_finish_reported = false;
+            let done = self.warmup_total.saturating_sub(self.edge_warmup.len());
+            return vec![AppEvent::ResolvingCalls {
+                done,
+                total: self.warmup_total,
+            }];
+        }
+
+        if self.warmup_finish_reported {
+            return vec![];
+        }
+        self.warmup_finish_reported = true;
+        log::info!(
+            "CoreApp: edge warmup drained, {} symbol(s) resolved",
+            self.warmup_total
+        );
+        vec![AppEvent::ResolvingCalls {
+            done: self.warmup_total,
+            total: self.warmup_total,
+        }]
     }
 
     /// Recompute the cached clustering if the graph has changed and then gone
@@ -975,6 +1034,58 @@ mod tests {
             std::iter::from_fn(|| rx.try_recv().ok()).count(),
             WARMUP_IN_FLIGHT
         );
+    }
+
+    #[test]
+    fn the_warmup_reports_progress_so_completed_does_not_read_as_ready() {
+        // `LspProgress(Completed)` fires the moment clangd stops handing over
+        // symbols, which on a large project is long before the graph is worth
+        // looking at. Without this the UI announces "ready" over a canvas that
+        // then grows edges for another minute.
+        let (mut app, _rx) = loaded_app(WARMUP_IN_FLIGHT * 2);
+
+        let events = app.tick();
+        let progress = events
+            .iter()
+            .find_map(|e| match e {
+                AppEvent::ResolvingCalls { done, total } => Some((*done, *total)),
+                _ => None,
+            })
+            .expect("the warmup reports itself");
+        assert_eq!(progress, (WARMUP_IN_FLIGHT, WARMUP_IN_FLIGHT * 2));
+
+        // Drained: the end is announced exactly once, so a frontend can put the
+        // indicator away without every later tick re-announcing it.
+        app.edge_warmup.clear();
+        app.lsp.pending_requests.clear();
+
+        let done_events: Vec<_> = app
+            .tick()
+            .into_iter()
+            .filter_map(|e| match e {
+                AppEvent::ResolvingCalls { done, total } => Some((done, total)),
+                _ => None,
+            })
+            .collect();
+        let all = WARMUP_IN_FLIGHT * 2;
+        assert_eq!(done_events, vec![(all, all)], "done == total marks the end");
+        assert!(
+            !app.tick()
+                .iter()
+                .any(|e| matches!(e, AppEvent::ResolvingCalls { .. })),
+            "and not repeated forever after"
+        );
+    }
+
+    #[test]
+    fn demo_mode_reports_no_warmup_progress() {
+        // Nothing is loading, so nothing may claim to be.
+        let mut app = CoreApp::new(crate::demo::create_demo_call_graph());
+        assert!(app.warmup_progress().is_none());
+        assert!(!app
+            .tick()
+            .iter()
+            .any(|e| matches!(e, AppEvent::ResolvingCalls { .. })));
     }
 
     #[test]

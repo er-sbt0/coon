@@ -35,6 +35,11 @@ pub fn app_event_to_status(event: &AppEvent, _graph: &CallGraph) -> Option<Statu
 
         // LSP lifecycle
         AppEvent::LspProgress(_) => None,
+        // Like the load phase, the warmup has its own bar above the graph,
+        // which reads the progress off `CoreApp` directly. Routing it through
+        // the transient status line as well would overwrite whatever the user
+        // last did, ten times a second, for the whole warmup.
+        AppEvent::ResolvingCalls { .. } => None,
         AppEvent::LspRequestTimedOut => Some(StatusMessage::LspRequestTimedOut),
         AppEvent::LoadingCalls { direction } => Some(StatusMessage::LoadingCalls {
             direction: direction.clone(),

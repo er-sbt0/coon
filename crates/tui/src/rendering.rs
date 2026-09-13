@@ -34,8 +34,12 @@ pub fn ui(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    // Create main layout with conditional LSP status bar above graph view
-    let show_lsp_status = !matches!(app.core.lsp.status, LspLoadPhase::Completed);
+    // Create main layout with conditional LSP status bar above graph view.
+    // `Completed` is not the end of the wait: clangd has handed over the
+    // symbols, but their edges are still being fetched, so the bar stays up
+    // until the warmup drains too.
+    let show_lsp_status = !matches!(app.core.lsp.status, LspLoadPhase::Completed)
+        || app.core.warmup_progress().is_some();
 
     let chunks = if show_lsp_status {
         Layout::default()
@@ -73,6 +77,20 @@ pub fn ui(f: &mut Frame, app: &mut App) {
 }
 
 fn render_lsp_status_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    // The warmup outlives the load phase, so it wins the line while it runs:
+    // saying "ready" over a graph that is still growing edges is the one
+    // reading the user cannot act on.
+    if let Some((done, total)) = app.core.warmup_progress() {
+        let status_text = format!("LSP: resolving calls… {done}/{total}");
+        let paragraph = Paragraph::new(Line::from(status_text)).block(
+            Block::default()
+                .borders(Borders::NONE)
+                .style(Style::default().fg(Color::Gray)),
+        );
+        f.render_widget(paragraph, area);
+        return;
+    }
+
     let status_text = match &app.core.lsp.status {
         LspLoadPhase::NotStarted => "LSP: not started".to_string(),
         LspLoadPhase::SpawningServer => "LSP: starting clangd…".to_string(),
@@ -339,4 +357,62 @@ fn render_workspace_manager_modal(f: &mut Frame, area: ratatui::layout::Rect, ap
         .style(Style::default().fg(Color::White).bg(Color::Black));
 
     f.render_widget(paragraph, popup_area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use model::CallGraph;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    /// Render the whole UI and return the screen as text.
+    fn screen(app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("test backend");
+        terminal.draw(|f| ui(f, app)).expect("draws");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(60)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_status_bar_stays_up_while_the_edges_are_still_arriving() {
+        // `Completed` only means clangd has stopped handing over symbols. Their
+        // call edges are fetched afterwards, and on a large project that is the
+        // part the user actually waits through — so the bar must not vanish the
+        // moment the phase flips.
+        let mut app = App::new(CallGraph::new());
+        app.core.lsp.status = LspLoadPhase::Completed;
+
+        assert!(
+            !screen(&mut app).contains("LSP:"),
+            "a finished load with no warmup running shows no status bar"
+        );
+
+        // Mid-warmup: seeded, and part of the queue still owed.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.core.lsp.request_tx = Some(tx);
+        for i in 0..5 {
+            app.core.call_graph.add_function(model::FunctionNode::new(
+                format!("f{i}"),
+                format!("f{i}"),
+                model::Location::new("/src/t.c".to_string(), i + 1, 1),
+            ));
+        }
+        app.core.tick();
+
+        let rendered = screen(&mut app);
+        assert!(
+            rendered.contains("resolving calls"),
+            "the warmup owns the line while it runs, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("LSP: ready"),
+            "and must not claim the wait is over"
+        );
+    }
 }

@@ -203,6 +203,11 @@ const tabsEl     = $('tabs');
 const crumbEl    = $('breadcrumb');
 const statSymbolsEl = $('stat-symbols');
 const statNodesEl   = $('stat-nodes');
+const loadOverlayEl = $('load-overlay');
+const loadLabelEl   = $('load-label');
+const loadCountEl   = $('load-count');
+const loadBarEl     = $('load-bar');
+const loadFillEl    = $('load-bar-fill');
 
 if (CoonTransport.isDesktop) document.body.classList.add('is-desktop');
 
@@ -753,28 +758,114 @@ function setStatus(text, state) {
   lspDotEl.className = state || '';
 }
 
+// ── Load progress ────────────────────────────────────────────────────────────
+//
+// One state object behind every surface that says "still loading": the canvas
+// overlay, the footer readout and the sidebar's empty row. Each used to read
+// the events on its own and they disagreed — a call-hierarchy reply would set
+// the footer to "Ready" while the project was still halfway through indexing.
+//
+// It has two stages, because loading a project has two. Clangd hands over the
+// symbols first (`LspProgress`), and only then are their call edges fetched
+// (`ResolvingCalls`) — on a large project the second stage is the long one,
+// and it runs entirely after the phase has gone to `Completed`.
+const load = {
+  label: '',        // what to call the current stage on screen
+  done: 0,          // determinate progress…
+  total: 0,         // …or 0 when this stage reports no total
+  count: null,      // a bare running count, for stages that have no end in sight
+  symbols: false,   // stage 1: clangd still has symbols to hand over
+  edges: false,     // stage 2: those symbols still need their calls
+};
+
+// Phases named for what the user is waiting on rather than for the protocol
+// step. Absent from the map: NotStarted (idle, and demo mode's permanent
+// phase), Completed and Failed, which are not waiting states.
+const PHASE_LABEL = {
+  SpawningServer:          'Starting clangd',
+  Initializing:            'Starting clangd',
+  Initialized:             'Starting clangd',
+  DiscoveringFiles:        'Finding source files',
+  PreloadingDocuments:     'Indexing files',
+  LoadingWorkspaceSymbols: 'Loading symbols',
+};
+
+function loading() { return load.symbols || load.edges; }
+
+/// Push `load` to the overlay, the footer and its dot.
+function renderLoad() {
+  if (!loading()) {
+    loadOverlayEl.hidden = true;
+    return;
+  }
+
+  const pct = load.total > 0 ? Math.min(100, Math.round((load.done / load.total) * 100)) : 0;
+  const counts = load.total > 0
+    ? `${load.done.toLocaleString()} / ${load.total.toLocaleString()}`
+    : (load.count != null ? load.count.toLocaleString() : '');
+
+  loadLabelEl.textContent = load.label;
+  loadCountEl.textContent = counts;
+  loadBarEl.hidden = load.total === 0;
+  loadFillEl.style.width = `${pct}%`;
+  loadOverlayEl.hidden = false;
+
+  setStatus(counts ? `${load.label} ${counts}` : load.label, 'busy');
+}
+
 function updateStatusFromEvent(key, payload) {
   if (key === 'LspProgress') {
     const phase = typeof payload === 'string' ? payload : Object.keys(payload)[0];
-    if (phase === 'Completed') {
-      setStatus('Ready', 'ready');
-    } else if (phase === 'PreloadingDocuments' && payload[phase]) {
-      const { done, total } = payload[phase];
-      setStatus(`Indexing ${done}/${total}`, 'busy');
-    } else if (phase === 'LoadingWorkspaceSymbols' && payload[phase]) {
-      setStatus(`Loading symbols ${payload[phase].loaded}`, 'busy');
-    } else if (phase === 'NotStarted') {
-      // The bridge's initial phase, and the permanent one in demo mode.
-      setStatus('Idle');
+    const body = typeof payload === 'string' ? null : payload[phase];
+
+    if (phase === 'PreloadingDocuments' && body) {
+      Object.assign(load, {
+        symbols: true, label: PHASE_LABEL[phase],
+        done: body.done, total: body.total, count: null,
+      });
+    } else if (phase === 'LoadingWorkspaceSymbols' && body) {
+      // No total: clangd streams symbols without saying how many are coming,
+      // so this stage shows a running count and no bar.
+      Object.assign(load, {
+        symbols: true, label: PHASE_LABEL[phase],
+        done: 0, total: 0, count: body.loaded,
+      });
+    } else if (PHASE_LABEL[phase]) {
+      Object.assign(load, {
+        symbols: true, label: PHASE_LABEL[phase], done: 0, total: 0, count: null,
+      });
     } else {
-      setStatus(phase.replace(/([A-Z])/g, ' $1').trim(), 'busy');
+      // Completed, NotStarted or Failed — stage 1 is over either way. Whether
+      // anything is still loading is now stage 2's to say.
+      load.symbols = false;
+      if (!load.edges) {
+        if (phase === 'Completed') setStatus('Ready', 'ready');
+        else if (phase === 'NotStarted') setStatus('Idle');
+        else if (phase === 'Failed') setStatus(typeof body === 'string' ? body : 'LSP failed', 'error');
+      }
     }
+    renderLoad();
+    // The sidebar's empty row says "loading" rather than "none" while this
+    // runs, and it is rendered from a snapshot that may not come for a while.
+    if (Object.keys(allFunctions).length === 0) renderSidebar(searchEl.value);
+  } else if (key === 'ResolvingCalls') {
+    const { done, total } = payload || {};
+    load.edges = total > 0 && done < total;
+    if (load.edges) {
+      Object.assign(load, { label: 'Resolving calls', done, total, count: null });
+    }
+    renderLoad();
+    if (!loading()) setStatus('Ready', 'ready');
   } else if (key === 'LoadingCalls') {
-    setStatus(`Loading ${(payload?.direction || '').toLowerCase()} calls`, 'busy');
+    // Drowned out by the warmup, which fires one of these per symbol. While it
+    // runs, the overlay is already saying the same thing with a number on it.
+    if (!loading()) setStatus(`Loading ${(payload?.direction || '').toLowerCase()} calls`, 'busy');
   } else if (key === 'FunctionHasNoCallees') {
     infoEl.textContent = 'No callees in this direction';
   } else if (key === 'OutgoingCallsLoaded' || key === 'IncomingCallsLoaded') {
-    setStatus('Ready', 'ready');
+    // Not "Ready" mid-load: the warmup answers hundreds of these while the
+    // graph is still filling in, and each one used to declare the wait over.
+    if (!loading()) setStatus('Ready', 'ready');
   } else if (key === 'RefreshingWorkspaceSymbols') {
     setStatus('Refreshing', 'busy');
   } else if (key === 'CannotCloseLastWorkspace') {
@@ -807,7 +898,9 @@ function renderSidebar(filter) {
   if (ids.length === 0) {
     const li = document.createElement('li');
     li.className = 'empty';
-    li.textContent = Object.keys(allFunctions).length === 0 ? 'No symbols loaded yet' : 'No matches';
+    li.textContent = Object.keys(allFunctions).length > 0 ? 'No matches'
+      : loading() ? 'Loading symbols…'
+      : 'No symbols loaded yet';
     fnListEl.appendChild(li);
     return;
   }

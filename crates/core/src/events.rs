@@ -57,6 +57,18 @@ pub enum AppEvent {
     WorkspaceSymbolsLoaded {
         count: usize,
     },
+    /// The initial edge warmup is walking the loaded symbols, asking clangd for
+    /// each one's calls.
+    ///
+    /// `LspProgress(Completed)` means clangd has finished handing over symbols,
+    /// not that the graph is ready to look at: the edges arrive afterwards, and
+    /// on a large project that is the part that takes the time. A frontend that
+    /// reported only the phase would say "ready" over a graph still filling in.
+    /// `done == total` marks the end, and is sent exactly once.
+    ResolvingCalls {
+        done: usize,
+        total: usize,
+    },
 
     // ---- Workspace lifecycle ----
     WorkspaceCreated {
