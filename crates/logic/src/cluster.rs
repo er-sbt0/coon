@@ -1,0 +1,921 @@
+//! Hierarchical community detection over the call graph.
+//!
+//! A whole call graph is unreadable at once — the point of clustering is to give
+//! the frontends a coarser thing to draw first, and a way to drill in. We use
+//! Louvain: greedy modularity maximisation with an aggregation step, which
+//! yields a dendrogram rather than a single flat partition. Level 0 is the
+//! finest grouping, the last level the coarsest.
+//!
+//! **Isolated functions are left out of the clustering entirely.** A function
+//! with no calls in either direction gets no cluster at all, and
+//! [`Clustering::cluster_of`] returns `None` for it. This is deliberate: a
+//! real project loaded through clangd carries a long tail of symbols that
+//! nothing in the indexed sources calls, and giving each one a singleton
+//! top-level cluster would drown the cluster map in hundreds of one-node boxes.
+//! A self-recursive function with no other edges counts as isolated too, since
+//! self-loops are dropped when the base graph is built, and what is left
+//! connects it to nothing.
+//!
+//! The implementation works in index space — every hot loop indexes `Vec`s
+//! rather than hashing `SymbolId`s — so it stays usable on the ~10k-node graphs
+//! a mid-sized C++ project produces.
+
+use model::{CallGraph, SymbolId};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet, VecDeque};
+
+/// Modularity differences below this are summation noise, not real gains, and
+/// treating them as improvements makes the level count depend on floating-point
+/// accidents.
+const MODULARITY_EPSILON: f64 = 1e-9;
+
+/// Above this many members, picking a gateway by within-cluster reachability
+/// costs a BFS per member. Fall back to out-degree, which is one pass.
+const REACHABILITY_MEMBER_LIMIT: usize = 200;
+
+/// Local moving provably terminates on strict gains, but floating point can in
+/// principle let two nodes trade places forever. Cap the sweeps rather than
+/// risk a hang on a pathological graph.
+const MAX_LOCAL_MOVING_SWEEPS: usize = 100;
+
+/// Identifier for a cluster within one [`Clustering`].
+///
+/// Ids are assigned sequentially when the dendrogram is flattened, so they are
+/// *not* stable identifiers across recomputes: the same group of functions can
+/// come back under a different id after the graph grows. Stability across
+/// recomputes comes from seeding ([`Clustering::compute_seeded`]), which keeps
+/// the *grouping* intact; it does not keep the numbering intact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ClusterId(pub u32);
+
+/// One community at one level of the dendrogram.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Cluster {
+    pub id: ClusterId,
+    pub level: usize,
+    pub parent: Option<ClusterId>,
+    /// Sub-clusters one level finer; empty at level 0.
+    pub children: Vec<ClusterId>,
+    /// Every leaf function under this cluster, transitively, ordered by symbol
+    /// id so two runs produce byte-identical output.
+    pub members: Vec<SymbolId>,
+    pub entry_point: Option<SymbolId>,
+    pub label: String,
+}
+
+/// A hierarchical partition of a [`CallGraph`]'s connected functions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Clustering {
+    /// Indexed by `ClusterId.0`.
+    clusters: Vec<Cluster>,
+    /// `levels[l]` holds the ids at level `l`, finest first.
+    levels: Vec<Vec<ClusterId>>,
+    /// Level-0 lookup; isolated symbols are absent by design.
+    index: HashMap<SymbolId, ClusterId>,
+}
+
+impl Clustering {
+    /// Cluster the graph from scratch. Equivalent to `compute_seeded(graph, None)`.
+    pub fn compute(graph: &CallGraph) -> Self {
+        Self::compute_seeded(graph, None)
+    }
+
+    /// Cluster the graph, optionally starting the first local-moving pass from
+    /// a previous result instead of from every-node-its-own-community.
+    ///
+    /// The graph arrives incrementally from clangd, and Louvain is only a greedy
+    /// heuristic: recomputing from singletons after each batch reshuffles
+    /// clusters that did not change, which reads to the user as the map
+    /// exploding for no reason. Seeding from the previous level-0 assignment
+    /// keeps symbols that were grouped together grouped together unless the new
+    /// edges actually argue otherwise.
+    pub fn compute_seeded(graph: &CallGraph, previous: Option<&Clustering>) -> Self {
+        let (symbols, base) = build_base_graph(graph);
+        if symbols.is_empty() {
+            return Self::default();
+        }
+
+        let seed = previous.map(|prev| seed_partition(&symbols, prev));
+        let dendrogram = build_dendrogram(base, seed);
+        if dendrogram.is_empty() {
+            return Self::default();
+        }
+
+        build_clustering(graph, &symbols, &dendrogram)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.clusters.is_empty()
+    }
+
+    pub fn level_count(&self) -> usize {
+        self.levels.len()
+    }
+
+    /// The coarsest level — the clusters a frontend should draw first.
+    pub fn top_level(&self) -> &[ClusterId] {
+        self.levels.last().map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// The clusters at `level`, or an empty slice if the level does not exist.
+    pub fn level(&self, level: usize) -> &[ClusterId] {
+        self.levels.get(level).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    pub fn cluster(&self, id: ClusterId) -> Option<&Cluster> {
+        self.clusters.get(id.0 as usize)
+    }
+
+    /// The finest (level 0) cluster holding `symbol`, or `None` if the symbol is
+    /// isolated or absent.
+    pub fn cluster_of(&self, symbol: &SymbolId) -> Option<ClusterId> {
+        self.index.get(symbol).copied()
+    }
+
+    /// The chain of clusters containing `symbol`, finest first, coarsest last.
+    pub fn ancestry(&self, symbol: &SymbolId) -> Vec<ClusterId> {
+        let mut chain = Vec::new();
+        let mut current = self.cluster_of(symbol);
+        while let Some(id) = current {
+            chain.push(id);
+            current = self.cluster(id).and_then(|c| c.parent);
+        }
+        chain
+    }
+
+    pub fn clusters(&self) -> impl Iterator<Item = &Cluster> + '_ {
+        self.clusters.iter()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Weighted graph in index space
+// ---------------------------------------------------------------------------
+
+/// An undirected weighted graph over `0..n`, the shape Louvain actually works on.
+struct WeightedGraph {
+    /// Neighbours and weights, never containing the node itself.
+    adj: Vec<Vec<(usize, f64)>>,
+    /// Weight of each node's self-loop. Aggregated levels *must* keep these:
+    /// a community's internal weight becomes a self-loop on its super-node, and
+    /// dropping it makes modularity at level 1+ measure the wrong graph.
+    self_loops: Vec<f64>,
+    /// `k_i`, with the self-loop counted twice as the undirected convention wants.
+    degrees: Vec<f64>,
+    /// `2m` — the sum of all degrees.
+    total_degree: f64,
+}
+
+impl WeightedGraph {
+    fn new(adj_maps: Vec<HashMap<usize, f64>>, self_loops: Vec<f64>) -> Self {
+        let mut adj: Vec<Vec<(usize, f64)>> = adj_maps
+            .into_iter()
+            .map(|m| m.into_iter().collect::<Vec<_>>())
+            .collect();
+        // Neighbour order leaks into tie-breaking during local moving, so pin it.
+        for neighbours in &mut adj {
+            neighbours.sort_unstable_by_key(|(index, _)| *index);
+        }
+
+        let degrees: Vec<f64> = adj
+            .iter()
+            .zip(&self_loops)
+            .map(|(neighbours, loop_weight)| {
+                neighbours.iter().map(|(_, w)| *w).sum::<f64>() + 2.0 * loop_weight
+            })
+            .collect();
+        let total_degree = degrees.iter().sum();
+
+        Self {
+            adj,
+            self_loops,
+            degrees,
+            total_degree,
+        }
+    }
+
+    fn node_count(&self) -> usize {
+        self.adj.len()
+    }
+}
+
+/// Build the undirected weighted graph the clustering runs on, plus the symbol
+/// list that gives every index its meaning.
+///
+/// `CallGraph::get_callees` returns one entry per distinct *call site*, not per
+/// distinct callee — the graph deduplicates on (caller, callee, location). So
+/// the duplicates in that `Vec` are exactly the number of times the caller calls
+/// the callee, and counting them is how we get an edge weight out of an API that
+/// exposes no weights and no `edges()` accessor.
+fn build_base_graph(graph: &CallGraph) -> (Vec<SymbolId>, WeightedGraph) {
+    let mut all: Vec<SymbolId> = graph.function_ids().copied().collect();
+    // Every downstream ordering — community numbering, member lists, cluster ids —
+    // descends from this sort, which is what makes two runs byte-identical.
+    all.sort_unstable_by_key(|s| s.0);
+
+    let position: HashMap<SymbolId, usize> = all.iter().enumerate().map(|(i, s)| (*s, i)).collect();
+
+    let mut weights: Vec<HashMap<usize, f64>> = vec![HashMap::new(); all.len()];
+    for (i, symbol) in all.iter().enumerate() {
+        for callee in graph.get_callees(symbol) {
+            let Some(&j) = position.get(&callee.id) else {
+                continue;
+            };
+            // Recursion says nothing about which community a function belongs to.
+            if i == j {
+                continue;
+            }
+            *weights[i].entry(j).or_insert(0.0) += 1.0;
+            *weights[j].entry(i).or_insert(0.0) += 1.0;
+        }
+    }
+
+    // Drop the isolated symbols and compact the index space around what is left.
+    let kept: Vec<usize> = (0..all.len()).filter(|i| !weights[*i].is_empty()).collect();
+    let mut compacted = vec![usize::MAX; all.len()];
+    for (new, &old) in kept.iter().enumerate() {
+        compacted[old] = new;
+    }
+
+    let symbols: Vec<SymbolId> = kept.iter().map(|&i| all[i]).collect();
+    let adj_maps: Vec<HashMap<usize, f64>> = kept
+        .iter()
+        .map(|&old| {
+            weights[old]
+                .iter()
+                .map(|(&j, &w)| (compacted[j], w))
+                .collect()
+        })
+        .collect();
+    let self_loops = vec![0.0; symbols.len()];
+
+    (symbols, WeightedGraph::new(adj_maps, self_loops))
+}
+
+/// Translate a previous clustering into initial communities for the first pass.
+///
+/// Symbols the previous run grouped together share a fresh community index;
+/// symbols it never saw start on their own.
+fn seed_partition(symbols: &[SymbolId], previous: &Clustering) -> Vec<usize> {
+    let mut mapping: HashMap<ClusterId, usize> = HashMap::new();
+    let mut next = 0usize;
+    let mut communities = Vec::with_capacity(symbols.len());
+
+    for symbol in symbols {
+        let community = match previous.cluster_of(symbol) {
+            Some(old) => *mapping.entry(old).or_insert_with(|| {
+                let assigned = next;
+                next += 1;
+                assigned
+            }),
+            None => {
+                let assigned = next;
+                next += 1;
+                assigned
+            }
+        };
+        communities.push(community);
+    }
+
+    communities
+}
+
+// ---------------------------------------------------------------------------
+// Louvain
+// ---------------------------------------------------------------------------
+
+/// Phase one: move nodes between communities while any move raises modularity.
+fn local_moving(graph: &WeightedGraph, mut communities: Vec<usize>) -> Vec<usize> {
+    let n = graph.node_count();
+    let m2 = graph.total_degree;
+    if n == 0 || m2 <= 0.0 {
+        return communities;
+    }
+
+    // Community labels are node indices, so `n` slots always suffice.
+    let mut community_degree = vec![0.0f64; n];
+    for (node, &community) in communities.iter().enumerate() {
+        community_degree[community] += graph.degrees[node];
+    }
+
+    let mut link_weight = vec![0.0f64; n];
+    let mut touched: Vec<usize> = Vec::new();
+
+    for _ in 0..MAX_LOCAL_MOVING_SWEEPS {
+        let mut moved = false;
+
+        for node in 0..n {
+            let origin = communities[node];
+
+            for &(neighbour, weight) in &graph.adj[node] {
+                let community = communities[neighbour];
+                // Weights are strictly positive, so a zero entry means untouched.
+                if link_weight[community] == 0.0 {
+                    touched.push(community);
+                }
+                link_weight[community] += weight;
+            }
+            // Evaluate every candidate with the node already pulled out, which is
+            // what makes the gains comparable to each other.
+            community_degree[origin] -= graph.degrees[node];
+
+            let mut best = origin;
+            let mut best_gain =
+                link_weight[origin] - community_degree[origin] * graph.degrees[node] / m2;
+            // Candidates arrive in neighbour order; sorting them makes the winner
+            // of a tie depend on the graph alone.
+            touched.sort_unstable();
+            for &candidate in &touched {
+                if candidate == origin {
+                    continue;
+                }
+                let gain =
+                    link_weight[candidate] - community_degree[candidate] * graph.degrees[node] / m2;
+                if gain > best_gain + MODULARITY_EPSILON {
+                    best_gain = gain;
+                    best = candidate;
+                }
+            }
+
+            community_degree[best] += graph.degrees[node];
+            if best != origin {
+                communities[node] = best;
+                moved = true;
+            }
+
+            for &community in &touched {
+                link_weight[community] = 0.0;
+            }
+            touched.clear();
+        }
+
+        if !moved {
+            break;
+        }
+    }
+
+    communities
+}
+
+/// Compact arbitrary community labels to `0..count`, in first-appearance order.
+fn renumber(communities: &[usize]) -> (Vec<usize>, usize) {
+    let mut mapping: HashMap<usize, usize> = HashMap::new();
+    let mut next = 0usize;
+    let compacted = communities
+        .iter()
+        .map(|&community| {
+            *mapping.entry(community).or_insert_with(|| {
+                let assigned = next;
+                next += 1;
+                assigned
+            })
+        })
+        .collect();
+    (compacted, next)
+}
+
+fn modularity(graph: &WeightedGraph, communities: &[usize], count: usize) -> f64 {
+    let m2 = graph.total_degree;
+    if m2 <= 0.0 {
+        return 0.0;
+    }
+
+    let mut internal = vec![0.0f64; count];
+    let mut total = vec![0.0f64; count];
+    for (node, &community) in communities.iter().enumerate() {
+        total[community] += graph.degrees[node];
+        internal[community] += 2.0 * graph.self_loops[node];
+        for &(neighbour, weight) in &graph.adj[node] {
+            if communities[neighbour] == community {
+                // Each undirected edge is walked from both ends, which is exactly
+                // the doubling the formula wants.
+                internal[community] += weight;
+            }
+        }
+    }
+
+    internal
+        .iter()
+        .zip(&total)
+        .map(|(inside, degree)| inside / m2 - (degree / m2) * (degree / m2))
+        .sum()
+}
+
+/// Phase two: collapse each community into a single node.
+fn aggregate(graph: &WeightedGraph, communities: &[usize], count: usize) -> WeightedGraph {
+    let mut adj_maps: Vec<HashMap<usize, f64>> = vec![HashMap::new(); count];
+    let mut self_loops = vec![0.0f64; count];
+
+    for (node, &community) in communities.iter().enumerate() {
+        self_loops[community] += graph.self_loops[node];
+        for &(neighbour, weight) in &graph.adj[node] {
+            let other = communities[neighbour];
+            if other == community {
+                // Seen once from each end, so halve to recover the edge's weight.
+                self_loops[community] += weight / 2.0;
+            } else {
+                *adj_maps[community].entry(other).or_insert(0.0) += weight;
+            }
+        }
+    }
+
+    WeightedGraph::new(adj_maps, self_loops)
+}
+
+/// Run Louvain to exhaustion, returning one partition per level.
+///
+/// `levels[0]` maps base nodes to level-0 communities; `levels[l]` maps level
+/// `l - 1` communities to level `l` communities.
+fn build_dendrogram(base: WeightedGraph, seed: Option<Vec<usize>>) -> Vec<Vec<usize>> {
+    let mut levels: Vec<Vec<usize>> = Vec::new();
+    let mut current = base;
+    let mut initial = seed.unwrap_or_else(|| (0..current.node_count()).collect());
+
+    let mut best_modularity = f64::NEG_INFINITY;
+    loop {
+        let (communities, count) = renumber(&local_moving(&current, initial));
+        let quality = modularity(&current, &communities, count);
+
+        // Level 0 is recorded whatever it looks like: the contract is that every
+        // connected symbol has a finest cluster, even on a graph Louvain cannot
+        // improve. Coarser levels have to earn their place.
+        if !levels.is_empty() && quality <= best_modularity + MODULARITY_EPSILON {
+            break;
+        }
+        levels.push(communities.clone());
+        best_modularity = quality;
+
+        if count == current.node_count() {
+            // Nothing merged, so aggregating would reproduce the same graph.
+            break;
+        }
+        current = aggregate(&current, &communities, count);
+        initial = (0..count).collect();
+    }
+
+    levels
+}
+
+// ---------------------------------------------------------------------------
+// Dendrogram -> clusters
+// ---------------------------------------------------------------------------
+
+fn build_clustering(
+    graph: &CallGraph,
+    symbols: &[SymbolId],
+    dendrogram: &[Vec<usize>],
+) -> Clustering {
+    // Which level-`l` community each base node ends up in.
+    let mut owners: Vec<Vec<usize>> = Vec::with_capacity(dendrogram.len());
+    owners.push(dendrogram[0].clone());
+    for level in &dendrogram[1..] {
+        let previous = owners.last().expect("a level was just pushed");
+        owners.push(previous.iter().map(|&community| level[community]).collect());
+    }
+
+    // Members per community per level. Base indices are already in symbol order,
+    // so pushing in index order leaves each member list sorted.
+    let mut members: Vec<Vec<Vec<usize>>> = Vec::with_capacity(owners.len());
+    for (level, owner) in owners.iter().enumerate() {
+        let count = dendrogram[level].iter().copied().max().unwrap_or(0) + 1;
+        let mut buckets = vec![Vec::new(); count];
+        for (node, &community) in owner.iter().enumerate() {
+            buckets[community].push(node);
+        }
+        members.push(buckets);
+    }
+
+    // Assign ids finest-to-coarsest, clusters within a level ordered by their
+    // lowest member — which, given the index order, is the lowest symbol id.
+    let mut ids: Vec<Vec<Option<ClusterId>>> = Vec::with_capacity(members.len());
+    let mut order: Vec<Vec<usize>> = Vec::with_capacity(members.len());
+    let mut next_id = 0u32;
+    let mut levels: Vec<Vec<ClusterId>> = Vec::with_capacity(members.len());
+
+    for buckets in &members {
+        let mut populated: Vec<usize> = (0..buckets.len())
+            .filter(|&c| !buckets[c].is_empty())
+            .collect();
+        populated.sort_unstable_by_key(|&c| buckets[c][0]);
+
+        let mut level_ids = Vec::with_capacity(populated.len());
+        let mut slots = vec![None; buckets.len()];
+        for &community in &populated {
+            let id = ClusterId(next_id);
+            next_id += 1;
+            slots[community] = Some(id);
+            level_ids.push(id);
+        }
+        levels.push(level_ids);
+        ids.push(slots);
+        order.push(populated);
+    }
+
+    let mut clusters: Vec<Cluster> = Vec::with_capacity(next_id as usize);
+    for (level, populated) in order.iter().enumerate() {
+        for &community in populated {
+            let id = ids[level][community].expect("populated communities all have ids");
+            let member_symbols: Vec<SymbolId> = members[level][community]
+                .iter()
+                .map(|&i| symbols[i])
+                .collect();
+
+            let parent = dendrogram
+                .get(level + 1)
+                .and_then(|next| ids[level + 1][next[community]]);
+
+            let children = if level == 0 {
+                Vec::new()
+            } else {
+                order[level - 1]
+                    .iter()
+                    .filter(|&&child| dendrogram[level][child] == community)
+                    .filter_map(|&child| ids[level - 1][child])
+                    .collect()
+            };
+
+            let entry_point = choose_entry_point(graph, &member_symbols);
+            let label = entry_point
+                .and_then(|id| graph.get_function(&id))
+                .map(|f| f.name.clone())
+                .unwrap_or_default();
+
+            clusters.push(Cluster {
+                id,
+                level,
+                parent,
+                children,
+                members: member_symbols,
+                entry_point,
+                label,
+            });
+        }
+    }
+
+    let index: HashMap<SymbolId, ClusterId> = members[0]
+        .iter()
+        .enumerate()
+        .filter_map(|(community, bucket)| ids[0][community].map(|id| (bucket, id)))
+        .flat_map(|(bucket, id)| bucket.iter().map(move |&node| (symbols[node], id)))
+        .collect();
+
+    Clustering {
+        clusters,
+        levels,
+        index,
+    }
+}
+
+/// Pick the member that best serves as the cluster's front door.
+///
+/// The useful label for a group of functions is the one callers outside the
+/// group actually go through, so the gateway is the member with the most
+/// incoming calls from outside. A cluster nothing calls into — the one holding
+/// `main`, typically — has no such member, and we fall back to whichever member
+/// reaches the most of the others from inside.
+fn choose_entry_point(graph: &CallGraph, members: &[SymbolId]) -> Option<SymbolId> {
+    if members.is_empty() {
+        return None;
+    }
+
+    let inside: HashSet<SymbolId> = members.iter().copied().collect();
+
+    // Multiplicity matters: five calls into a function from outside make it more
+    // of a front door than one does.
+    let external: Vec<usize> = members
+        .iter()
+        .map(|member| {
+            graph
+                .get_callers(member)
+                .iter()
+                .filter(|caller| !inside.contains(&caller.id))
+                .count()
+        })
+        .collect();
+
+    let scores = if external.iter().any(|&score| score > 0) {
+        external
+    } else if members.len() > REACHABILITY_MEMBER_LIMIT {
+        members
+            .iter()
+            .map(|member| {
+                graph
+                    .get_callees(member)
+                    .iter()
+                    .filter(|callee| inside.contains(&callee.id))
+                    .count()
+            })
+            .collect()
+    } else {
+        members
+            .iter()
+            .map(|member| internal_reach(graph, member, &inside))
+            .collect()
+    };
+
+    let best_score = scores.iter().copied().max().unwrap_or(0);
+    members
+        .iter()
+        .zip(&scores)
+        .filter(|(_, &score)| score == best_score)
+        .map(|(member, _)| *member)
+        // Definition order is the tie-break a reader would use themselves; the
+        // uuid behind it only exists so the answer is never ambiguous.
+        .min_by(|a, b| tie_break_key(graph, a).cmp(&tie_break_key(graph, b)))
+}
+
+/// How many other members this one reaches, following calls that stay inside
+/// the cluster.
+fn internal_reach(graph: &CallGraph, start: &SymbolId, inside: &HashSet<SymbolId>) -> usize {
+    let mut seen: HashSet<SymbolId> = HashSet::from([*start]);
+    let mut queue = VecDeque::from([*start]);
+
+    while let Some(current) = queue.pop_front() {
+        for callee in graph.get_callees(&current) {
+            if inside.contains(&callee.id) && seen.insert(callee.id) {
+                queue.push_back(callee.id);
+            }
+        }
+    }
+
+    seen.len() - 1
+}
+
+fn tie_break_key(graph: &CallGraph, symbol: &SymbolId) -> (String, u32, uuid_bytes::Bytes) {
+    let location = graph.get_function(symbol).map(|f| &f.definition_location);
+    (
+        location.map(|l| l.file_path.clone()).unwrap_or_default(),
+        location.map(|l| l.line).unwrap_or(u32::MAX),
+        uuid_bytes::Bytes(*symbol.0.as_bytes()),
+    )
+}
+
+/// A thin `Ord` wrapper so the tie-break key can end in the raw uuid without
+/// `logic` taking a direct dependency on the `uuid` crate.
+mod uuid_bytes {
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    pub struct Bytes(pub [u8; 16]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use model::{FunctionNode, Location};
+
+    /// Distinct lines keep the generated `SymbolId`s distinct.
+    fn add(graph: &mut CallGraph, name: &str, line: u32) -> SymbolId {
+        graph.add_function(FunctionNode::new(
+            name.to_string(),
+            name.to_string(),
+            Location::new("test.c".to_string(), line, 0),
+        ))
+    }
+
+    /// Call sites are deduplicated by location, so each call needs its own line.
+    fn call(graph: &mut CallGraph, from: SymbolId, to: SymbolId, line: u32) {
+        graph.add_call(from, to, Location::new("test.c".to_string(), line, 0));
+    }
+
+    /// A directed triangle `a -> b -> c`, `a -> c`.
+    fn triangle(graph: &mut CallGraph, prefix: &str, base_line: u32) -> [SymbolId; 3] {
+        let a = add(graph, &format!("{prefix}_a"), base_line);
+        let b = add(graph, &format!("{prefix}_b"), base_line + 1);
+        let c = add(graph, &format!("{prefix}_c"), base_line + 2);
+        call(graph, a, b, base_line + 100);
+        call(graph, b, c, base_line + 101);
+        call(graph, a, c, base_line + 102);
+        [a, b, c]
+    }
+
+    /// Two triangles joined by a single call from the first into the second.
+    fn two_triangles() -> (CallGraph, [SymbolId; 3], [SymbolId; 3]) {
+        let mut graph = CallGraph::new();
+        let left = triangle(&mut graph, "left", 10);
+        let right = triangle(&mut graph, "right", 40);
+        call(&mut graph, left[2], right[0], 500);
+        (graph, left, right)
+    }
+
+    /// Everything the public API exposes, as comparable text.
+    fn fingerprint(clustering: &Clustering) -> String {
+        let mut out = String::new();
+        for level in 0..clustering.level_count() {
+            out.push_str(&format!("level {level}:"));
+            for id in clustering.level(level) {
+                let cluster = clustering.cluster(*id).unwrap();
+                out.push_str(&format!(
+                    " [{} parent={:?} children={:?} label={} entry={:?} members={:?}]",
+                    cluster.id.0,
+                    cluster.parent,
+                    cluster.children,
+                    cluster.label,
+                    cluster.entry_point,
+                    cluster.members
+                ));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn two_triangles_split_into_two_clusters() {
+        let (graph, left, right) = two_triangles();
+        let clustering = Clustering::compute(&graph);
+
+        assert_eq!(clustering.level(0).len(), 2);
+
+        let left_cluster = clustering.cluster_of(&left[0]).unwrap();
+        let right_cluster = clustering.cluster_of(&right[0]).unwrap();
+        assert_ne!(left_cluster, right_cluster);
+        for member in left {
+            assert_eq!(clustering.cluster_of(&member), Some(left_cluster));
+        }
+        for member in right {
+            assert_eq!(clustering.cluster_of(&member), Some(right_cluster));
+        }
+    }
+
+    #[test]
+    fn recomputing_gives_identical_output() {
+        let (graph, _, _) = two_triangles();
+        assert_eq!(
+            fingerprint(&Clustering::compute(&graph)),
+            fingerprint(&Clustering::compute(&graph))
+        );
+    }
+
+    #[test]
+    fn compute_matches_unseeded_compute_seeded() {
+        let (graph, _, _) = two_triangles();
+        assert_eq!(
+            fingerprint(&Clustering::compute(&graph)),
+            fingerprint(&Clustering::compute_seeded(&graph, None))
+        );
+    }
+
+    #[test]
+    fn isolated_symbols_are_left_out() {
+        let (mut graph, left, right) = two_triangles();
+        let lonely = add(&mut graph, "lonely", 900);
+        let recursive = add(&mut graph, "recursive", 901);
+        call(&mut graph, recursive, recursive, 950);
+
+        let clustering = Clustering::compute(&graph);
+
+        assert_eq!(clustering.cluster_of(&lonely), None);
+        assert_eq!(
+            clustering.cluster_of(&recursive),
+            None,
+            "self-recursion alone connects a function to nothing"
+        );
+        for member in left.iter().chain(right.iter()) {
+            assert!(clustering.cluster_of(member).is_some());
+        }
+    }
+
+    #[test]
+    fn every_level_partitions_the_connected_symbols() {
+        let graph = layered_graph();
+        let clustering = Clustering::compute(&graph);
+
+        let connected: HashSet<SymbolId> = graph
+            .function_ids()
+            .copied()
+            .filter(|id| clustering.cluster_of(id).is_some())
+            .collect();
+        assert!(!connected.is_empty());
+
+        for level in 0..clustering.level_count() {
+            let mut seen: HashSet<SymbolId> = HashSet::new();
+            for id in clustering.level(level) {
+                for member in &clustering.cluster(*id).unwrap().members {
+                    assert!(seen.insert(*member), "symbol in two clusters at one level");
+                }
+            }
+            assert_eq!(seen, connected, "level {level} does not cover every symbol");
+        }
+    }
+
+    #[test]
+    fn ancestry_is_a_chain_to_the_top() {
+        let graph = layered_graph();
+        let clustering = Clustering::compute(&graph);
+        assert!(
+            clustering.level_count() >= 2,
+            "fixture is meant to produce a real hierarchy"
+        );
+
+        let symbol = *graph
+            .function_ids()
+            .find(|id| clustering.cluster_of(id).is_some())
+            .unwrap();
+        let chain = clustering.ancestry(&symbol);
+
+        assert_eq!(chain.len(), clustering.level_count());
+        for (level, id) in chain.iter().enumerate() {
+            let cluster = clustering.cluster(*id).unwrap();
+            assert_eq!(cluster.level, level);
+            assert!(cluster.members.contains(&symbol));
+            if level > 0 {
+                assert_eq!(
+                    clustering.cluster(chain[level - 1]).unwrap().parent,
+                    Some(*id)
+                );
+                assert!(cluster.children.contains(&chain[level - 1]));
+            }
+        }
+        assert!(clustering.top_level().contains(chain.last().unwrap()));
+    }
+
+    #[test]
+    fn the_gateway_member_becomes_the_entry_point() {
+        let (graph, _, right) = two_triangles();
+        let clustering = Clustering::compute(&graph);
+
+        // The right triangle is only entered through `right_a`.
+        let cluster = clustering
+            .cluster(clustering.cluster_of(&right[0]).unwrap())
+            .unwrap();
+        assert_eq!(cluster.entry_point, Some(right[0]));
+        assert_eq!(cluster.label, "right_a");
+    }
+
+    #[test]
+    fn a_cluster_with_no_external_callers_falls_back_to_reach() {
+        let (graph, left, _) = two_triangles();
+        let clustering = Clustering::compute(&graph);
+
+        // Nothing calls into the left triangle, so the member reaching the most
+        // others wins: `left_a` reaches both of the others.
+        let cluster = clustering
+            .cluster(clustering.cluster_of(&left[0]).unwrap())
+            .unwrap();
+        assert_eq!(cluster.entry_point, Some(left[0]));
+        assert_eq!(cluster.label, "left_a");
+    }
+
+    #[test]
+    fn seeding_keeps_previous_groupings_together() {
+        let (graph, left, right) = two_triangles();
+        let previous = Clustering::compute(&graph);
+
+        let mut grown = graph.clone();
+        let extra = add(&mut grown, "extra", 800);
+        call(&mut grown, right[2], extra, 801);
+
+        let seeded = Clustering::compute_seeded(&grown, Some(&previous));
+
+        let left_cluster = seeded.cluster_of(&left[0]).unwrap();
+        for member in left {
+            assert_eq!(seeded.cluster_of(&member), Some(left_cluster));
+        }
+        let right_cluster = seeded.cluster_of(&right[0]).unwrap();
+        for member in right {
+            assert_eq!(seeded.cluster_of(&member), Some(right_cluster));
+        }
+        assert_ne!(left_cluster, right_cluster);
+        assert!(seeded.cluster_of(&extra).is_some());
+    }
+
+    #[test]
+    fn an_empty_graph_yields_an_empty_clustering() {
+        let graph = CallGraph::new();
+        let clustering = Clustering::compute(&graph);
+
+        assert!(clustering.is_empty());
+        assert_eq!(clustering.level_count(), 0);
+        assert!(clustering.top_level().is_empty());
+        assert!(clustering.level(0).is_empty());
+        assert_eq!(clustering.clusters().count(), 0);
+        assert!(clustering
+            .ancestry(&SymbolId::from_content("nobody", "nowhere.c", 1))
+            .is_empty());
+    }
+
+    /// Four triangles, paired tightly and the pairs joined loosely, so Louvain
+    /// has something to merge on a second pass.
+    fn layered_graph() -> CallGraph {
+        let mut graph = CallGraph::new();
+        let t1 = triangle(&mut graph, "t1", 10);
+        let t2 = triangle(&mut graph, "t2", 40);
+        let t3 = triangle(&mut graph, "t3", 70);
+        let t4 = triangle(&mut graph, "t4", 100);
+
+        for (i, (from, to)) in [(t1[1], t2[0]), (t1[2], t2[1]), (t2[2], t1[0])]
+            .into_iter()
+            .enumerate()
+        {
+            call(&mut graph, from, to, 600 + i as u32);
+        }
+        for (i, (from, to)) in [(t3[1], t4[0]), (t3[2], t4[1]), (t4[2], t3[0])]
+            .into_iter()
+            .enumerate()
+        {
+            call(&mut graph, from, to, 700 + i as u32);
+        }
+        call(&mut graph, t2[2], t3[0], 800);
+
+        graph
+    }
+}
