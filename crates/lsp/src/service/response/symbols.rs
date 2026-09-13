@@ -106,8 +106,11 @@ pub(super) async fn handle_workspace_symbols_response(
             request_id
         );
 
+        // Trace, not info: an unlimited `workspace/symbol` over jemalloc answers
+        // with ~19,600 symbols, and a line each buried the run in 20k lines of
+        // log — and cost half a second to write.
         for (i, sym) in ws_response.symbols.iter().enumerate() {
-            log::info!(
+            log::trace!(
                 "  Workspace symbol {}: name='{}', kind={:?}, container={:?}, location={}:{}:{}",
                 i,
                 sym.name,

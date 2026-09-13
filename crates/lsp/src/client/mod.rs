@@ -18,6 +18,18 @@ pub struct LspClient {
     pub(crate) pending_requests: HashMap<i64, String>,
 }
 
+/// Arguments every clangd this crate spawns is given.
+///
+/// `--limit-results` defaults to 100, and clangd applies that cap to
+/// `workspace/symbol` *before* the reply reaches
+/// `handle_workspace_symbols_response`, which then filters it down to functions
+/// in project files. On jemalloc the same 100 results filtered to anywhere
+/// between 15 and 57 functions depending on which 100 the index happened to
+/// return — and since those functions are the only seeds the edge warmup ever
+/// expands, the whole graph came out a different size on every run. The seed
+/// for a call graph cannot be a 100-symbol sample. `0` means no limit.
+const CLANGD_ARGS: &[&str] = &["--limit-results=0"];
+
 /// Re-log one line of clangd's stderr at the level clangd gave it.
 ///
 /// clangd prefixes each line with its own severity — `I[12:00:00.000]`,
@@ -41,6 +53,7 @@ impl LspClient {
     /// Create a new LspClient with a custom clangd path
     pub async fn with_path(tx: mpsc::Sender<Value>, clangd_path: &str) -> Result<Self> {
         let process = Command::new(clangd_path)
+            .args(CLANGD_ARGS)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -56,6 +69,7 @@ impl LspClient {
         working_dir: &std::path::Path,
     ) -> Result<Self> {
         let process = Command::new(clangd_path)
+            .args(CLANGD_ARGS)
             .current_dir(working_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -185,6 +199,29 @@ impl LspClient {
         let content_length = format!("Content-Length: {}\r\n\r\n", notification_str.len());
         self.writer.write_all(content_length.as_bytes()).await?;
         self.writer.write_all(notification_str.as_bytes()).await?;
+        self.writer.flush().await?;
+
+        Ok(())
+    }
+
+    /// Answer a request the *server* sent us, with an empty result.
+    ///
+    /// clangd asks for exactly one thing: `window/workDoneProgress/create`,
+    /// before it starts reporting background-index progress. It will not send a
+    /// single `$/progress` for a token whose create request is still
+    /// outstanding, so leaving this unanswered is indistinguishable from a
+    /// clangd that does not report progress at all.
+    pub async fn respond_ok(&mut self, id: Value) -> Result<()> {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": Value::Null,
+        });
+
+        let response_str = serde_json::to_string(&response)?;
+        let content_length = format!("Content-Length: {}\r\n\r\n", response_str.len());
+        self.writer.write_all(content_length.as_bytes()).await?;
+        self.writer.write_all(response_str.as_bytes()).await?;
         self.writer.flush().await?;
 
         Ok(())

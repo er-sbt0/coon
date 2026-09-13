@@ -8,8 +8,20 @@ pub enum LspLoadPhase {
     Initializing,
     Initialized,
     DiscoveringFiles,
-    PreloadingDocuments { done: usize, total: usize },
-    LoadingWorkspaceSymbols { loaded: usize },
+    PreloadingDocuments {
+        done: usize,
+        total: usize,
+    },
+    /// clangd is building its background index. Nothing can be asked of
+    /// `workspace/symbol` until this finishes without getting back a sample of
+    /// the project rather than the project.
+    IndexingProject {
+        done: usize,
+        total: usize,
+    },
+    LoadingWorkspaceSymbols {
+        loaded: usize,
+    },
     Completed,
     Failed(String),
 }

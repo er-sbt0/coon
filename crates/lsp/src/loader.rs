@@ -7,25 +7,49 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::compile_commands;
-use crate::{LspClient, LspRequest, LspResponse, LspService};
+use crate::{IndexProgress, LspClient, LspRequest, LspResponse, LspService};
 use model::lsp_status::{LspLoadPhase, LspUiMessage};
-
-/// Maximum number of workspace symbols to load during initial discovery.
-const MAX_INITIAL_SYMBOLS: usize = 200;
 
 /// How long to wait for the initial `workspace/symbol` reply before giving up
 /// and wiring the bridge anyway.
-///
-/// clangd answers this one only once its background index has caught up, so the
-/// wait scales with the project: a 217-file tree (jemalloc) takes ~6 s on a warm
-/// machine, and a cold index is slower still. The old 2 s budget expired first
-/// on anything bigger than a toy, and the frontend came up with an empty graph.
 ///
 /// Blocking here costs nothing the user can feel — there are no symbols to click
 /// until this lands. If the deadline does expire, the reply is not lost: it is
 /// forwarded to the frontend through the bridge below, which ingests workspace
 /// symbols whether or not it issued the request.
 const INITIAL_SYMBOL_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+
+/// How long to wait for clangd's background indexer to *announce itself* before
+/// concluding that it is not going to.
+///
+/// A warm `.cache/clangd/index` can leave nothing to do, and a clangd built
+/// without background indexing never reports at all; neither is an error, and
+/// neither should cost the full [`INDEX_WAIT_TIMEOUT`] before the first query
+/// goes out.
+const INDEX_START_GRACE: tokio::time::Duration = tokio::time::Duration::from_secs(2);
+
+/// How long the indexer has to stay quiet after reporting itself done before
+/// that is believed.
+///
+/// clangd reports `end` whenever its queue drains, and the preload feeds that
+/// queue 217 `didOpen`s in a row — so an `end` can arrive between batches with
+/// most of the project still to go. Waiting out a quiet window turns "the queue
+/// is empty right now" into "there is no more work", and costs a second only on
+/// the path that was about to declare victory anyway.
+const INDEX_SETTLE: tokio::time::Duration = tokio::time::Duration::from_secs(1);
+
+/// The ceiling on waiting for a running index to finish.
+///
+/// `workspace/symbol` is answered from the index as it stands the instant the
+/// request arrives — clangd never blocks on the indexer — so querying early
+/// returns whatever fraction of the project has been indexed so far. That is
+/// where the graph's run-to-run size variance came from.
+///
+/// The wait is capped rather than unbounded because nothing is interactive
+/// until it ends: the bridge is wired below it. When the cap expires the query
+/// goes out against a partial index anyway, for a fast first paint, and
+/// `run_tui_lsp_bridge` repeats it the moment indexing does finish.
+const INDEX_WAIT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 
 /// Runs the full LSP initialization sequence in the background:
 ///
@@ -102,11 +126,10 @@ pub async fn lsp_loader_task(
 
     info!("Sending initialized notification...");
     lsp_client.send_initialized().await?;
-    // clangd processes `initialized` asynchronously: it loads compile_commands.json
-    // and enqueues background indexing only after this notification is handled.
-    // Without a pause here, `workspace/symbol` arrives before the compile DB is
-    // loaded and returns 0 symbols. 500 ms is sufficient for clangd to finish
-    // the synchronous startup phase on typical projects.
+    // clangd loads compile_commands.json in reaction to `initialized`, and a
+    // `didOpen` that overtakes it is compiled with fallback flags instead of
+    // the file's real ones. This pause is only about that ordering — what the
+    // *symbol query* waits for is the index, below.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     ui_tx.send(LspUiMessage::Progress(LspLoadPhase::DiscoveringFiles))?;
@@ -131,6 +154,13 @@ pub async fn lsp_loader_task(
         .iter()
         .filter_map(|path| lsp_types::Url::from_file_path(path).ok())
         .collect();
+
+    // Whether the last thing clangd said about its indexer was that it had gone
+    // idle. Tracked from here rather than only inside `await_background_index`,
+    // because every wait below drains the same channel: a `$/progress` that
+    // lands while one of the others is reading is gone, and waiting afterwards
+    // for an announcement that has already been made waits forever.
+    let mut index_idle = false;
 
     if !document_uris.is_empty() {
         let total = document_uris.len();
@@ -157,6 +187,10 @@ pub async fn lsp_loader_task(
                     );
                     break;
                 }
+                Ok(Some(LspResponse::IndexProgress(progress))) => {
+                    index_idle = progress == IndexProgress::Finished;
+                    continue;
+                }
                 Ok(Some(_)) => continue, // unrelated response, keep waiting
                 Ok(None) => {
                     let msg = "LSP service channel closed during preload".to_string();
@@ -176,13 +210,31 @@ pub async fn lsp_loader_task(
             done: total,
             total,
         }))?;
+    }
 
-        // PreloadComplete only means the didOpen notifications were sent, not
-        // that clangd has processed them.  clangd loads the compilation database
-        // and starts background indexing in reaction to didOpen; without a pause
-        // here, workspace/symbol arrives before the compile DB is loaded and
-        // returns 0 symbols.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // The point of everything above was to get clangd indexing. Wait for it to
+    // finish before asking it anything, so the answer describes the project.
+    //
+    // Whether the query below is the one that gets a complete answer: read here
+    // rather than after the wait for symbols, because that wait can itself see
+    // the index finish — too late for this query, which has already gone out.
+    let queried_a_finished_index =
+        await_background_index(&mut lsp_service, &ui_tx, index_idle).await;
+
+    // The preload existed to make clangd load the compilation database and index
+    // the project; the index is now built, so it has done its job. Closing here
+    // rather than after the query is deliberate on two counts. Holding every
+    // document open costs a live AST worker and a resident preamble each — on a
+    // 217-file tree the difference between hundreds of megabytes and several
+    // gigabytes — and buys nothing, since `workspace/symbol` is answered from
+    // the index and every position-based request reopens its own file through
+    // `ensure_document_opened`. And clangd answers `workspace/symbol` from the
+    // static index *merged with a dynamic index of whatever is open*, whose
+    // contents depend on which of the open files have finished building their
+    // ASTs — timing that `backgroundIndexProgress` says nothing about. Querying
+    // with nothing open is what makes the answer the same twice running.
+    if let Err(e) = lsp_service.close_documents().await {
+        log::warn!("Failed to close documents before the symbol sweep: {}", e);
     }
 
     let initial_request_id = Uuid::new_v4().to_string();
@@ -204,7 +256,7 @@ pub async fn lsp_loader_task(
                 symbols,
             })) if request_id == initial_request_id => {
                 info!("Received {} initial workspace symbols", symbols.len());
-                for function_node in symbols.into_iter().take(MAX_INITIAL_SYMBOLS) {
+                for function_node in symbols {
                     let workspace_symbol = model::WorkspaceSymbolInfo {
                         name: function_node.name.clone(),
                         qualified_name: function_node.qualified_name.clone(),
@@ -222,6 +274,10 @@ pub async fn lsp_loader_task(
                 ))?;
                 break 'symbol_wait;
             }
+            Ok(Some(LspResponse::IndexProgress(progress))) => {
+                index_idle = progress == IndexProgress::Finished;
+                continue;
+            }
             Ok(Some(_)) => continue, // response for a different request, keep waiting
             Ok(None) => break,       // channel closed
             Err(_) => {
@@ -235,15 +291,21 @@ pub async fn lsp_loader_task(
         }
     }
 
-    // The preload above exists to make clangd load the compilation database and
-    // index the project; once the symbols are in, it has done its job. Holding
-    // every document open past this point costs a live AST worker and a
-    // resident preamble each — on a 217-file tree that is the difference
-    // between hundreds of megabytes and several gigabytes — and buys nothing:
-    // `workspace/symbol` is answered from the index, and every position-based
-    // request reopens its own file through `ensure_document_opened`.
-    if let Err(e) = lsp_service.close_documents().await {
-        log::warn!("Failed to close documents after the symbol sweep: {}", e);
+    // The index went idle while the symbols above were in flight, so that reply
+    // describes a project that was still being indexed. Ask again — the answer
+    // appends, because `CoreApp` ingests workspace symbols whether or not it
+    // issued the request. `requery_on_index` stays set either way: this `end`
+    // may have been another lull, and the bridge asks again on the next one.
+    let requery_on_index = !queried_a_finished_index;
+    if requery_on_index && index_idle {
+        let request_id = Uuid::new_v4().to_string();
+        info!("Background index finished during the symbol wait; re-querying ({request_id})");
+        if let Err(e) = lsp_service
+            .request_workspace_symbols(request_id, String::new())
+            .await
+        {
+            log::error!("Failed to re-query workspace symbols: {}", e);
+        }
     }
 
     ui_tx.send(LspUiMessage::Progress(LspLoadPhase::Completed))?;
@@ -260,17 +322,123 @@ pub async fn lsp_loader_task(
         error!("Failed to send LSP channels: receiver was dropped");
     }
 
-    run_tui_lsp_bridge(lsp_service, tui_request_rx, tui_response_tx).await;
+    run_tui_lsp_bridge(
+        lsp_service,
+        tui_request_rx,
+        tui_response_tx,
+        requery_on_index,
+    )
+    .await;
 
     Ok(())
 }
 
+/// Block until clangd's background indexer has drained, so the discovery query
+/// that follows is answered from a finished index rather than from however much
+/// of one exists at that instant.
+///
+/// `already_idle` carries what the preload wait overheard: it drains the same
+/// channel, so an `end` it saw is an `end` this will never see.
+///
+/// Returns whether the index actually finished. It does not on two paths, and
+/// they are not the same: the budget can run out on a big cold tree, and — on a
+/// clangd with no background indexer — nothing is ever reported at all. Only
+/// the first leaves a partial answer behind, but neither is distinguishable
+/// from here, so both are reported as unfinished and the caller arranges to ask
+/// again.
+async fn await_background_index(
+    lsp_service: &mut LspService,
+    ui_tx: &mpsc::UnboundedSender<LspUiMessage>,
+    already_idle: bool,
+) -> bool {
+    let started_waiting = tokio::time::Instant::now();
+    let ceiling = started_waiting + INDEX_WAIT_TIMEOUT;
+    let mut saw_progress = already_idle;
+    // Whether the last word was `end`. Not the same as finished: the queue
+    // drains between batches, so what makes it final is the quiet that follows.
+    let mut idle = already_idle;
+    let mut deadline = started_waiting
+        + if already_idle {
+            INDEX_SETTLE
+        } else {
+            // Nothing has been heard at all yet, and on a clangd that does not
+            // report, nothing ever will be.
+            INDEX_START_GRACE
+        };
+
+    loop {
+        match tokio::time::timeout_at(deadline, lsp_service.recv_response()).await {
+            Ok(Some(LspResponse::IndexProgress(progress))) => {
+                saw_progress = true;
+                match progress {
+                    IndexProgress::Finished => {
+                        idle = true;
+                        deadline = tokio::time::Instant::now() + INDEX_SETTLE;
+                    }
+                    IndexProgress::Started => {
+                        idle = false;
+                        deadline = ceiling;
+                        let _ = ui_tx.send(LspUiMessage::Progress(LspLoadPhase::IndexingProject {
+                            done: 0,
+                            total: 0,
+                        }));
+                    }
+                    IndexProgress::Indexing { done, total } => {
+                        idle = false;
+                        deadline = ceiling;
+                        let _ = ui_tx.send(LspUiMessage::Progress(LspLoadPhase::IndexingProject {
+                            done,
+                            total,
+                        }));
+                    }
+                }
+            }
+            Ok(Some(_)) => continue, // a straggler from the preload; keep waiting
+            Ok(None) => {
+                log::warn!("LSP service channel closed while waiting for the background index");
+                return idle;
+            }
+            // Quiet since the last `end` — that one was the real one.
+            Err(_) if idle => {
+                info!(
+                    "Background index finished after {:?}; workspace/symbol now sees the whole project",
+                    started_waiting.elapsed()
+                );
+                return true;
+            }
+            Err(_) if saw_progress => {
+                log::warn!(
+                    "Background index still running after {:?}; querying it partially built. \
+                     The query will be repeated when indexing finishes.",
+                    INDEX_WAIT_TIMEOUT
+                );
+                return false;
+            }
+            Err(_) => {
+                info!(
+                    "clangd reported no indexing within {:?} — nothing to index, or a build \
+                     without a background indexer. Continuing.",
+                    INDEX_START_GRACE
+                );
+                return false;
+            }
+        }
+    }
+}
+
 /// Bridges TUI ↔ LSP indefinitely: forwards `LspRequest`s to `lsp_service` and pipes
 /// responses back through `tui_response_tx`. Owns the service and shuts it down on exit.
+///
+/// `requery_on_index` says the discovery query above went out against an index
+/// that was not finished, so its answer describes part of the project. When
+/// clangd reports the index done, the query is repeated; `CoreApp` ingests
+/// workspace symbols whether or not it issued the request, so the second reply
+/// lands as an append rather than a replacement.
 async fn run_tui_lsp_bridge(
     mut lsp_service: LspService,
     mut tui_request_rx: mpsc::UnboundedReceiver<LspRequest>,
     tui_response_tx: mpsc::UnboundedSender<LspResponse>,
+    mut requery_on_index: bool,
 ) {
     macro_rules! forward_lsp {
         ($rid:expr, $call:expr) => {{
@@ -339,6 +507,22 @@ async fn run_tui_lsp_bridge(
             response = lsp_service.recv_response() => {
                 match response {
                     Some(r) => {
+                        if requery_on_index
+                            && matches!(r, LspResponse::IndexProgress(IndexProgress::Finished))
+                        {
+                            requery_on_index = false;
+                            let request_id = Uuid::new_v4().to_string();
+                            info!(
+                                "Background index finished; re-querying workspace symbols ({})",
+                                request_id
+                            );
+                            if let Err(e) = lsp_service
+                                .request_workspace_symbols(request_id, String::new())
+                                .await
+                            {
+                                log::error!("Failed to re-query workspace symbols: {}", e);
+                            }
+                        }
                         log::trace!("Forwarding LSP response to TUI: {:?}", r);
                         if let Err(e) = tui_response_tx.send(r) {
                             log::error!("Failed to forward LSP response to TUI: {}", e);

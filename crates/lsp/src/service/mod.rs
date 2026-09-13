@@ -64,6 +64,22 @@ pub enum LspRequest {
     Shutdown,
 }
 
+/// How far clangd's background indexer has got.
+///
+/// `workspace/symbol` is answered from that index as it stands at the instant
+/// the request arrives — clangd never blocks waiting for it — so a query sent
+/// while this is anything but [`IndexProgress::Finished`] returns a sample of
+/// the project rather than the project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexProgress {
+    /// Indexing has begun; clangd has not said how much of it there is yet.
+    Started,
+    /// `done` of `total` translation units indexed.
+    Indexing { done: usize, total: usize },
+    /// The queue has drained. The index now covers the whole project.
+    Finished,
+}
+
 /// Response types for LSP operations
 #[derive(Debug, Clone)]
 pub enum LspResponse {
@@ -104,6 +120,9 @@ pub enum LspResponse {
         request_id: String,
         error: String,
     },
+    /// Unsolicited: clangd's background indexer moved. Carries no request id
+    /// because nothing asked for it.
+    IndexProgress(IndexProgress),
 }
 
 impl LspService {

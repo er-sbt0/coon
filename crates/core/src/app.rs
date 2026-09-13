@@ -427,6 +427,15 @@ impl CoreApp {
                 // No-op in core; the TUI handled this via a dedicated status message.
                 // Future: emit a dedicated AppEvent if needed.
             }
+            LspResponse::IndexProgress(progress) => {
+                // The loader waits on this one before it ever hands the bridge
+                // over, and re-queries on it if that wait ran out. What reaches
+                // here is the tail of an index that outlived the wait — worth a
+                // log line, but not a status change: `self.lsp.status` is
+                // already `Completed`, and the warmup's seeding and the
+                // clustering's settling both read that field.
+                log::info!("CoreApp: clangd background index {:?}", progress);
+            }
             LspResponse::CallHierarchyPrepared { request_id, items } => {
                 if let Some(pending) = self.lsp.take_pending(&request_id) {
                     if let Some(symbol_id) = pending.symbol_id {

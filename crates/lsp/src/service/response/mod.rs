@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 
 mod call_hierarchy;
 mod legacy;
+mod progress;
 mod references;
 mod symbols;
 
@@ -112,16 +113,30 @@ pub(super) async fn handle_lsp_message(
     state: &mut LspWorkerState,
     response_tx: &mpsc::Sender<LspResponse>,
 ) {
+    // A `method` field means clangd is talking to us rather than answering us:
+    // a notification, or a request of its own. Checked *before* the id, because
+    // clangd numbers its own requests from zero — the same space the ids in
+    // `service_requests` live in, so matching on the id first can route
+    // clangd's question into the handler for our question of the same number.
+    if let Some(method) = message
+        .get("method")
+        .and_then(|m| m.as_str())
+        .map(str::to_owned)
+    {
+        match method.as_str() {
+            "$/progress" => progress::handle_progress(message, response_tx).await,
+            "window/workDoneProgress/create" => {
+                progress::handle_work_done_progress_create(message, state).await
+            }
+            // Diagnostics, log messages, the rest. Nothing waits on them, so
+            // they are only interesting in full-trace mode.
+            _ => log::trace!("LSP notification: {method}"),
+        }
+        return;
+    }
+
     let Some(id) = message.get("id").and_then(|i| i.as_i64()) else {
-        // A notification: diagnostics, progress, a log message. Nothing waits
-        // on these, so they are only interesting in full-trace mode.
-        log::trace!(
-            "LSP notification: {}",
-            message
-                .get("method")
-                .and_then(|m| m.as_str())
-                .unwrap_or("?")
-        );
+        log::warn!("LSP worker: message with neither a method nor an id, dropped");
         return;
     };
 
@@ -207,21 +222,12 @@ pub(super) async fn handle_lsp_message(
 
         state.enhanced_lsp_requests.remove(&id);
     } else {
-        // Either clangd is answering something we have already given up on,
-        // or it is asking *us* something (configuration, a work-done token)
-        // that this loop silently drops. Both look like a lost reply from
-        // upstream, so say which one happened.
+        // Server-initiated traffic is routed above, so this is only ever clangd
+        // answering something upstream has already given up on.
         state.finish_request(id);
-        match message.get("method").and_then(|m| m.as_str()) {
-            Some(method) => log::info!(
-                "LSP worker: server-initiated request {} ({}), not answered",
-                id,
-                method
-            ),
-            None => log::warn!(
-                "LSP worker: reply to untracked request {} — dropped (was it already retired?)",
-                id
-            ),
-        }
+        log::warn!(
+            "LSP worker: reply to untracked request {} — dropped (was it already retired?)",
+            id
+        );
     }
 }

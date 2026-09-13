@@ -155,6 +155,12 @@ impl App {
                     failed: failed_count,
                 };
             }
+            LspResponse::IndexProgress(progress) => {
+                // The loader already waited on this before handing the bridge
+                // over; what arrives here is the tail of an index that outlived
+                // that wait, and the status bar has moved on to the warmup.
+                log::info!("clangd background index {:?}", progress);
+            }
             LspResponse::ReferencesWithSymbols {
                 request_id,
                 references,

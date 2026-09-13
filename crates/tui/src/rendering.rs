@@ -100,6 +100,13 @@ fn render_lsp_status_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &App) 
         LspLoadPhase::PreloadingDocuments { done, total } => {
             format!("LSP: preloading documents… {}/{}", done, total)
         }
+        LspLoadPhase::IndexingProject { done, total } => {
+            if *total > 0 {
+                format!("LSP: indexing project… {}/{}", done, total)
+            } else {
+                "LSP: indexing project…".to_string()
+            }
+        }
         LspLoadPhase::LoadingWorkspaceSymbols { loaded } => {
             format!("LSP: loading workspace symbols… {}", loaded)
         }

@@ -882,7 +882,8 @@ const PHASE_LABEL = {
   Initializing:            'Starting clangd',
   Initialized:             'Starting clangd',
   DiscoveringFiles:        'Finding source files',
-  PreloadingDocuments:     'Indexing files',
+  PreloadingDocuments:     'Opening files',
+  IndexingProject:         'Indexing project',
   LoadingWorkspaceSymbols: 'Loading symbols',
 };
 
@@ -913,7 +914,7 @@ function updateStatusFromEvent(key, payload) {
     const phase = typeof payload === 'string' ? payload : Object.keys(payload)[0];
     const body = typeof payload === 'string' ? null : payload[phase];
 
-    if (phase === 'PreloadingDocuments' && body) {
+    if ((phase === 'PreloadingDocuments' || phase === 'IndexingProject') && body) {
       Object.assign(load, {
         symbols: true, stage: 'symbols', label: PHASE_LABEL[phase],
         done: body.done, total: body.total, count: null,

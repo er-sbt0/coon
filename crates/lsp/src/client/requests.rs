@@ -45,6 +45,16 @@ impl LspClient {
                 }),
                 ..Default::default()
             }),
+            // Ask to be told about long-running server work. clangd gates its
+            // background-index reporting on this one flag: without it
+            // `BackgroundIndexProgress` stays `Unsupported` and not a single
+            // `$/progress` is sent, which leaves the loader nothing to wait on
+            // and no way to know whether `workspace/symbol` is being answered
+            // from a finished index or from a tenth of one.
+            window: Some(lsp::WindowClientCapabilities {
+                work_done_progress: Some(true),
+                ..Default::default()
+            }),
             ..Default::default()
         };
 
