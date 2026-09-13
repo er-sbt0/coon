@@ -38,3 +38,12 @@ grid = { path = "crates/grid" }
 web = { path = "crates/web" }
 desktop = { path = "crates/desktop" }
 axum = { version = "0.7", features = ["ws"] }
+
+[profile.dev]
+# Keep file/line info for backtraces in our own crates, but skip full debug
+# info: `target/debug` was dominated by dependency symbols.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# Dependencies get no debug info at all — we don't step into them.
+debug = false
