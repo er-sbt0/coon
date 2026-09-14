@@ -20,11 +20,32 @@ pub enum LoadingState {
     Failed(String),
 }
 
+/// Who asked for a request, and so whether its answer is worth a redraw.
+///
+/// The bootstrap edge warmup sends one call-hierarchy request per symbol in the
+/// project, and every reply used to be treated exactly like a user expanding a
+/// node: `LayoutDirty`, which every out-of-process frontend turns into a full
+/// snapshot. On jemalloc that was 767 whole-graph snapshots in the 110 seconds
+/// of loading, of which one changed anything on screen — the warmup fills in
+/// edges for nodes the canvas is not drawing, because the map it opens on has
+/// no root and shows no call edges at all.
+///
+/// So a request carries who wanted it, and only the user's answers redraw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestOrigin {
+    /// The user asked: a root selected, a node expanded, a refresh.
+    User,
+    /// The background warmup asked, with nobody waiting on this one reply.
+    Warmup,
+}
+
 /// Pending LSP request information.
 #[derive(Debug, Clone)]
 pub struct PendingRequest {
     pub symbol_id: Option<SymbolId>,
     pub timestamp: Instant,
+    /// Whether anyone is waiting to see this answer. See [`RequestOrigin`].
+    pub origin: RequestOrigin,
     /// What was asked for, in words, so a log line about a stuck request says
     /// which symbol it is stuck on rather than only a uuid. Carried on the
     /// request because by the time the wait is interesting the caller that knew
@@ -33,10 +54,15 @@ pub struct PendingRequest {
 }
 
 impl PendingRequest {
-    pub fn new(symbol_id: Option<SymbolId>, label: impl Into<String>) -> Self {
+    pub fn new(
+        symbol_id: Option<SymbolId>,
+        label: impl Into<String>,
+        origin: RequestOrigin,
+    ) -> Self {
         Self {
             symbol_id,
             timestamp: Instant::now(),
+            origin,
             label: label.into(),
         }
     }
@@ -217,6 +243,7 @@ impl LspBridge {
         &mut self,
         call_graph: &CallGraph,
         function_id: &SymbolId,
+        origin: RequestOrigin,
     ) -> Option<AppEvent> {
         let (file_path, line, column, _name) = {
             if let Some(function) = call_graph.get_function(function_id) {
@@ -268,6 +295,7 @@ impl LspBridge {
             PendingRequest::new(
                 Some(*function_id),
                 format!("prepare {} ({}:{})", _name, file_path, line),
+                origin,
             ),
         );
 
@@ -338,7 +366,11 @@ impl LspBridge {
 
         self.pending_requests.insert(
             request_id.clone(),
-            PendingRequest::new(Some(*function_id), format!("references {}", name)),
+            PendingRequest::new(
+                Some(*function_id),
+                format!("references {}", name),
+                RequestOrigin::User,
+            ),
         );
 
         let request = LspRequest::FindReferencesWithSymbols {
@@ -365,7 +397,7 @@ impl LspBridge {
 
         self.pending_requests.insert(
             request_id.clone(),
-            PendingRequest::new(None, "workspace symbols"),
+            PendingRequest::new(None, "workspace symbols", RequestOrigin::User),
         );
 
         let request = LspRequest::GetWorkspaceSymbols {
@@ -392,6 +424,7 @@ impl LspBridge {
         symbol_id: &SymbolId,
         item: lsp_types::CallHierarchyItem,
         outgoing: bool,
+        origin: RequestOrigin,
     ) -> Option<AppEvent> {
         let request_id = uuid::Uuid::new_v4().to_string();
 
@@ -404,6 +437,9 @@ impl LspBridge {
                     if outgoing { "outgoing" } else { "incoming" },
                     item.name
                 ),
+                // The prepare and its follow-up are two halves of one question,
+                // so the second half is asked by whoever asked the first.
+                origin,
             ),
         );
 

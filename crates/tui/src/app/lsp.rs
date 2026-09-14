@@ -1,3 +1,4 @@
+use ::core::RequestOrigin;
 use model::SymbolId;
 
 use super::event_translate::apply_event_to_status;
@@ -10,11 +11,11 @@ impl App {
     /// handling in `CoreApp`, plus pass-throughs to `core.lsp` that everything
     /// reached directly anyway.
     pub fn request_call_hierarchy(&mut self, function_id: &SymbolId) {
-        if let Some(ev) = self
-            .core
-            .lsp
-            .send_call_hierarchy(&self.core.call_graph, function_id)
-        {
+        if let Some(ev) = self.core.lsp.send_call_hierarchy(
+            &self.core.call_graph,
+            function_id,
+            RequestOrigin::User,
+        ) {
             apply_event_to_status(&mut self.status_message, &ev);
         }
     }

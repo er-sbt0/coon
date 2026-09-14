@@ -8,6 +8,7 @@
 //! no serialisation hop.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use logic::ClusterKey;
 use model::{CallDirection, CallGraph, LspLoadPhase, SymbolId};
@@ -20,6 +21,13 @@ use crate::layout::{
     compute_cluster_layout, compute_layout, GraphLayout, LayoutOptions, LayoutOrientation, NodePos,
 };
 use crate::workspace::ViewMode;
+
+/// While the bootstrap edge warmup runs, at most one snapshot this often.
+///
+/// Long enough that the client is not rebuilding its canvas and sidebar on a
+/// treadmill, short enough that a project whose map does settle mid-load shows
+/// it. Loading is reported by the status bar, not by the graph redrawing.
+const LOADING_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Messages the backend sends to the client.
 #[derive(Debug, Serialize)]
@@ -189,6 +197,14 @@ pub struct EventRouter {
     /// stuck "Resolving calls 15/19" raises is precisely whether the client was
     /// ever sent anything past 15.
     last_resolving: Option<(usize, usize)>,
+    /// Whether the bootstrap edge warmup is still running, as of the last
+    /// `ResolvingCalls`. While it is, snapshots are rate-limited.
+    warming_up: bool,
+    /// A snapshot that fell due while the rate limit was holding. Never
+    /// dropped — the next route past the interval sends it.
+    snapshot_owed: bool,
+    /// When the last snapshot went out, for that rate limit.
+    last_snapshot_at: Option<Instant>,
 }
 
 impl EventRouter {
@@ -198,14 +214,20 @@ impl EventRouter {
 
     pub fn route(&mut self, events: &[AppEvent]) -> Routed {
         let mut forward = Vec::new();
-        let mut resnapshot = false;
+        // Kept apart because only one of them is worth making somebody wait
+        // for. A user's redraw goes out the instant it is asked for; one the
+        // background caused can be held.
+        let mut user_resnapshot = false;
+        let mut background_resnapshot = false;
 
         for event in events {
             match event {
                 // Consumed, not forwarded: the snapshot that follows carries
                 // the new positions along with the graph structure.
                 AppEvent::LayoutDirty => {
-                    resnapshot = true;
+                    // Only ever user-initiated now — the warmup's replies no
+                    // longer emit one. See `RequestOrigin`.
+                    user_resnapshot = true;
                 }
                 // Forwarded exactly once, and that once matters: the client
                 // treats every phase before `Completed` as "stage 1 is still
@@ -221,7 +243,7 @@ impl EventRouter {
                             "[protocol] LspProgress(Completed) — forwarded once, with a resnapshot"
                         );
                         self.lsp_completed_sent = true;
-                        resnapshot = true;
+                        background_resnapshot = true;
                         forward.push(event.clone());
                     }
                 }
@@ -231,7 +253,7 @@ impl EventRouter {
                 // a double-send can leave the client inconsistent mid-flight.
                 AppEvent::GraphSymbolsUpdated { .. } => {
                     log::info!("[protocol] {:?} — scheduling resnapshot", event);
-                    resnapshot = true;
+                    background_resnapshot = true;
                 }
                 // A regrouping changes what the cluster map is made of — which
                 // communities exist, what they are called, how many functions
@@ -241,7 +263,7 @@ impl EventRouter {
                 // rather than leaving it to redraw unannounced.
                 AppEvent::ClusteringUpdated { .. } => {
                     log::info!("[protocol] {event:?} — regrouped, resnapshot");
-                    resnapshot = true;
+                    background_resnapshot = true;
                     forward.push(event.clone());
                 }
                 // Switching, creating or closing a tab changes the root the
@@ -253,10 +275,15 @@ impl EventRouter {
                 | AppEvent::WorkspaceClosed
                 | AppEvent::WorkspaceRenamed { .. } => {
                     log::info!("[protocol] {:?} — workspace change, resnapshot", event);
-                    resnapshot = true;
+                    user_resnapshot = true;
                     forward.push(event.clone());
                 }
                 AppEvent::ResolvingCalls { done, total } => {
+                    // The one thing that says whether the graph is still
+                    // growing on its own, which is what the rate limit below is
+                    // for. `LspProgress(Completed)` does not: the warmup only
+                    // starts once the symbols are all in.
+                    self.warming_up = *total > 0 && *done < *total;
                     if self.last_resolving != Some((*done, *total)) {
                         self.last_resolving = Some((*done, *total));
                         log::info!("[protocol] ResolvingCalls {done}/{total} — sent to client");
@@ -269,8 +296,44 @@ impl EventRouter {
 
         Routed {
             forward,
-            resnapshot,
+            resnapshot: self.gate_snapshot(user_resnapshot, background_resnapshot),
         }
+    }
+
+    /// Hold the snapshot rate down while the graph is still filling in.
+    ///
+    /// A snapshot is the whole call graph, and the client answers one by tearing
+    /// the canvas down, rebuilding it, and re-rendering a sidebar with every
+    /// symbol in the project in it. During bootstrap that is far more often than
+    /// there is anything new to see: the warmup grows the graph continuously,
+    /// but the map the user is looking at only moves when a regrouping lands.
+    ///
+    /// Only what the background caused is ever held: a `LayoutDirty` or a tab
+    /// change is somebody waiting on their own click, and making them wait out
+    /// an interval to see it would be trading one stutter for another.
+    ///
+    /// Nothing is dropped. An owed snapshot is held, not discarded, and goes out
+    /// on the first route past the interval — which is at most a tick away,
+    /// since `CoreApp::tick` always emits at least an `LspProgress`. The warmup
+    /// finishing clears `warming_up` and releases it immediately, and so does
+    /// any user action in the meantime.
+    fn gate_snapshot(&mut self, user: bool, background: bool) -> bool {
+        self.snapshot_owed |= background;
+
+        // A user waiting on their own click is never made to wait for the rate
+        // limit; it also carries whatever the background owed along with it.
+        let due = user
+            || !self.warming_up
+            || self
+                .last_snapshot_at
+                .is_none_or(|at| at.elapsed() >= LOADING_SNAPSHOT_INTERVAL);
+        if !(user || self.snapshot_owed) || !due {
+            return false;
+        }
+
+        self.snapshot_owed = false;
+        self.last_snapshot_at = Some(Instant::now());
+        true
     }
 }
 
@@ -370,6 +433,98 @@ mod tests {
 
         assert_eq!(routed.forward.len(), 2, "progress drives the status line");
         assert!(!routed.resnapshot);
+    }
+
+    /// The rate limit holds background snapshots down while the warmup runs —
+    /// but holds them, never drops them. A client that missed the update for
+    /// good would be drawing a graph that no longer exists.
+    #[test]
+    fn a_snapshot_held_back_during_the_warmup_still_goes_out() {
+        let mut router = EventRouter::new();
+
+        // The warmup announces itself, and the first regrouping goes out at once.
+        let first = router.route(&[
+            AppEvent::ResolvingCalls {
+                done: 1,
+                total: 100,
+            },
+            AppEvent::ClusteringUpdated { clusters: 3 },
+        ]);
+        assert!(first.resnapshot, "nothing to wait behind yet");
+
+        // Everything inside the interval is held.
+        for done in 2..20 {
+            let routed = router.route(&[
+                AppEvent::ResolvingCalls { done, total: 100 },
+                AppEvent::ClusteringUpdated { clusters: 3 },
+            ]);
+            assert!(!routed.resnapshot, "a second snapshot {done} ticks later");
+        }
+        assert!(router.snapshot_owed, "and it is owed, not forgotten");
+
+        // The warmup finishing releases it on the spot, without waiting out the
+        // rest of the interval: the graph has stopped moving, and what the
+        // client holds is now out of date for good.
+        let done = router.route(&[AppEvent::ResolvingCalls {
+            done: 100,
+            total: 100,
+        }]);
+        assert!(done.resnapshot, "the warmup is over; send what is owed");
+        assert!(!router.snapshot_owed);
+    }
+
+    /// The rate limit is for growth nobody asked for. Somebody waiting on their
+    /// own click is not made to wait out an interval to see it.
+    #[test]
+    fn a_users_own_redraw_is_never_held_back_by_the_rate_limit() {
+        let mut router = EventRouter::new();
+        router.route(&[
+            AppEvent::ResolvingCalls {
+                done: 1,
+                total: 100,
+            },
+            // The first goes out at once — nothing to wait behind yet — and
+            // starts the interval.
+            AppEvent::ClusteringUpdated { clusters: 3 },
+        ]);
+
+        // Held: the next regrouping the warmup causes, inside the interval.
+        assert!(
+            !router
+                .route(&[AppEvent::ClusteringUpdated { clusters: 4 }])
+                .resnapshot
+        );
+        assert!(router.snapshot_owed);
+
+        // Not held: expanding a node, mid-load, is an answer to a click.
+        assert!(router.route(&[AppEvent::LayoutDirty]).resnapshot);
+        assert!(
+            !router.snapshot_owed,
+            "and it carries the owed background snapshot out with it"
+        );
+
+        // Nor is switching tabs.
+        assert!(
+            router
+                .route(&[AppEvent::WorkspaceSwitched {
+                    id: 1,
+                    name: "Graph 1".to_string(),
+                }])
+                .resnapshot
+        );
+    }
+
+    /// Nothing is rate-limited when nothing is loading.
+    #[test]
+    fn the_rate_limit_only_applies_while_the_graph_is_still_filling_in() {
+        let mut router = EventRouter::new();
+        for _ in 0..5 {
+            assert!(
+                router
+                    .route(&[AppEvent::ClusteringUpdated { clusters: 3 }])
+                    .resnapshot
+            );
+        }
     }
 
     /// Every command shape the JavaScript client sends, verbatim.

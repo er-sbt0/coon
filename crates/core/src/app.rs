@@ -9,7 +9,7 @@ use model::{CallDirection, CallGraph, FunctionNode, Location, LspLoadPhase, Symb
 use crate::command::Command;
 use crate::events::AppEvent;
 use crate::layout::LayoutOrientation;
-use crate::lsp_bridge::{LoadingState, LspBridge};
+use crate::lsp_bridge::{LoadingState, LspBridge, RequestOrigin};
 use crate::workspace::{CoreWorkspace, CoreWorkspaceManager, ViewMode};
 
 /// How long the call graph must go without gaining nodes or edges before the
@@ -388,11 +388,20 @@ impl CoreApp {
                             symbol_id,
                             count
                         );
-                        if count == 0 {
-                            events.push(AppEvent::FunctionHasNoCallees);
-                        }
                         events.push(AppEvent::OutgoingCallsLoaded { symbol_id });
-                        events.push(AppEvent::LayoutDirty);
+                        // Only what somebody asked to see. A warmup reply is
+                        // edges for a node the canvas is not drawing, and
+                        // redrawing for each of them is what made loading
+                        // jemalloc lag; the map still catches up, through the
+                        // regrouping the settling timer starts. Nor is "no
+                        // callees" news when nobody asked: the warmup would say
+                        // it about every leaf in the project.
+                        if pending.origin == RequestOrigin::User {
+                            if count == 0 {
+                                events.push(AppEvent::FunctionHasNoCallees);
+                            }
+                            events.push(AppEvent::LayoutDirty);
+                        }
                     }
                 }
             }
@@ -414,11 +423,14 @@ impl CoreApp {
                             symbol_id,
                             count
                         );
-                        if count == 0 {
-                            events.push(AppEvent::FunctionHasNoCallees);
-                        }
                         events.push(AppEvent::IncomingCallsLoaded { symbol_id });
-                        events.push(AppEvent::LayoutDirty);
+                        // As above: a background fetch is not a redraw.
+                        if pending.origin == RequestOrigin::User {
+                            if count == 0 {
+                                events.push(AppEvent::FunctionHasNoCallees);
+                            }
+                            events.push(AppEvent::LayoutDirty);
+                        }
                     }
                 }
             }
@@ -513,10 +525,12 @@ impl CoreApp {
                                 .map(|w| w.direction)
                                 .unwrap_or(CallDirection::Outgoing);
                             let outgoing = matches!(direction, CallDirection::Outgoing);
-                            if let Some(ev) = self
-                                .lsp
-                                .send_follow_up_call(&symbol_id, first_item, outgoing)
-                            {
+                            if let Some(ev) = self.lsp.send_follow_up_call(
+                                &symbol_id,
+                                first_item,
+                                outgoing,
+                                pending.origin,
+                            ) {
                                 events.push(ev);
                             }
                         } else {
@@ -545,7 +559,10 @@ impl CoreApp {
         // Kick off call hierarchy loading if not already done
         if !self.lsp.is_function_loaded(&id) && !self.lsp.is_function_loading(&id) {
             self.lsp.set_loading_state(id, LoadingState::Loading);
-            if let Some(ev) = self.lsp.send_call_hierarchy(&self.call_graph, &id) {
+            if let Some(ev) =
+                self.lsp
+                    .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User)
+            {
                 return vec![ev, AppEvent::LayoutDirty];
             }
         }
@@ -556,7 +573,10 @@ impl CoreApp {
         // The selected node comes from the frontend (TUI passes it via SelectFunction).
         // Here we just request call hierarchy for the currently selected function.
         if let Some(id) = self.selected_function {
-            if let Some(ev) = self.lsp.send_call_hierarchy(&self.call_graph, &id) {
+            if let Some(ev) =
+                self.lsp
+                    .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User)
+            {
                 return vec![ev, AppEvent::LayoutDirty];
             }
             return vec![AppEvent::LayoutDirty];
@@ -584,7 +604,10 @@ impl CoreApp {
             events.push(ev);
         }
         if let Some(id) = self.selected_function {
-            if let Some(ev) = self.lsp.send_call_hierarchy(&self.call_graph, &id) {
+            if let Some(ev) =
+                self.lsp
+                    .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User)
+            {
                 events.push(ev);
             }
         }
@@ -810,7 +833,9 @@ impl CoreApp {
             .unwrap_or_else(|| "Graph".to_string());
         let (_, ws_event) = self.workspaces.create_with_function(name, id);
         self.selected_function = Some(id);
-        let lsp_event = self.lsp.send_call_hierarchy(&self.call_graph, &id);
+        let lsp_event = self
+            .lsp
+            .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User);
         let mut events = vec![ws_event, AppEvent::LayoutDirty];
         if let Some(ev) = lsp_event {
             events.push(ev);
@@ -847,7 +872,10 @@ impl CoreApp {
 
         if !self.lsp.is_function_loaded(&id) && !self.lsp.is_function_loading(&id) {
             self.lsp.set_loading_state(id, LoadingState::Loading);
-            if let Some(ev) = self.lsp.send_call_hierarchy(&self.call_graph, &id) {
+            if let Some(ev) =
+                self.lsp
+                    .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User)
+            {
                 return vec![ev, AppEvent::LayoutDirty];
             }
         }
@@ -1006,7 +1034,12 @@ impl CoreApp {
             }
             self.lsp.set_loading_state(id, LoadingState::Loading);
             sent += 1;
-            if let Some(ev) = self.lsp.send_call_hierarchy(&self.call_graph, &id) {
+            // Warmup, not user: nobody is watching for this one symbol's edges,
+            // so its reply must not redraw the client. See `RequestOrigin`.
+            if let Some(ev) =
+                self.lsp
+                    .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::Warmup)
+            {
                 events.push(ev);
             }
         }
@@ -1376,7 +1409,7 @@ fn same_grouping(before: &Clustering, after: &Clustering) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lsp_bridge::PendingRequest;
+    use crate::lsp_bridge::{PendingRequest, RequestOrigin};
     use model::Location;
     use tokio::sync::mpsc;
 
@@ -2108,7 +2141,7 @@ mod tests {
 
         app.lsp.pending_requests.insert(
             "symbols".to_string(),
-            PendingRequest::new(None, "workspace symbols"),
+            PendingRequest::new(None, "workspace symbols", RequestOrigin::User),
         );
         app.handle_lsp_response(LspResponse::WorkspaceSymbols {
             request_id: "symbols".to_string(),
@@ -2124,7 +2157,7 @@ mod tests {
         let caller = *app.call_graph.function_ids().next().expect("one symbol");
         app.lsp.pending_requests.insert(
             "calls".to_string(),
-            PendingRequest::new(Some(caller), "outgoing calls"),
+            PendingRequest::new(Some(caller), "outgoing calls", RequestOrigin::User),
         );
         app.handle_lsp_response(LspResponse::OutgoingCalls {
             request_id: "calls".to_string(),
@@ -2134,6 +2167,113 @@ mod tests {
             }],
         });
         assert!(app.clustering_dirty, "new calls are new graph edges");
+    }
+
+    /// The bootstrap warmup asks for every symbol's edges. Answering each of
+    /// those with a redraw is what made loading a real project lag: on jemalloc
+    /// it was 767 whole-graph snapshots, one of which changed the screen.
+    #[test]
+    fn a_warmup_reply_fills_in_edges_without_asking_for_a_redraw() {
+        for (origin, wants_redraw) in [(RequestOrigin::Warmup, false), (RequestOrigin::User, true)]
+        {
+            let mut app = CoreApp::new(CallGraph::new());
+            app.handle_lsp_response(LspResponse::WorkspaceSymbols {
+                request_id: "symbols".to_string(),
+                symbols: vec![FunctionNode::new(
+                    "alpha".to_string(),
+                    "alpha".to_string(),
+                    Location::new("test.c".to_string(), 1, 0),
+                )],
+            });
+            let caller = *app.call_graph.function_ids().next().expect("one symbol");
+            app.lsp.pending_requests.insert(
+                "calls".to_string(),
+                PendingRequest::new(Some(caller), "outgoing calls", origin),
+            );
+
+            let events = app.handle_lsp_response(LspResponse::OutgoingCalls {
+                request_id: "calls".to_string(),
+                calls: vec![lsp_types::CallHierarchyOutgoingCall {
+                    to: hierarchy_item("beta", 2),
+                    from_ranges: vec![hierarchy_item("beta", 2).range],
+                }],
+            });
+
+            assert_eq!(
+                events.iter().any(|e| matches!(e, AppEvent::LayoutDirty)),
+                wants_redraw,
+                "{origin:?} reply"
+            );
+            // Either way the edge is in the graph — the warmup still does its
+            // job, it just does it quietly.
+            assert_eq!(app.call_graph.edge_count(), 1, "{origin:?} reply");
+            assert!(app.clustering_dirty, "{origin:?} reply");
+        }
+    }
+
+    /// "No callees" is a leaf, and the warmup walks over thousands of them.
+    #[test]
+    fn a_warmup_reply_does_not_announce_every_leaf_in_the_project() {
+        let mut app = CoreApp::new(CallGraph::new());
+        app.handle_lsp_response(LspResponse::WorkspaceSymbols {
+            request_id: "symbols".to_string(),
+            symbols: vec![FunctionNode::new(
+                "leaf".to_string(),
+                "leaf".to_string(),
+                Location::new("test.c".to_string(), 1, 0),
+            )],
+        });
+        let leaf = *app.call_graph.function_ids().next().expect("one symbol");
+        app.lsp.pending_requests.insert(
+            "calls".to_string(),
+            PendingRequest::new(Some(leaf), "outgoing calls", RequestOrigin::Warmup),
+        );
+
+        let events = app.handle_lsp_response(LspResponse::OutgoingCalls {
+            request_id: "calls".to_string(),
+            calls: vec![],
+        });
+
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, AppEvent::FunctionHasNoCallees)));
+    }
+
+    /// The prepare and the call fetch are two halves of one question, and the
+    /// half that carries the answer is the second one — so the origin has to
+    /// survive the hop or the gate above never fires.
+    #[test]
+    fn the_follow_up_request_is_asked_by_whoever_asked_the_prepare() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = CoreApp::new(CallGraph::new());
+        app.lsp.request_tx = Some(tx);
+        app.handle_lsp_response(LspResponse::WorkspaceSymbols {
+            request_id: "symbols".to_string(),
+            symbols: vec![FunctionNode::new(
+                "alpha".to_string(),
+                "alpha".to_string(),
+                Location::new("test.c".to_string(), 1, 0),
+            )],
+        });
+        let id = *app.call_graph.function_ids().next().expect("one symbol");
+        app.lsp.pending_requests.insert(
+            "prepare".to_string(),
+            PendingRequest::new(Some(id), "prepare alpha", RequestOrigin::Warmup),
+        );
+
+        app.handle_lsp_response(LspResponse::CallHierarchyPrepared {
+            request_id: "prepare".to_string(),
+            items: vec![hierarchy_item("alpha", 1)],
+        });
+
+        rx.try_recv().expect("the follow-up went out");
+        assert!(
+            app.lsp
+                .pending_requests
+                .values()
+                .all(|p| p.origin == RequestOrigin::Warmup),
+            "the follow-up inherits the prepare's origin"
+        );
     }
 
     #[test]
