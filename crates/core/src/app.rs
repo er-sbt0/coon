@@ -274,6 +274,19 @@ impl CoreApp {
     // Public API
     // -------------------------------------------------------------------------
 
+    /// The direction the tab in front is reading the graph in, right now.
+    ///
+    /// Every user-initiated call-hierarchy fetch reads this at *send* time and
+    /// carries the answer on the request. There is no workspace at all only in
+    /// tests and the moment before the first one exists, and outgoing is what a
+    /// fresh workspace starts on, so that is the fallback.
+    pub fn current_direction(&self) -> CallDirection {
+        self.workspaces
+            .current()
+            .map(|w| w.direction)
+            .unwrap_or(CallDirection::Outgoing)
+    }
+
     /// Dispatch a domain command and return events describing what changed.
     pub fn dispatch(&mut self, cmd: Command) -> Vec<AppEvent> {
         log::info!("CoreApp::dispatch {:?}", cmd);
@@ -519,16 +532,21 @@ impl CoreApp {
                     if let Some(symbol_id) = pending.symbol_id {
                         if !items.is_empty() {
                             let first_item = items[0].clone();
-                            let direction = self
-                                .workspaces
-                                .current()
-                                .map(|w| w.direction)
-                                .unwrap_or(CallDirection::Outgoing);
-                            let outgoing = matches!(direction, CallDirection::Outgoing);
+                            // The direction comes off the request, not off
+                            // whichever tab is in front now. This arm runs
+                            // whenever clangd gets round to answering, which
+                            // may be long after the click: reading
+                            // `workspaces.current()` here asked for the callers
+                            // of a node someone had expanded in an outgoing
+                            // view simply because they hit `t` in the meantime,
+                            // and since the reply marks the symbol `Loaded`
+                            // either way, `cmd_expand_function`'s guard then
+                            // refused to ever ask again.
+                            let direction = pending.direction.unwrap_or(CallDirection::Outgoing);
                             if let Some(ev) = self.lsp.send_follow_up_call(
                                 &symbol_id,
                                 first_item,
-                                outgoing,
+                                direction,
                                 pending.origin,
                             ) {
                                 events.push(ev);
@@ -556,12 +574,13 @@ impl CoreApp {
         if let Some(ws) = self.workspaces.current_mut() {
             ws.set_root(id);
         }
+        let direction = self.current_direction();
         // Kick off call hierarchy loading if not already done
         if !self.lsp.is_function_loaded(&id) && !self.lsp.is_function_loading(&id) {
             self.lsp.set_loading_state(id, LoadingState::Loading);
             if let Some(ev) =
                 self.lsp
-                    .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User)
+                    .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User, direction)
             {
                 return vec![ev, AppEvent::LayoutDirty];
             }
@@ -572,10 +591,11 @@ impl CoreApp {
     fn cmd_expand_or_collapse(&mut self) -> Vec<AppEvent> {
         // The selected node comes from the frontend (TUI passes it via SelectFunction).
         // Here we just request call hierarchy for the currently selected function.
+        let direction = self.current_direction();
         if let Some(id) = self.selected_function {
             if let Some(ev) =
                 self.lsp
-                    .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User)
+                    .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User, direction)
             {
                 return vec![ev, AppEvent::LayoutDirty];
             }
@@ -598,6 +618,7 @@ impl CoreApp {
     }
 
     fn cmd_refresh(&mut self) -> Vec<AppEvent> {
+        let direction = self.current_direction();
         self.lsp.clear();
         let mut events = Vec::new();
         if let Some(ev) = self.lsp.send_workspace_symbols() {
@@ -606,7 +627,7 @@ impl CoreApp {
         if let Some(id) = self.selected_function {
             if let Some(ev) =
                 self.lsp
-                    .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User)
+                    .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User, direction)
             {
                 events.push(ev);
             }
@@ -833,9 +854,12 @@ impl CoreApp {
             .unwrap_or_else(|| "Graph".to_string());
         let (_, ws_event) = self.workspaces.create_with_function(name, id);
         self.selected_function = Some(id);
-        let lsp_event = self
-            .lsp
-            .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User);
+        // After the create, not before: the tab that will show this graph is
+        // the one just made, and it is that tab's reading the fetch answers.
+        let direction = self.current_direction();
+        let lsp_event =
+            self.lsp
+                .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User, direction);
         let mut events = vec![ws_event, AppEvent::LayoutDirty];
         if let Some(ev) = lsp_event {
             events.push(ev);
@@ -870,11 +894,12 @@ impl CoreApp {
             .is_some_and(|ws| ws.expand(id));
         log::info!("CoreApp: expand in-place {id:?}, layout changed: {changed}");
 
+        let direction = self.current_direction();
         if !self.lsp.is_function_loaded(&id) && !self.lsp.is_function_loading(&id) {
             self.lsp.set_loading_state(id, LoadingState::Loading);
             if let Some(ev) =
                 self.lsp
-                    .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User)
+                    .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User, direction)
             {
                 return vec![ev, AppEvent::LayoutDirty];
             }
@@ -1036,10 +1061,22 @@ impl CoreApp {
             sent += 1;
             // Warmup, not user: nobody is watching for this one symbol's edges,
             // so its reply must not redraw the client. See `RequestOrigin`.
-            if let Some(ev) =
-                self.lsp
-                    .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::Warmup)
-            {
+            if let Some(ev) = self.lsp.send_call_hierarchy(
+                &self.call_graph,
+                &id,
+                RequestOrigin::Warmup,
+                // Outgoing, fixed, and deliberately not the current tab's
+                // direction: no tab is waiting on this one. The warmup walks
+                // every symbol in the project, and every edge in the project
+                // has a project symbol at its caller end, so asking each of
+                // them who it calls reaches exactly the same edge set that
+                // asking each of them who calls it would — the graph the
+                // clustering needs comes out the same either way. Reading the
+                // active workspace instead would make the bootstrap depend on
+                // which tab happened to be in front, and change direction
+                // mid-sweep every time the user hit `t`, for no gain at all.
+                CallDirection::Outgoing,
+            ) {
                 events.push(ev);
             }
         }
@@ -2274,6 +2311,50 @@ mod tests {
                 .all(|p| p.origin == RequestOrigin::Warmup),
             "the follow-up inherits the prepare's origin"
         );
+    }
+
+    /// clangd answers a prepare whenever it gets round to it, and the user can
+    /// hit `t` — or move to a tab reading the other way — in the meantime.
+    /// Resolving the direction at reply time asked for the callers of a node
+    /// that had been expanded in an outgoing view, and since the reply marks
+    /// the symbol `Loaded` regardless, `cmd_expand_function`'s guard then meant
+    /// `+` on that node never did anything again.
+    #[test]
+    fn a_follow_up_asks_in_the_direction_its_prepare_was_asked_in() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut graph = CallGraph::new();
+        // An absolute path, unlike the rest of these tests: `send_call_hierarchy`
+        // turns the definition location into a `file://` URL, and a relative
+        // path fails that conversion before any request is ever sent.
+        let alpha = graph.add_function(FunctionNode::new(
+            "alpha".to_string(),
+            "alpha".to_string(),
+            Location::new("/test.c".to_string(), 1, 0),
+        ));
+        let mut app = CoreApp::new(graph);
+        app.lsp.request_tx = Some(tx);
+        assert_eq!(app.current_direction(), CallDirection::Outgoing);
+
+        // The click: expand a node while the tab reads outgoing.
+        app.dispatch(Command::ExpandFunction(alpha));
+        let request_id = match rx.try_recv().expect("the prepare went out") {
+            lsp::LspRequest::PrepareCallHierarchy { request_id, .. } => request_id,
+            other => panic!("expected a prepare, got {other:?}"),
+        };
+
+        // ...and the answer is slow enough that the tab flips first.
+        app.dispatch(Command::ToggleCallDirection);
+        assert_eq!(app.current_direction(), CallDirection::Incoming);
+
+        app.handle_lsp_response(LspResponse::CallHierarchyPrepared {
+            request_id,
+            items: vec![hierarchy_item("alpha", 1)],
+        });
+
+        match rx.try_recv().expect("the follow-up went out") {
+            lsp::LspRequest::GetOutgoingCalls { .. } => {}
+            other => panic!("the outgoing view must still get its callees, got {other:?}"),
+        }
     }
 
     #[test]

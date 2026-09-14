@@ -4,7 +4,9 @@ use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 
 use lsp::{LspRequest, LspResponse};
-use model::{lsp_status::LspLoadPhase, lsp_status::LspUiMessage, CallGraph, SymbolId};
+use model::{
+    lsp_status::LspLoadPhase, lsp_status::LspUiMessage, CallDirection, CallGraph, SymbolId,
+};
 
 use crate::events::AppEvent;
 
@@ -51,6 +53,22 @@ pub struct PendingRequest {
     /// request because by the time the wait is interesting the caller that knew
     /// the name is long gone.
     pub label: String,
+    /// Which way round the question was asked, for the requests where that
+    /// means anything — a call-hierarchy prepare, and the incoming/outgoing
+    /// fetch it turns into. `None` for everything else: a workspace-symbol
+    /// sweep or a find-references has no direction to have, and inventing one
+    /// for them would only make the field read as a default rather than as an
+    /// answer somebody actually gave.
+    ///
+    /// It rides on the request for the same reason [`RequestOrigin`] does. A
+    /// prepare and its follow-up are two halves of one question, and clangd
+    /// answers the first half whenever it gets round to it — by then the user
+    /// may have hit `t`, or moved to a tab reading the other way. Resolving the
+    /// direction at reply time therefore answered the tab that happened to be
+    /// in front instead of the tab that asked: the outgoing view sent a
+    /// prepare, got its callers fetched, and was marked `Loaded` all the same,
+    /// so `+` on that node did nothing ever again.
+    pub direction: Option<CallDirection>,
 }
 
 impl PendingRequest {
@@ -64,7 +82,19 @@ impl PendingRequest {
             timestamp: Instant::now(),
             origin,
             label: label.into(),
+            direction: None,
         }
+    }
+
+    /// Stamp the call direction this request was asked in.
+    ///
+    /// Separate from [`PendingRequest::new`] rather than a fourth argument to
+    /// it, because three of the four kinds of request tracked here have no
+    /// direction and would have to pass a `None` that reads like an oversight
+    /// next to the `None` symbol id already there.
+    pub fn in_direction(mut self, direction: CallDirection) -> Self {
+        self.direction = Some(direction);
+        self
     }
 
     /// How long this request has been outstanding.
@@ -239,11 +269,16 @@ impl LspBridge {
     }
 
     /// Send a call hierarchy request for the given function.
+    ///
+    /// `direction` is the way the *asker* was reading the graph at this moment,
+    /// and it is recorded on the pending entry rather than looked up again when
+    /// the reply lands. See [`PendingRequest::direction`].
     pub fn send_call_hierarchy(
         &mut self,
         call_graph: &CallGraph,
         function_id: &SymbolId,
         origin: RequestOrigin,
+        direction: CallDirection,
     ) -> Option<AppEvent> {
         let (file_path, line, column, _name) = {
             if let Some(function) = call_graph.get_function(function_id) {
@@ -296,16 +331,18 @@ impl LspBridge {
                 Some(*function_id),
                 format!("prepare {} ({}:{})", _name, file_path, line),
                 origin,
-            ),
+            )
+            .in_direction(direction),
         );
 
         log::info!(
-            "core::LspBridge prepare call hierarchy: request_id={} symbol={} at {}:{}:{} ({} in flight)",
+            "core::LspBridge prepare call hierarchy: request_id={} symbol={} at {}:{}:{} direction={:?} ({} in flight)",
             request_id,
             _name,
             file_path,
             line,
             column,
+            direction,
             self.pending_requests.len()
         );
 
@@ -419,28 +456,36 @@ impl LspBridge {
     }
 
     /// Send a follow-up call hierarchy request (incoming or outgoing).
+    ///
+    /// Takes the domain [`CallDirection`] rather than an `outgoing: bool`. The
+    /// bool was spelled back out as the string `"outgoing"` or `"incoming"` in
+    /// three places in this one function — the label, the failure message and
+    /// the event the status bar reads — which is the shape a type is for.
     pub fn send_follow_up_call(
         &mut self,
         symbol_id: &SymbolId,
         item: lsp_types::CallHierarchyItem,
-        outgoing: bool,
+        direction: CallDirection,
         origin: RequestOrigin,
     ) -> Option<AppEvent> {
         let request_id = uuid::Uuid::new_v4().to_string();
+        let which = match direction {
+            CallDirection::Outgoing => "outgoing",
+            CallDirection::Incoming => "incoming",
+        };
 
         self.pending_requests.insert(
             request_id.clone(),
             PendingRequest::new(
                 Some(*symbol_id),
-                format!(
-                    "{} calls {}",
-                    if outgoing { "outgoing" } else { "incoming" },
-                    item.name
-                ),
+                format!("{} calls {}", which, item.name),
                 // The prepare and its follow-up are two halves of one question,
                 // so the second half is asked by whoever asked the first.
                 origin,
-            ),
+            )
+            // And in the direction the first half was asked in, so a reply that
+            // is itself slow cannot drift onto a different tab's reading either.
+            .in_direction(direction),
         );
 
         let request_tx = match self.request_tx.as_ref() {
@@ -455,33 +500,28 @@ impl LspBridge {
             }
         };
 
-        let request = if outgoing {
-            log::info!("Requesting outgoing calls for: {}", item.name);
-            lsp::LspRequest::GetOutgoingCalls {
+        log::info!("Requesting {} calls for: {}", which, item.name);
+        let request = match direction {
+            CallDirection::Outgoing => lsp::LspRequest::GetOutgoingCalls {
                 request_id,
                 call_hierarchy_item: item,
-            }
-        } else {
-            log::info!("Requesting incoming calls for: {}", item.name);
-            lsp::LspRequest::GetIncomingCalls {
+            },
+            CallDirection::Incoming => lsp::LspRequest::GetIncomingCalls {
                 request_id,
                 call_hierarchy_item: item,
-            }
+            },
         };
 
         if let Err(e) = request_tx.send(request) {
             log::error!("Failed to send calls request: {}", e);
             self.loading_states.insert(
                 *symbol_id,
-                LoadingState::Failed(format!(
-                    "Failed to request {} calls",
-                    if outgoing { "outgoing" } else { "incoming" }
-                )),
+                LoadingState::Failed(format!("Failed to request {} calls", which)),
             );
             None
         } else {
             Some(AppEvent::LoadingCalls {
-                direction: if outgoing { "outgoing" } else { "incoming" }.to_string(),
+                direction: which.to_string(),
             })
         }
     }
