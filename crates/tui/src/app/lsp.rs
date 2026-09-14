@@ -1,86 +1,21 @@
 use model::SymbolId;
 
-use crate::status_message::StatusMessage;
-
 use super::event_translate::apply_event_to_status;
-use super::lsp_bridge::LoadingState;
 use super::App;
 
 impl App {
-    // LSP integration methods — delegate to self.core.lsp (LspBridge)
-
-    /// Request call hierarchy for a function
+    /// Request call hierarchy for a function.
+    ///
+    /// What is left of this module. The rest was a second copy of the response
+    /// handling in `CoreApp`, plus pass-throughs to `core.lsp` that everything
+    /// reached directly anyway.
     pub fn request_call_hierarchy(&mut self, function_id: &SymbolId) {
         if let Some(ev) = self
             .core
             .lsp
             .send_call_hierarchy(&self.core.call_graph, function_id)
         {
-            apply_event_to_status(&mut self.status_message, &ev, &self.core.call_graph);
-        }
-    }
-
-    /// Request references for a function
-    pub fn request_references(&mut self, function_id: &SymbolId) {
-        if let Some(ev) = self
-            .core
-            .lsp
-            .send_references(&self.core.call_graph, function_id)
-        {
-            apply_event_to_status(&mut self.status_message, &ev, &self.core.call_graph);
-        }
-    }
-
-    /// Request fresh workspace symbols from LSP server
-    pub fn request_workspace_symbols(&mut self) {
-        if let Some(ev) = self.core.lsp.send_workspace_symbols() {
-            apply_event_to_status(&mut self.status_message, &ev, &self.core.call_graph);
-        }
-    }
-
-    /// Check for LSP responses and update state
-    pub fn check_lsp_responses(&mut self) {
-        let (responses, timeout_events) = self.core.lsp.drain_responses();
-
-        for ev in timeout_events {
-            apply_event_to_status(&mut self.status_message, &ev, &self.core.call_graph);
-        }
-
-        for response in responses {
-            self.handle_lsp_response(response);
-        }
-    }
-
-    /// Check if a function is already loaded
-    pub fn is_function_loaded(&self, symbol_id: &SymbolId) -> bool {
-        self.core.lsp.is_function_loaded(symbol_id)
-    }
-
-    /// Check if a function is currently loading
-    pub fn is_function_loading(&self, symbol_id: &SymbolId) -> bool {
-        self.core.lsp.is_function_loading(symbol_id)
-    }
-
-    /// Get the loading state of a function
-    pub fn get_loading_state(&self, symbol_id: &SymbolId) -> &LoadingState {
-        self.core.lsp.get_loading_state(symbol_id)
-    }
-
-    /// Update loading state for a symbol and corresponding UI elements
-    pub(super) fn update_loading_state(&mut self, symbol_id: &SymbolId, state: LoadingState) {
-        self.core.lsp.set_loading_state(*symbol_id, state.clone());
-
-        match state {
-            LoadingState::Loading => {
-                self.status_message = StatusMessage::LoadingFunctionData;
-            }
-            LoadingState::Loaded => {
-                self.status_message = StatusMessage::Empty;
-            }
-            LoadingState::Failed(error) => {
-                self.status_message = StatusMessage::Error { error };
-            }
-            LoadingState::NotLoaded => {}
+            apply_event_to_status(&mut self.status_message, &ev);
         }
     }
 }

@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 
 use ::core::AppEvent;
-use model::CallGraph;
 
 use crate::graph_view::GraphViewState;
 use crate::status_message::StatusMessage;
@@ -12,7 +11,7 @@ use super::App;
 ///
 /// Returns `None` for events that do not have a meaningful TUI status message
 /// (e.g. `LayoutDirty`, which is a state-mutation signal, not a user-visible message).
-pub fn app_event_to_status(event: &AppEvent, _graph: &CallGraph) -> Option<StatusMessage> {
+pub fn app_event_to_status(event: &AppEvent) -> Option<StatusMessage> {
     match event {
         // Graph data
         AppEvent::GraphSymbolsUpdated { count } => {
@@ -84,9 +83,8 @@ pub fn app_event_to_status(event: &AppEvent, _graph: &CallGraph) -> Option<Statu
 pub fn apply_event_to_status(
     status: &mut crate::status_message::StatusMessage,
     event: &AppEvent,
-    graph: &CallGraph,
 ) {
-    if let Some(msg) = app_event_to_status(event, graph) {
+    if let Some(msg) = app_event_to_status(event) {
         *status = msg;
     }
 }
@@ -140,7 +138,6 @@ pub fn apply_events(app: &mut App, events: Vec<AppEvent>) {
             _ => {}
         }
         // Update status message (last non-None wins).
-        let graph_clone = app.core.call_graph.clone();
-        apply_event_to_status(&mut app.status_message, event, &graph_clone);
+        apply_event_to_status(&mut app.status_message, event);
     }
 }

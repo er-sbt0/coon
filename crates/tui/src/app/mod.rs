@@ -12,7 +12,6 @@ mod event_translate;
 mod events;
 mod lsp;
 pub mod lsp_bridge;
-mod update;
 mod workspace;
 
 pub use event_translate::{app_event_to_status, apply_events};

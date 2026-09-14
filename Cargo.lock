@@ -4583,7 +4583,6 @@ dependencies = [
  "log",
  "logic",
  "lsp",
- "lsp-types",
  "model",
  "ratatui",
  "serde_json",
