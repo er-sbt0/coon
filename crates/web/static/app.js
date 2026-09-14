@@ -61,7 +61,7 @@ function graphStyle() {
         'width': NODE_W,
         'height': NODE_H,
         'shape': 'roundrectangle',
-        'transition-property': 'border-color, background-color, opacity',
+        'transition-property': 'border-color, border-width, background-color, opacity',
         'transition-duration': '90ms',
       }
     },
@@ -76,17 +76,16 @@ function graphStyle() {
       }
     },
     { selector: 'node.hovered', style: { 'background-color': css('--surface-hover') } },
-    // The selected node, and there is only ever one. It is the only thing on
-    // the canvas with a filled ground: a ring in the one accent is what the
-    // root already wears, and two near-identical rings read as two selected
-    // nodes. Declared after `hovered` so that running the pointer over the
-    // selection does not wash it out.
+    // The selected node, and there is only ever one. It carries no fill: the
+    // ground stays the surface every other node sits on, and the selection is
+    // a bolder ring — the brighter accent, drawn thicker than the root's.
+    // Declared after `hovered` so that running the pointer over the selection
+    // does not wash it out.
     {
       selector: 'node.focused',
       style: {
-        'border-color': css('--accent'),
-        'border-width': 2,
-        'background-color': css('--accent-soft'),
+        'border-color': css('--accent-hover'),
+        'border-width': 3,
       }
     },
     // A node with children it isn't showing gets a dashed edge — the same
