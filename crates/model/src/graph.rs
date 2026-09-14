@@ -215,6 +215,12 @@ impl CallGraph {
         self.nodes.keys()
     }
 
+    /// Every call, one entry per call site — so a caller that calls the same
+    /// callee from five places appears five times.
+    pub fn edges(&self) -> impl Iterator<Item = &CallEdge> {
+        self.edges.iter()
+    }
+
     pub fn get_function(&self, id: &SymbolId) -> Option<&FunctionNode> {
         self.nodes.get(id)
     }

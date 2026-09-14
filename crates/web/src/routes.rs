@@ -49,8 +49,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 
     // Send an initial snapshot so the client has current state immediately.
     log::debug!("[web] sending initial snapshot to new client");
-    let msg = session.snapshot_msg().await;
-    send_json(&mut socket, &msg).await;
+    if let Some(text) = session.snapshot_json().await {
+        send_text(&mut socket, text).await;
+    }
 
     let mut tick_interval = tokio::time::interval(std::time::Duration::from_millis(100));
 
@@ -119,21 +120,26 @@ async fn handle_events(
         // has the updated graph structure (nodes + edges) alongside new positions.
         // A Layout-only message can't tell the client which nodes to add/remove.
         log::debug!("[web] sending snapshot");
-        let msg = session.snapshot_msg().await;
-        send_json(socket, &msg).await;
+        if let Some(text) = session.snapshot_json().await {
+            send_text(socket, text).await;
+        }
     }
 }
 
 async fn send_json<T: serde::Serialize>(socket: &mut WebSocket, msg: &T) {
     match serde_json::to_string(msg) {
-        Ok(text) => {
-            log::debug!("[web] → sending {} bytes to client", text.len());
-            if let Err(e) = socket.send(Message::Text(text)).await {
-                log::warn!("[web] failed to send message to client: {}", e);
-            }
-        }
+        Ok(text) => send_text(socket, text).await,
         Err(e) => {
             log::error!("[web] failed to serialise server message: {}", e);
         }
+    }
+}
+
+/// Send something already serialised — the snapshot, which is written out under
+/// the lock it borrows from.
+async fn send_text(socket: &mut WebSocket, text: String) {
+    log::debug!("[web] → sending {} bytes to client", text.len());
+    if let Err(e) = socket.send(Message::Text(text)).await {
+        log::warn!("[web] failed to send message to client: {}", e);
     }
 }

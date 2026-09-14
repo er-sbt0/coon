@@ -7,7 +7,7 @@
 //! The TUI does not use this module — it calls `CoreApp` directly and needs
 //! no serialisation hop.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use logic::ClusterKey;
@@ -29,13 +29,90 @@ use crate::workspace::ViewMode;
 /// it. Loading is reported by the status bar, not by the graph redrawing.
 const LOADING_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
 
+/// The call graph as the client reads it.
+///
+/// Deliberately not `CallGraph`. The client never touches a node's `references`
+/// or `diagnostics`, nor an edge's `call_location`, and shipping them cost more
+/// than everything it does read put together: on jemalloc a late-bootstrap
+/// snapshot was 5.97 MB of JSON, of which 4.63 MB was call sites it drops on
+/// the floor. It borrows rather than owns for the same reason — building one
+/// used to mean deep-copying the whole graph on the way to serialising it.
+///
+/// The field names are the ones the JavaScript already reads. Shortening them
+/// would save a little more and cost the client a rewrite.
+#[derive(Debug, Serialize)]
+pub struct WireGraph<'a> {
+    /// Keyed by symbol id, which is how the client indexes `allFunctions[id]`.
+    pub nodes: HashMap<&'a SymbolId, WireNode<'a>>,
+    /// One entry per caller/callee pair rather than per call site. A function
+    /// calling another from five places is five edges in the graph and one line
+    /// on the canvas — the client was already deduplicating them, after paying
+    /// to receive and parse all five.
+    pub edges: Vec<WireEdge<'a>>,
+}
+
+/// A function, as much of one as the client draws and searches.
+#[derive(Debug, Serialize)]
+pub struct WireNode<'a> {
+    pub name: &'a str,
+    pub qualified_name: &'a str,
+    pub definition_location: WireLocation<'a>,
+}
+
+/// Where a symbol is defined — the two fields the sidebar reads. `column` and
+/// `length` are on the model's `Location` and go nowhere on the client.
+#[derive(Debug, Serialize)]
+pub struct WireLocation<'a> {
+    pub file_path: &'a str,
+    pub line: u32,
+}
+
+/// A call, as an edge on the canvas: the two ends and nothing else.
+#[derive(Debug, Serialize)]
+pub struct WireEdge<'a> {
+    pub caller: &'a SymbolId,
+    pub callee: &'a SymbolId,
+}
+
+/// Borrow the graph in the shape the client reads it.
+pub fn wire_graph(graph: &CallGraph) -> WireGraph<'_> {
+    let nodes = graph
+        .functions()
+        .map(|f| {
+            (
+                &f.id,
+                WireNode {
+                    name: &f.name,
+                    qualified_name: &f.qualified_name,
+                    definition_location: WireLocation {
+                        file_path: &f.definition_location.file_path,
+                        line: f.definition_location.line,
+                    },
+                },
+            )
+        })
+        .collect();
+
+    let mut seen = HashSet::with_capacity(graph.edge_count());
+    let edges = graph
+        .edges()
+        .filter(|e| seen.insert((e.caller, e.callee)))
+        .map(|e| WireEdge {
+            caller: &e.caller,
+            callee: &e.callee,
+        })
+        .collect();
+
+    WireGraph { nodes, edges }
+}
+
 /// Messages the backend sends to the client.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ServerMsg {
+pub enum ServerMsg<'a> {
     /// Full state: graph structure, node positions, workspaces, selection.
     Snapshot {
-        graph: CallGraph,
+        graph: WireGraph<'a>,
         layout: HashMap<SymbolId, NodePos>,
         /// The cluster map, present only while the active workspace is showing
         /// one. It is a second, parallel layout rather than a replacement for
@@ -88,7 +165,11 @@ pub struct WorkspaceInfo {
 }
 
 /// Build a full `ServerMsg::Snapshot` from current `CoreApp` state.
-pub fn snapshot_of(core: &CoreApp) -> ServerMsg {
+///
+/// Borrows the app for as long as the message lives: the message is written
+/// straight out to a socket or an IPC channel, and copying a project's worth of
+/// symbols to get there was pure cost.
+pub fn snapshot_of(core: &CoreApp) -> ServerMsg<'_> {
     let ws = core.workspaces.current();
     let root = ws.and_then(|w| w.root_symbol);
     let direction = ws.map(|w| w.direction).unwrap_or(CallDirection::Outgoing);
@@ -109,7 +190,7 @@ pub fn snapshot_of(core: &CoreApp) -> ServerMsg {
     );
 
     ServerMsg::Snapshot {
-        graph: core.call_graph.clone(),
+        graph: wire_graph(&core.call_graph),
         layout,
         cluster_layout: cluster_layout_of(core),
         workspaces: workspace_infos(core),
@@ -525,6 +606,59 @@ mod tests {
                     .resnapshot
             );
         }
+    }
+
+    /// What the client actually reads off a node and an edge — and, just as
+    /// much to the point, what it does not.
+    #[test]
+    fn the_graph_ships_what_the_client_reads_and_nothing_else() {
+        use model::{FunctionNode, Location};
+
+        let mut graph = CallGraph::new();
+        let caller = graph.add_function(FunctionNode::new(
+            "caller".to_string(),
+            "ns::caller".to_string(),
+            Location::new("/src/a.c".to_string(), 10, 4),
+        ));
+        let callee = graph.add_function(FunctionNode::new(
+            "callee".to_string(),
+            "ns::callee".to_string(),
+            Location::new("/src/b.c".to_string(), 20, 4),
+        ));
+        // The same call from two places: two edges in the graph, one line on
+        // the canvas.
+        graph.add_call(caller, callee, Location::new("/src/a.c".to_string(), 11, 2));
+        graph.add_call(caller, callee, Location::new("/src/a.c".to_string(), 12, 2));
+        assert_eq!(graph.edge_count(), 2);
+
+        let core = CoreApp::new(graph);
+        let json = serde_json::to_value(snapshot_of(&core)).expect("snapshot serialises");
+        let node = &json["graph"]["nodes"][caller.0.to_string()];
+
+        assert_eq!(node["name"], "caller");
+        assert_eq!(node["qualified_name"], "ns::caller");
+        assert_eq!(node["definition_location"]["file_path"], "/src/a.c");
+        assert_eq!(node["definition_location"]["line"], 10);
+        for unread in ["references", "diagnostics"] {
+            assert!(
+                node.get(unread).is_none(),
+                "the client never reads `{unread}`, and on jemalloc these were \
+                 most of a 6 MB message"
+            );
+        }
+
+        let edges = json["graph"]["edges"].as_array().expect("an edge array");
+        assert_eq!(
+            edges.len(),
+            1,
+            "one line per caller/callee pair, not per call site"
+        );
+        assert_eq!(edges[0]["caller"], caller.0.to_string());
+        assert_eq!(edges[0]["callee"], callee.0.to_string());
+        assert!(
+            edges[0].get("call_location").is_none(),
+            "a full file path per call site, for an edge drawn by its two ends"
+        );
     }
 
     /// Every command shape the JavaScript client sends, verbatim.

@@ -60,8 +60,10 @@ impl Backend {
             // Full snapshot rather than positions only: a Layout-only message
             // can't tell the client which nodes to add or remove.
             log::debug!("[desktop] sending snapshot");
-            let msg = snapshot_of(&*self.core.lock().await);
-            emit(app, &msg);
+            // The guard is held across the emit on purpose: the message borrows
+            // the app rather than copying the call graph out of it.
+            let core = self.core.lock().await;
+            emit(app, &snapshot_of(&core));
         }
     }
 }
@@ -77,8 +79,8 @@ fn emit(app: &AppHandle, msg: &ServerMsg) {
 #[tauri::command]
 async fn request_snapshot(app: AppHandle, backend: State<'_, Backend>) -> Result<(), String> {
     log::debug!("[desktop] snapshot requested by client");
-    let msg = snapshot_of(&*backend.core.lock().await);
-    emit(&app, &msg);
+    let core = backend.core.lock().await;
+    emit(&app, &snapshot_of(&core));
     Ok(())
 }
 
