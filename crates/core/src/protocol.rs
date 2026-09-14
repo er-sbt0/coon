@@ -45,8 +45,6 @@ pub enum ServerMsg {
     },
     /// A single `AppEvent` forwarded verbatim for status display.
     Event { event: AppEvent },
-    /// New positions only, reusing the client's cached graph structure.
-    Layout { layout: HashMap<SymbolId, NodePos> },
 }
 
 /// Messages the client sends to the backend.
@@ -109,16 +107,6 @@ pub fn snapshot_of(core: &CoreApp) -> ServerMsg {
         workspaces: workspace_infos(core),
         active_workspace: core.workspaces.current_index,
         selected: core.selected_function,
-    }
-}
-
-/// Build a positions-only `ServerMsg::Layout` from current `CoreApp` state.
-pub fn layout_of(core: &CoreApp) -> ServerMsg {
-    let ws = core.workspaces.current();
-    let root = ws.and_then(|w| w.root_symbol);
-    let direction = ws.map(|w| w.direction).unwrap_or(CallDirection::Outgoing);
-    ServerMsg::Layout {
-        layout: compute_layout(&core.call_graph, root, direction, &layout_options(core)),
     }
 }
 

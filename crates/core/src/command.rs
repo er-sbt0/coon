@@ -69,10 +69,6 @@ pub enum Command {
     /// Create a new workspace rooted at the given function.
     StartGraphFromFunction(SymbolId),
 
-    // ---- Search (query resolved by the frontend before dispatch) ----
-    /// The user confirmed a search selection; switch focus to this symbol.
-    SearchSelectFunction(SymbolId),
-
     /// Load call hierarchy for a specific function without changing the graph root.
     /// Used by the web frontend to expand a node in-place.
     ExpandFunction(SymbolId),

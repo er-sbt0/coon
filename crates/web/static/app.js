@@ -220,11 +220,6 @@ CoonTransport.connect({
   onMessage: (msg) => {
     if (msg.type === 'snapshot') {
       handleSnapshot(msg);
-    } else if (msg.type === 'layout') {
-      // Layout-only: use the cached graph structure with new positions. These
-      // are the rooted view's positions and only ever those — the map arrives
-      // on a snapshot — so on the map this would redraw the other view.
-      if (currentView !== 'ClusterMap') rebuildGraph(currentGraph, msg.layout);
     } else if (msg.type === 'event') {
       handleEvent(msg.event);
     }

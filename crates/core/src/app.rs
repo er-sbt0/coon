@@ -298,7 +298,6 @@ impl CoreApp {
             Command::SwitchWorkspace(index) => self.cmd_switch_workspace(index),
             Command::RenameWorkspace(index, name) => self.cmd_rename_workspace(index, name),
             Command::StartGraphFromFunction(id) => self.cmd_start_graph_from_function(id),
-            Command::SearchSelectFunction(id) => self.cmd_search_select_function(id),
             Command::ExpandFunction(id) => self.cmd_expand_function(id),
             Command::FocusFunction(id) => self.cmd_focus_function(id),
         };
@@ -817,10 +816,6 @@ impl CoreApp {
             events.push(ev);
         }
         events
-    }
-
-    fn cmd_search_select_function(&mut self, id: SymbolId) -> Vec<AppEvent> {
-        self.cmd_select_function(id)
     }
 
     /// Point at a function: no new root, no layout, no fetch.

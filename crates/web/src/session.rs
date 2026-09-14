@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use ::core::protocol::{layout_of, snapshot_of};
+use ::core::protocol::snapshot_of;
 use ::core::CoreApp;
 
 use crate::protocol::ServerMsg;
@@ -18,9 +18,5 @@ impl WebSession {
 
     pub async fn snapshot_msg(&self) -> ServerMsg {
         snapshot_of(&*self.core.lock().await)
-    }
-
-    pub async fn layout_msg(&self) -> ServerMsg {
-        layout_of(&*self.core.lock().await)
     }
 }

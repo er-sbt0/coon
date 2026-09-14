@@ -2,6 +2,5 @@
 //! frontend. Re-exported here so existing `web::protocol::…` paths keep working.
 
 pub use ::core::protocol::{
-    layout_of, snapshot_of, workspace_infos, ClientMsg, EventRouter, Routed, ServerMsg,
-    WorkspaceInfo,
+    snapshot_of, workspace_infos, ClientMsg, EventRouter, Routed, ServerMsg, WorkspaceInfo,
 };

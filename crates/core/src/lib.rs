@@ -16,7 +16,5 @@ pub use demo::create_demo_call_graph;
 pub use events::AppEvent;
 pub use layout::{compute_layout, NodePos};
 pub use lsp_bridge::{LoadingState, LspBridge, PendingRequest};
-pub use protocol::{
-    layout_of, snapshot_of, ClientMsg, EventRouter, Routed, ServerMsg, WorkspaceInfo,
-};
+pub use protocol::{snapshot_of, ClientMsg, EventRouter, Routed, ServerMsg, WorkspaceInfo};
 pub use workspace::{CoreWorkspace, CoreWorkspaceManager, ViewMode};
