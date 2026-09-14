@@ -65,27 +65,20 @@ function graphStyle() {
         'transition-duration': '90ms',
       }
     },
-    // One accent, applied at different strengths, rather than a different hue
-    // per state — the eye tracks a single signal.
-    {
-      selector: 'node.root',
-      style: {
-        'border-color': css('--accent'),
-        'border-width': 2,
-        'color': css('--accent'),
-      }
-    },
     { selector: 'node.hovered', style: { 'background-color': css('--surface-hover') } },
-    // The selected node, and there is only ever one. It carries no fill: the
-    // ground stays the surface every other node sits on, and the selection is
-    // a bolder ring — the brighter accent, drawn thicker than the root's.
-    // Declared after `hovered` so that running the pointer over the selection
-    // does not wash it out.
+    // A node is either selected or it is not — those are the only two states a
+    // border carries, and there is only ever one selected node. It is the
+    // accent against every other node's neutral hairline, and it carries no
+    // fill: the ground stays the surface they all sit on. The graph root used
+    // to wear a ring of its own at a lighter weight, which made the border a
+    // three-way signal the eye had to measure rather than read; the breadcrumb
+    // already says where the tree is rooted. Declared after `hovered` so that
+    // running the pointer over the selection does not wash it out.
     {
       selector: 'node.focused',
       style: {
-        'border-color': css('--accent-hover'),
-        'border-width': 3,
+        'border-color': css('--accent'),
+        'border-width': 2,
       }
     },
     // A node with children it isn't showing gets a dashed edge — the same
@@ -525,10 +518,6 @@ function rebuildGraph(graph, layout) {
     }
   }
 
-  if (rootNodeId) cy.$id(rootNodeId).addClass('root');
-  // Including when the selection *is* the root: the two say different things —
-  // where the tree grows from, and which node the user last pointed at — and a
-  // click on the root that lit nothing would read as a click that missed.
   if (selectedNodeId) cy.$id(selectedNodeId).addClass('focused');
   markPathToSelection();
 
