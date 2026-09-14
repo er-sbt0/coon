@@ -49,6 +49,62 @@ fn log_clangd_line(line: &str) {
     }
 }
 
+/// Environment override for which clangd binary to run.
+///
+/// The index is only ever as good as the clangd that built it, and the two
+/// questions that follow a wrong-looking graph — is this clangd new enough,
+/// and is it the same one my editor uses — can only be answered by naming the
+/// binary explicitly. A distro `clangd` on `PATH` is frequently several
+/// releases behind the toolchain a project is actually built with, and
+/// re-pointing `PATH` is not something a user should have to do to answer a
+/// question about one project. Setting this names the choice instead, and the
+/// startup log records which way it went.
+const CLANGD_PATH_ENV: &str = "COON_CLANGD";
+
+/// Decide which clangd to spawn, and log which it is and where it came from.
+///
+/// An unset `COON_CLANGD` means `clangd` from `PATH`. A set one is taken
+/// literally and checked: pointing it at a missing or non-executable file is a
+/// mistake worth naming, because falling back to `PATH` would mean the user
+/// asked for one toolchain's clangd and silently got another's — the exact
+/// trap a hardcoded path used to set here.
+fn resolve_clangd_path() -> Result<String> {
+    let Some(configured) = std::env::var_os(CLANGD_PATH_ENV) else {
+        log::info!("using clangd `clangd` from PATH (set {CLANGD_PATH_ENV} to override)");
+        return Ok("clangd".to_string());
+    };
+
+    let path = std::path::PathBuf::from(&configured);
+    if !is_executable_file(&path) {
+        return Err(anyhow::anyhow!(
+            "{CLANGD_PATH_ENV} is set to `{}`, but no executable was found there",
+            path.display()
+        ));
+    }
+
+    log::info!("using clangd `{}` from {CLANGD_PATH_ENV}", path.display());
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Whether `path` is a file this process could actually exec.
+fn is_executable_file(path: &std::path::Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 impl LspClient {
     /// Create a new LspClient with a custom clangd path
     pub async fn with_path(tx: mpsc::Sender<Value>, clangd_path: &str) -> Result<Self> {
@@ -79,15 +135,14 @@ impl LspClient {
         Self::from_process(tx, process).await
     }
 
-    /// Create a new LspClient that tries to find clangd in PATH
+    /// Create a new LspClient running the clangd `resolve_clangd_path` picked.
+    ///
+    /// That is `$COON_CLANGD` when it is set, and `clangd` from `PATH`
+    /// otherwise; a `COON_CLANGD` pointing at nothing runnable is an error
+    /// rather than a fallback.
     pub async fn new(tx: mpsc::Sender<Value>) -> Result<Self> {
-        // First try the hardcoded path from the original code
-        if std::path::Path::new("/home/eransa/opt/llvm/llvm-20.1.8-build/bin/clangd").exists() {
-            return Self::with_path(tx, "/home/eransa/opt/llvm/llvm-20.1.8-build/bin/clangd").await;
-        }
-
-        // Then try to find clangd in PATH
-        Self::with_path(tx, "clangd").await
+        let clangd_path = resolve_clangd_path()?;
+        Self::with_path(tx, &clangd_path).await
     }
 
     async fn from_process(tx: mpsc::Sender<Value>, mut process: Child) -> Result<Self> {

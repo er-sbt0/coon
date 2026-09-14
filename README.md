@@ -15,7 +15,7 @@ Three frontends, one shared application core:
 ## Requirements
 
 - Rust (2021 edition)
-- `clangd` in `PATH` (for LSP mode)
+- `clangd` in `PATH` (for LSP mode), or `COON_CLANGD` set to the clangd binary to use
 - A `compile_commands.json` in the project root (or coon will fall back to directory walking)
 
 For the desktop frontend on Linux, Tauri's system dependencies:

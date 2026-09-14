@@ -18,6 +18,10 @@ Each test follows these steps:
 
 Ensure `clangd` is installed and accessible in your system's `PATH`. The tests will fail if they cannot find the `clangd` executable.
 
+Note that these tests spawn `clangd` themselves rather than going through
+`LspClient::new`, so the application's `COON_CLANGD` override does not apply to them —
+a test runs whatever `PATH` resolves.
+
 ## How to Write a New Test
 
 Here is a step-by-step guide to creating a new integration test.

@@ -27,6 +27,12 @@ cargo test <test_name>           # Single test by name pattern
 
 LSP integration tests require `clangd` to be installed and in `PATH`. See `lsp/TESTING.md` for details on writing integration tests.
 
+`LspClient::new` runs `clangd` from `PATH`; set `COON_CLANGD` to the full path of a
+particular binary to use that one instead. If `COON_CLANGD` is set but names nothing
+executable, startup fails rather than falling back to `PATH` — picking a different
+clangd than the one asked for is how an index ends up quietly wrong. Either way the
+choice, and where it came from, is logged at info on startup.
+
 Logs are written to `logs/` directory.
 
 ## Architecture
