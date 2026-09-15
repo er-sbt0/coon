@@ -12,12 +12,15 @@ members = [
     "crates/desktop"
 ]
 
-# `desktop` pulls the Tauri tree — 183 crates nothing else in the workspace
-# needs, and the largest artifacts in `target/`. Keep it out of the default
-# set so a bare `cargo build`/`cargo test` never compiles it; build it
-# explicitly with `cargo build -p desktop`.
+# The desktop app is the frontend, so it is what a bare `cargo run` launches —
+# which means it has to be in the default set, and `coon` (the deprecated TUI
+# and web server binary) has to be out of it, or `cargo run` has two binaries to
+# choose between and refuses. The cost is the Tauri tree: 183 crates nothing
+# else in the workspace needs, and the largest artifacts in `target/`, now
+# compiled by a bare `cargo build`/`cargo test`. Build the deprecated frontends
+# explicitly with `cargo build -p coon`.
 default-members = [
-    "crates/coon",
+    "crates/desktop",
     "crates/model",
     "crates/lsp",
     "crates/logic",

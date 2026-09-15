@@ -2,7 +2,7 @@
 name = "desktop"
 version = "0.1.0"
 edition = "2021"
-description = "COON desktop frontend (Tauri)"
+description = "COON desktop frontend (Tauri) — the default frontend"
 
 [[bin]]
 name = "coon-desktop"

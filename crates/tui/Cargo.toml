@@ -2,6 +2,7 @@
 name = "tui"
 version = "0.1.0"
 edition = "2021"
+description = "COON terminal frontend (DEPRECATED — kept working, no longer developed)"
 
 [dependencies]
 model.workspace = true

@@ -9,14 +9,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 cargo build
 cargo build --release
 
-# Run
-cargo run                             # TUI, demo mode (no clangd needed)
-cargo run -- /path/to/project          # TUI, LSP mode (real C/C++ project via clangd)
-cargo run -- --web 8080                # Web frontend, demo mode
-cargo run -- /path/to/project --web 8080   # Web frontend, LSP mode
+# Run — `cargo run` is the desktop app; `-p desktop` is the same thing spelled out
+cargo run                              # Desktop app, demo mode (no clangd needed)
+cargo run -- /path/to/project          # Desktop app, LSP mode (real C/C++ project via clangd)
 
-cargo run -p desktop                   # Desktop app, demo mode
-cargo run -p desktop -- /path/to/project   # Desktop app, LSP mode
+# Deprecated frontends — `coon` is outside default-members, so name it
+cargo run -p coon                              # TUI, demo mode
+cargo run -p coon -- /path/to/project          # TUI, LSP mode
+cargo run -p coon -- --web 8080                # Web frontend, demo mode
+cargo run -p coon -- /path/to/project --web 8080   # Web frontend, LSP mode
 
 # Test
 cargo test                       # All tests
@@ -37,7 +38,7 @@ Logs are written to `logs/` directory.
 
 ## Architecture
 
-COON is a Rust workspace that visualizes C/C++ call graphs, using `clangd` as the analysis backend. It ships **three frontends** over one shared application core.
+COON is a Rust workspace that visualizes C/C++ call graphs, using `clangd` as the analysis backend. It ships **three frontends** over one shared application core — the desktop app, and the TUI and web server it replaced.
 
 ### Crates
 
@@ -46,18 +47,22 @@ COON is a Rust workspace that visualizes C/C++ call graphs, using `clangd` as th
 - **`logic`** — Pure graph algorithms (BFS traversal, path-finding, reachability) operating on `CallGraph`.
 - **`core`** — Frontend-agnostic application core. `CoreApp` (owns `CallGraph`, `LspBridge`, `CoreWorkspaceManager`) exposes `dispatch(Command) -> Vec<AppEvent>` and `tick() -> Vec<AppEvent>`. Also holds `layout::compute_layout` (node positions), `protocol` (the shared wire format), `boot::spawn_lsp_bridge`, `demo`, and `logging`.
 - **`grid`** — Tree/DAG layout algorithm (a workspace crate, used by `core::layout` and the TUI).
-- **`coon`** — The `coon` binary: CLI parsing, and the TUI + web runners.
-- **`tui`** — Ratatui TUI: `TuiApp` (main state/event loop), `GraphView`/`GraphViewState`, search bar, workspace management.
-- **`web`** — Axum server: WebSocket at `/ws`, client assets embedded via `rust-embed`.
-- **`desktop`** — The `coon-desktop` binary: Tauri v2 shell hosting the same client as `web`.
+- **`desktop`** — The `coon-desktop` binary: Tauri v2 shell hosting the client in `crates/web/static`. **The frontend**, and the binary a bare `cargo run` launches.
+- **`coon`** — *Deprecated.* The `coon` binary: CLI parsing, and the TUI + web runners.
+- **`tui`** — *Deprecated.* Ratatui TUI: `TuiApp` (main state/event loop), `GraphView`/`GraphViewState`, search bar, workspace management.
+- **`web`** — *Deprecated server, live client.* Axum server: WebSocket at `/ws`, client assets embedded via `rust-embed`. The Rust is what is deprecated; `static/` is the shared client and the desktop app's `frontendDist`.
 
 ### Frontends
 
-| Frontend | Entry point | Transport to `CoreApp` |
-|---|---|---|
-| TUI | `coon` (default) | Direct calls — no serialisation |
-| Web | `coon --web <PORT>` | JSON over WebSocket |
-| Desktop | `coon-desktop` | The same JSON over Tauri IPC |
+| Frontend | Entry point | Transport to `CoreApp` | Status |
+|---|---|---|---|
+| Desktop | `coon-desktop` (default) | JSON over Tauri IPC | Where frontend work goes |
+| Web | `coon --web <PORT>` | The same JSON over a WebSocket | Deprecated |
+| TUI | `coon` | Direct calls — no serialisation | Deprecated |
+
+**The desktop app is the default; the TUI and the web server are deprecated.** Deprecated means kept working, not frozen out: both still build, still run, are still covered by the workspace's tests, and both still have to compile after a change to `core` or `protocol` — a change that breaks them is a change to fix, not a reason to delete them. What stops is new work: a feature belongs in the desktop app and the shared client, and is not expected to reach the other two. Neither is `#[deprecated]` as an attribute, because `coon` is their only caller and is deprecated itself, so the warnings would land nowhere that does not already say so. The notice a user sees is `main::warn_deprecated`, printed to stderr before the TUI takes the terminal.
+
+Two consequences in the manifests, both deliberate: `crates/desktop` is in `default-members` and `crates/coon` is not — `cargo run` picks a binary from the default set and refuses if there are two — which is also why a bare `cargo build`/`cargo test` now compiles the Tauri tree it used to skip. And `crates/web/static` is not deprecated with the crate around it: it is the client the desktop app ships, so client work goes there exactly as before.
 
 The web and desktop frontends **share one JavaScript client** (`crates/web/static`). They differ only in `transport.js`, which feature-detects `window.__TAURI__` and picks either a WebSocket or Tauri `invoke`/`listen`. Because both backends emit identical `core::protocol::ServerMsg` shapes, `app.js` needs no knowledge of which one it is talking to. Keep it that way: put shared behaviour in `app.js`, and anything pipe-specific (including window management, via `CoonHost`) in `transport.js`.
 
@@ -105,9 +110,9 @@ The desktop window is **undecorated** (`decorations: false`); `#titlebar` is the
 
 ### Data Flow
 
-`main.rs` has two paths:
+Every frontend's `main.rs` — `crates/desktop/src/main.rs`, and `crates/coon/src/main.rs` for the deprecated two — has the same two paths, chosen by whether a project path was given:
 
-1. **Demo mode** (`cargo run`): builds a synthetic `CallGraph` and passes it directly to `run_tui`.
+1. **Demo mode** (`cargo run`): builds a synthetic `CallGraph` and hands it straight to the frontend.
 2. **LSP mode** (`cargo run -- <path>`): spins up a background `lsp_loader_task` that connects to clangd, opens every source file in the compilation database, and builds a `CallGraph` via workspace symbol queries. Those documents do not stay open — see **Open documents are a cache, not the project** below. The frontend starts immediately while loading proceeds asynchronously. A Tokio MPSC bridge forwards `LspRequest` messages to `LspService` and returns `LspResponse`/`LspUiMessage` results back. `core::boot::spawn_lsp_bridge` performs this wiring for every frontend.
 
 The web and desktop backends both poll `CoreApp::tick()` every 100ms and translate the resulting events through `core::protocol::EventRouter`, which decides what to forward verbatim and when to push a fresh snapshot.

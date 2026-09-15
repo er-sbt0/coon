@@ -1,5 +1,10 @@
 # Web Frontend Support Plan
 
+> **Historical.** This is the plan the web frontend was built from, kept for the
+> reasoning behind `core`/`protocol`. The web server is now deprecated in favour
+> of the desktop app, and the commands below are spelled `cargo run -p coon -- …`
+> since `coon` left the workspace's default members.
+
 ## Current State
 
 The `core` crate is fully implemented:

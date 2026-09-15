@@ -2,6 +2,7 @@
 name = "web"
 version = "0.1.0"
 edition = "2021"
+description = "COON web server frontend (DEPRECATED — `static/` is the shared client and is not)"
 
 [dependencies]
 core.workspace = true

@@ -2,6 +2,7 @@
 name = "coon"
 version = "0.1.0"
 edition = "2021"
+description = "COON TUI and web server frontends (DEPRECATED — use the `desktop` crate's `coon-desktop`)"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
