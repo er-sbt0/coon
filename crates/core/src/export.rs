@@ -698,6 +698,77 @@ mod tests {
     }
 
     #[test]
+    fn opening_a_community_inside_a_community_nests_the_boxes() {
+        // The dendrogram is a hierarchy, and a map with two levels open has to
+        // export as boxes inside boxes — not as a flattened list that loses
+        // which community the inner one belongs to.
+        let mut core = CoreApp::new(create_demo_call_graph());
+
+        let top = core.active_clustering().top_level()[0];
+        let top_key = core.active_clustering().cluster(top).unwrap().key;
+        let children = core
+            .active_clustering()
+            .cluster(top)
+            .unwrap()
+            .children
+            .clone();
+        assert!(
+            !children.is_empty(),
+            "this test needs a cluster with a finer level under it"
+        );
+        core.dispatch(crate::Command::ToggleClusterExpanded(top_key));
+        let child_key = core.active_clustering().cluster(children[0]).unwrap().key;
+        core.dispatch(crate::Command::ToggleClusterExpanded(child_key));
+
+        let out = dot(&core);
+        let outer = out.find("subgraph cluster_").expect("the opened community");
+        let inner = out[outer + 1..]
+            .find("subgraph cluster_")
+            .map(|i| outer + 1 + i)
+            .expect("the community opened inside it");
+        let close = out[outer..].find("\n  }\n").map(|i| outer + i).unwrap();
+        assert!(
+            inner < close,
+            "the nested box has to be emitted before the outer one closes:\n{out}"
+        );
+        // And opening the finest level is what finally puts functions on the
+        // map, rather than another community standing in for them.
+        assert!(
+            out.contains("tooltip=\"crc32_update\\n"),
+            "a level-0 box holds its member functions; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_map_scoped_to_a_function_exports_that_map() {
+        let mut core = CoreApp::new(create_demo_call_graph());
+        let main = core.call_graph.find_function_by_name("main").unwrap().id;
+        core.dispatch(crate::Command::SetMapScope(Some(main)));
+        // The scoped clustering is computed off the tick loop.
+        for _ in 0..50 {
+            core.tick();
+            if core.workspaces.current().unwrap().map_scope.is_some()
+                && !core
+                    .clustering_for(core.workspaces.current().unwrap())
+                    .is_empty()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let out = export(&core, ExportFormat::Dot).expect("main has a neighbourhood");
+        assert_eq!(
+            out.filename, "main-clusters.dot",
+            "a scoped map and the whole project's must not overwrite each other"
+        );
+        assert!(
+            out.contents.contains("main — neighbourhood"),
+            "the two look identical otherwise, so the file has to say which it is"
+        );
+    }
+
+    #[test]
     fn cluster_edges_never_point_at_a_box() {
         // Graphviz cannot draw an edge to a subgraph without `compound` and an
         // `lhead`, and this export sets neither — which is only safe because
