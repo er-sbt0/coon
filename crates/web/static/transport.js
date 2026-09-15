@@ -76,9 +76,17 @@
   // Saving a file is here for the same reason: `core` builds the bytes and
   // says nothing about where they land, and where they land is exactly what
   // the two pipes disagree about. A browser can only hand the file to the
-  // download machinery; the desktop shell has a real filesystem and writes to
-  // it. Both answer with a promise for something to show the user, because
-  // "saved" without a location is not an answer.
+  // download machinery; the desktop shell can ask, and does — `save_export`
+  // opens a native save dialog rather than choosing a directory on the user's
+  // behalf, which is how three exports ended up in a home directory that XDG
+  // calls "downloads".
+  //
+  //   CoonHost.saveFile(filename, contents) -> Promise<string | null>
+  //
+  // The string is where the file went, and is shown to the user, because
+  // "saved" without a location is not an answer. `null` means they cancelled,
+  // which is not a failure and must not be reported as one — only the browser
+  // build, which has nothing to cancel, never returns it.
   function browserSave(filename, contents) {
     const url = URL.createObjectURL(new Blob([contents], { type: 'text/plain' }));
     const a = document.createElement('a');

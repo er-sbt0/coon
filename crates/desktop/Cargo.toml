@@ -22,3 +22,4 @@ serde_json.workspace = true
 log.workspace = true
 clap = { version = "4", features = ["derive"] }
 tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"

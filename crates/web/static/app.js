@@ -993,7 +993,13 @@ function updateStatusFromEvent(key, payload) {
     // file on the desktop. Either way say where, because a save the user
     // cannot find did not happen as far as they are concerned.
     CoonHost.saveFile(payload.filename, payload.contents)
-      .then((where) => { holdInfo(`Exported ${where}`); })
+      .then((where) => {
+        // `null` is the desktop save dialog being dismissed. Nothing went
+        // wrong and nothing was written, so the line says so plainly and does
+        // not hold — there is no path to go and find.
+        if (where) holdInfo(`Exported ${where}`);
+        else setInfo('Export cancelled');
+      })
       .catch((err) => {
         console.error('export failed', err);
         holdInfo(`Could not save ${payload.filename}`);

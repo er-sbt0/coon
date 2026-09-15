@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_dialog::DialogExt;
 use tokio::sync::Mutex;
 
 use coon_core::{
@@ -44,6 +45,9 @@ struct Args {
 struct Backend {
     core: Arc<Mutex<CoreApp>>,
     router: Arc<Mutex<EventRouter>>,
+    /// The project being analysed, so the export dialog opens where the user is
+    /// already looking. `None` in demo mode, where there is no such directory.
+    project_dir: Option<std::path::PathBuf>,
 }
 
 impl Backend {
@@ -98,19 +102,38 @@ async fn dispatch(
     Ok(())
 }
 
-/// Write an export to disk and answer with where it went.
+/// Ask where the export goes, write it there, and answer with the path.
+///
+/// `Ok(None)` means the user cancelled, which is not a failure and must not be
+/// reported as one.
 ///
 /// The browser build hands the file to the download machinery instead (see
-/// `browserSave` in `transport.js`); a desktop app has a real filesystem, so
-/// it uses it. The downloads directory rather than the working directory,
-/// because a bundled app's working directory is wherever the launcher happened
-/// to be.
+/// `browserSave` in `transport.js`), because that is the only place a page can
+/// put a file. A desktop app can ask, and asking is the answer here: picking a
+/// directory on the user's behalf went to whatever XDG calls "downloads", which
+/// on a machine with `XDG_DOWNLOAD_DIR="$HOME/"` is the home directory — so
+/// three exports landed in `~` and read as a key that did nothing.
 ///
-/// `filename` is built by `core::export`, which already slugs it — but it
+/// The dialog is opened from Rust rather than from `transport.js` on purpose:
+/// a plugin's JavaScript bindings come as an npm package, and reaching for one
+/// would cost this client the property that it is a plain script with no build
+/// step. The pipe stays `invoke`, exactly as it was.
+///
+/// It opens on the project being analysed — the directory the export describes
+/// is the one the user is thinking about — falling back to downloads when coon
+/// is running on demo data.
+///
+/// `filename` is built by `core::export`, which already slugs it, but it
 /// arrives here across an IPC boundary, so it is checked again rather than
-/// trusted. A name is a name, never a path.
+/// trusted: a name is a name, never a path. The dialog would contain it either
+/// way; this keeps a bad one from ever reaching the dialog.
 #[tauri::command]
-async fn save_export(app: AppHandle, filename: String, contents: String) -> Result<String, String> {
+async fn save_export(
+    app: AppHandle,
+    backend: State<'_, Backend>,
+    filename: String,
+    contents: String,
+) -> Result<Option<String>, String> {
     if filename.is_empty()
         || filename.contains('/')
         || filename.contains('\\')
@@ -119,17 +142,42 @@ async fn save_export(app: AppHandle, filename: String, contents: String) -> Resu
         return Err(format!("`{filename}` is not a filename"));
     }
 
-    let dir = app
-        .path()
-        .download_dir()
-        .or_else(|_| app.path().home_dir())
-        .map_err(|e| format!("nowhere to save to: {e}"))?;
-    let path = dir.join(&filename);
+    let mut dialog = app
+        .dialog()
+        .file()
+        .set_title("Export graph")
+        .set_file_name(&filename)
+        .add_filter("Graphviz DOT", &["dot"]);
+    if let Some(dir) = backend
+        .project_dir
+        .clone()
+        .or_else(|| app.path().download_dir().ok())
+    {
+        dialog = dialog.set_directory(dir);
+    }
 
+    // `save_file` answers on a callback, and the command has to hold the reply
+    // until it does — the client is waiting on this promise to know what to put
+    // on the status line.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    dialog.save_file(move |chosen| {
+        let _ = tx.send(chosen);
+    });
+    let Some(chosen) = rx
+        .await
+        .map_err(|e| format!("the save dialog closed unexpectedly: {e}"))?
+    else {
+        log::info!("[desktop] export cancelled at the save dialog");
+        return Ok(None);
+    };
+
+    let path = chosen
+        .into_path()
+        .map_err(|e| format!("that is not a path this can write to: {e}"))?;
     std::fs::write(&path, contents)
         .map_err(|e| format!("could not write {}: {e}", path.display()))?;
     log::info!("[desktop] exported to {}", path.display());
-    Ok(path.display().to_string())
+    Ok(Some(path.display().to_string()))
 }
 
 fn main() {
@@ -163,9 +211,11 @@ fn main() {
     let backend = Backend {
         core: Arc::new(Mutex::new(core)),
         router: Arc::new(Mutex::new(EventRouter::new())),
+        project_dir: args.project_path.as_deref().map(std::path::PathBuf::from),
     };
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(backend)
         .invoke_handler(tauri::generate_handler![
             dispatch,
