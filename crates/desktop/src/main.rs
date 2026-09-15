@@ -98,6 +98,40 @@ async fn dispatch(
     Ok(())
 }
 
+/// Write an export to disk and answer with where it went.
+///
+/// The browser build hands the file to the download machinery instead (see
+/// `browserSave` in `transport.js`); a desktop app has a real filesystem, so
+/// it uses it. The downloads directory rather than the working directory,
+/// because a bundled app's working directory is wherever the launcher happened
+/// to be.
+///
+/// `filename` is built by `core::export`, which already slugs it — but it
+/// arrives here across an IPC boundary, so it is checked again rather than
+/// trusted. A name is a name, never a path.
+#[tauri::command]
+async fn save_export(app: AppHandle, filename: String, contents: String) -> Result<String, String> {
+    if filename.is_empty()
+        || filename.contains('/')
+        || filename.contains('\\')
+        || filename.starts_with('.')
+    {
+        return Err(format!("`{filename}` is not a filename"));
+    }
+
+    let dir = app
+        .path()
+        .download_dir()
+        .or_else(|_| app.path().home_dir())
+        .map_err(|e| format!("nowhere to save to: {e}"))?;
+    let path = dir.join(&filename);
+
+    std::fs::write(&path, contents)
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    log::info!("[desktop] exported to {}", path.display());
+    Ok(path.display().to_string())
+}
+
 fn main() {
     if let Err(e) = coon_core::logging::init_logging() {
         eprintln!("Failed to initialize logging: {}", e);
@@ -133,7 +167,11 @@ fn main() {
 
     tauri::Builder::default()
         .manage(backend)
-        .invoke_handler(tauri::generate_handler![dispatch, request_snapshot])
+        .invoke_handler(tauri::generate_handler![
+            dispatch,
+            request_snapshot,
+            save_export
+        ])
         .setup(|app| {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {

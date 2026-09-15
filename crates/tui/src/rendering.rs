@@ -146,6 +146,7 @@ fn render_help_overlay(f: &mut Frame, area: ratatui::layout::Rect) {
         Line::from("General:"),
         Line::from("  F         - Find references"),
         Line::from("  R         - Refresh from LSP"),
+        Line::from("  e         - Export the graph as Graphviz (.dot)"),
         Line::from("  ?         - Show/hide this help"),
         Line::from("  q / Esc   - Quit application"),
         Line::from(""),

@@ -90,6 +90,7 @@ fn map_normal_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('F') => Some(Action::FindReferences),
         KeyCode::Char('t') => Some(Action::ToggleCallDirection),
         KeyCode::Char('R') => Some(Action::Refresh),
+        KeyCode::Char('e') => Some(Action::ExportGraph),
 
         _ => None,
     }
@@ -174,6 +175,19 @@ mod tests {
         assert_eq!(
             map_key_event(press(KeyCode::Down), true),
             Some(Action::SearchNextResult)
+        );
+    }
+
+    #[test]
+    fn normal_mode_export() {
+        assert_eq!(
+            map_key_event(press(KeyCode::Char('e')), false),
+            Some(Action::ExportGraph)
+        );
+        // In the search bar it is just a letter, like every other key there.
+        assert_eq!(
+            map_key_event(press(KeyCode::Char('e')), true),
+            Some(Action::SearchInput('e'))
         );
     }
 

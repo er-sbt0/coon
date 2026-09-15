@@ -313,6 +313,7 @@ impl CoreApp {
             Command::StartGraphFromFunction(id) => self.cmd_start_graph_from_function(id),
             Command::ExpandFunction(id) => self.cmd_expand_function(id),
             Command::FocusFunction(id) => self.cmd_focus_function(id),
+            Command::ExportGraph(format) => self.cmd_export_graph(format),
         };
         // Any command can be the one that changes which map is wanted — a tab
         // switch, a direction toggle, a new scope — so the cache is squared up
@@ -865,6 +866,32 @@ impl CoreApp {
             events.push(ev);
         }
         events
+    }
+
+    /// Render the current view to a file's worth of text and hand it back.
+    ///
+    /// Changes nothing — no selection, no layout, no fetch — so it emits no
+    /// `LayoutDirty` and costs the client no snapshot. The frontend that asked
+    /// is the one that knows where a file goes; see `AppEvent::GraphExported`.
+    fn cmd_export_graph(&mut self, format: crate::export::ExportFormat) -> Vec<AppEvent> {
+        match crate::export::export(self, format) {
+            Some(export) => {
+                log::info!(
+                    "CoreApp: exported {} ({} bytes of {:?})",
+                    export.filename,
+                    export.contents.len(),
+                    format
+                );
+                vec![AppEvent::GraphExported {
+                    filename: export.filename,
+                    contents: export.contents,
+                }]
+            }
+            None => {
+                log::info!("CoreApp: nothing on screen to export");
+                vec![AppEvent::NothingToExport]
+            }
+        }
     }
 
     /// Point at a function: no new root, no layout, no fetch.

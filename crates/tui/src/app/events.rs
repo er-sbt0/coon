@@ -28,6 +28,9 @@ impl App {
             Action::Help => self.toggle_help(),
             Action::ToggleCallDirection => self.dispatch_cmd(::core::Command::ToggleCallDirection),
             Action::ResetView => self.handle_reset_view(),
+            Action::ExportGraph => {
+                self.dispatch_cmd(::core::Command::ExportGraph(::core::ExportFormat::Dot));
+            }
 
             // Graph navigation (hjkl)
             Action::NavigateParent => self.handle_navigate_parent(),

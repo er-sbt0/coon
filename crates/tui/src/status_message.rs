@@ -102,6 +102,14 @@ pub enum StatusMessage {
     WorkspaceCreatedFromSearch,
     GraphWorkspaceCreated,
 
+    // ── Export ────────────────────────────────────────────────
+    /// The graph was written out. Carries the path, because the TUI writes
+    /// into the working directory and "Exported" alone leaves the user hunting.
+    GraphExported {
+        path: String,
+    },
+    NothingToExport,
+
     // ── Errors ────────────────────────────────────────────────
     LspError {
         error: String,
@@ -216,6 +224,10 @@ impl fmt::Display for StatusMessage {
             }
             Self::WorkspaceCreatedFromSearch => write!(f, "Workspace created from search"),
             Self::GraphWorkspaceCreated => write!(f, "Graph workspace created"),
+
+            // Export
+            Self::GraphExported { path } => write!(f, "Exported to {}", path),
+            Self::NothingToExport => write!(f, "Nothing on screen to export"),
 
             // Errors
             Self::LspError { error } => write!(f, "LSP error: {}", error),

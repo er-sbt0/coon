@@ -1,6 +1,7 @@
 use logic::ClusterKey;
 use model::SymbolId;
 
+use crate::export::ExportFormat;
 use crate::layout::LayoutOrientation;
 use crate::workspace::ViewMode;
 use serde::{Deserialize, Serialize};
@@ -72,6 +73,14 @@ pub enum Command {
     /// Load call hierarchy for a specific function without changing the graph root.
     /// Used by the web frontend to expand a node in-place.
     ExpandFunction(SymbolId),
+
+    // ---- Export ----
+    /// Write the current view out as a file the user can keep.
+    ///
+    /// The view, not the graph: what comes back is the subgraph on screen, with
+    /// this workspace's depth limit, collapsed nodes, direction and orientation
+    /// already applied. See [`crate::export`].
+    ExportGraph(ExportFormat),
 
     /// Move the selection to this function and do nothing else.
     ///

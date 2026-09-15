@@ -45,6 +45,22 @@ pub enum AppEvent {
         clusters: usize,
     },
 
+    // ---- Export ----
+    /// The current view was rendered to a file's worth of text.
+    ///
+    /// `CoreApp` builds the contents and stops there: where a file belongs is
+    /// the one part of exporting that differs per frontend — the TUI's working
+    /// directory, a browser download, a desktop save dialog — and a web server
+    /// writing to its own disk on behalf of a tab on another machine would be
+    /// the wrong answer in the only case that has a network in it.
+    GraphExported {
+        filename: String,
+        contents: String,
+    },
+    /// There was nothing on screen to export: a tab with no root, or a cluster
+    /// map of a graph whose edges have not arrived yet.
+    NothingToExport,
+
     // ---- LSP lifecycle ----
     LspProgress(LspLoadPhase),
     LspRequestTimedOut,

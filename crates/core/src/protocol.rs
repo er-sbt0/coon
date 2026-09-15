@@ -223,7 +223,7 @@ fn cluster_layout_of(core: &CoreApp) -> Option<GraphLayout> {
 }
 
 /// Layout options taken from the active workspace.
-fn layout_options(core: &CoreApp) -> LayoutOptions<'_> {
+pub(crate) fn layout_options(core: &CoreApp) -> LayoutOptions<'_> {
     match core.workspaces.current() {
         Some(ws) => LayoutOptions {
             depth: ws.depth,

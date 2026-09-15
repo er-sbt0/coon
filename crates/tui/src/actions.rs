@@ -18,6 +18,8 @@ pub enum Action {
     Help,
     ToggleCallDirection,
     ResetView,
+    /// Write the graph on screen out as a Graphviz file.
+    ExportGraph,
 
     // -- graph navigation (hjkl) --
     NavigateParent,

@@ -72,16 +72,37 @@
   // Window management is the one genuinely desktop-only surface. It lives here
   // rather than in app.js so __TAURI__ is touched in exactly one file; in the
   // browser these are no-ops and the controls stay hidden.
+  //
+  // Saving a file is here for the same reason: `core` builds the bytes and
+  // says nothing about where they land, and where they land is exactly what
+  // the two pipes disagree about. A browser can only hand the file to the
+  // download machinery; the desktop shell has a real filesystem and writes to
+  // it. Both answer with a promise for something to show the user, because
+  // "saved" without a location is not an answer.
+  function browserSave(filename, contents) {
+    const url = URL.createObjectURL(new Blob([contents], { type: 'text/plain' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    // Revoked on the next turn: revoking synchronously races the download in
+    // some browsers, which then save an empty file.
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+    return Promise.resolve(filename);
+  }
+
   window.CoonHost = isTauri
     ? (() => {
         const win = window.__TAURI__.window.getCurrentWindow();
+        const { invoke } = window.__TAURI__.core;
         return {
           minimize: () => win.minimize(),
           toggleMaximize: () => win.toggleMaximize(),
           close: () => win.close(),
+          saveFile: (filename, contents) => invoke('save_export', { filename, contents }),
         };
       })()
-    : { minimize() {}, toggleMaximize() {}, close() {} };
+    : { minimize() {}, toggleMaximize() {}, close() {}, saveFile: browserSave };
 
   console.log(`[coon] transport: ${window.CoonTransport.name}`);
 })();

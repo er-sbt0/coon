@@ -957,6 +957,18 @@ function updateStatusFromEvent(key, payload) {
     // because a map shifting under the user unannounced reads as a bug.
     const n = payload?.clusters;
     infoEl.textContent = n ? `Regrouped into ${n} communities` : 'Communities regrouped';
+  } else if (key === 'GraphExported') {
+    // Where it goes is the transport's business: a browser download, or a real
+    // file on the desktop. Either way say where, because a save the user
+    // cannot find did not happen as far as they are concerned.
+    CoonHost.saveFile(payload.filename, payload.contents)
+      .then((where) => { infoEl.textContent = `Exported ${where}`; })
+      .catch((err) => {
+        console.error('export failed', err);
+        infoEl.textContent = `Could not save ${payload.filename}`;
+      });
+  } else if (key === 'NothingToExport') {
+    infoEl.textContent = 'Nothing on screen to export';
   } else if (key === 'WorkspaceCreated' || key === 'WorkspaceSwitched') {
     infoEl.textContent = payload?.name ? `Graph: ${payload.name}` : '';
   }
@@ -1345,6 +1357,11 @@ function buildCommands() {
     },
     { id: 'view.theme', label: 'View: Toggle Theme', run: toggleTheme },
 
+    // Both views export — the rooted tree as a DAG, the map as nested DOT
+    // `subgraph cluster_` boxes — so this is the one graph command that is
+    // never greyed out on the map.
+    { id: 'graph.export', label: 'Graph: Export as Graphviz (DOT)', hint: 'Ctrl+E', run: exportGraph },
+
     { id: 'lsp.refresh', label: 'LSP: Refresh Symbols', hint: 'Ctrl+R', run: () => sendCommand('Refresh') },
     { id: 'lsp.refs', label: 'LSP: Find References', disabled: !selectedNodeId, run: () => sendCommand('FindReferences') },
   ];
@@ -1360,6 +1377,15 @@ function buildCommands() {
   });
 
   return cmds;
+}
+
+/// Ask for the current view as a file.
+///
+/// The backend does the rendering and hands back `{ filename, contents }`;
+/// `GraphExported` below is where it lands. Nothing is drawn or re-fetched, so
+/// this costs no snapshot.
+function exportGraph() {
+  sendCommand({ ExportGraph: 'Dot' });
 }
 
 function openCommandPalette() {
@@ -1419,6 +1445,7 @@ document.addEventListener('keydown', (e) => {
   }
   else if (key === 'f') { e.preventDefault(); searchEl.focus(); searchEl.select(); }
   else if (key === 'r') { e.preventDefault(); sendCommand('Refresh'); }
+  else if (key === 'e') { e.preventDefault(); exportGraph(); }
   else if (key === 'm' && e.shiftKey) { e.preventDefault(); clusterThisFunction(); }
   else if (key === 'm') { e.preventDefault(); toggleView(); }
   else if (key === 'd' && e.shiftKey) { e.preventDefault(); setOrientation(currentOrientation === 'LeftRight' ? 'TopDown' : 'LeftRight'); }

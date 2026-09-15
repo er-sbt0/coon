@@ -43,6 +43,16 @@ cargo run -p desktop -- /path/to/your/project
 
 Every frontend accepts the same optional project path; omit it for demo data.
 
+## Exporting a graph
+
+Any view — a rooted call tree or a cluster map — exports as [Graphviz](https://graphviz.org) DOT: `e` in the TUI, `Ctrl+E` (or the command palette) in the web and desktop clients. What you get is the graph on screen, with its depth limit, collapsed nodes and direction already applied — not the whole project.
+
+```bash
+dot -Tsvg main.dot -o main.svg     # or -Tpng, -Tpdf
+```
+
+The TUI writes into its working directory, the browser downloads the file, and the desktop app saves to your downloads directory; each says where it went. Open communities come out as nested `subgraph cluster_…` boxes, and closed ones as a single node carrying the number of functions it stands for.
+
 ## Build
 
 ```bash
