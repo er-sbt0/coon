@@ -22,7 +22,18 @@ pub async fn handler(uri: Uri) -> Response {
         Some(file) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
             (
-                [(header::CONTENT_TYPE, mime.as_ref())],
+                [
+                    (header::CONTENT_TYPE, mime.as_ref()),
+                    // The client shipped with no cache validators at all — no
+                    // `ETag`, no `Last-Modified`, no `Cache-Control` — which
+                    // leaves a browser free to apply heuristic freshness and go
+                    // on running an `app.js` from a previous run of the server.
+                    // The symptom is a feature that is simply absent: no
+                    // keybinding, no palette entry, no error. The assets live
+                    // in the binary, so they change exactly when it does and
+                    // there is nothing here worth caching across that.
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
                 file.data.into_owned(),
             )
                 .into_response()

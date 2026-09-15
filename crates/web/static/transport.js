@@ -84,7 +84,13 @@
     const a = document.createElement('a');
     a.href = url;
     a.download = filename;
+    // In the document, not detached: Chrome starts a download from a detached
+    // anchor and Firefox silently does not, which makes the export look like a
+    // key that does nothing at all.
+    a.style.display = 'none';
+    document.body.appendChild(a);
     a.click();
+    a.remove();
     // Revoked on the next turn: revoking synchronously races the download in
     // some browsers, which then save an empty file.
     setTimeout(() => URL.revokeObjectURL(url), 0);
