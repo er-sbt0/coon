@@ -66,7 +66,7 @@ Any view — a rooted call tree or a cluster map — exports as [Graphviz](https
 dot -Tsvg main.dot -o main.svg     # or -Tpng, -Tpdf
 ```
 
-The desktop app saves to your downloads directory, the browser downloads the file, and the TUI writes into its working directory; each says where it went. Open communities come out as nested `subgraph cluster_…` boxes, and closed ones as a single node carrying the number of functions it stands for.
+The desktop app opens a save dialog on the project directory, the browser downloads the file, and the TUI writes into its working directory; each says where the file went. Open communities come out as nested `subgraph cluster_…` boxes, and closed ones as a single node carrying the number of functions it stands for.
 
 ## Build
 
