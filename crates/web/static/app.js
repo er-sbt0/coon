@@ -273,7 +273,7 @@ function handleSnapshot(msg) {
   statNodesEl.textContent = placed.toLocaleString();
 
   if (n > 0 && placed === 0) {
-    infoEl.textContent = 'Ctrl+P to find a symbol · Ctrl+Shift+P for commands';
+    setInfo('Ctrl+P to find a symbol · Ctrl+Shift+P for commands');
   }
 }
 
@@ -678,7 +678,7 @@ function clusterTap(node) {
   if (!key) return;                    // a function inside a box: nothing to open
   clearTimeout(pendingOpen);
   pendingOpen = setTimeout(() => {
-    infoEl.textContent = `${node.hasClass('group') ? 'Closing' : 'Opening'} ${node.data('name')}`;
+    setInfo(`${node.hasClass('group') ? 'Closing' : 'Opening'} ${node.data('name')}`);
     sendCommand({ ToggleClusterExpanded: key });
   }, DRILL_WINDOW_MS);
 }
@@ -689,7 +689,7 @@ function clusterDrill(node) {
   clearTimeout(pendingOpen);
   const key = node.data('key');
   if (key) {
-    infoEl.textContent = `Drilling into ${node.data('name')}`;
+    setInfo(`Drilling into ${node.data('name')}`);
     sendCommand({ DrillIntoCluster: key });
     return;
   }
@@ -764,10 +764,10 @@ function clusterThisFunction() {
   // selected is not on it — so from here this is a request with no subject.
   const id = currentView === 'ClusterMap' ? null : scopeTarget();
   if (!id) {
-    infoEl.textContent = 'Open a call tree first — this groups what a function reaches';
+    setInfo('Open a call tree first — this groups what a function reaches');
     return;
   }
-  infoEl.textContent = `Grouping what ${allFunctions[id]?.name ?? id} reaches`;
+  setInfo(`Grouping what ${allFunctions[id]?.name ?? id} reaches`);
   sendCommand({ SetMapScope: id });
 }
 
@@ -834,6 +834,37 @@ function handleEvent(event) {
 function setStatus(text, state) {
   statusEl.textContent = text;
   lspDotEl.className = state || '';
+}
+
+// ── The hint line ────────────────────────────────────────────────────────────
+//
+// One line with many writers: hovering a node writes the symbol under the
+// pointer, leaving it writes an empty string, and a regrouping writes that the
+// map moved — which during the warmup is constant. That is right for a hint,
+// where the next one is along in a moment and nothing is lost.
+//
+// It is wrong for a result. An export names the file it just wrote, and on a
+// project the size of jemalloc that line was overwritten by the next
+// `ClusteringUpdated` before it could be read — or by simply moving the mouse
+// across the canvas. A message the user never sees is the same as no message,
+// which is what makes a working export look like a key that does nothing.
+//
+// So a held message outranks the hints until it lapses. The same reason the
+// `load` object exists for the status bar: one line, several writers, and only
+// one of them saying something worth waiting for.
+const INFO_HOLD_MS = 15000;
+let infoHeldUntil = 0;
+
+/// A passing hint. Yields to anything currently held.
+function setInfo(text) {
+  if (performance.now() < infoHeldUntil) return;
+  infoEl.textContent = text;
+}
+
+/// A result worth reading. Holds the line against the hints for a while.
+function holdInfo(text) {
+  infoHeldUntil = performance.now() + INFO_HOLD_MS;
+  infoEl.textContent = text;
 }
 
 // ── Load progress ────────────────────────────────────────────────────────────
@@ -938,10 +969,10 @@ function updateStatusFromEvent(key, payload) {
     // runs, the overlay is already saying the same thing with a number on it.
     if (!loading()) setStatus(`Loading ${(payload?.direction || '').toLowerCase()} calls`, 'busy');
   } else if (key === 'FunctionHasNoCallees') {
-    infoEl.textContent = 'No callees in this direction';
+    setInfo('No callees in this direction');
   } else if (key === 'FunctionHasNoCommunities') {
     // The view deliberately did not change, so without this the key looks dead.
-    infoEl.textContent = 'Nothing to group here — this function reaches too little';
+    setInfo('Nothing to group here — this function reaches too little');
   } else if (key === 'OutgoingCallsLoaded' || key === 'IncomingCallsLoaded') {
     // Not "Ready" mid-load: the warmup answers hundreds of these while the
     // graph is still filling in, and each one used to declare the wait over.
@@ -949,28 +980,28 @@ function updateStatusFromEvent(key, payload) {
   } else if (key === 'RefreshingWorkspaceSymbols') {
     setStatus('Refreshing', 'busy');
   } else if (key === 'CannotCloseLastWorkspace') {
-    infoEl.textContent = 'Cannot close the last graph';
+    setInfo('Cannot close the last graph');
   } else if (key === 'LspError') {
     setStatus(typeof payload === 'string' ? payload : 'LSP error', 'error');
   } else if (key === 'ClusteringUpdated') {
     // The map is about to redraw with different communities on it; say so,
     // because a map shifting under the user unannounced reads as a bug.
     const n = payload?.clusters;
-    infoEl.textContent = n ? `Regrouped into ${n} communities` : 'Communities regrouped';
+    setInfo(n ? `Regrouped into ${n} communities` : 'Communities regrouped');
   } else if (key === 'GraphExported') {
     // Where it goes is the transport's business: a browser download, or a real
     // file on the desktop. Either way say where, because a save the user
     // cannot find did not happen as far as they are concerned.
     CoonHost.saveFile(payload.filename, payload.contents)
-      .then((where) => { infoEl.textContent = `Exported ${where}`; })
+      .then((where) => { holdInfo(`Exported ${where}`); })
       .catch((err) => {
         console.error('export failed', err);
-        infoEl.textContent = `Could not save ${payload.filename}`;
+        holdInfo(`Could not save ${payload.filename}`);
       });
   } else if (key === 'NothingToExport') {
-    infoEl.textContent = 'Nothing on screen to export';
+    holdInfo('Nothing on screen to export');
   } else if (key === 'WorkspaceCreated' || key === 'WorkspaceSwitched') {
-    infoEl.textContent = payload?.name ? `Graph: ${payload.name}` : '';
+    setInfo(payload?.name ? `Graph: ${payload.name}` : '');
   }
 }
 
@@ -1071,7 +1102,7 @@ searchEl.addEventListener('keydown', (e) => {
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 function selectRoot(id) {
-  infoEl.textContent = `Exploring ${allFunctions[id]?.name ?? id}`;
+  setInfo(`Exploring ${allFunctions[id]?.name ?? id}`);
   // Naming a symbol is asking for its call tree, and `core` switches the
   // workspace to the rooted view on its own — no need to pair the commands here.
   sendCommand({ SelectFunction: id });
@@ -1096,7 +1127,7 @@ function focusNode(id) {
 
 // Expand a node in place: load its children without changing the root.
 function expandNode(id) {
-  infoEl.textContent = `Expanding ${allFunctions[id]?.name ?? id}`;
+  setInfo(`Expanding ${allFunctions[id]?.name ?? id}`);
   sendCommand({ ExpandFunction: id });
 }
 
@@ -1135,7 +1166,7 @@ cy.on('mouseover', 'node', (e) => {
 
   // The canvas has no tooltips, and the label may be truncated, so the status
   // bar carries the full qualified name.
-  infoEl.textContent = node.data('full');
+  setInfo(node.data('full'));
   // The overlay loads or hides a function's callees; a community has neither.
   if (currentView !== 'ClusterMap') showExpandBtn(node);
 });
@@ -1143,7 +1174,7 @@ cy.on('mouseout', 'node', (e) => {
   e.target.removeClass('hovered');
   cy.edges().removeClass('incident');
   cy.elements().removeClass('faded');
-  infoEl.textContent = '';
+  setInfo('');
   hideExpandBtn();
 });
 
