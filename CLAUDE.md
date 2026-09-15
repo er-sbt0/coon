@@ -2,6 +2,30 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Scope — where work goes
+
+Read this before editing. The details are in **Architecture** below; this is the rule.
+
+| Path | Status |
+|---|---|
+| `crates/desktop` | The frontend. Work here. |
+| `crates/web/static` | The shared JavaScript client — the desktop app ships it. Work here. |
+| `crates/core`, `model`, `lsp`, `logic`, `grid` | The shared core. Work here. |
+| `crates/tui`, `crates/coon`, `crates/web/src` | **Deprecated. Do not do new work in these.** |
+
+Deprecated means kept working, not frozen out. In those three paths:
+
+- **Do** fix them when a change to `core` or `protocol` breaks their build, and
+  fix a test they catch. A break there is a change to fix, not a reason to
+  delete the crate. They are still workspace members and still tested.
+- **Do not** port a desktop feature across, refactor, clean up, or improve them
+  in passing. A feature belongs in the desktop app and the shared client and is
+  not expected to reach the other two.
+
+If a task asks for work in a deprecated path, check whether it actually wants
+the desktop app, and say so rather than building it twice. Each of those
+directories carries its own `CLAUDE.md` repeating this where you will land.
+
 ## Commands
 
 ```bash

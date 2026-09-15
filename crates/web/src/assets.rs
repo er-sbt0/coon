@@ -11,6 +11,9 @@ use rust_embed::RustEmbed;
 
 #[derive(RustEmbed)]
 #[folder = "static/"]
+// The client's `CLAUDE.md` is guidance for whoever edits it, not an asset to
+// serve or to carry in the binary.
+#[exclude = "CLAUDE.md"]
 struct Assets;
 
 /// Serve an embedded asset, falling back to `index.html` for `/`.
