@@ -265,6 +265,7 @@ fn cluster_dot(core: &CoreApp) -> Option<String> {
     let layout = compute_cluster_layout(
         &core.call_graph,
         clustering,
+        core.map_frame(),
         core.map_level_for(ws),
         ws.direction,
         ws.orientation,

@@ -250,6 +250,7 @@ fn cluster_layout_of(core: &CoreApp) -> Option<GraphLayout> {
     Some(compute_cluster_layout(
         &core.call_graph,
         core.clustering_for(ws),
+        core.map_frame(),
         core.map_level_for(ws),
         ws.direction,
         ws.orientation,

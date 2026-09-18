@@ -8,7 +8,7 @@ use model::{CallDirection, CallGraph, FunctionNode, Location, LspLoadPhase, Symb
 
 use crate::command::Command;
 use crate::events::AppEvent;
-use crate::layout::LayoutOrientation;
+use crate::layout::{compute_map_frame, LayoutOrientation, MapFrame};
 use crate::lsp_bridge::{LoadingState, LspBridge, RequestOrigin};
 use crate::workspace::{CoreWorkspace, CoreWorkspaceManager, ViewMode};
 
@@ -81,8 +81,22 @@ impl ClusterTarget {
 /// stays something you can call without one.
 struct ClusteringJob {
     target: ClusterTarget,
-    result: mpsc::Receiver<Clustering>,
+    result: mpsc::Receiver<Clustered>,
     started_at: Instant,
+}
+
+/// What a worker hands back: the grouping it was asked for, and — when the app
+/// had no frame in step with the graph when the job went out — the frame the
+/// maps are placed in.
+///
+/// They travel together because they are the same errand. Both are computed
+/// from the graph as it stands when the job starts, both take long enough that
+/// doing them under the app's lock froze the tick loop, and the frame is per
+/// *graph* rather than per target, so pinning it to its own job would mean a
+/// second worker and a second queue for a tenth of the work.
+struct Clustered {
+    clustering: Clustering,
+    frame: Option<MapFrame>,
 }
 
 /// Frontend-agnostic application core.
@@ -127,6 +141,21 @@ pub struct CoreApp {
     /// the expensive thing, so a second alongside it would compete for a core
     /// rather than add one.
     clustering_job: Option<ClusteringJob>,
+    /// Where every function sits when the whole graph is laid out at once — the
+    /// frame each rung of each map is placed in, so that a box lands where the
+    /// functions it holds already are. See [`crate::layout::MapFrame`].
+    ///
+    /// One per graph, not one per target: a scoped map draws a neighbourhood of
+    /// the same program and belongs in the same picture of it, so widening a
+    /// scope moves nothing that stayed.
+    map_frame: MapFrame,
+    /// Whether that frame describes a graph that has since grown.
+    ///
+    /// A stale frame is still the right thing to draw with — it seats every
+    /// function that was there a moment ago, and `MapFrame::seat_of` says so
+    /// for the handful that arrived since — so this marks it rather than
+    /// dropping it, exactly as `stale` does for a clustering.
+    frame_stale: bool,
     /// Targets whose worker died without answering, so they are not sent
     /// straight back out.
     ///
@@ -204,6 +233,11 @@ impl CoreApp {
         };
         let clusterings =
             HashMap::from([(opening, Clustering::compute(&call_graph, opening.method))]);
+        // The frame the map is placed in, for the same reason and on the same
+        // terms: over an empty graph it returns before it allocates, and over a
+        // demo graph it is the frame every rung is drawn in from the first
+        // snapshot on.
+        let map_frame = compute_map_frame(&call_graph);
         Self {
             call_graph,
             selected_function: None,
@@ -212,6 +246,8 @@ impl CoreApp {
             clusterings,
             stale: HashSet::new(),
             clustering_job: None,
+            map_frame,
+            frame_stale: false,
             clustering_failed: HashSet::new(),
             graph_changed_at: None,
             edge_warmup: VecDeque::new(),
@@ -241,6 +277,16 @@ impl CoreApp {
         self.clusterings
             .get(&ClusterTarget::of(ws))
             .unwrap_or_else(|| PENDING.get_or_init(Clustering::default))
+    }
+
+    /// The frame every cluster map is placed in: where each function sits when
+    /// the whole graph is laid out at once.
+    ///
+    /// Empty until the first worker has been round, which is what a map drawn
+    /// before then is placed against — and there is nothing to draw then
+    /// anyway, since the clustering that would fill it comes from the same job.
+    pub fn map_frame(&self) -> &MapFrame {
+        &self.map_frame
     }
 
     /// Which rung of the ladder this workspace's map is drawn at.
@@ -765,6 +811,14 @@ impl CoreApp {
             method: ws.method,
         };
         let clustering = cluster_within(&self.call_graph, symbol, direction, target.method);
+        // And the frame it will be placed in, if no worker has been round yet —
+        // which is the case while the project is still arriving, since nothing
+        // is clustered until it settles. Inline for the same reason the
+        // clustering above is: the user is already waiting on this gesture, and
+        // a map placed against no frame is every box in one lane.
+        if self.map_frame.is_empty() {
+            self.map_frame = compute_map_frame(&self.call_graph);
+        }
         if clustering.is_empty() {
             log::info!("CoreApp: map scope {symbol:?} declined — nothing to group");
             return vec![AppEvent::FunctionHasNoCommunities];
@@ -1011,6 +1065,8 @@ impl CoreApp {
         // Every map cached describes the graph as it was a moment ago.
         let cached: Vec<ClusterTarget> = self.clusterings.keys().copied().collect();
         self.stale.extend(cached);
+        // And so does the frame they are placed in.
+        self.frame_stale = true;
         self.graph_changed_at = Some(Instant::now());
         // A new graph is a new question, so whatever failed against the old one
         // is worth asking again.
@@ -1316,8 +1372,8 @@ impl CoreApp {
             return vec![];
         };
         let (target, started_at) = (job.target, job.started_at);
-        let next = match job.result.try_recv() {
-            Ok(clustering) => clustering,
+        let Clustered { clustering, frame } = match job.result.try_recv() {
+            Ok(done) => done,
             Err(mpsc::TryRecvError::Empty) => return vec![],
             Err(mpsc::TryRecvError::Disconnected) => {
                 // The worker went away without answering, which means it
@@ -1331,17 +1387,25 @@ impl CoreApp {
             }
         };
         self.clustering_job = None;
+        if let Some(frame) = frame {
+            log::info!(
+                "CoreApp: map frame seats {} of {} function(s)",
+                frame.len(),
+                self.call_graph.node_count(),
+            );
+            self.map_frame = frame;
+        }
 
-        let clusters = next.top_level().len();
+        let clusters = clustering.top_level().len();
         log::info!(
             "CoreApp: clustered {:?} over {} node(s) in {:.1}s: {} cluster(s) at the top of {} rung(s)",
             target,
             self.call_graph.node_count(),
             started_at.elapsed().as_secs_f32(),
             clusters,
-            next.level_count(),
+            clustering.level_count(),
         );
-        self.clusterings.insert(target, next);
+        self.clusterings.insert(target, clustering);
 
         // Announced whoever asked for it. A map nobody is looking at right now
         // still belongs to a tab that will be, and the event is what every
@@ -1358,6 +1422,11 @@ impl CoreApp {
     /// *does* run with the app's lock held.
     fn spawn_clustering(&mut self, target: ClusterTarget) {
         let graph = self.call_graph.clone();
+        // The frame rides along with whichever job goes out first after the
+        // graph moved, and only that one: it is per graph, not per target, so
+        // the jobs behind this one would each recompute the same picture.
+        let frame_wanted = self.frame_stale || self.map_frame.is_empty();
+        self.frame_stale = false;
         // Marked clean here rather than when the result lands. The job computes
         // against a copy of the graph as it stands at this instant, so anything
         // arriving while it runs is work the job will not cover; clearing the
@@ -1372,9 +1441,10 @@ impl CoreApp {
                 None => Clustering::compute(&graph, target.method),
                 Some((scope, direction)) => cluster_within(&graph, scope, direction, target.method),
             };
+            let frame = frame_wanted.then(|| compute_map_frame(&graph));
             // A gone receiver means the app was dropped while this ran, which
             // is an ordinary shutdown and not worth a word.
-            let _ = tx.send(clustering);
+            let _ = tx.send(Clustered { clustering, frame });
         });
 
         log::info!(

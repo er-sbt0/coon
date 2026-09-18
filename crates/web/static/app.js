@@ -599,10 +599,14 @@ function rebuildClusterMap(map) {
     cy.$id(id).addClass(edge.mutual ? 'aggregate mutual' : 'aggregate');
   }
 
-  // A different rung is a different map of a different size, so the viewport
-  // the user had is about something that is no longer on screen — refit. The
-  // rung is therefore part of the key, alongside what the rooted view keys on.
-  const fitKey = `cluster:${mapScope ?? 'all'}:${clusterMethod}:${mapLevel}:${currentDirection}:${currentOrientation}`;
+  // The rung is deliberately *not* part of the key. Every box is placed where
+  // the functions it holds sit (`core::layout::MapFrame`), so a zoom step
+  // merges boxes in place rather than redrawing a different picture of the same
+  // program — and refitting would throw away the viewport the user had over a
+  // map that has not moved under it. `View: Fit Graph to Screen` is there for
+  // when they want it back. Everything else in the key changes what is being
+  // drawn, not how much of it.
+  const fitKey = `cluster:${mapScope ?? 'all'}:${clusterMethod}:${currentDirection}:${currentOrientation}`;
   if (cy.nodes().length > 0 && fitKey !== lastFitKey) {
     lastFitKey = fitKey;
     requestAnimationFrame(fitGraph);

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 
 use grid::{Dag, LayoutConfig, LayoutEngine};
@@ -417,13 +417,166 @@ pub struct GraphLayout {
     pub edges: Vec<LayoutEdge>,
 }
 
+/// Where one function sits when the whole call graph is laid out at once: the
+/// layer it lands in, and how far along that layer it sits.
+///
+/// Unit-free on purpose. `cross` counts node slots from the middle of its
+/// layer, not pixels, so one frame serves both orientations — the map turns a
+/// seat into a position using whichever node size and pitch the orientation
+/// being drawn calls for.
+#[derive(Debug, Clone, Copy)]
+struct Seat {
+    layer: u32,
+    cross: f32,
+}
+
+/// A layout of every function in the graph, kept as seats rather than pixels —
+/// the frame the cluster map borrows its geometry from.
+///
+/// The map used to lay its own quotient out from scratch, which made every rung
+/// a different picture of the same program: the boxes a zoom step merged landed
+/// wherever crossing minimisation put them, so zooming out shuffled the canvas
+/// instead of coarsening it, and a box holding `main` had no reason to sit
+/// anywhere near where `main` sits in the call tree. A frame fixes both at once,
+/// because every rung is placed by where its members already are.
+///
+/// Computed over the whole graph and not over the window on screen: the map is
+/// a partition of the whole program, so a rooted, depth-limited walk would seat
+/// only the handful of functions the tree happens to reach.
+#[derive(Debug, Clone, Default)]
+pub struct MapFrame {
+    seats: HashMap<SymbolId, Seat>,
+}
+
+impl MapFrame {
+    pub fn is_empty(&self) -> bool {
+        self.seats.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.seats.len()
+    }
+
+    /// Where a whole cluster sits: the average of its members' seats.
+    ///
+    /// The mean rather than the root-most member, because a box is the whole of
+    /// what it holds — a module whose entry point is shallow and whose helpers
+    /// are deep belongs between them, not on top of its entry point. `None`
+    /// when nothing in the cluster has a seat, which is what a frame one
+    /// generation behind the graph says about a cluster made of functions that
+    /// arrived after it.
+    fn seat_of(&self, members: &[SymbolId]) -> Option<Seat> {
+        let mut layer = 0.0f64;
+        let mut cross = 0.0f64;
+        let mut seated = 0u32;
+        for member in members {
+            if let Some(seat) = self.seats.get(member) {
+                layer += f64::from(seat.layer);
+                cross += f64::from(seat.cross);
+                seated += 1;
+            }
+        }
+        if seated == 0 {
+            return None;
+        }
+        let n = f64::from(seated);
+        Some(Seat {
+            layer: (layer / n).round() as u32,
+            cross: (cross / n) as f32,
+        })
+    }
+}
+
+/// Lay every function in the graph out at once, and keep where each one landed.
+///
+/// Rootless, unlike [`compute_layout`]: there is no one function a whole
+/// program hangs off, and the map does not have one either. `grid` layers a
+/// DAG from its sources, so the frame comes out reading the way the call tree
+/// does — callers before what they call — which is the whole point of borrowing
+/// it.
+///
+/// Isolated functions are left out. `logic::cluster` drops them too, so a seat
+/// for one could only ever go unused, and each would otherwise take a slot in
+/// the first layer and push the graph that does have calls off to one side.
+///
+/// Not cheap — a few hundred milliseconds over a project's worth of functions,
+/// where a snapshot has to be built in a fraction of that — so it is computed
+/// on the worker thread that computes a clustering, once per settled graph, and
+/// every rung of every map is then placed from the one frame. See
+/// `CoreApp::sync_clusterings`.
+pub fn compute_map_frame(graph: &CallGraph) -> MapFrame {
+    // `function_ids` is a HashMap iteration and `Dag::add_node` hands out
+    // indices in call order, so the graph has to be walked in a fixed order or
+    // the frame — and every map placed from it — comes out different run to
+    // run.
+    let mut functions: Vec<SymbolId> = graph
+        .function_ids()
+        .copied()
+        .filter(|id| !graph.get_callees(id).is_empty() || !graph.get_callers(id).is_empty())
+        .collect();
+    functions.sort_unstable_by_key(|id| id.0);
+    if functions.is_empty() {
+        return MapFrame::default();
+    }
+
+    let mut dag: Dag<SymbolId> = Dag::new();
+    let index: HashMap<SymbolId, usize> =
+        functions.iter().map(|&id| (id, dag.add_node(id))).collect();
+    // `get_callees` reports one entry per call *site*, which is what
+    // `aggregate_calls` wants and what a layout does not: the same pair added
+    // twelve times is twelve parallel edges for the crossing pass to chew on.
+    let mut seen: HashSet<(usize, usize)> = HashSet::new();
+    for caller in &functions {
+        let from = index[caller];
+        for callee in graph.get_callees(caller) {
+            let Some(&to) = index.get(&callee.id) else {
+                continue;
+            };
+            if seen.insert((from, to)) {
+                let _ = dag.add_edge(from, to);
+            }
+        }
+    }
+
+    let mut engine = match LayoutEngine::with_config(layout_config(LayoutOrientation::LeftRight)) {
+        Ok(engine) => engine,
+        Err(_) => LayoutEngine::new(),
+    };
+    let Ok(layout) = engine.compute_dag(&dag) else {
+        return MapFrame::default();
+    };
+
+    // The frame is read back in the units `grid` laid it out in: a layer is at
+    // `layer_index * level_separation`, and a node sits `pos_in_layer` slots of
+    // `node_separation` from the middle of its layer. Dividing them back out is
+    // what makes the frame unit-free — and it is why `balance_aspect` is not
+    // run here, since stretching the level axis would leave the layer index no
+    // longer recoverable from the coordinate.
+    let seats = functions
+        .iter()
+        .filter_map(|id| {
+            let pos = layout.position(index[id])?;
+            Some((
+                *id,
+                Seat {
+                    layer: (pos.x / LEVEL_SEPARATION).round().max(0.0) as u32,
+                    cross: pos.y / NODE_SEPARATION,
+                },
+            ))
+        })
+        .collect();
+
+    MapFrame { seats }
+}
+
 /// Lay out one rung of the coarsening ladder: every cluster at `level` as a
 /// single node, with the calls between them aggregated onto the lines.
 ///
 /// This is a second path alongside [`compute_layout`], not a replacement. A
 /// rooted call tree starts from one function and walks outwards; the map draws
 /// a partition of the whole graph. The two share their geometry
-/// (`layout_config`, `to_centre`, `balance_aspect`) and nothing else.
+/// (`layout_config`, `balance_aspect`) and the frame the map is placed in
+/// ([`compute_map_frame`]), which is a `compute_layout`-shaped walk of its own.
 ///
 /// A `level` the ladder does not have draws nothing, which is the right answer
 /// while a clustering is still being computed and the frontend is holding a
@@ -432,6 +585,7 @@ pub struct GraphLayout {
 pub fn compute_cluster_layout(
     graph: &CallGraph,
     clustering: &Clustering,
+    frame: &MapFrame,
     level: usize,
     direction: CallDirection,
     orientation: LayoutOrientation,
@@ -444,6 +598,7 @@ pub fn compute_cluster_layout(
     let mut display: Vec<LayoutNodeId> = Vec::with_capacity(ids.len());
     let mut metas: Vec<MetaNode> = Vec::with_capacity(ids.len());
     let mut owner: HashMap<SymbolId, LayoutNodeId> = HashMap::new();
+    let mut seats: Vec<Option<Seat>> = Vec::with_capacity(ids.len());
 
     for &id in ids {
         let Some(cluster) = clustering.cluster(id) else {
@@ -460,47 +615,11 @@ pub fn compute_cluster_layout(
         for member in &cluster.members {
             owner.insert(*member, me);
         }
+        seats.push(frame.seat_of(&cluster.members));
     }
 
     let edges = aggregate_calls(graph, &owner, direction);
-
-    // `Dag::add_node` hands out indices in call order, so a node's index is its
-    // position in `display` and no second lookup table is needed.
-    let mut dag: Dag<LayoutNodeId> = Dag::new();
-    for node in &display {
-        dag.add_node(*node);
-    }
-    let index: HashMap<LayoutNodeId, usize> = display
-        .iter()
-        .enumerate()
-        .map(|(i, node)| (*node, i))
-        .collect();
-    for edge in &edges {
-        // A rung's quotient is freely cyclic — see `LayoutEdge::mutual` — and
-        // folding the mutual pairs into one line does not make it acyclic, only
-        // smaller. `grid` breaks what cycles remain for itself in its cycle
-        // pass.
-        let _ = dag.add_edge(index[&edge.source], index[&edge.target]);
-    }
-
-    let mut engine = match LayoutEngine::with_config(layout_config(orientation)) {
-        Ok(e) => e,
-        Err(_) => LayoutEngine::new(),
-    };
-    let layout = match engine.compute_dag(&dag) {
-        Ok(l) => l,
-        Err(_) => return GraphLayout::default(),
-    };
-
-    let mut nodes: HashMap<LayoutNodeId, NodePos> = display
-        .iter()
-        .enumerate()
-        .filter_map(|(i, node)| {
-            layout
-                .position(i)
-                .map(|pos| (*node, to_centre(&pos, orientation)))
-        })
-        .collect();
+    let mut nodes = place_boxes(&display, &seats, direction, orientation);
     balance_aspect(&mut nodes, orientation);
 
     GraphLayout {
@@ -508,6 +627,159 @@ pub fn compute_cluster_layout(
         metas,
         edges,
     }
+}
+
+/// Put each box where its functions already are.
+///
+/// Three steps, and each one gives up as little of the frame as it has to:
+///
+/// 1. **A column per layer that is used.** A box's layer is the average of its
+///    members', so the layers a map lands on are a subset of the frame's with
+///    gaps in it; the gaps are closed rather than drawn, because an empty
+///    column is a stretch of blank canvas saying nothing. Reading the map
+///    incoming turns the columns round, which is what reversing every edge
+///    does to a layering.
+/// 2. **A shared cross axis, scaled to fit.** The frame spreads a project over
+///    thousands of slots and a rung holds a few dozen boxes, so the cross
+///    coordinates are scaled onto the span the busiest column actually needs.
+///    It is one scale for the whole map, not one per column: what makes the map
+///    readable as the same picture is that a box and the box it calls line up
+///    across columns.
+/// 3. **Pushed apart only where they collide.** Averaging lands boxes on top of
+///    one another; within a column they are separated in the order the frame
+///    put them, by the least that clears a node, and the column is then slid
+///    back so its middle has not moved. Order is the part of the frame worth
+///    defending to the last — that is what a reader recognises — and absolute
+///    position is what gives way.
+///
+/// A box no member of which has a seat cannot be placed by any of this. Those
+/// go in a lane of their own past the last column, in the clustering's order:
+/// the frame is one generation behind a graph that just grew, so this is a box
+/// of functions that arrived after it, and stacking them where they cannot be
+/// confused for placed boxes says so better than dropping them.
+fn place_boxes(
+    display: &[LayoutNodeId],
+    seats: &[Option<Seat>],
+    direction: CallDirection,
+    orientation: LayoutOrientation,
+) -> HashMap<LayoutNodeId, NodePos> {
+    // 1. Columns. A BTreeSet is what makes "the layers in use, in order" fall
+    //    out; the map from layer to column is then just the rank.
+    let used: std::collections::BTreeSet<u32> = seats.iter().flatten().map(|s| s.layer).collect();
+    let column_of: BTreeMap<u32, usize> = used
+        .iter()
+        .enumerate()
+        .map(|(rank, &layer)| {
+            let column = match direction {
+                CallDirection::Outgoing => rank,
+                CallDirection::Incoming => used.len() - 1 - rank,
+            };
+            (layer, column)
+        })
+        .collect();
+    let unseated_column = used.len();
+
+    // 2. The cross axis, scaled onto what the busiest column needs. Boxes with
+    //    no seat are placed, not scaled — they have no position to preserve —
+    //    so they are kept out of both the extent and the scale.
+    let mut per_column: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (slot, seat) in seats.iter().enumerate() {
+        let column = match seat {
+            Some(seat) => column_of[&seat.layer],
+            None => unseated_column,
+        };
+        per_column.entry(column).or_default().push(slot);
+    }
+    let crowd = per_column
+        .iter()
+        .filter(|(&column, _)| column != unseated_column)
+        .map(|(_, boxes)| boxes.len())
+        .max()
+        .unwrap_or(0);
+    let (low, high) = seats
+        .iter()
+        .flatten()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), seat| {
+            (low.min(seat.cross), high.max(seat.cross))
+        });
+    let extent = high - low;
+    let scale = if extent > f32::EPSILON && crowd > 1 {
+        (crowd - 1) as f32 / extent
+    } else {
+        0.0
+    };
+
+    // 3. Within a column: in the frame's order, pushed apart to clear a node,
+    //    then slid back onto the middle the column asked for.
+    let mut slots: Vec<f32> = vec![0.0; display.len()];
+    for (&column, boxes) in &mut per_column {
+        let mut wanted: Vec<(usize, f32)> = boxes
+            .iter()
+            .enumerate()
+            .map(|(nth, &slot)| {
+                let cross = match seats[slot] {
+                    Some(seat) => (seat.cross - low) * scale,
+                    // An unseated box has no cross coordinate at all; its lane
+                    // is ordered by the clustering, which `display` is already in.
+                    None => nth as f32,
+                };
+                (slot, cross)
+            })
+            .collect();
+        // Ties are broken on the node id so that two boxes whose members
+        // average to the same spot do not swap places between runs.
+        wanted.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| display[a.0].to_string().cmp(&display[b.0].to_string()))
+        });
+
+        let before: f32 = wanted.iter().map(|(_, cross)| *cross).sum::<f32>();
+        let mut last = f32::NEG_INFINITY;
+        let mut after = 0.0;
+        for (slot, cross) in &mut wanted {
+            let placed = cross.max(last + 1.0);
+            last = placed;
+            after += placed;
+            slots[*slot] = placed;
+        }
+        // Spreading a column only ever pushes downwards, so a crowded one
+        // drifts off the end of the map it belongs to unless it is recentred.
+        // Unseated boxes have no middle worth keeping — they are a lane, not a
+        // position — so they are left where the spread put them.
+        if column != unseated_column && !wanted.is_empty() {
+            let drift = (after - before) / wanted.len() as f32;
+            for (slot, _) in &wanted {
+                slots[*slot] -= drift;
+            }
+        }
+    }
+
+    // Pixels, at last. Levels advance along the axis the orientation names, and
+    // a slot is that orientation's own sibling pitch — a node is 150x32, so the
+    // two axes are not interchangeable and reusing one pair for both would give
+    // a top-down map a flat stripe, exactly as it would the rooted tree.
+    let (level_pitch, cross_pitch) = match orientation {
+        LayoutOrientation::LeftRight => (LEVEL_SEPARATION, NODE_SEPARATION),
+        LayoutOrientation::TopDown => (LEVEL_SEPARATION_TOPDOWN, NODE_SEPARATION_TOPDOWN),
+    };
+    display
+        .iter()
+        .enumerate()
+        .map(|(slot, node)| {
+            let column = match seats[slot] {
+                Some(seat) => column_of[&seat.layer],
+                None => unseated_column,
+            };
+            let level = column as f32 * level_pitch;
+            let cross = slots[slot] * cross_pitch;
+            let pos = match orientation {
+                LayoutOrientation::LeftRight => NodePos { x: level, y: cross },
+                LayoutOrientation::TopDown => NodePos { x: cross, y: level },
+            };
+            (*node, pos)
+        })
+        .collect()
 }
 
 /// Roll every call up to the pair of clusters it runs between, folding a pair
@@ -1004,6 +1276,7 @@ mod tests {
         compute_cluster_layout(
             graph,
             clustering,
+            &compute_map_frame(graph),
             level,
             CallDirection::Outgoing,
             LayoutOrientation::LeftRight,
@@ -1265,6 +1538,7 @@ mod tests {
         let out = compute_cluster_layout(
             &graph,
             &clustering,
+            &compute_map_frame(&graph),
             top,
             CallDirection::Outgoing,
             LayoutOrientation::LeftRight,
@@ -1272,6 +1546,7 @@ mod tests {
         let incoming = compute_cluster_layout(
             &graph,
             &clustering,
+            &compute_map_frame(&graph),
             top,
             CallDirection::Incoming,
             LayoutOrientation::LeftRight,
@@ -1312,6 +1587,7 @@ mod tests {
         let left_right = compute_cluster_layout(
             &graph,
             &clustering,
+            &compute_map_frame(&graph),
             top,
             CallDirection::Outgoing,
             LayoutOrientation::LeftRight,
@@ -1319,6 +1595,7 @@ mod tests {
         let top_down = compute_cluster_layout(
             &graph,
             &clustering,
+            &compute_map_frame(&graph),
             top,
             CallDirection::Outgoing,
             LayoutOrientation::TopDown,
@@ -1357,6 +1634,261 @@ mod tests {
         for (node, pos) in &first.nodes {
             let other = second.nodes.get(node).expect("the same nodes");
             assert_eq!((pos.x, pos.y), (other.x, other.y));
+        }
+    }
+
+    // -- the frame -----------------------------------------------------------
+
+    /// The frame reads the way the call tree does: a caller before what it
+    /// calls, which is the whole reason the map is worth placing in it.
+    #[test]
+    fn the_frame_seats_a_caller_ahead_of_what_it_calls() {
+        let (graph, chain) = graph_with_chain(&["a", "b", "c", "d"]);
+        let frame = compute_map_frame(&graph);
+
+        assert_eq!(
+            frame.len(),
+            chain.len(),
+            "every function in the chain is seated"
+        );
+        let layers: Vec<u32> = chain
+            .iter()
+            .map(|id| frame.seats.get(id).expect("a seat").layer)
+            .collect();
+        assert_eq!(layers, vec![0, 1, 2, 3], "one layer per step of the chain");
+    }
+
+    /// A function nothing calls and that calls nothing is in no cluster, so a
+    /// seat for it could only take a slot in the first layer and push the graph
+    /// that does have calls sideways.
+    #[test]
+    fn the_frame_leaves_out_what_has_no_calls() {
+        let (mut graph, chain) = graph_with_chain(&["a", "b"]);
+        let alone = graph.add_function(FunctionNode::new(
+            "alone".to_string(),
+            "alone".to_string(),
+            Location::new("alone.c".to_string(), 1, 1),
+        ));
+
+        let frame = compute_map_frame(&graph);
+        assert_eq!(frame.len(), chain.len());
+        assert!(!frame.seats.contains_key(&alone));
+    }
+
+    /// A box is the whole of what it holds, so it sits at the average of its
+    /// members rather than on top of whichever one is nearest the front.
+    #[test]
+    fn a_box_sits_at_the_average_of_its_members() {
+        let (graph, chain) = graph_with_chain(&["a", "b", "c", "d", "e"]);
+        let frame = compute_map_frame(&graph);
+
+        let seat = frame.seat_of(&chain[0..5]).expect("the chain is seated");
+        assert_eq!(seat.layer, 2, "layers 0..4 average to the middle one");
+        assert!(
+            frame.seat_of(&[]).is_none(),
+            "an empty box has nowhere to be"
+        );
+    }
+
+    // -- placement ------------------------------------------------------------
+
+    fn boxes(n: usize) -> Vec<LayoutNodeId> {
+        (0..n)
+            .map(|i| {
+                LayoutNodeId::Cluster(ClusterKey {
+                    level: 0,
+                    anchor: SymbolId::from_content(&format!("b{i}"), "b.c", i as u32),
+                })
+            })
+            .collect()
+    }
+
+    fn placed(
+        display: &[LayoutNodeId],
+        seats: &[Option<Seat>],
+        direction: CallDirection,
+    ) -> Vec<NodePos> {
+        let nodes = place_boxes(display, seats, direction, LayoutOrientation::LeftRight);
+        display.iter().map(|node| nodes[node]).collect()
+    }
+
+    /// A layer with no box in it is closed up rather than drawn: an empty
+    /// column is a stretch of blank canvas saying nothing.
+    #[test]
+    fn a_column_per_layer_that_is_used() {
+        let display = boxes(3);
+        let seats = vec![
+            Some(Seat {
+                layer: 0,
+                cross: 0.0,
+            }),
+            Some(Seat {
+                layer: 2,
+                cross: 0.0,
+            }),
+            Some(Seat {
+                layer: 9,
+                cross: 0.0,
+            }),
+        ];
+
+        let out = placed(&display, &seats, CallDirection::Outgoing);
+        assert_eq!(
+            out.iter().map(|p| p.x).collect::<Vec<_>>(),
+            vec![0.0, LEVEL_SEPARATION, 2.0 * LEVEL_SEPARATION]
+        );
+    }
+
+    /// Reading the map the other way round is what reversing every call does to
+    /// a layering: the callers end up on the far side.
+    #[test]
+    fn reading_the_map_incoming_turns_the_columns_round() {
+        let display = boxes(3);
+        let seats = vec![
+            Some(Seat {
+                layer: 0,
+                cross: 0.0,
+            }),
+            Some(Seat {
+                layer: 1,
+                cross: 0.0,
+            }),
+            Some(Seat {
+                layer: 2,
+                cross: 0.0,
+            }),
+        ];
+
+        let out = placed(&display, &seats, CallDirection::Incoming);
+        assert_eq!(
+            out.iter().map(|p| p.x).collect::<Vec<_>>(),
+            vec![2.0 * LEVEL_SEPARATION, LEVEL_SEPARATION, 0.0]
+        );
+    }
+
+    /// Averaging lands boxes on top of one another. They are pushed apart by
+    /// the least that clears a node, and the column is slid back so that
+    /// spreading it has not moved where the column as a whole sits.
+    #[test]
+    fn boxes_in_one_column_clear_each_other_without_moving_the_column() {
+        let display = boxes(3);
+        let seats = vec![
+            Some(Seat {
+                layer: 0,
+                cross: 4.0
+            });
+            3
+        ];
+
+        let mut out: Vec<f32> = placed(&display, &seats, CallDirection::Outgoing)
+            .iter()
+            .map(|p| p.y)
+            .collect();
+        out.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        for pair in out.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= NODE_SEPARATION - 0.01,
+                "a box has to clear the one above it: {out:?}"
+            );
+        }
+        let middle = out.iter().sum::<f32>() / out.len() as f32;
+        assert!(
+            middle.abs() < 0.01,
+            "three boxes that all wanted the same spot end up centred on it: {middle}"
+        );
+    }
+
+    /// Order is the part of the frame worth defending to the last: it is what a
+    /// reader recognises from the call tree, and absolute position is what
+    /// gives way when the boxes will not fit.
+    #[test]
+    fn a_crowded_column_keeps_the_order_the_frame_put_it_in() {
+        let display = boxes(4);
+        let seats = vec![
+            Some(Seat {
+                layer: 0,
+                cross: 30.0,
+            }),
+            Some(Seat {
+                layer: 0,
+                cross: 10.0,
+            }),
+            Some(Seat {
+                layer: 0,
+                cross: 20.0,
+            }),
+            Some(Seat {
+                layer: 0,
+                cross: 0.0,
+            }),
+        ];
+
+        let out = placed(&display, &seats, CallDirection::Outgoing);
+        let order: Vec<usize> = {
+            let mut slots: Vec<usize> = (0..display.len()).collect();
+            slots.sort_by(|a, b| out[*a].y.partial_cmp(&out[*b].y).unwrap());
+            slots
+        };
+        assert_eq!(
+            order,
+            vec![3, 1, 2, 0],
+            "top to bottom, as the frame had them"
+        );
+    }
+
+    /// The frame is one generation behind a graph that just grew, so a box of
+    /// functions that arrived after it cannot be placed by any of this. Stacked
+    /// past the last column, where they cannot be read as a position.
+    #[test]
+    fn a_box_with_no_seat_waits_past_the_last_column() {
+        let display = boxes(3);
+        let seats = vec![
+            Some(Seat {
+                layer: 0,
+                cross: 0.0,
+            }),
+            Some(Seat {
+                layer: 1,
+                cross: 0.0,
+            }),
+            None,
+        ];
+
+        let out = placed(&display, &seats, CallDirection::Outgoing);
+        assert_eq!(out[2].x, 2.0 * LEVEL_SEPARATION);
+        assert!(out[2].x > out[0].x && out[2].x > out[1].x);
+    }
+
+    /// The point of the whole thing, end to end: a box holding the entry point
+    /// reads before a box holding the allocator everything bottoms out in, at
+    /// every rung of the ladder — which is where they are in the call tree, and
+    /// where they were at the rung before.
+    #[test]
+    fn a_box_lands_where_its_functions_are_at_every_rung() {
+        let (graph, clustering) = demo();
+        let holder = |layout: &GraphLayout, name: &str| -> NodePos {
+            let symbol = graph
+                .function_ids()
+                .find(|id| graph.get_function(id).is_some_and(|f| f.name == name))
+                .copied()
+                .expect("the demo graph has it");
+            let key = clustering
+                .cluster(
+                    clustering
+                        .cluster_of_at(&symbol, layout.metas[0].level)
+                        .expect("a cluster at this rung"),
+                )
+                .expect("a cluster")
+                .key;
+            layout.nodes[&LayoutNodeId::Cluster(key)]
+        };
+
+        for level in 0..clustering.level_count() {
+            let layout = map_at(&graph, &clustering, level);
+            assert!(
+                holder(&layout, "main").x < holder(&layout, "xmalloc").x,
+                "rung {level}: the entry point reads before the allocator"
+            );
         }
     }
 
