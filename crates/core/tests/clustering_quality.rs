@@ -1,12 +1,17 @@
 //! Does `logic::cluster` recover the module structure of a C project from call
 //! structure alone?
 //!
-//! That is the bet the clustering feature makes. Louvain never sees a file
-//! path: it only sees who calls whom. If the communities it finds line up with
-//! `src/net`, `src/store`, `src/proto` and friends, then the edge weighting is
-//! carrying real information and the clusters will mean something on a canvas.
-//! If they do not, no amount of rendering will rescue them, and we would much
-//! rather learn that here than after the feature ships.
+//! That is the bet the clustering feature makes. The coarsener never sees a
+//! file path: it only sees who calls whom, and how often. If the clusters it
+//! merges line up with `src/net`, `src/store`, `src/proto` and friends, then
+//! the edge weighting is carrying real information and the boxes will mean
+//! something on a canvas. If they do not, no amount of rendering will rescue
+//! them, and we would much rather learn that here than after the feature ships.
+//!
+//! Heavy-edge matching is not looking for modules — it merges the busiest pair
+//! it can find, round after round — so this is a real test of whether call
+//! frequency tracks module structure, and not a tautology about an algorithm
+//! that was told to find seams.
 //!
 //! The demo graph is the specimen. It fakes a small key-value daemon with a
 //! real directory layout, deep call chains, a second root, recursion, a cycle
@@ -26,7 +31,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use logic::cluster::{Cluster, ClusterId, Clustering};
+use logic::cluster::{Cluster, ClusterId, ClusterMethod, Clustering};
 use model::{CallGraph, SymbolId};
 
 /// The directory part of a source path: `src/net/server.c` is `src/net`, and a
@@ -68,7 +73,7 @@ impl Fixture {
         // `::core::` rather than `core::`: the workspace crate of that name
         // shadows Rust's built-in one, and the leading `::` picks ours.
         let graph = ::core::create_demo_call_graph();
-        let clustering = Clustering::compute(&graph);
+        let clustering = Clustering::compute(&graph, ClusterMethod::HeavyEdge);
 
         let mut directories = HashMap::new();
         let mut names = HashMap::new();
@@ -264,9 +269,18 @@ fn top_level_clusters_mostly_follow_the_source_tree() {
 /// A count the user can navigate. One cluster tells them nothing they did not
 /// already know, and forty clusters over fifty-odd functions is no better than
 /// showing the raw nodes — the whole point is to collapse the graph into a few
-/// things a person can hold in their head at once. The demo's ~56 reachable
-/// functions live in five directories, so anything in the 3-to-14 range is a
-/// defensible read of the structure; outside it the resolution is simply wrong.
+/// things a person can hold in their head at once.
+///
+/// The upper bound is the method's own contract rather than a judgement call:
+/// coarsening runs until the top rung is at most `TARGET_TOP_CLUSTERS` wide, so
+/// a top level wider than that means the ladder stopped early — a round that
+/// merged nothing, which on a real graph means the matching has stopped
+/// finding pairs and the map has quietly become a node list. The lower bound is
+/// the judgement: collapsing a whole program into one or two boxes hides the
+/// structure instead of revealing it. The second assertion is the one that says
+/// the boxes are worth drawing, and it is about size rather than count, because
+/// a map of twelve two-function boxes satisfies every count you could name and
+/// still summarises nothing.
 #[test]
 fn top_level_holds_a_navigable_number_of_clusters() {
     let fixture = Fixture::new();
@@ -285,10 +299,23 @@ fn top_level_holds_a_navigable_number_of_clusters() {
         fixture.graph.node_count()
     );
     assert!(
-        count < 15,
-        "{count} top-level clusters for {} functions — at this resolution the \
-         clustering is barely coarser than the raw node list: {names:#?}",
-        fixture.graph.node_count()
+        count <= logic::cluster::TARGET_TOP_CLUSTERS,
+        "{count} top-level clusters, above the {} the coarsening is supposed to \
+         stop at — a round must have merged nothing: {names:#?}",
+        logic::cluster::TARGET_TOP_CLUSTERS
+    );
+
+    let clustered: usize = fixture
+        .top_level_clusters()
+        .iter()
+        .map(|c| c.members.len())
+        .sum();
+    let per_cluster = clustered as f64 / count as f64;
+    assert!(
+        per_cluster >= 3.0,
+        "{count} top-level clusters hold {clustered} functions between them — \
+         {per_cluster:.1} apiece, which is barely coarser than the raw node \
+         list: {names:#?}"
     );
 }
 
@@ -588,21 +615,23 @@ fn report_where_the_cross_cutting_helpers_landed() {
 }
 
 /// Every other assertion in this file is worthless if the clustering is a coin
-/// flip, and plain Louvain is famously order-dependent. So: the same graph must
-/// give the same partition twice, and re-clustering with the previous result as
-/// a seed must leave that partition alone. The comparison is on member sets
-/// keyed by function name rather than on cluster ids, because ids are free to
-/// be renumbered — it is the grouping that has to hold still.
+/// flip. Heavy-edge matching is deterministic by construction — the visit order
+/// is by degree then index, the partner tie-break is the lower index — but
+/// "by construction" is exactly the kind of claim that quietly stops being true
+/// when a `HashMap` iteration creeps into the pipeline. The comparison is on
+/// member sets keyed by function name rather than on cluster ids, because ids
+/// are free to be renumbered: it is the grouping that has to hold still.
 #[test]
-fn clustering_is_stable_and_seeding_preserves_it() {
-    // The grouping a clustering induces, stripped of cluster identity: a set
-    // of sets of function names.
+fn clustering_is_deterministic() {
+    /// The grouping a clustering induces at one rung, stripped of cluster
+    /// identity: a set of sets of function names.
     fn partition(
         clustering: &Clustering,
+        level: usize,
         names: &HashMap<SymbolId, String>,
     ) -> BTreeSet<BTreeSet<String>> {
         clustering
-            .top_level()
+            .level(level)
             .iter()
             .filter_map(|id| clustering.cluster(*id))
             .map(|cluster| {
@@ -619,21 +648,23 @@ fn clustering_is_stable_and_seeding_preserves_it() {
     let names: HashMap<SymbolId, String> =
         graph.functions().map(|f| (f.id, f.name.clone())).collect();
 
-    let first = Clustering::compute(&graph);
-    let second = Clustering::compute(&graph);
-    assert_eq!(
-        partition(&first, &names),
-        partition(&second, &names),
-        "two runs over the same graph disagree; the clustering is not \
-         deterministic, which makes every quality check here a coin flip"
-    );
+    let first = Clustering::compute(&graph, ClusterMethod::HeavyEdge);
+    let second = Clustering::compute(&graph, ClusterMethod::HeavyEdge);
 
-    let seeded = Clustering::compute_seeded(&graph, Some(&first));
     assert_eq!(
-        partition(&first, &names),
-        partition(&seeded, &names),
-        "seeding with the previous clustering of an unchanged graph moved \
-         functions between clusters; the point of the seed is that the canvas \
-         does not reshuffle under the user when nothing changed"
+        first.level_count(),
+        second.level_count(),
+        "two runs over the same graph built ladders of different heights"
     );
+    // Every rung, not just the top: a round that merged a different pair
+    // low down can still come out the same width at the top.
+    for level in 0..first.level_count() {
+        assert_eq!(
+            partition(&first, level, &names),
+            partition(&second, level, &names),
+            "two runs over the same graph disagree at rung {level}; the \
+             clustering is not deterministic, which makes every quality check \
+             here a coin flip"
+        );
+    }
 }

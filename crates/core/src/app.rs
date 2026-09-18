@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use logic::{ClusterKey, Clustering, GraphTraversal};
+use logic::{ClusterKey, ClusterMethod, Clustering, GraphTraversal};
 use lsp::LspResponse;
 use model::{CallDirection, CallGraph, FunctionNode, Location, LspLoadPhase, SymbolId};
 
@@ -11,22 +11,6 @@ use crate::events::AppEvent;
 use crate::layout::LayoutOrientation;
 use crate::lsp_bridge::{LoadingState, LspBridge, RequestOrigin};
 use crate::workspace::{CoreWorkspace, CoreWorkspaceManager, ViewMode};
-
-/// How long the call graph must go without gaining nodes or edges before the
-/// clustering is recomputed.
-///
-/// clangd does not hand over a call graph, it dribbles one: workspace symbols
-/// arrive in batches and each call hierarchy lands as its own response. A
-/// recompute per mutation would spend the whole load running Louvain over a
-/// graph that is about to change again, and — worse than the CPU — would
-/// reshuffle the map under the user several times a second. Waiting for quiet
-/// collapses a burst of arrivals into one recompute.
-///
-/// Three hundred milliseconds is three of the 100ms ticks the web and desktop
-/// backends poll on: long enough that a batch arriving in the next breath still
-/// counts as part of the same burst, short enough that the map appears while
-/// the user is still looking at the place it belongs.
-const CLUSTERING_SETTLE: Duration = Duration::from_millis(300);
 
 /// How many call-hierarchy requests to keep in flight while warming up edges.
 ///
@@ -51,13 +35,40 @@ const WARMUP_LOG_INTERVAL: Duration = Duration::from_secs(2);
 /// going to answer is named here before the timeout quietly retires it.
 const WARMUP_STALL_AFTER: Duration = Duration::from_secs(10);
 
-/// Which clustering a background job is computing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClusterTarget {
-    /// The whole call graph — what [`CoreApp::clustering`] caches.
-    Whole,
-    /// One function's neighbourhood, for a workspace that has scoped its map.
-    Scope(SymbolId, CallDirection),
+/// Which clustering a workspace is asking for — and so what a cache entry and
+/// a background job are each about.
+///
+/// Every part of it comes off the workspace, because every part of it changes
+/// what comes back: the method is the algorithm, the scope is the subgraph, and
+/// the direction decides which way a scope reaches. Two tabs agreeing on all
+/// three are asking the same question and share the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ClusterTarget {
+    /// One function's neighbourhood, or `None` for the whole program.
+    scope: Option<(SymbolId, CallDirection)>,
+    method: ClusterMethod,
+}
+
+impl ClusterTarget {
+    fn of(ws: &CoreWorkspace) -> Self {
+        Self {
+            scope: ws.map_scope.map(|scope| (scope, ws.direction)),
+            method: ws.method,
+        }
+    }
+
+    /// A total order, so which of several owed maps is computed first does not
+    /// depend on hash iteration.
+    fn order(&self) -> (bool, u128, bool, usize) {
+        let (scope, incoming) = match self.scope {
+            Some((symbol, direction)) => (
+                symbol.0.as_u128(),
+                matches!(direction, CallDirection::Incoming),
+            ),
+            None => (0, false),
+        };
+        (self.scope.is_some(), scope, incoming, self.method as usize)
+    }
 }
 
 /// A clustering being computed off the tick loop.
@@ -84,56 +95,47 @@ pub struct CoreApp {
     pub selected_function: Option<SymbolId>,
     pub lsp: LspBridge,
     pub workspaces: CoreWorkspaceManager,
-    /// Communities derived from the **whole** graph, cached.
+    /// The cluster map behind each question a workspace is asking, cached.
     ///
-    /// Deriving them from the visible BFS window instead would be cheaper and
-    /// wrong: the window changes every time the user expands a node, so the
-    /// boxes would regroup and rename themselves on every click. The clustering
-    /// is a property of the program, not of what is currently on screen.
-    clustering: Clustering,
-    /// Set whenever the graph gains nodes or edges; cleared by the recompute.
-    clustering_dirty: bool,
-    /// The communities of one function's neighbourhood, for each scope a
-    /// workspace currently has its map pointed at.
+    /// Keyed by [`ClusterTarget`] rather than held as one whole-program
+    /// clustering plus a table of scoped ones: with the method now part of what
+    /// is being asked, "the" clustering stopped being a single thing, and the
+    /// whole-program map is simply the target whose scope is `None`. One table
+    /// then means one staleness rule, one job queue and one eviction pass
+    /// instead of two of each.
     ///
-    /// Cached here rather than on the workspace because two tabs scoped to the
-    /// same function in the same direction are asking for the same clustering,
-    /// and because this is where the recompute that keeps it current already
-    /// lives. Kept in step with the workspaces by `sync_scoped_clusterings`, so
-    /// that reading one — which every snapshot does — needs no `&mut`.
-    scoped: HashMap<(SymbolId, CallDirection), Clustering>,
-    /// Scopes whose cached clustering is out of date with the graph. The
-    /// entries are still worth keeping — they stay drawable while the
-    /// replacement is computed, and they seed it — so this marks them stale
-    /// rather than dropping them and losing the grouping stability seeding buys.
+    /// Derived from the whole graph (or the whole scope), never from the BFS
+    /// window on screen: the window changes every time the user expands a node,
+    /// and boxes that regrouped and renamed themselves on every click would be
+    /// describing the view rather than the program.
+    clusterings: HashMap<ClusterTarget, Clustering>,
+    /// Targets whose cached map is out of date with the graph. The entries are
+    /// still worth keeping — a stale map is drawable, and stands in while the
+    /// replacement is computed — so this marks them rather than dropping them.
     ///
-    /// Per scope rather than one flag covering all of them because only one
+    /// Per target rather than one flag covering all of them because only one
     /// clustering is computed at a time: a single bool cannot say "A has been
     /// redone, B is still owed", so clearing it when the first job went out
-    /// would strand every other scope on a stale map for good.
-    scoped_stale: HashSet<(SymbolId, CallDirection)>,
+    /// would strand every other map on a stale grouping for good.
+    stale: HashSet<ClusterTarget>,
     /// The clustering currently being computed on a worker thread, if any.
     ///
-    /// Louvain plus the convexity repair runs into seconds on a large project,
-    /// and `tick()` is called with the app's own lock held by the web and
-    /// desktop backends — so computing inline froze every command, every
-    /// snapshot and the tick loop itself for the duration. Only one job runs at
-    /// a time: the recompute *is* the expensive thing, so a second alongside it
-    /// would compete for a core rather than add one.
+    /// Coarsening a large project runs into seconds, and `tick()` is called
+    /// with the app's own lock held by the web and desktop backends — so
+    /// computing inline froze every command, every snapshot and the tick loop
+    /// itself for the duration. Only one job runs at a time: the recompute *is*
+    /// the expensive thing, so a second alongside it would compete for a core
+    /// rather than add one.
     clustering_job: Option<ClusteringJob>,
-    /// The target of a job whose worker died without answering, so it is not
-    /// sent straight back out.
+    /// Targets whose worker died without answering, so they are not sent
+    /// straight back out.
     ///
     /// A panic in the clustering is deterministic given the same graph, so a
-    /// retry against that graph panics again. The whole-program recompute is
-    /// already shielded by `clustering_dirty` staying false; a scope is not,
-    /// because `sync_scoped_clusterings` works out what is owed from
-    /// `scoped_stale` and the missing cache entry — neither of which a death
-    /// clears. Without this, one repeatable panic spawns a fresh thread every
-    /// tick for as long as the app runs. Cleared by `mark_graph_changed`,
-    /// which is the same condition that lets the whole-program one try again:
-    /// a different graph is a different question.
-    clustering_failed: Option<ClusterTarget>,
+    /// retry against that graph panics again — and since what is owed is worked
+    /// out from the cache being empty, a death would otherwise spawn a fresh
+    /// thread every tick for as long as the app runs. Cleared by
+    /// `mark_graph_changed`: a different graph is a different question.
+    clustering_failed: HashSet<ClusterTarget>,
     /// When the graph last changed. The settling period is measured from here.
     graph_changed_at: Option<Instant>,
     /// Functions still awaiting their first call-hierarchy fetch.
@@ -190,23 +192,27 @@ impl CoreApp {
     }
 
     fn with_bridge(call_graph: CallGraph, lsp: LspBridge) -> Self {
-        // Cluster up front rather than leaving it to the first tick. In demo
-        // mode the graph handed in here is the entire graph and no loader will
-        // ever arrive to mark the cache dirty, so a clustering that only
-        // happens on a settling timer would never happen at all. In LSP mode
-        // the graph is empty at this point and this costs nothing.
-        let clustering = Clustering::compute(&call_graph);
+        // Cluster up front rather than leaving it to the first tick, and only
+        // here: a graph that arrives already populated is demo mode, where this
+        // is the whole of it and no loader will ever arrive to say so. In LSP
+        // mode the graph is empty at this point and this costs nothing, which
+        // is exactly why it can be unconditional — `build_base_graph` over no
+        // symbols returns before it allocates.
+        let opening = ClusterTarget {
+            scope: None,
+            method: ClusterMethod::default(),
+        };
+        let clusterings =
+            HashMap::from([(opening, Clustering::compute(&call_graph, opening.method))]);
         Self {
             call_graph,
             selected_function: None,
             lsp,
             workspaces: CoreWorkspaceManager::new(),
-            clustering,
-            clustering_dirty: false,
-            scoped: HashMap::new(),
-            scoped_stale: HashSet::new(),
+            clusterings,
+            stale: HashSet::new(),
             clustering_job: None,
-            clustering_failed: None,
+            clustering_failed: HashSet::new(),
             graph_changed_at: None,
             edge_warmup: VecDeque::new(),
             warmup_seeded: false,
@@ -219,42 +225,46 @@ impl CoreApp {
         }
     }
 
-    /// The cached communities of the whole call graph.
-    pub fn clustering(&self) -> &Clustering {
-        &self.clustering
+    /// The cluster map this workspace is looking at: its method, over its
+    /// scope, in its direction.
+    ///
+    /// A target with nothing computed yet reads as empty, not as some other
+    /// map. There is a real window where that happens — a project still
+    /// loading, or a tab that has just toggled its direction and wants a
+    /// neighbourhood nothing has walked — and answering with the nearest thing
+    /// to hand would draw every function in the project under a breadcrumb
+    /// reading "map of `f`", which says the scope silently failed rather than
+    /// that it is not ready. An empty map says the second, which is the true
+    /// one.
+    pub fn clustering_for(&self, ws: &CoreWorkspace) -> &Clustering {
+        static PENDING: std::sync::OnceLock<Clustering> = std::sync::OnceLock::new();
+        self.clusterings
+            .get(&ClusterTarget::of(ws))
+            .unwrap_or_else(|| PENDING.get_or_init(Clustering::default))
     }
 
-    /// The communities the given workspace's map is drawn from: one function's
-    /// neighbourhood where it has been scoped to one, the whole program
-    /// otherwise.
+    /// Which rung of the ladder this workspace's map is drawn at.
     ///
-    /// A scope with no clustering yet reads as empty, not as the whole program.
-    ///
-    /// It used to be impossible to ask for one — `sync_scoped_clusterings`
-    /// computed it before the dispatch that wanted it returned — and the fall
-    /// back to the whole program's communities was there only so that the
-    /// answer to "which communities" was never a panic. Now that the recompute
-    /// runs on a worker there is a real window: toggling the direction of a
-    /// scoped tab wants `(scope, the other direction)`, which nothing has
-    /// computed. Answering with the whole program's would draw every community
-    /// in the project under a breadcrumb reading "communities under `f`", which
-    /// says the scope silently failed rather than that it is not ready. An
-    /// empty map says the second, which is the true one.
-    pub fn clustering_for(&self, ws: &CoreWorkspace) -> &Clustering {
-        let Some(scope) = ws.map_scope else {
-            return &self.clustering;
-        };
-        static PENDING: std::sync::OnceLock<Clustering> = std::sync::OnceLock::new();
-        self.scoped
-            .get(&(scope, ws.direction))
-            .unwrap_or_else(|| PENDING.get_or_init(Clustering::default))
+    /// The workspace stores a wish — `None` for "the coarsest", a number the
+    /// user zoomed to otherwise — and this is where it meets the ladder that
+    /// actually exists. Clamping here rather than when the level is set is what
+    /// lets the wish outlive a recompute: a ladder that grew a rung as the
+    /// project loaded gives the user the rung they asked for, and one that lost
+    /// rungs gives them the coarsest rather than a blank canvas.
+    pub fn map_level_for(&self, ws: &CoreWorkspace) -> usize {
+        let top = self
+            .clustering_for(ws)
+            .top_level_index()
+            .unwrap_or_default();
+        ws.map_level.unwrap_or(top).min(top)
     }
 
     /// The communities of the active workspace's map.
     pub fn active_clustering(&self) -> &Clustering {
+        static PENDING: std::sync::OnceLock<Clustering> = std::sync::OnceLock::new();
         match self.workspaces.current() {
             Some(ws) => self.clustering_for(ws),
-            None => &self.clustering,
+            None => PENDING.get_or_init(Clustering::default),
         }
     }
 
@@ -301,7 +311,8 @@ impl CoreApp {
             Command::SetGraphOrientation(o) => self.cmd_set_graph_orientation(o),
             Command::SetViewMode(view) => self.cmd_set_view_mode(view),
             Command::SetMapScope(scope) => self.cmd_set_map_scope(scope),
-            Command::ToggleClusterExpanded(key) => self.cmd_toggle_cluster_expanded(key),
+            Command::SetMapLevel(level) => self.cmd_set_map_level(level),
+            Command::SetClusterMethod(method) => self.cmd_set_cluster_method(method),
             Command::DrillIntoCluster(key) => self.cmd_drill_into_cluster(key),
             Command::ZoomOutToClusters => self.cmd_zoom_out_to_clusters(),
             Command::NewWorkspace => self.cmd_new_workspace(),
@@ -316,9 +327,10 @@ impl CoreApp {
             Command::ExportGraph(format) => self.cmd_export_graph(format),
         };
         // Any command can be the one that changes which map is wanted — a tab
-        // switch, a direction toggle, a new scope — so the cache is squared up
-        // once, here, rather than in each handler that might have moved it.
-        self.sync_scoped_clusterings();
+        // switch, a direction toggle, a new scope, a new method — so the cache
+        // is squared up once, here, rather than in each handler that might have
+        // moved it.
+        self.sync_clusterings();
         log::info!(
             "CoreApp::dispatch result: {} event(s): {:?}",
             events.len(),
@@ -371,11 +383,10 @@ impl CoreApp {
         // recompute below from running against an edgeless graph.
         events.extend(self.pump_edge_warmup());
 
-        // Last, so a batch ingested on this very tick is counted before the
-        // settling period is judged.
-        events.extend(self.maybe_recluster());
-        // And after it, because that is what marks the scoped clusterings stale.
-        self.sync_scoped_clusterings();
+        // Take delivery of a finished map before deciding what is owed, so a
+        // job that landed on this tick frees the slot for the next one.
+        events.extend(self.collect_finished_clustering());
+        self.sync_clusterings();
 
         events
     }
@@ -744,16 +755,20 @@ impl CoreApp {
         // recompute this replaced fired on a timer for as long as the graph
         // kept growing.
         let direction = ws.direction;
-        let clustering = cluster_within(&self.call_graph, symbol, direction, None);
+        let target = ClusterTarget {
+            scope: Some((symbol, direction)),
+            method: ws.method,
+        };
+        let clustering = cluster_within(&self.call_graph, symbol, direction, target.method);
         if clustering.is_empty() {
             log::info!("CoreApp: map scope {symbol:?} declined — nothing to group");
             return vec![AppEvent::FunctionHasNoCommunities];
         }
-        self.scoped.insert((symbol, direction), clustering);
-        // Freshly computed, so whatever the last whole-program recompute said
-        // about this scope no longer applies — without this the sync below
-        // would send the same work straight back out to a thread.
-        self.scoped_stale.remove(&(symbol, direction));
+        self.clusterings.insert(target, clustering);
+        // Freshly computed, so whatever marked it stale no longer applies —
+        // without this the sync below would send the same work straight back
+        // out to a thread.
+        self.stale.remove(&target);
 
         let changed = self
             .workspaces
@@ -767,11 +782,49 @@ impl CoreApp {
         }
     }
 
-    fn cmd_toggle_cluster_expanded(&mut self, key: ClusterKey) -> Vec<AppEvent> {
+    /// Draw the map at one rung of the ladder, clamped to the rungs there are.
+    ///
+    /// Clamped rather than refused: a frontend sending a level is working from
+    /// the snapshot it last received, and a ladder that has since lost a rung
+    /// should land the user on the coarsest map rather than leave the zoom
+    /// control looking broken.
+    fn cmd_set_map_level(&mut self, level: usize) -> Vec<AppEvent> {
+        let Some(ws) = self.workspaces.current() else {
+            return vec![];
+        };
+        let top = self
+            .clustering_for(ws)
+            .top_level_index()
+            .unwrap_or_default();
+        let level = level.min(top);
         match self.workspaces.current_mut() {
             Some(ws) => {
-                ws.toggle_cluster_expanded(key);
-                vec![AppEvent::LayoutDirty]
+                if ws.set_map_level(level) {
+                    vec![AppEvent::LayoutDirty]
+                } else {
+                    vec![]
+                }
+            }
+            None => vec![],
+        }
+    }
+
+    /// Rebuild the map with a different algorithm.
+    ///
+    /// Emits nothing but `LayoutDirty`, and that draws the *old* map until the
+    /// new one lands: switching method asks a question no cache has an answer
+    /// to, so `sync_clusterings` starts a job and the map arrives with the
+    /// `ClusteringUpdated` that follows. Blanking the canvas in the meantime
+    /// would be honest about the wait and useless to look at.
+    fn cmd_set_cluster_method(&mut self, method: ClusterMethod) -> Vec<AppEvent> {
+        match self.workspaces.current_mut() {
+            Some(ws) => {
+                if ws.set_method(method) {
+                    log::info!("CoreApp: cluster map switched to {}", method.label());
+                    vec![AppEvent::LayoutDirty]
+                } else {
+                    vec![]
+                }
             }
             None => vec![],
         }
@@ -950,65 +1003,102 @@ impl CoreApp {
     /// when the cache goes dirty: the settling period is about the stream
     /// having gone quiet, not about how long ago it started talking.
     fn mark_graph_changed(&mut self) {
-        self.clustering_dirty = true;
+        // Every map cached describes the graph as it was a moment ago.
+        let cached: Vec<ClusterTarget> = self.clusterings.keys().copied().collect();
+        self.stale.extend(cached);
         self.graph_changed_at = Some(Instant::now());
         // A new graph is a new question, so whatever failed against the old one
         // is worth asking again.
-        self.clustering_failed = None;
+        self.clustering_failed.clear();
     }
 
-    /// Bring the scoped clusterings in step with what the workspaces are asking
-    /// for: start a recompute for one that is missing or stale, drop the ones
-    /// no tab points at any more.
+    /// Bring the cached maps in step with what the workspaces are asking for:
+    /// start a recompute for one that is missing or stale, drop the ones no tab
+    /// points at any more.
     ///
     /// Doing it here, once per dispatch and once per tick, is what lets
-    /// `clustering_for` be a lookup on `&self` — and so lets a snapshot, which
-    /// only ever holds `&CoreApp`, draw a scoped map at all.
-    fn sync_scoped_clusterings(&mut self) {
-        let wanted: HashSet<(SymbolId, CallDirection)> = self
+    /// [`Self::clustering_for`] be a lookup on `&self` — and so lets a snapshot,
+    /// which only ever holds `&CoreApp`, draw a map at all.
+    ///
+    /// Nothing starts while the project is still arriving. Coarsening is not
+    /// incremental — a run over a graph that gained a thousand functions is a
+    /// different ladder, not the same one extended — so a map computed mid-load
+    /// is a map that will be thrown away, after moving every box under whoever
+    /// was reading it. One run when the graph settles, and then one per action
+    /// that changes it, is both cheaper and the only version that holds still.
+    fn sync_clusterings(&mut self) {
+        // Each tab's own map, and the whole-program map for its method
+        // alongside it. The second is not speculative: it is what a new tab
+        // opens on and what widening a scope goes back to, so evicting it
+        // because one tab happens to be scoped right now means that gesture
+        // blanks the canvas and waits for a worker. There is one per method,
+        // and it is the thing most likely to be wanted next.
+        let wanted: HashSet<ClusterTarget> = self
             .workspaces
             .workspaces
             .iter()
-            .filter_map(|ws| ws.map_scope.map(|scope| (scope, ws.direction)))
-            .collect();
-
-        // The overwhelmingly common case: no tab has scoped its map, and there
-        // is nothing to recompute however dirty the graph has got.
-        if wanted.is_empty() && self.scoped.is_empty() {
-            self.scoped_stale.clear();
-            return;
-        }
-
-        self.scoped.retain(|key, _| wanted.contains(key));
-        self.scoped_stale.retain(|key| wanted.contains(key));
-
-        // One job at a time, and the whole-program recompute has first claim on
-        // the slot: it is what marks these stale in the first place, so a scope
-        // started against a clustering that is about to be replaced would be
-        // work done twice.
-        if self.clustering_job.is_some() {
-            return;
-        }
-
-        let mut owed: Vec<(SymbolId, CallDirection)> = wanted
-            .into_iter()
-            .filter(|key| self.scoped_stale.contains(key) || !self.scoped.contains_key(key))
-            .filter(|&(scope, direction)| {
-                self.clustering_failed != Some(ClusterTarget::Scope(scope, direction))
+            .flat_map(|ws| {
+                [
+                    ClusterTarget::of(ws),
+                    ClusterTarget {
+                        scope: None,
+                        method: ws.method,
+                    },
+                ]
             })
             .collect();
-        // `wanted` is a set, so without this which tab gets served first would
-        // depend on hash order.
-        owed.sort_unstable_by_key(|(scope, direction)| {
-            (scope.0, matches!(direction, CallDirection::Incoming))
-        });
 
-        // Whichever scopes are left waiting keep last time's communities, which
-        // are stale but drawable — better than a tab that blanks while it waits
-        // its turn.
-        if let Some(&(scope, direction)) = owed.first() {
-            self.spawn_clustering(ClusterTarget::Scope(scope, direction));
+        self.clusterings.retain(|target, _| wanted.contains(target));
+        self.stale.retain(|target| wanted.contains(target));
+        self.clustering_failed
+            .retain(|target| wanted.contains(target));
+
+        // One job at a time: the recompute *is* the expensive thing, so a
+        // second alongside it would compete for a core rather than add one.
+        if self.clustering_job.is_some() || self.loading() {
+            return;
         }
+
+        let mut owed: Vec<ClusterTarget> = wanted
+            .into_iter()
+            .filter(|target| self.stale.contains(target) || !self.clusterings.contains_key(target))
+            .filter(|target| !self.clustering_failed.contains(target))
+            .collect();
+        owed.sort_unstable_by_key(ClusterTarget::order);
+
+        // Whichever targets are left waiting keep last time's grouping, which
+        // is stale but drawable — better than a tab that blanks while it waits
+        // its turn.
+        if let Some(&target) = owed.first() {
+            self.spawn_clustering(target);
+        }
+    }
+
+    /// Whether every map a workspace is asking for has been computed against
+    /// the graph as it stands.
+    #[cfg(test)]
+    fn settled(&self) -> bool {
+        self.clustering_job.is_none()
+            && self.workspaces.workspaces.iter().all(|ws| {
+                let target = ClusterTarget::of(ws);
+                self.clusterings.contains_key(&target) && !self.stale.contains(&target)
+            })
+    }
+
+    /// Whether the graph is still arriving from clangd.
+    ///
+    /// Both halves are needed. `LspProgress(Completed)` says the symbols have
+    /// stopped coming, not that the graph has: the edge warmup that follows
+    /// adds every call in the project, and a map built from the symbols alone
+    /// is a map of isolated functions — which `logic::cluster` drops, leaving
+    /// nothing to draw. `NotStarted` is demo mode, where the graph handed to
+    /// `CoreApp::new` is the whole of it and nothing is pending at all.
+    fn loading(&self) -> bool {
+        let phase_done = matches!(
+            self.lsp.status,
+            LspLoadPhase::NotStarted | LspLoadPhase::Completed | LspLoadPhase::Failed(_)
+        );
+        !phase_done || self.warming_up()
     }
 
     /// Whether the initial edge warmup is still running.
@@ -1212,50 +1302,6 @@ impl CoreApp {
         }]
     }
 
-    /// Take delivery of a finished clustering, and start the next one if one is
-    /// owed.
-    ///
-    /// Two separate questions, because the recompute itself happens on a thread
-    /// (see [`ClusteringJob`]): has the job we started come back, and is there
-    /// another to send out?
-    fn maybe_recluster(&mut self) -> Vec<AppEvent> {
-        let events = self.collect_finished_clustering();
-
-        // One at a time.
-        if self.clustering_job.is_some() || !self.clustering_dirty {
-            return events;
-        }
-
-        let settled = self
-            .graph_changed_at
-            .is_some_and(|at| at.elapsed() >= CLUSTERING_SETTLE);
-        // Once the load is complete the graph only grows because the user asked
-        // it to, and then they are waiting on the answer: one recompute per
-        // action is both affordable and the thing they just requested. It also
-        // rescues a project whose symbols arrive in an unbroken stream, where
-        // waiting for quiet would mean waiting until the very end anyway.
-        // The warmup below makes the graph grow on its own after the load
-        // reports Completed, so the "nothing more is coming" shortcut would fire
-        // on every tick for as long as it runs — a Louvain pass per 100 ms, each
-        // one free to move the map under the user. While it runs, fall back to
-        // the ordinary quiet rule; the shortcut returns once it drains.
-        let load_finished =
-            matches!(self.lsp.status, LspLoadPhase::Completed) && !self.warming_up();
-        if !settled && !load_finished {
-            return events;
-        }
-
-        // Cleared here rather than when the result lands. The job computes
-        // against a copy of the graph as it stands at this instant, so anything
-        // arriving while it runs is work the job will not cover; marking the
-        // cache clean on completion would swallow exactly those changes.
-        // Clearing it now means `mark_graph_changed` dirties it again and the
-        // next settle picks them up — one generation late, never lost.
-        self.clustering_dirty = false;
-        self.spawn_clustering(ClusterTarget::Whole);
-        events
-    }
-
     /// Install a clustering a worker thread has finished, if one is ready.
     ///
     /// Never blocks: a job still running leaves everything as it was and is
@@ -1270,94 +1316,56 @@ impl CoreApp {
             Err(mpsc::TryRecvError::Empty) => return vec![],
             Err(mpsc::TryRecvError::Disconnected) => {
                 // The worker went away without answering, which means it
-                // panicked. The dirty flag is deliberately *not* set again: a
-                // panic that is deterministic would spin here forever. The next
-                // batch of symbols re-dirties the cache and it is tried once
-                // more then, which on a loading project is moments away.
+                // panicked. Recorded rather than retried: a panic that is
+                // deterministic would spin here forever, and `mark_graph_changed`
+                // is what lets it be asked again.
                 log::error!("CoreApp: clustering worker for {target:?} died without a result");
                 self.clustering_job = None;
-                self.clustering_failed = Some(target);
+                self.clustering_failed.insert(target);
                 return vec![];
             }
         };
         self.clustering_job = None;
 
-        match target {
-            ClusterTarget::Whole => {
-                // Only when nothing arrived while the worker ran. A batch that
-                // landed meanwhile has already restamped this, and wiping that
-                // stamp would leave the cache dirty with no settling clock to
-                // measure — work owed that nothing would ever start, until some
-                // later batch happened to restamp it.
-                if !self.clustering_dirty {
-                    self.graph_changed_at = None;
-                }
-                // Any scoped map is derived from the same graph and is now just
-                // as out of date — including when the grouping turns out not to
-                // have moved, since a new edge can leave the whole program's
-                // communities alone and still redraw one function's
-                // neighbourhood.
-                let scopes: Vec<_> = self.scoped.keys().copied().collect();
-                self.scoped_stale.extend(scopes);
+        let clusters = next.top_level().len();
+        log::info!(
+            "CoreApp: clustered {:?} over {} node(s) in {:.1}s: {} cluster(s) at the top of {} rung(s)",
+            target,
+            self.call_graph.node_count(),
+            started_at.elapsed().as_secs_f32(),
+            clusters,
+            next.level_count(),
+        );
+        self.clusterings.insert(target, next);
 
-                if same_grouping(&self.clustering, &next) {
-                    return vec![];
-                }
-                let clusters = next.top_level().len();
-                self.clustering = next;
-                log::info!(
-                    "CoreApp: clustering recomputed over {} node(s) in {:.1}s: {} top-level cluster(s)",
-                    self.call_graph.node_count(),
-                    started_at.elapsed().as_secs_f32(),
-                    clusters
-                );
-                vec![AppEvent::ClusteringUpdated { clusters }]
-            }
-            ClusterTarget::Scope(scope, direction) => {
-                log::info!(
-                    "CoreApp: clustered the neighbourhood of {:?} ({:?}) in {:.1}s: {} top-level cluster(s)",
-                    scope,
-                    direction,
-                    started_at.elapsed().as_secs_f32(),
-                    next.top_level().len()
-                );
-                self.scoped_stale.remove(&(scope, direction));
-                self.scoped.insert((scope, direction), next);
-                // A scoped map is what some tab is looking at, and nothing else
-                // is going to announce that it moved. The synchronous version
-                // needed no event because it always ran inside a dispatch that
-                // was emitting one anyway; landing on a tick of its own, this
-                // has to ask for the redraw itself.
-                vec![AppEvent::LayoutDirty]
-            }
-        }
+        // Announced whoever asked for it. A map nobody is looking at right now
+        // still belongs to a tab that will be, and the event is what every
+        // out-of-process frontend turns into the snapshot carrying it.
+        vec![AppEvent::ClusteringUpdated { clusters }]
     }
 
     /// Hand a clustering off to a worker thread.
     ///
-    /// The graph is copied rather than shared. `Clustering::compute` wants it
-    /// for seconds, so an `Arc` would mean either holding a lock across all of
-    /// that or making every `&mut CallGraph` in the app copy-on-write. At
-    /// 10,000 functions the copy is a few milliseconds — which is the whole
-    /// point, because this much *does* run with the app's lock held.
+    /// The graph is copied rather than shared. Coarsening wants it for seconds,
+    /// so an `Arc` would mean either holding a lock across all of that or making
+    /// every `&mut CallGraph` in the app copy-on-write. At 10,000 functions the
+    /// copy is a few milliseconds — which is the whole point, because this much
+    /// *does* run with the app's lock held.
     fn spawn_clustering(&mut self, target: ClusterTarget) {
         let graph = self.call_graph.clone();
-        // Seeded, always. Louvain is greedy, so a cold run over a graph that
-        // gained a single edge can regroup communities nothing touched; seeding
-        // from what is already on screen keeps the map still unless the new
-        // edges genuinely argue for moving something.
-        let previous = match target {
-            ClusterTarget::Whole => Some(self.clustering.clone()),
-            ClusterTarget::Scope(scope, direction) => self.scoped.get(&(scope, direction)).cloned(),
-        };
+        // Marked clean here rather than when the result lands. The job computes
+        // against a copy of the graph as it stands at this instant, so anything
+        // arriving while it runs is work the job will not cover; clearing the
+        // mark on completion would swallow exactly those changes. Clearing it
+        // now means `mark_graph_changed` sets it again and the next sync picks
+        // them up — one generation late, never lost.
+        self.stale.remove(&target);
 
         let (tx, result) = mpsc::channel();
         std::thread::spawn(move || {
-            let clustering = match target {
-                ClusterTarget::Whole => Clustering::compute_seeded(&graph, previous.as_ref()),
-                ClusterTarget::Scope(scope, direction) => {
-                    cluster_within(&graph, scope, direction, previous.as_ref())
-                }
+            let clustering = match target.scope {
+                None => Clustering::compute(&graph, target.method),
+                Some((scope, direction)) => cluster_within(&graph, scope, direction, target.method),
             };
             // A gone receiver means the app was dropped while this ran, which
             // is an ordinary shutdown and not worth a word.
@@ -1433,7 +1441,7 @@ fn cluster_within(
     graph: &CallGraph,
     scope: SymbolId,
     direction: CallDirection,
-    previous: Option<&Clustering>,
+    method: ClusterMethod,
 ) -> Clustering {
     let traversal = GraphTraversal::new(graph);
     // Unbounded, unlike the rooted tree's BFS: depth is how much of a tree
@@ -1447,27 +1455,7 @@ fn cluster_within(
     .into_iter()
     .collect();
 
-    Clustering::compute_within(graph, &reachable, previous)
-}
-
-/// Whether two clusterings describe the same grouping.
-///
-/// `Cluster` is deliberately not `PartialEq` and does not need to be: the only
-/// question here is whether anything a frontend would draw has moved, so this
-/// compares the fields a frontend draws. It is a linear pass next to the
-/// Louvain run that produced the thing, and it is what keeps a recompute that
-/// confirms the status quo from announcing itself as news.
-fn same_grouping(before: &Clustering, after: &Clustering) -> bool {
-    before.clusters().count() == after.clusters().count()
-        && before.clusters().zip(after.clusters()).all(|(a, b)| {
-            a.id == b.id
-                && a.level == b.level
-                && a.parent == b.parent
-                && a.children == b.children
-                && a.entry_point == b.entry_point
-                && a.label == b.label
-                && a.members == b.members
-        })
+    Clustering::compute_within(graph, &reachable, method)
 }
 
 #[cfg(test)]
@@ -1515,8 +1503,9 @@ mod tests {
     /// commands take, since they come back from a frontend whose snapshot may
     /// predate a recompute.
     fn key_of(app: &CoreApp, symbol: SymbolId) -> ClusterKey {
-        let id = app.clustering().cluster_of(&symbol).expect("clustered");
-        app.clustering().cluster(id).expect("a known id").key
+        let clustering = active(app);
+        let id = clustering.cluster_of(&symbol).expect("clustered");
+        clustering.cluster(id).expect("a known id").key
     }
 
     /// The laid-out nodes of the current snapshot — what the canvas would draw.
@@ -1598,34 +1587,34 @@ mod tests {
         );
     }
 
-    /// Pretend the settling period has already elapsed, rather than sleeping
-    /// through it for real in a unit test.
-    fn backdate(app: &mut CoreApp) {
-        app.graph_changed_at = Some(Instant::now() - CLUSTERING_SETTLE);
+    /// Say the load has finished, which is what lets a recompute start at all.
+    fn loaded(app: &mut CoreApp) {
+        app.lsp.status = LspLoadPhase::Completed;
+        app.edge_warmup.clear();
+        app.lsp.pending_requests.clear();
     }
 
-    /// Tick until every clustering the app owes has been computed and installed.
+    /// Tick until every map the app owes has been computed and installed.
     ///
-    /// The recompute runs on a worker thread now, so a single `tick()` only
-    /// starts one — the result lands on some later tick, and a scoped map needs
-    /// a second round after the whole-program one marks it stale. This is what
-    /// the frontends do anyway at 100ms intervals; it just does it faster, and
-    /// gives up loudly rather than hanging if the result never comes.
+    /// The recompute runs on a worker thread, so a single `tick()` only starts
+    /// one — the result lands on some later tick, and a second target waits its
+    /// turn behind the first. This is what the frontends do anyway at 100ms
+    /// intervals; it just does it faster, and gives up loudly rather than
+    /// hanging if the result never comes.
     fn tick_until_settled(app: &mut CoreApp) -> Vec<AppEvent> {
         let mut events = Vec::new();
         for _ in 0..500 {
             events.extend(app.tick());
-            if app.clustering_job.is_none() && !app.clustering_dirty && app.scoped_stale.is_empty()
-            {
+            if app.settled() {
                 return events;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
         panic!(
-            "clustering never settled: job in flight={}, dirty={}, stale scopes={}",
+            "clustering never settled: job in flight={}, stale={}, cached={}",
             app.clustering_job.is_some(),
-            app.clustering_dirty,
-            app.scoped_stale.len()
+            app.stale.len(),
+            app.clusterings.len(),
         );
     }
 
@@ -1653,46 +1642,53 @@ mod tests {
         let app = CoreApp::new(graph);
 
         // Nothing has polled, and in demo mode nothing ever will deliver a
-        // batch to start the settling clock — the clustering has to be there
-        // from the moment the graph is handed over.
-        assert!(!app.clustering().is_empty());
-        let left_cluster = app.clustering().cluster_of(&left[0]).expect("clustered");
-        let right_cluster = app.clustering().cluster_of(&right[0]).expect("clustered");
+        // batch to say the graph is complete — the map has to be there from the
+        // moment the graph is handed over.
+        let clustering = active(&app);
+        assert!(!clustering.is_empty());
+        let left_cluster = clustering.cluster_of(&left[0]).expect("clustered");
+        let right_cluster = clustering.cluster_of(&right[0]).expect("clustered");
         assert_ne!(left_cluster, right_cluster);
     }
 
     #[test]
-    fn a_changed_graph_is_not_reclustered_until_the_stream_goes_quiet() {
+    fn a_project_still_loading_is_not_clustered_until_it_lands() {
         let mut app = CoreApp::new(CallGraph::new());
-        assert!(app.clustering().is_empty());
+        assert!(active(&app).is_empty());
 
+        // Symbols are still arriving. Coarsening is not incremental, so a map
+        // built now is one that will be thrown away — after moving every box
+        // under whoever was reading it.
+        app.lsp.status = LspLoadPhase::LoadingWorkspaceSymbols { loaded: 3 };
         let (graph, left, _) = two_triangles();
         app.call_graph = graph;
         app.mark_graph_changed();
 
-        // A batch that has only just landed may be one of several; recomputing
-        // now would be work thrown away and a map that jumps.
         let events = app.tick();
         assert!(
             app.clustering_job.is_none(),
-            "a change still arriving must not trigger a recompute"
+            "a project still arriving must not be clustered"
         );
-        assert!(
-            app.clustering().is_empty(),
-            "and nothing has replaced the empty clustering"
-        );
+        assert!(active(&app).is_empty(), "and nothing has been drawn");
         assert!(!events
             .iter()
             .any(|e| matches!(e, AppEvent::ClusteringUpdated { .. })));
 
-        backdate(&mut app);
-        let events = tick_until_settled(&mut app);
-        assert!(app.clustering().cluster_of(&left[0]).is_some());
+        // clangd says there is nothing more coming, and the warmup has drained.
+        loaded(&mut app);
+        let mut events = app.tick();
+        assert!(
+            app.clustering_job.is_some(),
+            "the recompute goes out the moment the graph stops moving"
+        );
+
+        events.extend(tick_until_settled(&mut app));
+        assert!(active(&app).cluster_of(&left[0]).is_some());
         let reported = events.iter().find_map(|e| match e {
             AppEvent::ClusteringUpdated { clusters } => Some(*clusters),
             _ => None,
         });
-        assert_eq!(reported, Some(app.clustering().top_level().len()));
+        assert_eq!(reported, Some(active(&app).top_level().len()));
 
         // Nothing changed since, so the next tick has nothing to say.
         assert!(!app
@@ -1702,47 +1698,25 @@ mod tests {
     }
 
     #[test]
-    fn a_completed_load_reclusters_without_waiting_for_quiet() {
-        let mut app = CoreApp::new(CallGraph::new());
-        let (graph, left, _) = two_triangles();
-        app.call_graph = graph;
-        app.mark_graph_changed();
-
-        // clangd says there is nothing more coming, so there is nothing left to
-        // settle and no reason to make the user watch an empty map for it.
-        app.lsp.status = LspLoadPhase::Completed;
-        let mut events = app.tick();
-        assert!(
-            app.clustering_job.is_some(),
-            "the change landed this instant and the recompute went out anyway"
-        );
-
-        events.extend(tick_until_settled(&mut app));
-        assert!(app.clustering().cluster_of(&left[0]).is_some());
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, AppEvent::ClusteringUpdated { .. })));
-    }
-
-    #[test]
     fn a_graph_that_grows_mid_recompute_is_clustered_again_rather_than_lost() {
         // The worker holds a copy of the graph as it stood when it started, so
         // anything arriving while it runs is invisible to it. Clearing the
-        // dirty flag at spawn rather than on completion is what makes the next
-        // settle pick those up instead of marking them already handled.
+        // staleness at spawn rather than on completion is what makes the next
+        // sync pick those up instead of marking them already handled.
         let mut app = CoreApp::new(CallGraph::new());
         let (graph, left, _) = two_triangles();
         app.call_graph = graph;
         app.mark_graph_changed();
-        backdate(&mut app);
+        loaded(&mut app);
 
         app.tick();
         assert!(
             app.clustering_job.is_some(),
             "the recompute went out to a worker"
         );
+        let target = ClusterTarget::of(app.workspaces.current().expect("a workspace"));
         assert!(
-            !app.clustering_dirty,
+            !app.stale.contains(&target),
             "and the graph it covers is no longer owed"
         );
 
@@ -1751,14 +1725,13 @@ mod tests {
         call(&mut app.call_graph, left[0], extra, 901);
         app.mark_graph_changed();
         assert!(
-            app.clustering_dirty,
+            app.stale.contains(&target),
             "which puts the cache straight back in debt"
         );
 
-        backdate(&mut app);
         tick_until_settled(&mut app);
         assert!(
-            app.clustering().cluster_of(&extra).is_some(),
+            active(&app).cluster_of(&extra).is_some(),
             "the node that arrived mid-flight is on the map"
         );
     }
@@ -1772,7 +1745,7 @@ mod tests {
         let (graph, left, _) = two_triangles();
         app.call_graph = graph;
         app.mark_graph_changed();
-        backdate(&mut app);
+        loaded(&mut app);
         app.tick();
         assert!(app.clustering_job.is_some());
 
@@ -1789,23 +1762,25 @@ mod tests {
     #[test]
     fn a_clustering_worker_that_dies_is_not_sent_straight_back_out() {
         // A panic in the clustering is a function of the graph, so retrying it
-        // against the same graph panics again. The whole-program recompute is
-        // shielded by its dirty flag staying false; a scope is worked out afresh
-        // from `scoped_stale` every tick, so without a guard one repeatable
-        // panic means a new thread ten times a second for as long as the app
-        // runs.
+        // against the same graph panics again — and since what is owed is
+        // worked out afresh every tick from the cache being empty, one
+        // repeatable panic would mean a new thread ten times a second for as
+        // long as the app runs.
         let (graph, left, _) = two_triangles();
         let mut app = CoreApp::new(graph);
         app.dispatch(Command::SetMapScope(Some(left[0])));
-        let key = (left[0], CallDirection::Outgoing);
-        assert!(app.scoped.contains_key(&key), "the tab has a scoped map");
+        let target = ClusterTarget::of(app.workspaces.current().expect("a workspace"));
+        assert!(
+            app.clusterings.contains_key(&target),
+            "the tab has a scoped map"
+        );
         assert!(app.clustering_job.is_none());
 
         // That scope's worker dies without answering.
-        app.scoped_stale.insert(key);
-        app.clustering_failed = Some(ClusterTarget::Scope(key.0, key.1));
+        app.stale.insert(target);
+        app.clustering_failed.insert(target);
 
-        app.sync_scoped_clusterings();
+        app.sync_clusterings();
         assert!(
             app.clustering_job.is_none(),
             "the target that just killed a worker is not handed straight to another"
@@ -1813,8 +1788,8 @@ mod tests {
 
         // A changed graph is a different question, so it is worth asking again.
         app.mark_graph_changed();
-        assert_eq!(app.clustering_failed, None);
-        app.sync_scoped_clusterings();
+        assert!(app.clustering_failed.is_empty());
+        app.sync_clusterings();
         assert!(
             app.clustering_job.is_some(),
             "and the next graph gets a fresh attempt"
@@ -1844,12 +1819,21 @@ mod tests {
         app.dispatch(Command::ToggleCallDirection);
 
         let ws = app.workspaces.current().expect("a workspace");
-        let shown = app.clustering_for(ws);
+        let whole = app
+            .clusterings
+            .get(&ClusterTarget {
+                scope: None,
+                method: ClusterMethod::default(),
+            })
+            .expect("demo mode clustered the whole graph up front");
         assert!(
-            !std::ptr::eq(shown, app.clustering()),
-            "a scoped tab must never be handed the whole program's communities"
+            !whole.is_empty(),
+            "the whole program's map is sitting right there to be mistakenly handed over"
         );
-        assert!(shown.is_empty(), "it reads as not ready instead");
+        assert!(
+            app.clustering_for(ws).is_empty(),
+            "a scoped tab reads as not ready rather than being handed the whole program"
+        );
 
         // And the real one arrives without anyone having blocked on it.
         tick_until_settled(&mut app);
@@ -2142,25 +2126,34 @@ mod tests {
 
     #[test]
     fn reclustering_holds_off_until_the_warmup_drains() {
-        // `Completed` normally means "recluster now, nothing more is coming".
-        // The warmup makes that false: the graph keeps growing on its own, and
-        // honouring the shortcut would run Louvain on every 100ms tick.
+        // `Completed` means the *symbols* have stopped arriving. The warmup
+        // makes that not the end of the wait: the graph keeps growing on its
+        // own as every function's edges land, and a map built from symbols
+        // alone is a map of isolated functions, which the clustering drops.
         let (mut app, _rx) = loaded_app(2);
         app.tick();
         assert!(app.warming_up());
+        assert!(app.loading(), "a warmup still running is still loading");
 
-        app.clustering_dirty = true;
-        app.graph_changed_at = Some(Instant::now());
+        let target = ClusterTarget::of(app.workspaces.current().expect("a workspace"));
+        app.stale.insert(target);
+        app.sync_clusterings();
         assert!(
-            app.maybe_recluster().is_empty(),
+            app.clustering_job.is_none(),
             "no recompute while edges are still arriving"
         );
-        assert!(app.clustering_dirty, "and the work is still owed");
+        assert!(app.stale.contains(&target), "and the work is still owed");
 
-        // Drained: the shortcut comes back.
+        // Drained: the graph has stopped moving.
         app.edge_warmup.clear();
         app.lsp.pending_requests.clear();
         assert!(!app.warming_up());
+        assert!(!app.loading());
+        app.sync_clusterings();
+        assert!(
+            app.clustering_job.is_some(),
+            "and the map goes out the moment it has"
+        );
     }
 
     #[test]
@@ -2192,7 +2185,7 @@ mod tests {
         });
 
         assert_eq!(app.call_graph.function_ids().count(), 1);
-        assert!(app.clustering_dirty);
+        assert!(!app.stale.is_empty());
         assert!(events
             .iter()
             .any(|e| matches!(e, AppEvent::GraphSymbolsUpdated { count: 1 })));
@@ -2201,7 +2194,7 @@ mod tests {
     #[test]
     fn every_way_the_graph_grows_marks_the_cache_dirty() {
         let mut app = CoreApp::new(CallGraph::new());
-        assert!(!app.clustering_dirty);
+        assert!(app.stale.is_empty());
 
         app.lsp.pending_requests.insert(
             "symbols".to_string(),
@@ -2215,9 +2208,9 @@ mod tests {
                 Location::new("test.c".to_string(), 1, 0),
             )],
         });
-        assert!(app.clustering_dirty, "new symbols are new graph nodes");
+        assert!(!app.stale.is_empty(), "new symbols are new graph nodes");
 
-        app.clustering_dirty = false;
+        app.stale.clear();
         let caller = *app.call_graph.function_ids().next().expect("one symbol");
         app.lsp.pending_requests.insert(
             "calls".to_string(),
@@ -2230,7 +2223,7 @@ mod tests {
                 from_ranges: vec![hierarchy_item("beta", 2).range],
             }],
         });
-        assert!(app.clustering_dirty, "new calls are new graph edges");
+        assert!(!app.stale.is_empty(), "new calls are new graph edges");
     }
 
     /// The bootstrap warmup asks for every symbol's edges. Answering each of
@@ -2271,7 +2264,7 @@ mod tests {
             // Either way the edge is in the graph — the warmup still does its
             // job, it just does it quietly.
             assert_eq!(app.call_graph.edge_count(), 1, "{origin:?} reply");
-            assert!(app.clustering_dirty, "{origin:?} reply");
+            assert!(!app.stale.is_empty(), "{origin:?} reply");
         }
     }
 
@@ -2391,8 +2384,7 @@ mod tests {
         app.dispatch(Command::SetViewMode(ViewMode::ClusterMap));
 
         let key = key_of(&app, right[0]);
-        let entry = app
-            .clustering()
+        let entry = active(&app)
             .by_key(key)
             .and_then(|c| c.entry_point)
             .expect("a cluster with members has a front door");
@@ -2444,37 +2436,46 @@ mod tests {
     }
 
     #[test]
-    fn toggling_a_cluster_round_trips_and_a_new_root_clears_it() {
-        let (graph, left, right) = two_triangles();
+    fn zooming_the_map_is_clamped_to_the_ladder_and_reset_by_a_new_root() {
+        let (graph, left, _) = two_triangles();
         let mut app = CoreApp::new(graph);
-        let key = key_of(&app, right[0]);
+        let rungs = active(&app).level_count();
+        assert!(rungs > 0, "the demo pair of triangles is clustered");
 
-        let events = app.dispatch(Command::ToggleClusterExpanded(key));
+        let events = app.dispatch(Command::SetMapLevel(0));
         assert!(events.iter().any(|e| matches!(e, AppEvent::LayoutDirty)));
-        assert!(app
-            .workspaces
-            .current()
-            .unwrap()
-            .expanded_clusters
-            .contains(&key));
+        assert_eq!(app.workspaces.current().unwrap().map_level, Some(0));
 
-        app.dispatch(Command::ToggleClusterExpanded(key));
-        assert!(app
-            .workspaces
-            .current()
-            .unwrap()
-            .expanded_clusters
-            .is_empty());
+        // A level from a taller ladder lands on the coarsest rung rather than
+        // on a blank canvas.
+        app.dispatch(Command::SetMapLevel(rungs + 10));
+        assert_eq!(
+            app.workspaces.current().unwrap().map_level,
+            Some(rungs - 1),
+            "a level past the top is clamped to the top"
+        );
+        assert_eq!(
+            app.map_level_for(app.workspaces.current().unwrap()),
+            rungs - 1
+        );
 
-        app.dispatch(Command::ToggleClusterExpanded(key));
         app.dispatch(Command::SelectFunction(left[0]));
+        assert_eq!(
+            app.workspaces.current().unwrap().map_level,
+            None,
+            "the zoom described the old view"
+        );
+    }
+
+    #[test]
+    fn picking_the_method_already_shown_changes_nothing() {
+        let (graph, _, _) = two_triangles();
+        let mut app = CoreApp::new(graph);
+
         assert!(
-            app.workspaces
-                .current()
-                .unwrap()
-                .expanded_clusters
+            app.dispatch(Command::SetClusterMethod(ClusterMethod::HeavyEdge))
                 .is_empty(),
-            "what stood open described the old view"
+            "the map is already built that way"
         );
     }
 
@@ -2515,7 +2516,14 @@ mod tests {
         }
 
         assert!(
-            app.clustering().cluster_of(&left[0]).is_some(),
+            app.clusterings
+                .get(&ClusterTarget {
+                    scope: None,
+                    method: ClusterMethod::default(),
+                })
+                .expect("the whole-program map is still cached")
+                .cluster_of(&left[0])
+                .is_some(),
             "and the whole-program clustering is untouched underneath it"
         );
     }
@@ -2579,7 +2587,7 @@ mod tests {
             "the whole program is on the map again"
         );
         assert!(
-            app.scoped.is_empty(),
+            app.clusterings.keys().all(|target| target.scope.is_none()),
             "and the clustering nothing points at any more is not kept around"
         );
     }
@@ -2630,7 +2638,6 @@ mod tests {
         let extra = add(&mut app.call_graph, "extra", 900);
         call(&mut app.call_graph, right[2], extra, 901);
         app.mark_graph_changed();
-        backdate(&mut app);
         tick_until_settled(&mut app);
 
         assert!(
@@ -2641,18 +2648,26 @@ mod tests {
 
     #[test]
     fn only_the_scopes_in_use_are_kept_clustered() {
+        let scoped = |app: &CoreApp| {
+            app.clusterings
+                .keys()
+                .filter(|target| target.scope.is_some())
+                .count()
+        };
+
         let (graph, _, right) = two_triangles();
         let mut app = CoreApp::new(graph);
         app.dispatch(Command::SetMapScope(Some(right[0])));
-        assert_eq!(app.scoped.len(), 1);
+        assert_eq!(scoped(&app), 1);
 
         // A second tab, on the whole-program map like every new tab.
         app.dispatch(Command::NewWorkspace);
-        assert_eq!(app.scoped.len(), 1, "the first tab still wants its map");
+        assert_eq!(scoped(&app), 1, "the first tab still wants its map");
 
         app.dispatch(Command::CloseWorkspace(0));
-        assert!(
-            app.scoped.is_empty(),
+        assert_eq!(
+            scoped(&app),
+            0,
             "closing the only tab that wanted it drops the clustering"
         );
     }

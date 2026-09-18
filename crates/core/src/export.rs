@@ -38,14 +38,11 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
-use logic::ClusterKey;
 use model::{CallDirection, CallGraph, SymbolId};
 use serde::{Deserialize, Serialize};
 
 use crate::app::CoreApp;
-use crate::layout::{
-    compute_cluster_layout, compute_layout, GroupBox, LayoutNodeId, LayoutOrientation,
-};
+use crate::layout::{compute_cluster_layout, compute_layout, LayoutOrientation};
 use crate::protocol::layout_options;
 use crate::workspace::{CoreWorkspace, ViewMode};
 
@@ -248,12 +245,27 @@ fn hidden_children(
 // The cluster map
 // ---------------------------------------------------------------------------
 
+/// The cluster map, as one `subgraph cluster_…` per box.
+///
+/// The canvas draws a cluster as a single node, because a box holding two
+/// hundred names is unreadable on screen. A file is not a screen: `subgraph
+/// cluster_…` is the native DOT concept the map maps onto, and it is most of
+/// why DOT was the format chosen at all, so the export opens each box and puts
+/// the functions inside it — the grouping is the thing being exported, and a
+/// picture of twenty opaque boxes carries none of it.
+///
+/// Which makes the rung the size control. The whole map is always every
+/// clustered function in the project, so exporting the coarsest rung writes the
+/// whole graph into twenty boxes; zoom in first and the same file comes back
+/// finer-grained and no larger. That is the one piece of sizing the user does
+/// by hand here, and the zoom control is where they were already doing it.
 fn cluster_dot(core: &CoreApp) -> Option<String> {
     let ws = core.workspaces.current()?;
+    let clustering = core.clustering_for(ws);
     let layout = compute_cluster_layout(
         &core.call_graph,
-        core.clustering_for(ws),
-        &ws.expanded_clusters,
+        clustering,
+        core.map_level_for(ws),
         ws.direction,
         ws.orientation,
     );
@@ -261,31 +273,25 @@ fn cluster_dot(core: &CoreApp) -> Option<String> {
         return None;
     }
 
-    // Every element that got a position, named. Sorted by the id's own string
-    // form, which is stable across runs where a HashMap iteration is not.
-    let mut drawn: Vec<LayoutNodeId> = layout.nodes.keys().copied().collect();
-    drawn.sort_by_key(|id| id.to_string());
-    let name_of: HashMap<LayoutNodeId, String> = drawn
-        .iter()
-        .enumerate()
-        .map(|(i, id)| (*id, format!("n{i}")))
-        .collect();
+    // Boxes in the order the layout listed them, which is the clustering's own
+    // order and stable across runs where a HashMap iteration is not.
+    let boxes: Vec<&crate::layout::MetaNode> = layout.metas.iter().collect();
 
-    // A meta-node is a closed community drawn as one box; the label and the
-    // count come from the layout rather than from the clustering, because the
-    // layout is what decided which communities the map shows at all.
-    let meta_of: HashMap<ClusterKey, &crate::layout::MetaNode> =
-        layout.metas.iter().map(|m| (m.key, m)).collect();
-    let group_of: HashMap<ClusterKey, &GroupBox> =
-        layout.groups.iter().map(|g| (g.key, g)).collect();
-
-    // Anything listed inside a box is emitted by that box, so the top level is
-    // whatever no box claimed.
-    let nested: HashSet<LayoutNodeId> = layout
-        .groups
-        .iter()
-        .flat_map(|g| g.members.iter().copied())
-        .collect();
+    // Every member of every box, named. A function can only be in one box at a
+    // rung, so one pass over the boxes names the lot.
+    let mut name_of: HashMap<SymbolId, String> = HashMap::new();
+    let mut members_of: Vec<Vec<SymbolId>> = Vec::with_capacity(boxes.len());
+    for meta in &boxes {
+        let members = match clustering.by_key(meta.key) {
+            Some(cluster) => cluster.members.clone(),
+            None => Vec::new(),
+        };
+        for member in &members {
+            let next = name_of.len();
+            name_of.entry(*member).or_insert_with(|| format!("n{next}"));
+        }
+        members_of.push(members);
+    }
 
     let mut out = String::new();
     let scope = match ws.map_scope.and_then(|s| core.call_graph.get_function(&s)) {
@@ -296,49 +302,41 @@ fn cluster_dot(core: &CoreApp) -> Option<String> {
         &mut out,
         ws.orientation,
         &format!(
-            "Cluster map: {scope}, {} communities",
-            layout.groups.len() + layout.metas.len()
+            "Cluster map: {scope}, {} clusters ({}, rung {} of {})",
+            boxes.len(),
+            ws.method.label(),
+            core.map_level_for(ws) + 1,
+            clustering.level_count(),
         ),
     );
 
-    let mut next_cluster = 0usize;
-    for group in &layout.groups {
-        if nested.contains(&LayoutNodeId::Cluster(group.key)) {
-            continue;
-        }
-        emit_group(
+    for (id, (meta, members)) in boxes.iter().zip(&members_of).enumerate() {
+        // The `cluster_` prefix is not decoration: Graphviz draws a subgraph as
+        // a labelled box only when its name starts with it.
+        writeln!(&mut out, "  subgraph cluster_{id} {{").ok();
+        writeln!(
             &mut out,
-            group,
-            &group_of,
-            &meta_of,
-            &name_of,
-            &core.call_graph,
-            1,
-            &mut next_cluster,
-        );
-    }
-    for id in &drawn {
-        if nested.contains(id) {
-            continue;
+            "    label={};",
+            quote(&format!("{}  ({})", meta.label, meta.count))
+        )
+        .ok();
+        out.push_str("    style=\"rounded\";\n");
+        for member in members {
+            emit_function(&mut out, *member, &name_of, &core.call_graph, 2);
         }
-        emit_node(&mut out, *id, &meta_of, &name_of, &core.call_graph, 1);
+        out.push_str("  }\n");
     }
 
     out.push('\n');
-    for edge in &layout.edges {
-        // Both ends are always real nodes, never boxes: `compute_cluster_layout`
-        // attributes a call to the innermost *drawn* element, and an open
-        // cluster is a box precisely because its contents are drawn instead. So
-        // no `lhead`/`ltail` is needed and `compound` stays off.
-        let (Some(source), Some(target)) = (name_of.get(&edge.source), name_of.get(&edge.target))
-        else {
+    for edge in call_edges(&core.call_graph, &name_of, ws.direction) {
+        let (Some(source), Some(target)) = (name_of.get(&edge.0), name_of.get(&edge.1)) else {
             continue;
         };
         writeln!(
-            out,
+            &mut out,
             "  {source} -> {target} [penwidth={:.1}, tooltip={}];",
-            pen_width(edge.weight),
-            quote(&count_of("call", edge.weight))
+            pen_width(edge.2),
+            quote(&count_of("call", edge.2))
         )
         .ok();
     }
@@ -347,104 +345,71 @@ fn cluster_dot(core: &CoreApp) -> Option<String> {
     Some(out)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn emit_group(
-    out: &mut String,
-    group: &GroupBox,
-    groups: &HashMap<ClusterKey, &GroupBox>,
-    metas: &HashMap<ClusterKey, &crate::layout::MetaNode>,
-    names: &HashMap<LayoutNodeId, String>,
+/// Every call between two exported functions, as (from, to, how many), sorted.
+///
+/// `CallGraph` exposes no `edges()` accessor that counts multiplicity, so the
+/// calls are walked the way `logic::cluster` and `layout` walk them:
+/// `get_callees` per function, which returns one entry per distinct call site.
+/// Calls inside a box are kept — that is what the box is for here — and the
+/// ones leaving the exported set are dropped, exactly as an isolated function
+/// is absent from the map it was never clustered into.
+fn call_edges(
     graph: &CallGraph,
-    depth: usize,
-    next_cluster: &mut usize,
-) {
-    let pad = "  ".repeat(depth);
-    // The `cluster_` prefix is not decoration: Graphviz draws a subgraph as a
-    // labelled box only when its name starts with it.
-    let id = *next_cluster;
-    *next_cluster += 1;
-
-    writeln!(out, "{pad}subgraph cluster_{id} {{").ok();
-    writeln!(
-        out,
-        "{pad}  label={};",
-        quote(&format!("{}  ({})", group.label, group.count))
-    )
-    .ok();
-    writeln!(out, "{pad}  style=\"rounded\";").ok();
-
-    for member in &group.members {
-        match member {
-            // A cluster key in `members` names a nested box exactly when the
-            // walk opened it, and a meta-node otherwise — the two lists are
-            // disjoint by construction, see `GroupBox::members`.
-            LayoutNodeId::Cluster(key) if groups.contains_key(key) => emit_group(
-                out,
-                groups[key],
-                groups,
-                metas,
-                names,
-                graph,
-                depth + 1,
-                next_cluster,
-            ),
-            _ => emit_node(out, *member, metas, names, graph, depth + 1),
+    exported: &HashMap<SymbolId, String>,
+    direction: CallDirection,
+) -> Vec<(SymbolId, SymbolId, usize)> {
+    let mut weights: HashMap<(SymbolId, SymbolId), usize> = HashMap::new();
+    for caller in graph.function_ids() {
+        if !exported.contains_key(caller) {
+            continue;
+        }
+        for callee in graph.get_callees(caller) {
+            if !exported.contains_key(&callee.id) || callee.id == *caller {
+                continue;
+            }
+            let pair = match direction {
+                CallDirection::Outgoing => (*caller, callee.id),
+                CallDirection::Incoming => (callee.id, *caller),
+            };
+            *weights.entry(pair).or_insert(0) += 1;
         }
     }
 
-    writeln!(out, "{pad}}}").ok();
+    let mut edges: Vec<(SymbolId, SymbolId, usize)> = weights
+        .into_iter()
+        .map(|((from, to), weight)| (from, to, weight))
+        .collect();
+    // A HashMap iteration decided the order; the file has to not depend on it.
+    edges.sort_by(|a, b| {
+        exported[&a.0]
+            .cmp(&exported[&b.0])
+            .then_with(|| exported[&a.1].cmp(&exported[&b.1]))
+    });
+    edges
 }
 
-fn emit_node(
+fn emit_function(
     out: &mut String,
-    id: LayoutNodeId,
-    metas: &HashMap<ClusterKey, &crate::layout::MetaNode>,
-    names: &HashMap<LayoutNodeId, String>,
+    symbol: SymbolId,
+    names: &HashMap<SymbolId, String>,
     graph: &CallGraph,
     depth: usize,
 ) {
-    let Some(name) = names.get(&id) else {
+    let (Some(name), Some(func)) = (names.get(&symbol), graph.get_function(&symbol)) else {
         return;
     };
-    let pad = "  ".repeat(depth);
-
-    match id {
-        LayoutNodeId::Symbol(symbol) => {
-            let Some(func) = graph.get_function(&symbol) else {
-                return;
-            };
-            let tooltip = format!(
-                "{}\n{}:{}",
-                func.qualified_name,
-                func.definition_location.file_path,
-                func.definition_location.line
-            );
-            writeln!(
-                out,
-                "{pad}{name} [label={}, tooltip={}];",
-                quote(&func.name),
-                quote(&tooltip)
-            )
-            .ok();
-        }
-        LayoutNodeId::Cluster(key) => {
-            let Some(meta) = metas.get(&key) else {
-                return;
-            };
-            // Dashed for the same reason a node hiding callees is: the picture
-            // stops here, and the number says how much of it is missing.
-            // A real newline: `quote` is what turns it into the `\n` a DOT
-            // label breaks on. Writing the escape here would escape the
-            // backslash on the way out and put it on the canvas verbatim.
-            writeln!(
-                out,
-                "{pad}{name} [label={}, style=\"rounded,dashed\", tooltip={}];",
-                quote(&format!("{}\n+{}", meta.label, meta.count)),
-                quote(&count_of("function", meta.count))
-            )
-            .ok();
-        }
-    }
+    let tooltip = format!(
+        "{}\n{}:{}",
+        func.qualified_name, func.definition_location.file_path, func.definition_location.line
+    );
+    writeln!(
+        out,
+        "{}{name} [label={}, tooltip={}];",
+        "  ".repeat(depth),
+        quote(&func.name),
+        quote(&tooltip)
+    )
+    .ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -668,74 +633,73 @@ mod tests {
     }
 
     #[test]
-    fn a_cluster_map_exports_boxes_for_what_is_open_and_nodes_for_what_is_not() {
-        let mut core = CoreApp::new(create_demo_call_graph());
-        // A fresh workspace opens on the whole-program map with nothing open.
+    fn a_cluster_map_exports_one_box_per_cluster_holding_its_functions() {
+        let core = CoreApp::new(create_demo_call_graph());
+        // A fresh workspace opens on the whole-program map.
         assert_eq!(
             core.workspaces.current().unwrap().view,
             ViewMode::ClusterMap
         );
 
-        let closed = dot(&core);
+        let out = dot(&core);
+        let ws = core.workspaces.current().unwrap();
+        let boxes = core.clustering_for(ws).level(core.map_level_for(ws)).len();
+
+        assert_eq!(
+            out.matches("subgraph cluster_").count(),
+            boxes,
+            "every cluster on the rung is a DOT cluster subgraph; got:\n{out}"
+        );
+        // The canvas draws a box as one node; the file opens it, which is the
+        // whole reason the format is DOT.
         assert!(
-            !closed.contains("subgraph cluster_"),
-            "nothing is open, so there are no boxes yet"
+            out.contains("tooltip=\"crc32_update\\n"),
+            "a box holds its member functions, not a placeholder; got:\n{out}"
         );
         assert!(
-            closed.contains("\\n+"),
-            "every community is a single node carrying its size"
-        );
-
-        let key = core.active_clustering().top_level()[0];
-        let key = core.active_clustering().cluster(key).unwrap().key;
-        core.dispatch(crate::Command::ToggleClusterExpanded(key));
-
-        let opened = dot(&core);
-        assert!(
-            opened.contains("subgraph cluster_0 {"),
-            "an opened community is a DOT cluster subgraph; got:\n{opened}"
+            !out.contains("\\n+"),
+            "and so nothing stands in for functions it is not showing"
         );
     }
 
     #[test]
-    fn opening_a_community_inside_a_community_nests_the_boxes() {
-        // The dendrogram is a hierarchy, and a map with two levels open has to
-        // export as boxes inside boxes — not as a flattened list that loses
-        // which community the inner one belongs to.
+    fn zooming_in_exports_the_rung_that_is_showing() {
+        // The rung is the size control: the same functions, divided more finely.
         let mut core = CoreApp::new(create_demo_call_graph());
+        let coarse = dot(&core);
 
-        let top = core.active_clustering().top_level()[0];
-        let top_key = core.active_clustering().cluster(top).unwrap().key;
-        let children = core
-            .active_clustering()
-            .cluster(top)
-            .unwrap()
-            .children
-            .clone();
+        core.dispatch(crate::Command::SetMapLevel(0));
+        let fine = dot(&core);
+
+        let count = |out: &str| out.matches("subgraph cluster_").count();
         assert!(
-            !children.is_empty(),
-            "this test needs a cluster with a finer level under it"
+            count(&fine) > count(&coarse),
+            "the finest rung has more boxes than the coarsest: {} vs {}",
+            count(&fine),
+            count(&coarse)
         );
-        core.dispatch(crate::Command::ToggleClusterExpanded(top_key));
-        let child_key = core.active_clustering().cluster(children[0]).unwrap().key;
-        core.dispatch(crate::Command::ToggleClusterExpanded(child_key));
+        let functions = |out: &str| out.matches("tooltip=").count();
+        assert_eq!(
+            functions(&fine),
+            functions(&coarse),
+            "and every rung covers the same functions"
+        );
+    }
 
+    #[test]
+    fn the_map_export_names_the_rung_and_the_method() {
+        // A map of the same project at two zoom levels exports two different
+        // pictures, and a reader opening the file months later has nothing else
+        // to tell them which one they are looking at.
+        let core = CoreApp::new(create_demo_call_graph());
         let out = dot(&core);
-        let outer = out.find("subgraph cluster_").expect("the opened community");
-        let inner = out[outer + 1..]
-            .find("subgraph cluster_")
-            .map(|i| outer + 1 + i)
-            .expect("the community opened inside it");
-        let close = out[outer..].find("\n  }\n").map(|i| outer + i).unwrap();
         assert!(
-            inner < close,
-            "the nested box has to be emitted before the outer one closes:\n{out}"
+            out.contains("Heavy-edge matching"),
+            "the file says how it was grouped; got:\n{out}"
         );
-        // And opening the finest level is what finally puts functions on the
-        // map, rather than another community standing in for them.
         assert!(
-            out.contains("tooltip=\"crc32_update\\n"),
-            "a level-0 box holds its member functions; got:\n{out}"
+            out.contains("rung "),
+            "and which rung of the ladder it is; got:\n{out}"
         );
     }
 
@@ -769,28 +733,31 @@ mod tests {
     }
 
     #[test]
-    fn cluster_edges_never_point_at_a_box() {
-        // Graphviz cannot draw an edge to a subgraph without `compound` and an
-        // `lhead`, and this export sets neither — which is only safe because
-        // `compute_cluster_layout` attributes every call to a drawn node.
-        let mut core = CoreApp::new(create_demo_call_graph());
-        let keys: Vec<ClusterKey> = core.active_clustering().clusters().map(|c| c.key).collect();
-        for key in keys {
-            core.dispatch(crate::Command::ToggleClusterExpanded(key));
-        }
+    fn every_exported_call_runs_between_two_exported_functions() {
+        // The edges are built from the graph rather than from the layout, so
+        // nothing stops them naming a function no box holds — which Graphviz
+        // would happily render as a mystery node with no label.
+        let core = CoreApp::new(create_demo_call_graph());
+        let out = dot(&core);
 
-        let ws = core.workspaces.current().unwrap();
-        let layout = compute_cluster_layout(
-            &core.call_graph,
-            core.clustering_for(ws),
-            &ws.expanded_clusters,
-            ws.direction,
-            ws.orientation,
-        );
-        for edge in &layout.edges {
+        let declared: HashSet<&str> = out
+            .lines()
+            .filter_map(|line| line.trim().strip_suffix(';'))
+            .filter(|line| line.contains("[label="))
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        for line in out.lines() {
+            let Some((left, right)) = line.trim().split_once(" -> ") else {
+                continue;
+            };
+            let target = right.split_whitespace().next().unwrap_or_default();
             assert!(
-                layout.nodes.contains_key(&edge.source) && layout.nodes.contains_key(&edge.target),
-                "an aggregated edge reached something that has no position"
+                declared.contains(left),
+                "edge from an undeclared node: {line}"
+            );
+            assert!(
+                declared.contains(target),
+                "edge to an undeclared node: {line}"
             );
         }
     }

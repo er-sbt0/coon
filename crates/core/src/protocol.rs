@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use logic::ClusterKey;
+use logic::ClusterMethod;
 use model::{CallDirection, CallGraph, LspLoadPhase, SymbolId};
 use serde::{Deserialize, Serialize};
 
@@ -121,6 +121,14 @@ pub enum ServerMsg<'a> {
         /// `layout` and never sees this field at all.
         #[serde(skip_serializing_if = "Option::is_none")]
         cluster_layout: Option<GraphLayout>,
+        /// The algorithms the map can be built with, in the order a picker
+        /// should list them.
+        ///
+        /// Constant, and sent anyway: the alternative is the client carrying
+        /// its own copy of the list, which is how a method added in `logic`
+        /// comes to be one the user cannot reach. A handful of bytes per
+        /// snapshot against a dropdown that is never out of date.
+        cluster_methods: Vec<MethodInfo>,
         workspaces: Vec<WorkspaceInfo>,
         /// Index into `workspaces` of the active tab. The workspace commands
         /// (`SwitchWorkspace`, `CloseWorkspace`, `RenameWorkspace`) address
@@ -139,6 +147,15 @@ pub enum ClientMsg {
     Command { command: Command },
 }
 
+/// One entry in the method picker.
+#[derive(Debug, Serialize)]
+pub struct MethodInfo {
+    /// The value to send back in `Command::SetClusterMethod`.
+    pub id: ClusterMethod,
+    pub label: &'static str,
+    pub description: &'static str,
+}
+
 #[derive(Debug, Serialize)]
 pub struct WorkspaceInfo {
     pub id: usize,
@@ -153,10 +170,19 @@ pub struct WorkspaceInfo {
     pub orientation: LayoutOrientation,
     /// Which view this workspace is showing — the cluster map or a rooted tree.
     pub view: ViewMode,
-    /// Clusters the user has opened on the map, so the client can mark them.
-    /// These are the keys the client sends back, so they have to survive a
-    /// recompute the client did not see.
-    pub expanded_clusters: Vec<ClusterKey>,
+    /// Which rung of the coarsening ladder the map is drawn at, already
+    /// resolved against the clustering that exists — so this is the rung the
+    /// client is looking at, never the wish the workspace stored.
+    pub map_level: usize,
+    /// How many rungs there are. With `map_level` this is the zoom control:
+    /// 0 is the finest map and `map_levels - 1` the coarsest. Zero means
+    /// nothing is clustered yet, and the control has nothing to offer.
+    pub map_levels: usize,
+    /// How many clusters the rung being shown holds — the number the zoom
+    /// control reads out, and the reason a user picks one rung over another.
+    pub map_clusters: usize,
+    /// Which algorithm built the map.
+    pub method: ClusterMethod,
     /// The function this workspace's cluster map is drawn from, or `null` for
     /// the whole program. The client shows it — a map of one function's
     /// neighbourhood and a map of the project look identical otherwise — and
@@ -193,6 +219,14 @@ pub fn snapshot_of(core: &CoreApp) -> ServerMsg<'_> {
         graph: wire_graph(&core.call_graph),
         layout,
         cluster_layout: cluster_layout_of(core),
+        cluster_methods: ClusterMethod::ALL
+            .iter()
+            .map(|&id| MethodInfo {
+                id,
+                label: id.label(),
+                description: id.description(),
+            })
+            .collect(),
         workspaces: workspace_infos(core),
         active_workspace: core.workspaces.current_index,
         selected: core.selected_function,
@@ -216,7 +250,7 @@ fn cluster_layout_of(core: &CoreApp) -> Option<GraphLayout> {
     Some(compute_cluster_layout(
         &core.call_graph,
         core.clustering_for(ws),
-        &ws.expanded_clusters,
+        core.map_level_for(ws),
         ws.direction,
         ws.orientation,
     ))
@@ -248,7 +282,10 @@ pub fn workspace_infos(core: &CoreApp) -> Vec<WorkspaceInfo> {
             collapsed: ws.collapsed.iter().copied().collect(),
             orientation: ws.orientation,
             view: ws.view,
-            expanded_clusters: ws.expanded_clusters.iter().copied().collect(),
+            map_level: core.map_level_for(ws),
+            map_levels: core.clustering_for(ws).level_count(),
+            map_clusters: core.clustering_for(ws).level(core.map_level_for(ws)).len(),
+            method: ws.method,
             map_scope: ws.map_scope,
         })
         .collect()
@@ -690,7 +727,9 @@ mod tests {
             "{\"SetViewMode\":\"Rooted\"}".to_string(),
             format!("{{\"SetMapScope\":{id}}}"),
             "{\"SetMapScope\":null}".to_string(),
-            format!("{{\"ToggleClusterExpanded\":{{\"level\":0,\"anchor\":{id}}}}}"),
+            "{\"SetMapLevel\":0}".to_string(),
+            "{\"SetMapLevel\":7}".to_string(),
+            "{\"SetClusterMethod\":\"HeavyEdge\"}".to_string(),
             format!("{{\"DrillIntoCluster\":{{\"level\":2,\"anchor\":{id}}}}}"),
             "\"ZoomOutToClusters\"".to_string(),
         ];
@@ -713,6 +752,16 @@ mod tests {
         assert!(json["workspaces"].is_array());
         assert!(json.get("graph").is_some());
         assert!(json.get("layout").is_some());
+        let methods = json["cluster_methods"]
+            .as_array()
+            .expect("the picker's entries");
+        assert!(!methods.is_empty());
+        for field in ["id", "label", "description"] {
+            assert!(
+                methods[0].get(field).is_some(),
+                "method field `{field}` is read by the client"
+            );
+        }
 
         let ws = &json["workspaces"][0];
         for field in [
@@ -724,7 +773,10 @@ mod tests {
             "collapsed",
             "orientation",
             "view",
-            "expanded_clusters",
+            "map_level",
+            "map_levels",
+            "map_clusters",
+            "method",
             "map_scope",
         ] {
             assert!(

@@ -1,4 +1,4 @@
-use logic::ClusterKey;
+use logic::{ClusterKey, ClusterMethod};
 use model::SymbolId;
 
 use crate::export::ExportFormat;
@@ -47,12 +47,18 @@ pub enum Command {
     /// than a toggle for the reason the view and orientation commands are:
     /// what names the scope names one function, not "some other function".
     SetMapScope(Option<SymbolId>),
-    /// Open or close one cluster's contents on the map. The box stays visible.
+    /// Draw the map at one rung of the coarsening ladder — 0 the finest, the
+    /// top the coarsest.
     ///
-    /// Named by [`ClusterKey`], not `ClusterId`: this arrives from a frontend
-    /// holding a snapshot that the next recompute may already have invalidated,
-    /// and an id would then open some other community without complaint.
-    ToggleClusterExpanded(ClusterKey),
+    /// Absolute rather than "zoom in one", for the reason the view and
+    /// orientation commands are: the control names where it lands. It is also
+    /// what lets the client offer both a step and a jump to either end without
+    /// a second command. Out-of-range levels are clamped to the ladder, so a
+    /// frontend holding a level from a taller ladder is never wrong, only
+    /// coarse.
+    SetMapLevel(usize),
+    /// Build the cluster map with a different algorithm.
+    SetClusterMethod(ClusterMethod),
     /// Leave the map for the call tree rooted at this cluster's entry point —
     /// the member the clustering picked as its front door. Keyed for the same
     /// reason as `ToggleClusterExpanded`.
