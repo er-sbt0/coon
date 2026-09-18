@@ -694,7 +694,7 @@ mod tests {
         let core = CoreApp::new(create_demo_call_graph());
         let out = dot(&core);
         assert!(
-            out.contains("Heavy-edge matching"),
+            out.contains("Modularity"),
             "the file says how it was grouped; got:\n{out}"
         );
         assert!(

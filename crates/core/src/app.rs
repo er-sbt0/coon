@@ -2478,7 +2478,7 @@ mod tests {
         let mut app = CoreApp::new(graph);
 
         assert!(
-            app.dispatch(Command::SetClusterMethod(ClusterMethod::HeavyEdge))
+            app.dispatch(Command::SetClusterMethod(ClusterMethod::Modularity))
                 .is_empty(),
             "the map is already built that way"
         );

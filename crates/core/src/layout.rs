@@ -996,7 +996,7 @@ mod tests {
 
     fn demo() -> (CallGraph, Clustering) {
         let graph = create_demo_call_graph();
-        let clustering = Clustering::compute(&graph, ClusterMethod::HeavyEdge);
+        let clustering = Clustering::compute(&graph, ClusterMethod::Modularity);
         (graph, clustering)
     }
 
@@ -1147,7 +1147,7 @@ mod tests {
         let b = add(&mut graph, "b", 2);
         let c = add(&mut graph, "c", 3);
         let d = add(&mut graph, "d", 4);
-        // Heavy inside each pair, so that is what the matching picks.
+        // Heavy inside each pair, so that is what pays to merge.
         for line in 100..105 {
             call(&mut graph, a, c, line);
             call(&mut graph, b, d, line + 50);
@@ -1164,7 +1164,7 @@ mod tests {
             }
         }
 
-        let clustering = Clustering::compute(&graph, ClusterMethod::HeavyEdge);
+        let clustering = Clustering::compute(&graph, ClusterMethod::Modularity);
         (graph, clustering)
     }
 

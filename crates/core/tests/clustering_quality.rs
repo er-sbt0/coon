@@ -8,10 +8,10 @@
 //! something on a canvas. If they do not, no amount of rendering will rescue
 //! them, and we would much rather learn that here than after the feature ships.
 //!
-//! Heavy-edge matching is not looking for modules — it merges the busiest pair
-//! it can find, round after round — so this is a real test of whether call
-//! frequency tracks module structure, and not a tautology about an algorithm
-//! that was told to find seams.
+//! Modularity is not looking for modules in the source-tree sense — it groups
+//! functions that call each other more than chance would predict — so this is
+//! a real test of whether call structure tracks module structure, and not a
+//! tautology about an algorithm that was told where the seams are.
 //!
 //! The demo graph is the specimen. It fakes a small key-value daemon with a
 //! real directory layout, deep call chains, a second root, recursion, a cycle
@@ -73,7 +73,7 @@ impl Fixture {
         // `::core::` rather than `core::`: the workspace crate of that name
         // shadows Rust's built-in one, and the leading `::` picks ours.
         let graph = ::core::create_demo_call_graph();
-        let clustering = Clustering::compute(&graph, ClusterMethod::HeavyEdge);
+        let clustering = Clustering::compute(&graph, ClusterMethod::Modularity);
 
         let mut directories = HashMap::new();
         let mut names = HashMap::new();
@@ -647,20 +647,15 @@ fn report_where_the_cross_cutting_helpers_landed() {
     println!();
 }
 
-/// The map opens on a rung that reads.
+/// The map opens on the modularity optimum, not on the top.
 ///
-/// Coarsening runs until the top rung is a handful of boxes, which is where a
-/// user zooms out *to* and not where they should land: merging two clusters
-/// unions their neighbourhoods, so density roughly doubles per round and the
-/// top rung comes out a near-complete quotient. Measured on a real
-/// 188-function project the ladder ran 5%, 11%, 24%, 50%, 94%, and the map used
-/// to open on the last of those — 34 of the 45 possible box pairs drawn, half
-/// of them in both directions.
-///
-/// So the opening rung is bounded from both sides, and this checks both on the
-/// demo, where the same shape shows at a size a person can read.
+/// Plain modularity decides how many boxes the program has; `TARGET_TOP_CLUSTERS`
+/// decides how few a person can take in at once. When the first is wider than
+/// the second the ladder keeps merging past the optimum so the user has
+/// somewhere to zoom out to, and those rungs are not where the map should
+/// land: they merge modules that did not want to merge, to fit a count.
 #[test]
-fn the_map_opens_on_a_rung_that_reads() {
+fn the_map_opens_on_the_modularity_optimum() {
     let fixture = Fixture::new();
     let clustering = &fixture.clustering;
     let top = clustering.level_count() - 1;
@@ -692,55 +687,38 @@ fn the_map_opens_on_a_rung_that_reads() {
         );
     }
 
-    let box_size = |level: usize| {
-        let boxes = clustering.level(level).len();
-        let held: usize = clustering
-            .level(level)
-            .iter()
-            .map(|id| clustering.cluster(*id).unwrap().members.len())
-            .sum();
-        held as f64 / boxes as f64
-    };
+    assert!(opening <= top, "the opening rung has to exist");
+    for level in opening + 1..=top {
+        assert!(
+            clustering.level(level).len() <= logic::cluster::TARGET_TOP_CLUSTERS,
+            "a rung past the optimum exists only to reach the target: {}",
+            describe(level)
+        );
+    }
+    if opening < top {
+        assert!(
+            clustering.level(opening).len() > logic::cluster::TARGET_TOP_CLUSTERS,
+            "and is only built when the optimum did not fit: {}",
+            describe(opening)
+        );
+    }
 
+    let boxes = clustering.level(opening).len();
+    let held: usize = clustering
+        .level(opening)
+        .iter()
+        .map(|id| clustering.cluster(*id).unwrap().members.len())
+        .sum();
     assert!(
-        fixture.crossing_density(top) > logic::cluster::MAX_READABLE_DENSITY,
-        "the demo's top rung is supposed to be the hairball this test is about: {}",
-        describe(top)
-    );
-    assert!(
-        opening < top,
-        "so the map must not open on it: {}",
-        describe(opening)
-    );
-    assert!(
-        box_size(opening) >= logic::cluster::MIN_BOX_SIZE,
+        held as f64 / boxes as f64 >= 3.0,
         "a map of one- and two-function boxes is the sidebar with arrows on it: {}",
         describe(opening)
-    );
-
-    // And the rung is exactly where the two bounds meet. Worth stating even
-    // though it restates the rule, because the density this test measures is
-    // counted off the call graph the way the map draws it, where the one
-    // `logic::cluster` picks the rung with is counted off the undirected
-    // quotient it coarsens. The two are supposed to be the same number.
-    let readable = (0..clustering.level_count())
-        .rposition(|level| fixture.crossing_density(level) <= logic::cluster::MAX_READABLE_DENSITY)
-        .unwrap_or(top);
-    let useful = (0..clustering.level_count())
-        .position(|level| box_size(level) >= logic::cluster::MIN_BOX_SIZE)
-        .unwrap_or(0);
-    assert_eq!(
-        opening,
-        readable.max(useful).min(top),
-        "readable up to rung {}, useful from rung {}",
-        readable + 1,
-        useful + 1
     );
 }
 
 /// Every other assertion in this file is worthless if the clustering is a coin
-/// flip. Heavy-edge matching is deterministic by construction — the visit order
-/// is by degree then index, the partner tie-break is the lower index — but
+/// flip. The Louvain sweep is deterministic by construction — nodes are swept
+/// in index order, candidates tried in ascending id, ties stay put — but
 /// "by construction" is exactly the kind of claim that quietly stops being true
 /// when a `HashMap` iteration creeps into the pipeline. The comparison is on
 /// member sets keyed by function name rather than on cluster ids, because ids
@@ -772,8 +750,8 @@ fn clustering_is_deterministic() {
     let names: HashMap<SymbolId, String> =
         graph.functions().map(|f| (f.id, f.name.clone())).collect();
 
-    let first = Clustering::compute(&graph, ClusterMethod::HeavyEdge);
-    let second = Clustering::compute(&graph, ClusterMethod::HeavyEdge);
+    let first = Clustering::compute(&graph, ClusterMethod::Modularity);
+    let second = Clustering::compute(&graph, ClusterMethod::Modularity);
 
     assert_eq!(
         first.level_count(),

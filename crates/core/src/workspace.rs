@@ -518,7 +518,7 @@ mod tests {
         ws.set_map_level(4);
 
         assert!(
-            !ws.set_method(ClusterMethod::HeavyEdge),
+            !ws.set_method(ClusterMethod::Modularity),
             "re-picking the method already shown is not a change"
         );
         assert_eq!(

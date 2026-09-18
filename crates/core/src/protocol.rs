@@ -729,7 +729,7 @@ mod tests {
             "{\"SetMapScope\":null}".to_string(),
             "{\"SetMapLevel\":0}".to_string(),
             "{\"SetMapLevel\":7}".to_string(),
-            "{\"SetClusterMethod\":\"HeavyEdge\"}".to_string(),
+            "{\"SetClusterMethod\":\"Modularity\"}".to_string(),
             format!("{{\"DrillIntoCluster\":{{\"level\":2,\"anchor\":{id}}}}}"),
             "\"ZoomOutToClusters\"".to_string(),
         ];

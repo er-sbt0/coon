@@ -75,7 +75,7 @@ fn from_dot(text: &str) -> CallGraph {
 }
 
 fn report(name: &str, graph: &CallGraph) {
-    let clustering = Clustering::compute(graph, ClusterMethod::HeavyEdge);
+    let clustering = Clustering::compute(graph, ClusterMethod::Modularity);
     println!(
         "\n{name}: {} functions, {} calls — opens on rung {} of {}",
         graph.node_count(),
