@@ -68,6 +68,35 @@ use std::collections::{HashMap, HashSet, VecDeque};
 /// difference between summarising a program and reprinting it.
 pub const TARGET_TOP_CLUSTERS: usize = 12;
 
+/// How dense a rung's quotient may be and still be worth opening on.
+///
+/// Measured as the share of the possible cluster pairs that anything calls
+/// between: `crossings / (n * (n - 1) / 2)`. Merging two clusters unions their
+/// neighbourhoods, so density roughly doubles per round and saturates — on a
+/// real 188-function project the ladder ran 5%, 11%, 24%, 51%, 78%, and at the
+/// top 35 of the 45 possible pairs were drawn, half of them in both directions.
+/// That is a hairball, and it is the rung the map used to open on.
+///
+/// A quarter is about where a map stops being readable as flow: past it most
+/// boxes touch most boxes and the lines stop distinguishing anything. It picks
+/// the *opening* rung only — [`TARGET_TOP_CLUSTERS`] still says how far the
+/// ladder goes, and the zoom control still reaches the top.
+pub const MAX_READABLE_DENSITY: f64 = 0.25;
+
+/// How few functions a box may hold, on average, and still be worth drawing.
+///
+/// The density cap alone picks the finest rung it can, and on a small project
+/// that is a map of the function list: the demo's 57 functions come through the
+/// first round as 30 boxes of not quite two functions each, under the cap and
+/// saying nothing the sidebar was not already saying. A box standing in for
+/// three functions is the least that earns its place on a map, which is also
+/// the floor `clustering_quality` holds the top rung to.
+///
+/// It pulls against [`MAX_READABLE_DENSITY`] and wins, because a map that
+/// relists the functions has no reason to exist, where a dense one at least
+/// still says which parts there are.
+pub const MIN_BOX_SIZE: f64 = 3.0;
+
 /// A round that merges nothing ends the coarsening on its own, so this only
 /// bounds the pathological case. Each productive round removes at least one
 /// node, and a graph large enough to need 64 rounds of halving does not exist.
@@ -191,6 +220,9 @@ pub struct Clustering {
     /// so [`Clustering::by_key`] is a lookup rather than a scan over every
     /// cluster at the level.
     anchors: Vec<HashMap<SymbolId, ClusterId>>,
+    /// The rung a map should open on — see [`MAX_READABLE_DENSITY`]. Not
+    /// necessarily the top, and never past it.
+    opening: usize,
     /// Which method built it, so a holder can tell whether the clustering it
     /// has is the one that was asked for.
     method: ClusterMethod,
@@ -248,7 +280,9 @@ impl Clustering {
         let ladder = match method {
             ClusterMethod::HeavyEdge => coarsen(base),
         };
-        let mut clustering = build_clustering(graph, &symbols, &ladder);
+        let opening = ladder.opening();
+        let mut clustering = build_clustering(graph, &symbols, &ladder.levels);
+        clustering.opening = opening;
         clustering.method = method;
         clustering
     }
@@ -270,6 +304,18 @@ impl Clustering {
     /// The index of the coarsest level, or `None` when nothing is clustered.
     pub fn top_level_index(&self) -> Option<usize> {
         self.levels.len().checked_sub(1)
+    }
+
+    /// The rung a map should open on.
+    ///
+    /// Usually finer than the top. Coarsening runs until the top rung is a
+    /// handful of boxes, which is the right place to *stop* and the wrong place
+    /// to *start*: merging two clusters unions their neighbourhoods, so by the
+    /// last rung most boxes call most boxes and the lines have stopped
+    /// distinguishing anything. This is the coarsest rung whose quotient is
+    /// still under [`MAX_READABLE_DENSITY`]. See [`Ladder::opening`].
+    pub fn opening_level(&self) -> usize {
+        self.opening.min(self.levels.len().saturating_sub(1))
     }
 
     /// The clusters at `level`, or an empty slice if the level does not exist.
@@ -454,11 +500,15 @@ fn build_base_graph(
 /// singletons. A map has to have something to draw, and "every function is its
 /// own box" is the honest answer for a graph that small — coarsening it further
 /// would merge a program small enough to read whole.
-fn coarsen(base: WeightedGraph) -> Vec<Vec<usize>> {
-    let mut ladder: Vec<Vec<usize>> = Vec::new();
+fn coarsen(base: WeightedGraph) -> Ladder {
+    let mut levels: Vec<Vec<usize>> = Vec::new();
+    let mut densities: Vec<f64> = Vec::new();
+    let mut widths: Vec<usize> = Vec::new();
+    let functions = base.node_count();
+    let mut sizes: Vec<usize> = vec![1; functions];
     let mut current = base;
 
-    while current.node_count() > TARGET_TOP_CLUSTERS && ladder.len() < MAX_ROUNDS {
+    while current.node_count() > TARGET_TOP_CLUSTERS && levels.len() < MAX_ROUNDS {
         let (matching, count) = heavy_edge_match(&current);
         // Every node hub-like enough to have had its neighbours claimed before
         // its turn comes stays single, and a round where that is *all* of them
@@ -467,14 +517,181 @@ fn coarsen(base: WeightedGraph) -> Vec<Vec<usize>> {
         if count == current.node_count() {
             break;
         }
+        sizes = merged_sizes(&sizes, &matching, count);
         current = aggregate(&current, &matching, count);
-        ladder.push(matching);
+        levels.push(matching);
+        densities.push(density(&current));
+        widths.push(current.node_count());
     }
 
-    if ladder.is_empty() {
-        ladder.push((0..current.node_count()).collect());
+    if levels.is_empty() {
+        // A graph small enough to read whole. Every function is its own box,
+        // and there is nothing to fold: they are *all* singletons, so the pass
+        // below would merge the program into one.
+        levels.push((0..current.node_count()).collect());
+        densities.push(density(&current));
+        widths.push(current.node_count());
+        return Ladder {
+            levels,
+            densities,
+            widths,
+            base: functions,
+        };
     }
-    ladder
+
+    if let Some((fold, count)) = fold_singletons(&current, &sizes) {
+        // Composed into the last round rather than added as a rung of its own:
+        // it is a repair to the top of the ladder, not a step of the zoom, and
+        // a rung that differs from the one below it by one box is a rung the
+        // user would step through for nothing.
+        let last = levels.last_mut().expect("the ladder is not empty here");
+        for group in last.iter_mut() {
+            *group = fold[*group];
+        }
+        current = aggregate(&current, &fold, count);
+        *densities.last_mut().expect("pushed with the level") = density(&current);
+        *widths.last_mut().expect("pushed with the level") = current.node_count();
+    }
+
+    Ladder {
+        levels,
+        densities,
+        widths,
+        base: functions,
+    }
+}
+
+/// The coarsening, plus what is known about how each rung reads.
+struct Ladder {
+    /// Entry 0 maps a base node to its level-0 cluster, and entry `l` maps a
+    /// level-`l - 1` cluster to its level-`l` one.
+    levels: Vec<Vec<usize>>,
+    /// Parallel to `levels`: the share of the possible cluster pairs that
+    /// anything calls between, at that rung.
+    densities: Vec<f64>,
+    /// Parallel to `levels`: how many boxes the rung holds.
+    widths: Vec<usize>,
+    /// How many functions are being clustered altogether.
+    base: usize,
+}
+
+impl Ladder {
+    /// The rung a map should open on.
+    ///
+    /// How far the ladder goes and where it opens are separate questions, and
+    /// answering them with one number is what put the map on its own worst
+    /// rung. Coarsening to [`TARGET_TOP_CLUSTERS`] is right — the top is where
+    /// a user zooms out to when they want the shape of the whole thing — but
+    /// what they should *land* on is the coarsest map that still says something.
+    ///
+    /// Two bounds, pulling opposite ways, and the rung is where they meet:
+    ///
+    /// * No coarser than the last rung under [`MAX_READABLE_DENSITY`], because
+    ///   past that most boxes call most boxes and the lines distinguish nothing.
+    /// * No finer than the first rung whose boxes average [`MIN_BOX_SIZE`]
+    ///   functions, because a map of one-and-two-function boxes is the sidebar
+    ///   with arrows on it.
+    ///
+    /// When they conflict the second wins. When no rung is readable at all the
+    /// top is the answer: a graph whose finest rung is already a near-complete
+    /// quotient has no readable map in it, and the smallest drawing of an
+    /// unreadable thing beats the largest.
+    fn opening(&self) -> usize {
+        let top = self.levels.len().saturating_sub(1);
+        let readable = self
+            .densities
+            .iter()
+            .rposition(|&d| d <= MAX_READABLE_DENSITY)
+            .unwrap_or(top);
+        let useful = self
+            .widths
+            .iter()
+            .position(|&w| w > 0 && self.base as f64 / w as f64 >= MIN_BOX_SIZE)
+            .unwrap_or(0);
+        readable.max(useful).min(top)
+    }
+}
+
+/// The share of the possible node pairs that have an edge between them.
+fn density(graph: &WeightedGraph) -> f64 {
+    let n = graph.node_count();
+    if n < 2 {
+        return 0.0;
+    }
+    // Every edge is stored from both ends.
+    let crossings: usize = graph.adj.iter().map(Vec::len).sum::<usize>() / 2;
+    crossings as f64 / (n * (n - 1) / 2) as f64
+}
+
+/// How many base functions each merged group holds.
+fn merged_sizes(sizes: &[usize], groups: &[usize], count: usize) -> Vec<usize> {
+    let mut merged = vec![0usize; count];
+    for (node, &group) in groups.iter().enumerate() {
+        merged[group] += sizes[node];
+    }
+    merged
+}
+
+/// Fold every one-function cluster at the top of the ladder into the neighbour
+/// it shares the heaviest edge with.
+///
+/// Returns `None` when there is nothing to fold.
+///
+/// A function that is never matched in any round comes through as a box of its
+/// own, and at the top of the ladder that is a box holding one function beside
+/// boxes holding thirty. On a real project that was `fputc`, alone, next to
+/// clusters of 22 and 29 — a tenth of the map spent on a libc call, and a slot
+/// that says nothing a label on an edge could not.
+///
+/// Hubs staying unmatched is the method working, not failing: everything
+/// adjacent to a hub has the hub as a neighbour, and something else claims each
+/// of them first. It is only at the last rung that the leftovers have nowhere
+/// further to go, so this is the one place the matching is overruled, and it is
+/// overruled the same way it decides everything else — by the heaviest edge.
+fn fold_singletons(graph: &WeightedGraph, sizes: &[usize]) -> Option<(Vec<usize>, usize)> {
+    let n = graph.node_count();
+    let mut parent: Vec<usize> = (0..n).collect();
+
+    fn root(parent: &mut [usize], mut node: usize) -> usize {
+        while parent[node] != node {
+            parent[node] = parent[parent[node]];
+            node = parent[node];
+        }
+        node
+    }
+
+    let mut folded = false;
+    for (node, &size) in sizes.iter().enumerate() {
+        if size != 1 {
+            continue;
+        }
+        // `adj` is sorted by index and the comparison is strict, so among
+        // equally heavy candidates the lowest index wins — the same tie-break
+        // the matching itself uses.
+        let mut best: Option<(usize, f64)> = None;
+        for &(neighbour, weight) in &graph.adj[node] {
+            if best.is_none_or(|(_, heaviest)| weight > heaviest) {
+                best = Some((neighbour, weight));
+            }
+        }
+        // A cluster with no neighbours at all is a whole connected component
+        // that merged into one box. There is nothing to fold it into.
+        let Some((partner, _)) = best else {
+            continue;
+        };
+
+        let (mine, theirs) = (root(&mut parent, node), root(&mut parent, partner));
+        if mine != theirs {
+            parent[mine] = theirs;
+            folded = true;
+        }
+    }
+
+    if !folded {
+        return None;
+    }
+    let roots: Vec<usize> = (0..n).map(|node| root(&mut parent, node)).collect();
+    Some(renumber(&roots))
 }
 
 /// One round: pair each node with its heaviest available neighbour.
@@ -692,8 +909,9 @@ fn build_clustering(graph: &CallGraph, symbols: &[SymbolId], ladder: &[Vec<usize
         levels,
         index,
         anchors,
-        // Set by the caller, which is the half that knows which method asked
-        // for this ladder.
+        // Both set by the caller, which is the half still holding the ladder
+        // these were measured from and the method that asked for it.
+        opening: 0,
         method: ClusterMethod::default(),
     }
 }
@@ -1008,6 +1226,116 @@ mod tests {
         );
     }
 
+    // -- where the map opens -------------------------------------------------
+
+    /// A ladder that never gets dense has nothing to protect the user from, so
+    /// the coarsest rung is also the best one.
+    #[test]
+    fn a_sparse_ladder_opens_at_the_top() {
+        let (graph, _) = chain_of(60);
+        let clustering = Clustering::compute(&graph, ClusterMethod::HeavyEdge);
+
+        assert_eq!(
+            clustering.opening_level(),
+            clustering.level_count() - 1,
+            "a chain's quotient stays a chain; there is no hairball to avoid"
+        );
+    }
+
+    /// The density bound alone picks the finest rung it can, which on a small
+    /// project is the sidebar with arrows on it. A box has to stand in for
+    /// something.
+    #[test]
+    fn a_map_never_opens_on_boxes_of_one_or_two_functions() {
+        let (graph, _) = chain_of(60);
+        let clustering = Clustering::compute(&graph, ClusterMethod::HeavyEdge);
+        let opening = clustering.opening_level();
+
+        let boxes = clustering.level(opening).len();
+        let held: usize = clustering
+            .level(opening)
+            .iter()
+            .map(|id| clustering.cluster(*id).unwrap().members.len())
+            .sum();
+        assert!(
+            held as f64 / boxes as f64 >= MIN_BOX_SIZE,
+            "opened on {boxes} boxes holding {held} functions"
+        );
+    }
+
+    #[test]
+    fn the_opening_rung_is_one_the_ladder_has() {
+        for graph in [chain_of(60).0, chain_of(3).0, CallGraph::new()] {
+            let clustering = Clustering::compute(&graph, ClusterMethod::HeavyEdge);
+            assert!(
+                clustering.opening_level() < clustering.level_count().max(1),
+                "the opening rung has to be drawable"
+            );
+        }
+    }
+
+    // -- the singleton fold ---------------------------------------------------
+
+    /// A function that is never matched in any round comes through as a box
+    /// holding one function beside boxes holding thirty. On a real project that
+    /// was `fputc`, alone, next to clusters of 22 and 29.
+    #[test]
+    fn no_box_holds_one_function_at_the_top_of_the_ladder() {
+        // A hub and a tail of leaves that pair off among themselves: the hub is
+        // claimed by nobody, round after round, and comes through alone.
+        let mut graph = CallGraph::new();
+        let hub = add(&mut graph, "hub", 1);
+        for i in 0..20u32 {
+            let left = add(&mut graph, &format!("leaf{i}a"), 100 + i * 2);
+            let right = add(&mut graph, &format!("leaf{i}b"), 101 + i * 2);
+            call_often(&mut graph, left, right, 1000 + i * 20, 4);
+            call(&mut graph, hub, left, 5000 + i);
+        }
+
+        let clustering = Clustering::compute(&graph, ClusterMethod::HeavyEdge);
+        let top = clustering.level_count() - 1;
+        assert!(top > 0, "this fixture is big enough to coarsen");
+
+        let alone: Vec<&str> = clustering
+            .level(top)
+            .iter()
+            .filter(|id| clustering.cluster(**id).unwrap().members.len() == 1)
+            .map(|id| clustering.cluster(*id).unwrap().label.as_str())
+            .collect();
+        assert!(alone.is_empty(), "left alone at the top: {alone:?}");
+    }
+
+    /// Folded into the heaviest edge, like everything else the method decides.
+    #[test]
+    fn a_leftover_singleton_folds_into_its_heaviest_neighbour() {
+        let mut adj = vec![HashMap::new(); 3];
+        // Node 0 is alone; it touches 1 lightly and 2 heavily.
+        for (other, weight) in [(1usize, 1.0f64), (2, 9.0)] {
+            adj[0].insert(other, weight);
+            adj[other].insert(0, weight);
+        }
+        let graph = WeightedGraph::new(adj, vec![0.0; 3]);
+
+        let (fold, count) = fold_singletons(&graph, &[1, 5, 5]).expect("a singleton to fold");
+
+        assert_eq!(count, 2, "three boxes became two");
+        assert_eq!(
+            fold[0], fold[2],
+            "the singleton joins the neighbour it shares the heaviest edge with"
+        );
+        assert_ne!(fold[0], fold[1]);
+    }
+
+    #[test]
+    fn nothing_is_folded_when_no_box_is_alone() {
+        let mut adj = vec![HashMap::new(); 2];
+        adj[0].insert(1usize, 3.0f64);
+        adj[1].insert(0usize, 3.0f64);
+        let graph = WeightedGraph::new(adj, vec![0.0; 2]);
+
+        assert!(fold_singletons(&graph, &[4, 6]).is_none());
+    }
+
     /// The finest rung of a graph small enough to read whole is the graph
     /// itself, not a first round of merges applied anyway.
     #[test]
@@ -1064,6 +1392,7 @@ mod tests {
     fn the_ladder_is_a_refinement_of_itself() {
         let (graph, _) = chain_of(60);
         let clustering = Clustering::compute(&graph, ClusterMethod::HeavyEdge);
+        let top = clustering.level_count() - 1;
 
         for level in 1..clustering.level_count() {
             for id in clustering.level(level) {
@@ -1078,10 +1407,28 @@ mod tests {
                     cluster.members.iter().copied().collect::<HashSet<_>>(),
                     "a cluster must hold exactly what its children hold"
                 );
-                assert!(
-                    (1..=2).contains(&cluster.children.len()),
-                    "a round merges pairs, so a cluster has one or two children"
-                );
+                if level < top {
+                    assert!(
+                        (1..=2).contains(&cluster.children.len()),
+                        "a round merges pairs, so a cluster has one or two children"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The exception to the pair rule, and the only one: the singleton fold is
+    /// composed into the last round rather than added as a rung of its own, so
+    /// a top-level cluster can be a pair plus whatever leftovers folded into it.
+    #[test]
+    fn only_the_top_rung_may_hold_more_than_a_pair() {
+        let (graph, _) = chain_of(60);
+        let clustering = Clustering::compute(&graph, ClusterMethod::HeavyEdge);
+        let top = clustering.level_count() - 1;
+
+        for level in 1..top {
+            for id in clustering.level(level) {
+                assert!((1..=2).contains(&clustering.cluster(*id).unwrap().children.len()));
             }
         }
     }

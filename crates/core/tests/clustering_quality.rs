@@ -136,6 +136,39 @@ impl Fixture {
         format!("{label} · {} fns — {spread}", cluster.members.len())
     }
 
+    /// The share of the possible cluster pairs that anything calls between —
+    /// how much of a hairball the map at this rung would be.
+    fn crossing_density(&self, level: usize) -> f64 {
+        let ids = self.clustering.level(level);
+        let mut owner: HashMap<SymbolId, usize> = HashMap::new();
+        for (slot, id) in ids.iter().enumerate() {
+            for member in &self.clustering.cluster(*id).unwrap().members {
+                owner.insert(*member, slot);
+            }
+        }
+
+        let mut pairs: HashSet<(usize, usize)> = HashSet::new();
+        for caller in self.graph.function_ids() {
+            let Some(&a) = owner.get(caller) else {
+                continue;
+            };
+            for callee in self.graph.get_callees(caller) {
+                let Some(&b) = owner.get(&callee.id) else {
+                    continue;
+                };
+                if a != b {
+                    pairs.insert(if a < b { (a, b) } else { (b, a) });
+                }
+            }
+        }
+
+        let n = ids.len();
+        if n < 2 {
+            return 0.0;
+        }
+        pairs.len() as f64 / (n * (n - 1) / 2) as f64
+    }
+
     fn top_level_clusters(&self) -> Vec<&Cluster> {
         self.clustering
             .top_level()
@@ -612,6 +645,97 @@ fn report_where_the_cross_cutting_helpers_landed() {
         println!("      landed in: {landed}");
     }
     println!();
+}
+
+/// The map opens on a rung that reads.
+///
+/// Coarsening runs until the top rung is a handful of boxes, which is where a
+/// user zooms out *to* and not where they should land: merging two clusters
+/// unions their neighbourhoods, so density roughly doubles per round and the
+/// top rung comes out a near-complete quotient. Measured on a real
+/// 188-function project the ladder ran 5%, 11%, 24%, 50%, 94%, and the map used
+/// to open on the last of those — 34 of the 45 possible box pairs drawn, half
+/// of them in both directions.
+///
+/// So the opening rung is bounded from both sides, and this checks both on the
+/// demo, where the same shape shows at a size a person can read.
+#[test]
+fn the_map_opens_on_a_rung_that_reads() {
+    let fixture = Fixture::new();
+    let clustering = &fixture.clustering;
+    let top = clustering.level_count() - 1;
+    let opening = clustering.opening_level();
+
+    let describe = |level: usize| {
+        let boxes = clustering.level(level).len();
+        let held: usize = clustering
+            .level(level)
+            .iter()
+            .map(|id| clustering.cluster(*id).unwrap().members.len())
+            .sum();
+        format!(
+            "rung {} — {boxes} boxes, {:.1} fns/box, density {:.0}%",
+            level + 1,
+            held as f64 / boxes as f64,
+            fixture.crossing_density(level) * 100.0
+        )
+    };
+    for level in 0..clustering.level_count() {
+        println!(
+            "  {}{}",
+            describe(level),
+            if level == opening {
+                "   <- opens here"
+            } else {
+                ""
+            }
+        );
+    }
+
+    let box_size = |level: usize| {
+        let boxes = clustering.level(level).len();
+        let held: usize = clustering
+            .level(level)
+            .iter()
+            .map(|id| clustering.cluster(*id).unwrap().members.len())
+            .sum();
+        held as f64 / boxes as f64
+    };
+
+    assert!(
+        fixture.crossing_density(top) > logic::cluster::MAX_READABLE_DENSITY,
+        "the demo's top rung is supposed to be the hairball this test is about: {}",
+        describe(top)
+    );
+    assert!(
+        opening < top,
+        "so the map must not open on it: {}",
+        describe(opening)
+    );
+    assert!(
+        box_size(opening) >= logic::cluster::MIN_BOX_SIZE,
+        "a map of one- and two-function boxes is the sidebar with arrows on it: {}",
+        describe(opening)
+    );
+
+    // And the rung is exactly where the two bounds meet. Worth stating even
+    // though it restates the rule, because the density this test measures is
+    // counted off the call graph the way the map draws it, where the one
+    // `logic::cluster` picks the rung with is counted off the undirected
+    // quotient it coarsens. The two are supposed to be the same number.
+    let readable = (0..clustering.level_count())
+        .rposition(|level| fixture.crossing_density(level) <= logic::cluster::MAX_READABLE_DENSITY)
+        .unwrap_or(top);
+    let useful = (0..clustering.level_count())
+        .position(|level| box_size(level) >= logic::cluster::MIN_BOX_SIZE)
+        .unwrap_or(0);
+    assert_eq!(
+        opening,
+        readable.max(useful).min(top),
+        "readable up to rung {}, useful from rung {}",
+        readable + 1,
+        useful + 1
+    );
 }
 
 /// Every other assertion in this file is worthless if the clustering is a coin

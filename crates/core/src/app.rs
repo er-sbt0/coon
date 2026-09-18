@@ -245,18 +245,23 @@ impl CoreApp {
 
     /// Which rung of the ladder this workspace's map is drawn at.
     ///
-    /// The workspace stores a wish — `None` for "the coarsest", a number the
-    /// user zoomed to otherwise — and this is where it meets the ladder that
-    /// actually exists. Clamping here rather than when the level is set is what
-    /// lets the wish outlive a recompute: a ladder that grew a rung as the
-    /// project loaded gives the user the rung they asked for, and one that lost
-    /// rungs gives them the coarsest rather than a blank canvas.
+    /// The workspace stores a wish — `None` for "wherever this clustering says
+    /// to open", a number the user zoomed to otherwise — and this is where it
+    /// meets the ladder that actually exists. Clamping here rather than when
+    /// the level is set is what lets the wish outlive a recompute: a ladder
+    /// that grew a rung as the project loaded gives the user the rung they
+    /// asked for, and one that lost rungs gives them the coarsest rather than a
+    /// blank canvas.
+    ///
+    /// The default is [`Clustering::opening_level`], not the top. Coarsening
+    /// stops at a handful of boxes, which is where a user zooms out *to* and
+    /// not where they should land.
     pub fn map_level_for(&self, ws: &CoreWorkspace) -> usize {
-        let top = self
-            .clustering_for(ws)
-            .top_level_index()
-            .unwrap_or_default();
-        ws.map_level.unwrap_or(top).min(top)
+        let clustering = self.clustering_for(ws);
+        let top = clustering.top_level_index().unwrap_or_default();
+        ws.map_level
+            .unwrap_or_else(|| clustering.opening_level())
+            .min(top)
     }
 
     /// The communities of the active workspace's map.
