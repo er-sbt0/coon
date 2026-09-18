@@ -28,11 +28,8 @@ const truncate = (name) => truncateTo(name, LABEL_MAX);
 // band: the band is exactly where every edge reaching a node inside the box
 // crosses, and edges are painted over a compound parent whatever z-index it is
 // given, so a name written in there gets struck through.
-const GROUP_PAD = 20;
-const GROUP_LABEL_LIFT = -6;
-
 // A cluster-map edge stands for however many calls actually cross between two
-// communities, so its width has to say "a hundred" differently from "one".
+// clusters, so its width has to say "a hundred" differently from "one".
 // Log-scaled and capped, for two reasons: linear width would turn a hot
 // relation into a hundred pixels of ink, and past a few pixels a thicker line
 // stops reading as "more calls" and starts swallowing the arrowhead and the
@@ -104,9 +101,9 @@ function graphStyle() {
     { selector: 'edge.incident', style: { 'line-color': css('--accent'), 'target-arrow-color': css('--accent') } },
 
     // ── Cluster map ──
-    // A community is named, not called: its label is prose about a group of
+    // A cluster is named, not called: its label is prose about a group of
     // functions rather than a symbol, so it takes the UI stack while the
-    // functions around it keep the mono one.
+    // functions elsewhere keep the mono one.
     {
       selector: 'node.community',
       style: {
@@ -115,42 +112,15 @@ function graphStyle() {
         'text-max-width': NODE_W - 16,
       }
     },
-    // An opened community: a compound parent, which sizes and places itself
-    // around whatever it turned into. Every box gets the same neutral tint —
-    // a hue per community would be a second signal fighting the accent, and
-    // there are no twenty hues that stay apart at twenty communities.
+    // Calls cross this boundary in both directions. Pair merging puts no
+    // constraint on direction, so a rung of the ladder is freely cyclic even
+    // over a call graph that is a clean DAG — and two opposed arrows between
+    // the same two boxes read as "these call each other" over code where
+    // nothing of the sort happens. One line with a head at each end says the
+    // true thing: the boundary is crossed both ways.
     {
-      selector: 'node.group',
-      style: {
-        'background-color': css('--group-bg'),
-        'background-opacity': 1,
-        'border-color': css('--group-border'),
-        'border-width': 1,
-        'shape': 'roundrectangle',
-        'label': 'data(label)',
-        'color': css('--group-label'),
-        'font-family': css('--font-ui'),
-        'font-size': 11,
-        'text-valign': 'top',
-        'text-halign': 'center',
-        'text-margin-y': GROUP_LABEL_LIFT,
-        'padding': GROUP_PAD,
-        // Outside the box the name sits over open canvas, which on a crowded
-        // map is still somebody's edge; a halo in the box's own tint keeps it
-        // legible without drawing a second border around it.
-        'text-background-color': css('--group-bg'),
-        'text-background-opacity': 1,
-        'text-background-padding': 4,
-        'text-background-shape': 'roundrectangle',
-        // The label is the part of an open box a user can actually aim at:
-        // everything else inside it belongs to a child.
-        'text-events': 'yes',
-      }
-    },
-    // Hovering a box must not repaint it as a node — it is ground, not figure.
-    {
-      selector: 'node.group.hovered',
-      style: { 'background-color': css('--group-bg'), 'border-color': css('--accent-border') }
+      selector: 'edge.mutual',
+      style: { 'source-arrow-shape': 'triangle', 'source-arrow-color': css('--edge') }
     },
     { selector: 'edge.aggregate', style: { 'width': 'data(width)' } },
   ];
@@ -178,6 +148,11 @@ let collapsed        = new Set();
 let currentView      = 'ClusterMap';  // or 'Rooted'; a workspace opens on the map
 let clusterMap       = null;          // the laid-out map, while one is showing
 let mapScope         = null;          // the function the map is drawn from, or null for all of it
+let mapLevel         = 0;             // which rung of the coarsening ladder is showing
+let mapLevels        = 0;             // how many rungs there are; 0 while nothing is clustered
+let mapClusters      = 0;             // how many boxes this rung holds — what the zoom control reads out
+let clusterMethod    = null;          // which algorithm built the map
+let clusterMethods   = [];            // every algorithm on offer, for the picker
 let lastFitKey       = null;                      // refit only on root/direction change
 
 const MAX_FIT_ZOOM = 1.15;
@@ -239,8 +214,15 @@ function handleSnapshot(msg) {
   currentView = active?.view ?? 'Rooted';
   clusterMap = msg.cluster_layout ?? null;
   mapScope = active?.map_scope ?? null;
+  mapLevel = active?.map_level ?? 0;
+  mapLevels = active?.map_levels ?? 0;
+  mapClusters = active?.map_clusters ?? 0;
+  clusterMethod = active?.method ?? null;
+  if (Array.isArray(msg.cluster_methods)) clusterMethods = msg.cluster_methods;
   if (typeof active?.depth === 'number') graphDepth = active.depth;
   updateDepthControl();
+  updateZoomControl();
+  updateMethodControl();
   if (active?.direction) {
     currentDirection = active.direction;
     updateDirToggle();
@@ -253,7 +235,7 @@ function handleSnapshot(msg) {
   renderTabs();
   if (currentView === 'ClusterMap') {
     // The map always rides along with this view, but an empty one is a real
-    // answer — before any symbols load there are no communities to draw.
+    // answer — before any symbols load there is nothing to cluster.
     rebuildClusterMap(clusterMap ?? {});
   } else {
     rebuildGraph(currentGraph, msg.layout);
@@ -403,18 +385,18 @@ function renderMapCrumbs() {
 function renderBreadcrumb() {
   crumbEl.innerHTML = '';
 
-  // The map has no root and no path through it; what it has is a level of the
-  // hierarchy and however many boxes the user has opened on it.
+  // The map has no root and no path through it; what it has is a rung of the
+  // coarsening ladder and however many boxes that rung holds.
   if (currentView === 'ClusterMap') {
     renderMapCrumbs();
 
-    const shown = (clusterMap?.metas?.length ?? 0) + (clusterMap?.groups?.length ?? 0);
-    const open = clusterMap?.groups?.length ?? 0;
+    const shown = clusterMap?.metas?.length ?? 0;
     const note = document.createElement('span');
     note.className = 'placeholder';
     note.textContent = shown === 0
-      ? 'No communities yet'
-      : `${shown} ${shown === 1 ? 'community' : 'communities'}${open ? ` · ${open} open` : ''}`;
+      ? 'Nothing clustered yet'
+      : `${shown} ${shown === 1 ? 'cluster' : 'clusters'}` +
+        (mapLevels > 1 ? ` · grouping ${mapLevel + 1} of ${mapLevels}` : '');
     crumbEl.appendChild(note);
     return;
   }
@@ -558,17 +540,17 @@ function fitGraph() {
 
 
 // ── Cluster map ───────────────────────────────────────────────────────────────
-// What a workspace opens on: the communities the backend derived from call
-// structure, each standing in for everything inside it, with aggregated edges
-// for the calls that cross between them. Opening one replaces it with a
-// labelled box holding whatever is a level finer.
+// What a workspace opens on: one rung of the coarsening ladder the backend
+// built out of call structure. Every cluster at that rung is a single node
+// standing in for the functions inside it, with aggregated edges for the calls
+// that cross between them.
 //
-// One invariant does most of the work here: a cluster is either open — a box,
-// a compound parent, absent from `nodes` — or closed — a single node with a
-// position — and never both. `groups` says which were opened and `metas` which
-// were not, so neither list has to be reconciled against the other, and a
-// box's `members` are its *direct* children, which is exactly what cytoscape's
-// single `parent` field wants.
+// The map is flat, and that is the whole design. Every rung partitions the same
+// functions, so a rung *is* a whole map and exactly one is on screen — zooming
+// redraws all of it a step finer or coarser rather than opening one box. The
+// ladder halves at each round, so a box opened in place would reveal two boxes
+// and a user would click eleven times to travel what one control walks in a
+// step.
 
 /// The wire id for a cluster, matching `LayoutNodeId::Cluster`'s Display. Every
 /// other id arrives as a string already and is used verbatim as an element id.
@@ -583,66 +565,29 @@ const functionsLabel = (n) => `${n} function${n === 1 ? '' : 's'}`;
 function rebuildClusterMap(map) {
   cy.elements().remove();
 
-  // Whichever box lists an element is its parent. Nested boxes list the nested
-  // cluster's own id, so one pass over `groups` gives every link at every depth.
-  const groups = map.groups ?? [];
-  const parentOf = {};
-  for (const group of groups) {
-    const id = clusterId(group.key);
-    for (const member of group.members) parentOf[member] = id;
-  }
-  const depthOf = (id) => {
-    let depth = 0;
-    for (let at = parentOf[id]; at != null; at = parentOf[at]) depth += 1;
-    return depth;
-  };
-
-  // Boxes first, outermost first: cytoscape needs a parent to exist before
-  // anything names it, and a nested box is itself somebody's child.
-  for (const group of [...groups].sort((a, b) => depthOf(clusterId(a.key)) - depthOf(clusterId(b.key)))) {
-    const id = clusterId(group.key);
-    cy.add({
-      group: 'nodes',
-      data: {
-        id,
-        parent: parentOf[id],
-        key: group.key,
-        name: group.label,
-        label: `${truncate(group.label)} · ${group.count}`,
-        full: `${group.label} — ${functionsLabel(group.count)}, open`,
-      },
-    });
-    cy.$id(id).addClass('group');
-  }
-
   const metas = new Map((map.metas ?? []).map((meta) => [clusterId(meta.key), meta]));
   for (const [id, pos] of Object.entries(map.nodes || {})) {
     const meta = metas.get(id);
-    const data = { id, parent: parentOf[id] };
+    if (!meta) continue;   // the map draws clusters and nothing else
 
-    if (meta) {
-      data.key = meta.key;
-      data.name = meta.label;
-      // The +N is the point of a closed community, so it gets its share of the
-      // label budget first and the name is cut to what is left — truncating the
-      // name alone leaves the count to be ellipsised away by the node's width.
-      const count = `  +${meta.count}`;
-      data.label = truncateTo(meta.label, LABEL_MAX - count.length) + count;
-      data.full = `${meta.label} — ${functionsLabel(meta.count)}, closed`;
-    } else {
-      const fn = allFunctions[symbolOf(id)];
-      data.symbol = symbolOf(id);
-      data.name = fn?.name ?? symbolOf(id);
-      data.label = truncate(data.name);
-      data.full = fn?.qualified_name || data.name;
-    }
+    // The count is the point of a box, so it gets its share of the label budget
+    // first and the name is cut to what is left — truncating the name alone
+    // leaves the count to be ellipsised away by the node's width.
+    const count = `  +${meta.count}`;
+    const data = {
+      id,
+      key: meta.key,
+      name: meta.label,
+      label: truncateTo(meta.label, LABEL_MAX - count.length) + count,
+      full: `${meta.label} — ${functionsLabel(meta.count)}`,
+    };
 
     // Positions are node centres in the pixels the canvas draws in, so they go
     // straight through — no cytoscape layout runs over the map.
     cy.add({ group: 'nodes', data, position: { x: pos.x, y: pos.y } });
-    // A closed community is hiding everything it stands for, which is the same
-    // thing a collapsed node in the rooted view is doing: dashed, plus the +N.
-    if (meta) cy.$id(id).addClass('community has-hidden');
+    // A box is hiding everything it stands for, which is the same thing a
+    // collapsed node in the rooted view is doing: dashed, plus the +N.
+    cy.$id(id).addClass('community has-hidden');
   }
 
   for (const edge of map.edges || []) {
@@ -651,51 +596,109 @@ function rebuildClusterMap(map) {
       group: 'edges',
       data: { id, source: edge.source, target: edge.target, width: edgeWidth(edge.weight) },
     });
-    cy.$id(id).addClass('aggregate');
+    cy.$id(id).addClass(edge.mutual ? 'aggregate mutual' : 'aggregate');
   }
 
-  // Opening or closing a box relays out everything, so the viewport the user
-  // had is about a map that no longer exists — refit. Which boxes are open is
-  // therefore part of the key, alongside what the rooted view keys on.
-  const open = groups.map((g) => clusterId(g.key)).sort().join(',');
-  const fitKey = `cluster:${mapScope ?? 'all'}:${currentDirection}:${currentOrientation}:${open}`;
+  // A different rung is a different map of a different size, so the viewport
+  // the user had is about something that is no longer on screen — refit. The
+  // rung is therefore part of the key, alongside what the rooted view keys on.
+  const fitKey = `cluster:${mapScope ?? 'all'}:${clusterMethod}:${mapLevel}:${currentDirection}:${currentOrientation}`;
   if (cy.nodes().length > 0 && fitKey !== lastFitKey) {
     lastFitKey = fitKey;
     requestAnimationFrame(fitGraph);
   }
 }
 
-// A double-click arrives as two clicks, so opening a community and drilling
-// into it would both fire on the way to a drill — and opening one relays out
-// the whole map. Hold the open for a beat and let the second click cancel it.
-const DRILL_WINDOW_MS = 250;
-let pendingOpen = null;
-
-/// One click on the map: open a closed community, or close an open one. Both
-/// are the same command, and a box is only clickable where no child covers it.
+/// One click on the map: point at a cluster, and say what it holds.
+///
+/// Pointing, not acting — the same rule the rooted view follows. There is
+/// nothing to open here: the rung below is a step of the zoom control, and a
+/// click that redrew the whole map would be a very large thing to do by
+/// accident while aiming at a label.
 function clusterTap(node) {
   const key = node.data('key');
-  if (!key) return;                    // a function inside a box: nothing to open
-  clearTimeout(pendingOpen);
-  pendingOpen = setTimeout(() => {
-    setInfo(`${node.hasClass('group') ? 'Closing' : 'Opening'} ${node.data('name')}`);
-    sendCommand({ ToggleClusterExpanded: key });
-  }, DRILL_WINDOW_MS);
+  if (!key) return;
+  cy.nodes().removeClass('selected');
+  node.addClass('selected');
+  setInfo(node.data('full'));
 }
 
-/// Two clicks: leave the map for the call tree. A community roots it at the
-/// entry point the clustering picked as its front door; a function, at itself.
+/// Two clicks: leave the map for the call tree, rooted at the entry point the
+/// clustering picked as this cluster's front door.
 function clusterDrill(node) {
-  clearTimeout(pendingOpen);
   const key = node.data('key');
-  if (key) {
-    setInfo(`Drilling into ${node.data('name')}`);
-    sendCommand({ DrillIntoCluster: key });
-    return;
-  }
-  const symbol = node.data('symbol');
-  if (symbol) selectRoot(symbol);
+  if (!key) return;
+  setInfo(`Drilling into ${node.data('name')}`);
+  sendCommand({ DrillIntoCluster: key });
 }
+
+// ── Map zoom ──────────────────────────────────────────────────────────────────
+// Rung 0 is the finest map and `mapLevels - 1` the coarsest. The control reads
+// out how many boxes the rung holds rather than which rung it is, because the
+// count is the thing the user is choosing between; the rung number is an
+// implementation detail of the ladder underneath it.
+
+function updateZoomControl() {
+  const onMap = currentView === 'ClusterMap';
+  const live = onMap && mapLevels > 0;
+  $('zoom-value').textContent = live ? mapClusters : '—';
+  // `+` is more boxes, which is a *finer* rung and so a lower number.
+  $('zoom-in').disabled = !live || mapLevel <= 0;
+  $('zoom-out').disabled = !live || mapLevel >= mapLevels - 1;
+  const control = $('zoom-control');
+  control.classList.toggle('inactive', !live);
+  control.title = !onMap
+    ? 'Grouping applies to the cluster map (Ctrl+M)'
+    : live
+      ? `${mapClusters} clusters, ${mapLevel + 1} of ${mapLevels} grouping levels`
+      : 'Nothing is clustered yet';
+}
+
+function setMapLevel(next) {
+  if (currentView !== 'ClusterMap' || mapLevels === 0) return;
+  const clamped = Math.min(Math.max(next, 0), mapLevels - 1);
+  if (clamped === mapLevel) return;
+  sendCommand({ SetMapLevel: clamped });
+}
+
+$('zoom-in').addEventListener('click', () => setMapLevel(mapLevel - 1));
+$('zoom-out').addEventListener('click', () => setMapLevel(mapLevel + 1));
+
+// ── Clustering method ─────────────────────────────────────────────────────────
+
+const methodSelectEl = $('method-select');
+
+function updateMethodControl() {
+  const onMap = currentView === 'ClusterMap';
+  // Rebuilt only when the list itself changes: replacing the options on every
+  // snapshot would close the dropdown under a user who had it open.
+  const wanted = clusterMethods.map((m) => m.id).join(',');
+  if (methodSelectEl.dataset.methods !== wanted) {
+    methodSelectEl.dataset.methods = wanted;
+    methodSelectEl.innerHTML = '';
+    for (const method of clusterMethods) {
+      const option = document.createElement('option');
+      option.value = method.id;
+      option.textContent = method.label;
+      option.title = method.description;
+      methodSelectEl.appendChild(option);
+    }
+  }
+  if (clusterMethod != null) methodSelectEl.value = clusterMethod;
+  methodSelectEl.disabled = !onMap || clusterMethods.length === 0;
+  const chosen = clusterMethods.find((m) => m.id === clusterMethod);
+  const control = $('method-control');
+  control.classList.toggle('inactive', methodSelectEl.disabled);
+  control.title = onMap
+    ? chosen?.description ?? 'How the cluster map is built'
+    : 'Grouping applies to the cluster map (Ctrl+M)';
+}
+
+methodSelectEl.addEventListener('change', () => {
+  if (methodSelectEl.value !== clusterMethod) {
+    sendCommand({ SetClusterMethod: methodSelectEl.value });
+  }
+});
 
 // ── Graph relationships ───────────────────────────────────────────────────────
 // The client holds the whole call graph, not just the laid-out subset, so it
@@ -754,8 +757,8 @@ function scopeTarget() {
 }
 
 /// Redraw the map from one function's neighbourhood rather than the whole
-/// project — the same communities, found again over what this function
-/// reaches, which is a different question and usually a different answer.
+/// project — the same coarsening, run again over what this function reaches,
+/// which is a different question and usually a different answer.
 ///
 /// The backend declines a function with nothing to group and says so, so there
 /// is nothing to check for here.
@@ -792,9 +795,10 @@ const DEPTH_MIN = 1;
 const DEPTH_MAX = 8;
 
 function updateDepthControl() {
-  // Depth is where the rooted view's BFS stops. The map is bounded by which
-  // boxes are open instead, so the stepper governs nothing here — and a live
-  // control that does nothing when pressed is worse than a quiet one.
+  // Depth is where the rooted view's BFS stops. The map is bounded by the rung
+  // of the ladder it is drawn at instead, so the stepper governs nothing here —
+  // and a live control that does nothing when pressed is worse than a quiet
+  // one. The zoom control next to it is the map's equivalent.
   const onMap = currentView === 'ClusterMap';
   $('depth-value').textContent = graphDepth;
   $('depth-dec').disabled = onMap || graphDepth <= DEPTH_MIN;
@@ -802,7 +806,7 @@ function updateDepthControl() {
   const control = $('depth-control');
   control.classList.toggle('inactive', onMap);
   control.title = onMap
-    ? 'Depth applies to the call tree — open a community to get there'
+    ? 'Depth applies to the call tree — double-click a cluster to get there'
     : 'How many levels of calls to show';
 }
 
@@ -984,10 +988,10 @@ function updateStatusFromEvent(key, payload) {
   } else if (key === 'LspError') {
     setStatus(typeof payload === 'string' ? payload : 'LSP error', 'error');
   } else if (key === 'ClusteringUpdated') {
-    // The map is about to redraw with different communities on it; say so,
+    // The map is about to redraw with different clusters on it; say so,
     // because a map shifting under the user unannounced reads as a bug.
     const n = payload?.clusters;
-    setInfo(n ? `Regrouped into ${n} communities` : 'Communities regrouped');
+    setInfo(n ? `Regrouped into ${n} clusters` : 'Clusters regrouped');
   } else if (key === 'GraphExported') {
     // Where it goes is the transport's business: a browser download, or a real
     // file on the desktop. Either way say where, because a save the user
@@ -1162,18 +1166,13 @@ cy.on('mouseover', 'node', (e) => {
   node.connectedEdges().addClass('incident');
 
   // Fade everything that isn't adjacent. At 50+ nodes this is the difference
-  // between reading a node's calls and squinting at a hairball. A box and its
-  // contents count as one thing to the eye, so the compound relatives ride
-  // along: fading a community's members out from under a lit box around them
-  // reads as a rendering fault rather than as focus.
-  let keep = node.closedNeighborhood().union(node.ancestors());
-  if (node.isParent()) keep = keep.union(node.descendants());
-  cy.elements().difference(keep).addClass('faded');
+  // between reading a node's calls and squinting at a hairball.
+  cy.elements().difference(node.closedNeighborhood()).addClass('faded');
 
   // The canvas has no tooltips, and the label may be truncated, so the status
   // bar carries the full qualified name.
   setInfo(node.data('full'));
-  // The overlay loads or hides a function's callees; a community has neither.
+  // The overlay loads or hides a function's callees; a cluster has neither.
   if (currentView !== 'ClusterMap') showExpandBtn(node);
 });
 cy.on('mouseout', 'node', (e) => {
@@ -1332,7 +1331,7 @@ function buildCommands() {
   // bounded by which boxes are open, so they go grey there rather than
   // silently changing a view the user is not looking at.
   const onMap = currentView === 'ClusterMap';
-  const openGroups = onMap ? (clusterMap?.groups ?? []) : [];
+  const canZoom = onMap && mapLevels > 0;
 
   const cmds = [
     { id: 'goto', label: 'Go to Symbol\u2026', hint: 'Ctrl+P', run: openSymbolFinder },
@@ -1367,11 +1366,34 @@ function buildCommands() {
       run: () => sendCommand({ SetMapScope: null }),
     },
     { id: 'view.rooted', label: 'View: Rooted Graph', hint: 'Ctrl+M', disabled: !onMap || !rootNodeId, run: () => sendCommand({ SetViewMode: 'Rooted' }) },
+    // The zoom, named at both ends as well as stepped: "as few boxes as there
+    // are" is a place on the ladder a user asks for directly, and stepping to
+    // it from the other end takes eleven presses on a real project.
     {
-      id: 'view.closeclusters',
-      label: 'View: Close All Open Communities',
-      disabled: !onMap || openGroups.length === 0,
-      run: () => openGroups.forEach((g) => sendCommand({ ToggleClusterExpanded: g.key })),
+      id: 'view.finer',
+      label: 'Map: Smaller Clusters',
+      hint: 'Ctrl+]',
+      disabled: !canZoom || mapLevel <= 0,
+      run: () => setMapLevel(mapLevel - 1),
+    },
+    {
+      id: 'view.coarser',
+      label: 'Map: Larger Clusters',
+      hint: 'Ctrl+[',
+      disabled: !canZoom || mapLevel >= mapLevels - 1,
+      run: () => setMapLevel(mapLevel + 1),
+    },
+    {
+      id: 'view.finest',
+      label: 'Map: Finest Grouping',
+      disabled: !canZoom || mapLevel <= 0,
+      run: () => setMapLevel(0),
+    },
+    {
+      id: 'view.coarsest',
+      label: 'Map: Coarsest Grouping',
+      disabled: !canZoom || mapLevel >= mapLevels - 1,
+      run: () => setMapLevel(mapLevels - 1),
     },
 
     { id: 'view.sidebar', label: 'View: Toggle Sidebar', hint: 'Ctrl+B', run: toggleSidebar },
@@ -1394,14 +1416,26 @@ function buildCommands() {
     },
     { id: 'view.theme', label: 'View: Toggle Theme', run: toggleTheme },
 
-    // Both views export — the rooted tree as a DAG, the map as nested DOT
-    // `subgraph cluster_` boxes — so this is the one graph command that is
-    // never greyed out on the map.
+    // Both views export — the rooted tree as a DAG, the map as one DOT
+    // `subgraph cluster_` box per cluster, opened to show the functions inside
+    // — so this is the one graph command that is never greyed out on the map.
     { id: 'graph.export', label: 'Graph: Export as Graphviz (DOT)', hint: 'Ctrl+E', run: exportGraph },
 
     { id: 'lsp.refresh', label: 'LSP: Refresh Symbols', hint: 'Ctrl+R', run: () => sendCommand('Refresh') },
     { id: 'lsp.refs', label: 'LSP: Find References', disabled: !selectedNodeId, run: () => sendCommand('FindReferences') },
   ];
+
+  // One entry per clustering method, so a method added in `logic` is reachable
+  // without the client knowing anything about it but its name.
+  clusterMethods.forEach((method) => {
+    cmds.push({
+      id: `view.method.${method.id}`,
+      label: `Map: Group by ${method.label}`,
+      hint: method.description,
+      disabled: !onMap || method.id === clusterMethod,
+      run: () => sendCommand({ SetClusterMethod: method.id }),
+    });
+  });
 
   workspaces.forEach((ws, index) => {
     if (index === activeWorkspace) return;
@@ -1487,8 +1521,16 @@ document.addEventListener('keydown', (e) => {
   else if (key === 'm') { e.preventDefault(); toggleView(); }
   else if (key === 'd' && e.shiftKey) { e.preventDefault(); setOrientation(currentOrientation === 'LeftRight' ? 'TopDown' : 'LeftRight'); }
   else if (key === 'd') { e.preventDefault(); sendCommand('ToggleCallDirection'); }
-  else if (key === ']') { e.preventDefault(); setDepth(graphDepth + 1); }
-  else if (key === '[') { e.preventDefault(); setDepth(graphDepth - 1); }
+  // One pair of keys, one meaning — more or less detail — pointed at whichever
+  // view is showing: the tree's depth limit, or the map's grouping.
+  else if (key === ']') {
+    e.preventDefault();
+    if (currentView === 'ClusterMap') setMapLevel(mapLevel - 1); else setDepth(graphDepth + 1);
+  }
+  else if (key === '[') {
+    e.preventDefault();
+    if (currentView === 'ClusterMap') setMapLevel(mapLevel + 1); else setDepth(graphDepth - 1);
+  }
   else if (key === 'Tab') {
     e.preventDefault();
     sendCommand(e.shiftKey ? 'PreviousWorkspace' : 'NextWorkspace');

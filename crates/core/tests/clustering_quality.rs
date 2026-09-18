@@ -1,12 +1,17 @@
 //! Does `logic::cluster` recover the module structure of a C project from call
 //! structure alone?
 //!
-//! That is the bet the clustering feature makes. Louvain never sees a file
-//! path: it only sees who calls whom. If the communities it finds line up with
-//! `src/net`, `src/store`, `src/proto` and friends, then the edge weighting is
-//! carrying real information and the clusters will mean something on a canvas.
-//! If they do not, no amount of rendering will rescue them, and we would much
-//! rather learn that here than after the feature ships.
+//! That is the bet the clustering feature makes. The coarsener never sees a
+//! file path: it only sees who calls whom, and how often. If the clusters it
+//! merges line up with `src/net`, `src/store`, `src/proto` and friends, then
+//! the edge weighting is carrying real information and the boxes will mean
+//! something on a canvas. If they do not, no amount of rendering will rescue
+//! them, and we would much rather learn that here than after the feature ships.
+//!
+//! Modularity is not looking for modules in the source-tree sense — it groups
+//! functions that call each other more than chance would predict — so this is
+//! a real test of whether call structure tracks module structure, and not a
+//! tautology about an algorithm that was told where the seams are.
 //!
 //! The demo graph is the specimen. It fakes a small key-value daemon with a
 //! real directory layout, deep call chains, a second root, recursion, a cycle
@@ -26,7 +31,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use logic::cluster::{Cluster, ClusterId, Clustering};
+use logic::cluster::{Cluster, ClusterId, ClusterMethod, Clustering};
 use model::{CallGraph, SymbolId};
 
 /// The directory part of a source path: `src/net/server.c` is `src/net`, and a
@@ -68,7 +73,7 @@ impl Fixture {
         // `::core::` rather than `core::`: the workspace crate of that name
         // shadows Rust's built-in one, and the leading `::` picks ours.
         let graph = ::core::create_demo_call_graph();
-        let clustering = Clustering::compute(&graph);
+        let clustering = Clustering::compute(&graph, ClusterMethod::Modularity);
 
         let mut directories = HashMap::new();
         let mut names = HashMap::new();
@@ -129,6 +134,39 @@ impl Fixture {
             cluster.label.clone()
         };
         format!("{label} · {} fns — {spread}", cluster.members.len())
+    }
+
+    /// The share of the possible cluster pairs that anything calls between —
+    /// how much of a hairball the map at this rung would be.
+    fn crossing_density(&self, level: usize) -> f64 {
+        let ids = self.clustering.level(level);
+        let mut owner: HashMap<SymbolId, usize> = HashMap::new();
+        for (slot, id) in ids.iter().enumerate() {
+            for member in &self.clustering.cluster(*id).unwrap().members {
+                owner.insert(*member, slot);
+            }
+        }
+
+        let mut pairs: HashSet<(usize, usize)> = HashSet::new();
+        for caller in self.graph.function_ids() {
+            let Some(&a) = owner.get(caller) else {
+                continue;
+            };
+            for callee in self.graph.get_callees(caller) {
+                let Some(&b) = owner.get(&callee.id) else {
+                    continue;
+                };
+                if a != b {
+                    pairs.insert(if a < b { (a, b) } else { (b, a) });
+                }
+            }
+        }
+
+        let n = ids.len();
+        if n < 2 {
+            return 0.0;
+        }
+        pairs.len() as f64 / (n * (n - 1) / 2) as f64
     }
 
     fn top_level_clusters(&self) -> Vec<&Cluster> {
@@ -264,9 +302,18 @@ fn top_level_clusters_mostly_follow_the_source_tree() {
 /// A count the user can navigate. One cluster tells them nothing they did not
 /// already know, and forty clusters over fifty-odd functions is no better than
 /// showing the raw nodes — the whole point is to collapse the graph into a few
-/// things a person can hold in their head at once. The demo's ~56 reachable
-/// functions live in five directories, so anything in the 3-to-14 range is a
-/// defensible read of the structure; outside it the resolution is simply wrong.
+/// things a person can hold in their head at once.
+///
+/// The upper bound is the method's own contract rather than a judgement call:
+/// coarsening runs until the top rung is at most `TARGET_TOP_CLUSTERS` wide, so
+/// a top level wider than that means the ladder stopped early — a round that
+/// merged nothing, which on a real graph means the matching has stopped
+/// finding pairs and the map has quietly become a node list. The lower bound is
+/// the judgement: collapsing a whole program into one or two boxes hides the
+/// structure instead of revealing it. The second assertion is the one that says
+/// the boxes are worth drawing, and it is about size rather than count, because
+/// a map of twelve two-function boxes satisfies every count you could name and
+/// still summarises nothing.
 #[test]
 fn top_level_holds_a_navigable_number_of_clusters() {
     let fixture = Fixture::new();
@@ -285,10 +332,23 @@ fn top_level_holds_a_navigable_number_of_clusters() {
         fixture.graph.node_count()
     );
     assert!(
-        count < 15,
-        "{count} top-level clusters for {} functions — at this resolution the \
-         clustering is barely coarser than the raw node list: {names:#?}",
-        fixture.graph.node_count()
+        count <= logic::cluster::TARGET_TOP_CLUSTERS,
+        "{count} top-level clusters, above the {} the coarsening is supposed to \
+         stop at — a round must have merged nothing: {names:#?}",
+        logic::cluster::TARGET_TOP_CLUSTERS
+    );
+
+    let clustered: usize = fixture
+        .top_level_clusters()
+        .iter()
+        .map(|c| c.members.len())
+        .sum();
+    let per_cluster = clustered as f64 / count as f64;
+    assert!(
+        per_cluster >= 3.0,
+        "{count} top-level clusters hold {clustered} functions between them — \
+         {per_cluster:.1} apiece, which is barely coarser than the raw node \
+         list: {names:#?}"
     );
 }
 
@@ -587,22 +647,93 @@ fn report_where_the_cross_cutting_helpers_landed() {
     println!();
 }
 
-/// Every other assertion in this file is worthless if the clustering is a coin
-/// flip, and plain Louvain is famously order-dependent. So: the same graph must
-/// give the same partition twice, and re-clustering with the previous result as
-/// a seed must leave that partition alone. The comparison is on member sets
-/// keyed by function name rather than on cluster ids, because ids are free to
-/// be renumbered — it is the grouping that has to hold still.
+/// The map opens on the modularity optimum, not on the top.
+///
+/// Plain modularity decides how many boxes the program has; `TARGET_TOP_CLUSTERS`
+/// decides how few a person can take in at once. When the first is wider than
+/// the second the ladder keeps merging past the optimum so the user has
+/// somewhere to zoom out to, and those rungs are not where the map should
+/// land: they merge modules that did not want to merge, to fit a count.
 #[test]
-fn clustering_is_stable_and_seeding_preserves_it() {
-    // The grouping a clustering induces, stripped of cluster identity: a set
-    // of sets of function names.
+fn the_map_opens_on_the_modularity_optimum() {
+    let fixture = Fixture::new();
+    let clustering = &fixture.clustering;
+    let top = clustering.level_count() - 1;
+    let opening = clustering.opening_level();
+
+    let describe = |level: usize| {
+        let boxes = clustering.level(level).len();
+        let held: usize = clustering
+            .level(level)
+            .iter()
+            .map(|id| clustering.cluster(*id).unwrap().members.len())
+            .sum();
+        format!(
+            "rung {} — {boxes} boxes, {:.1} fns/box, density {:.0}%",
+            level + 1,
+            held as f64 / boxes as f64,
+            fixture.crossing_density(level) * 100.0
+        )
+    };
+    for level in 0..clustering.level_count() {
+        println!(
+            "  {}{}",
+            describe(level),
+            if level == opening {
+                "   <- opens here"
+            } else {
+                ""
+            }
+        );
+    }
+
+    assert!(opening <= top, "the opening rung has to exist");
+    for level in opening + 1..=top {
+        assert!(
+            clustering.level(level).len() <= logic::cluster::TARGET_TOP_CLUSTERS,
+            "a rung past the optimum exists only to reach the target: {}",
+            describe(level)
+        );
+    }
+    if opening < top {
+        assert!(
+            clustering.level(opening).len() > logic::cluster::TARGET_TOP_CLUSTERS,
+            "and is only built when the optimum did not fit: {}",
+            describe(opening)
+        );
+    }
+
+    let boxes = clustering.level(opening).len();
+    let held: usize = clustering
+        .level(opening)
+        .iter()
+        .map(|id| clustering.cluster(*id).unwrap().members.len())
+        .sum();
+    assert!(
+        held as f64 / boxes as f64 >= 3.0,
+        "a map of one- and two-function boxes is the sidebar with arrows on it: {}",
+        describe(opening)
+    );
+}
+
+/// Every other assertion in this file is worthless if the clustering is a coin
+/// flip. The Louvain sweep is deterministic by construction — nodes are swept
+/// in index order, candidates tried in ascending id, ties stay put — but
+/// "by construction" is exactly the kind of claim that quietly stops being true
+/// when a `HashMap` iteration creeps into the pipeline. The comparison is on
+/// member sets keyed by function name rather than on cluster ids, because ids
+/// are free to be renumbered: it is the grouping that has to hold still.
+#[test]
+fn clustering_is_deterministic() {
+    /// The grouping a clustering induces at one rung, stripped of cluster
+    /// identity: a set of sets of function names.
     fn partition(
         clustering: &Clustering,
+        level: usize,
         names: &HashMap<SymbolId, String>,
     ) -> BTreeSet<BTreeSet<String>> {
         clustering
-            .top_level()
+            .level(level)
             .iter()
             .filter_map(|id| clustering.cluster(*id))
             .map(|cluster| {
@@ -619,21 +750,23 @@ fn clustering_is_stable_and_seeding_preserves_it() {
     let names: HashMap<SymbolId, String> =
         graph.functions().map(|f| (f.id, f.name.clone())).collect();
 
-    let first = Clustering::compute(&graph);
-    let second = Clustering::compute(&graph);
-    assert_eq!(
-        partition(&first, &names),
-        partition(&second, &names),
-        "two runs over the same graph disagree; the clustering is not \
-         deterministic, which makes every quality check here a coin flip"
-    );
+    let first = Clustering::compute(&graph, ClusterMethod::Modularity);
+    let second = Clustering::compute(&graph, ClusterMethod::Modularity);
 
-    let seeded = Clustering::compute_seeded(&graph, Some(&first));
     assert_eq!(
-        partition(&first, &names),
-        partition(&seeded, &names),
-        "seeding with the previous clustering of an unchanged graph moved \
-         functions between clusters; the point of the seed is that the canvas \
-         does not reshuffle under the user when nothing changed"
+        first.level_count(),
+        second.level_count(),
+        "two runs over the same graph built ladders of different heights"
     );
+    // Every rung, not just the top: a round that merged a different pair
+    // low down can still come out the same width at the top.
+    for level in 0..first.level_count() {
+        assert_eq!(
+            partition(&first, level, &names),
+            partition(&second, level, &names),
+            "two runs over the same graph disagree at rung {level}; the \
+             clustering is not deterministic, which makes every quality check \
+             here a coin flip"
+        );
+    }
 }

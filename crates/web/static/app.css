@@ -384,6 +384,35 @@ body.resizing { cursor: col-resize; user-select: none; }
 
 /* A two-position view setting, shown as both options at once rather than a
    button whose label has to double as a verb: you click the one you want. */
+/* A picker, wearing the pill rather than the browser's own control: the select
+   keeps every bit of its keyboard and screen-reader behaviour, and loses only
+   its chrome. */
+.pill.select { padding: 0; overflow: hidden; }
+.pill.select::after {
+  content: "";
+  width: 0;
+  height: 0;
+  margin-right: var(--sp-2);
+  border-left: 3px solid transparent;
+  border-right: 3px solid transparent;
+  border-top: 4px solid currentColor;
+  opacity: 0.6;
+  pointer-events: none;
+}
+.pill.select select {
+  appearance: none;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-family: var(--font-ui);
+  padding: var(--sp-1) var(--sp-1) var(--sp-1) var(--sp-2);
+  cursor: pointer;
+}
+.pill.select select:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+.pill.select.inactive select { cursor: default; }
+.pill.select option { background: var(--surface); color: var(--text); }
+
 .pill.segmented { gap: 0; padding: 0; overflow: hidden; }
 .pill.segmented button {
   width: 24px;

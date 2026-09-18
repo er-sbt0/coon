@@ -66,7 +66,7 @@ Any view — a rooted call tree or a cluster map — exports as [Graphviz](https
 dot -Tsvg main.dot -o main.svg     # or -Tpng, -Tpdf
 ```
 
-The desktop app opens a save dialog on the project directory, the browser downloads the file, and the TUI writes into its working directory; each says where the file went. Open communities come out as nested `subgraph cluster_…` boxes, and closed ones as a single node carrying the number of functions it stands for.
+The desktop app opens a save dialog on the project directory, the browser downloads the file, and the TUI writes into its working directory; each says where the file went. A cluster map exports as one `subgraph cluster_…` box per cluster, opened to show the functions inside — the canvas draws a box as a single node because a box holding two hundred names is unreadable on screen, and a file is not a screen. The zoom control is therefore the size control: export a finer grouping and the same file comes back divided into more, smaller boxes.
 
 ## Build
 

@@ -60,6 +60,15 @@
       <button id="orient-lr" aria-pressed="true" title="Lay the graph out left to right" aria-label="Left to right">→</button>
       <button id="orient-td" aria-pressed="false" title="Lay the graph out top to bottom" aria-label="Top to bottom">↓</button>
     </div>
+    <div class="pill stepper" id="zoom-control" title="How finely the cluster map is grouped">
+      <button id="zoom-out" aria-label="Fewer, larger clusters">−</button>
+      <span class="stepper-label">clusters</span>
+      <b id="zoom-value">—</b>
+      <button id="zoom-in" aria-label="More, smaller clusters">+</button>
+    </div>
+    <div class="pill select" id="method-control" title="How the cluster map is built">
+      <select id="method-select" aria-label="Clustering method"></select>
+    </div>
     <button class="pill" id="refresh-btn" title="Refresh workspace symbols">Refresh</button>
   </div>
 

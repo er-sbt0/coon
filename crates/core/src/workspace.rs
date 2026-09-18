@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
-use logic::ClusterKey;
+use logic::ClusterMethod;
 use model::{CallDirection, SymbolId};
 use serde::{Deserialize, Serialize};
 
@@ -11,8 +11,8 @@ use crate::events::AppEvent;
 
 /// Which of the two views a workspace is showing.
 ///
-/// `ClusterMap` draws the top-level communities as boxes and lets the user open
-/// them; `Rooted` is the familiar call tree grown out of one function.
+/// `ClusterMap` draws one rung of the coarsening ladder, every cluster at that
+/// rung a box; `Rooted` is the familiar call tree grown out of one function.
 ///
 /// It lives beside the workspace rather than beside `LayoutOrientation` in
 /// `layout` because it is not a layout parameter. Orientation says how to draw
@@ -55,13 +55,19 @@ pub struct CoreWorkspace {
     pub orientation: LayoutOrientation,
     /// Which view this workspace is showing.
     pub view: ViewMode,
-    /// Clusters the user has opened on the map. Everything else stays a box.
+    /// Which rung of the coarsening ladder the map is drawn at, or `None` for
+    /// the coarsest — which is where a map should open, and which rung that is
+    /// depends on a clustering the workspace does not hold.
     ///
-    /// Keyed by [`ClusterKey`] rather than `ClusterId` because this set outlives
-    /// the clustering it was filled from: the graph grows, the clustering is
-    /// recomputed, and the ids are handed out afresh. A key goes on naming the
-    /// community the user opened; an id would quietly start naming another one.
-    pub expanded_clusters: HashSet<ClusterKey>,
+    /// Held as a level rather than as a set of opened boxes because the ladder
+    /// is a zoom: every rung partitions the same functions, so the map shows
+    /// exactly one of them and moving is a step, not an expansion. The number
+    /// survives a recompute on its own terms — rung 4 of the next ladder is
+    /// still about as coarse as rung 4 of this one — and `CoreApp` clamps it to
+    /// what the current ladder has.
+    pub map_level: Option<usize>,
+    /// Which algorithm builds the ladder this workspace is looking at.
+    pub method: ClusterMethod,
     /// The function whose neighbourhood the cluster map is drawn from, or
     /// `None` for the whole program.
     ///
@@ -88,7 +94,8 @@ impl CoreWorkspace {
             expanded: HashSet::new(),
             orientation: LayoutOrientation::default(),
             view: ViewMode::default(),
-            expanded_clusters: HashSet::new(),
+            map_level: None,
+            method: ClusterMethod::default(),
             map_scope: None,
             created_at: now,
             last_accessed: now,
@@ -111,9 +118,9 @@ impl CoreWorkspace {
         self.collapsed.clear();
         // And so does the set of nodes walked past the depth limit.
         self.expanded.clear();
-        // Which clusters stood open describes a particular map, and for the
+        // How far the map was zoomed in describes a particular map, and for the
         // same reason it does not survive being pointed at a new root.
-        self.expanded_clusters.clear();
+        self.map_level = None;
         // Naming a root *is* asking for the rooted view — the cluster map draws
         // communities and has nowhere to put one. Doing it here rather than
         // leaving each frontend to pair the two commands is what keeps a
@@ -163,12 +170,13 @@ impl CoreWorkspace {
     /// Switches to the map for the same reason [`Self::set_root`] switches away
     /// from it: naming what a map should be drawn from *is* asking to see that
     /// map, and leaving each frontend to pair the two commands is how a
-    /// frontend stops being a transport. The open boxes go with the old scope —
-    /// they name communities of a clustering this one has nothing to do with.
+    /// frontend stops being a transport. The zoom goes back to the coarsest
+    /// with it: a new scope is a new ladder, of a different height, and rung 6
+    /// of the old one names nothing in particular on the new.
     pub fn set_map_scope(&mut self, scope: Option<SymbolId>) -> bool {
         let changed = scope != self.map_scope || self.view != ViewMode::ClusterMap;
         self.map_scope = scope;
-        self.expanded_clusters.clear();
+        self.map_level = None;
         self.view = ViewMode::ClusterMap;
         if changed {
             self.touch();
@@ -176,15 +184,33 @@ impl CoreWorkspace {
         changed
     }
 
-    /// Open or close one cluster on the map. Returns true if now expanded.
-    pub fn toggle_cluster_expanded(&mut self, cluster: ClusterKey) -> bool {
-        self.touch();
-        if self.expanded_clusters.remove(&cluster) {
-            false
-        } else {
-            self.expanded_clusters.insert(cluster);
-            true
+    /// Draw the map at one rung of the ladder. Returns true when that is news.
+    ///
+    /// Takes the level rather than a direction to step, for the reason
+    /// [`Self::set_orientation`] takes an orientation: a zoom control names the
+    /// rung it lands on. Nothing is clamped here — how many rungs there are is
+    /// a property of the clustering, which lives in `CoreApp`.
+    pub fn set_map_level(&mut self, level: usize) -> bool {
+        let changed = self.map_level != Some(level);
+        self.map_level = Some(level);
+        if changed {
+            self.touch();
         }
+        changed
+    }
+
+    /// Build the map with a different method. Returns true when that is news.
+    ///
+    /// The zoom resets, because the rungs are the method's own: another method
+    /// coarsens at its own rate and its ladder is a different height.
+    pub fn set_method(&mut self, method: ClusterMethod) -> bool {
+        let changed = method != self.method;
+        self.method = method;
+        if changed {
+            self.map_level = None;
+            self.touch();
+        }
+        changed
     }
 
     /// Collapse or re-expand a node's children. Returns true if now collapsed.
@@ -468,23 +494,37 @@ mod tests {
     }
 
     #[test]
-    fn cluster_expansion_toggles_and_resets_with_the_root() {
+    fn the_map_zoom_is_absolute_and_resets_with_the_root() {
         let mut ws = CoreWorkspace::new(1, "w".to_string());
-        let cluster = ClusterKey {
-            level: 1,
-            anchor: SymbolId::from_content("anchor", "test.c", 1),
-        };
+        assert_eq!(ws.map_level, None, "a map opens at the coarsest rung");
 
-        assert!(ws.toggle_cluster_expanded(cluster), "first toggle opens");
-        assert!(ws.expanded_clusters.contains(&cluster));
-        assert!(!ws.toggle_cluster_expanded(cluster), "second toggle closes");
-        assert!(ws.expanded_clusters.is_empty());
-
-        ws.toggle_cluster_expanded(cluster);
-        ws.set_root(SymbolId::from_content("b", "b.c", 1));
+        assert!(ws.set_map_level(3), "a new rung is a change");
+        assert_eq!(ws.map_level, Some(3));
         assert!(
-            ws.expanded_clusters.is_empty(),
-            "a new root starts with nothing opened"
+            !ws.set_map_level(3),
+            "re-picking the rung already shown is not a change"
+        );
+
+        ws.set_root(SymbolId::from_content("b", "b.c", 1));
+        assert_eq!(
+            ws.map_level, None,
+            "a new root starts at the coarsest rung again"
+        );
+    }
+
+    #[test]
+    fn a_new_method_resets_the_zoom() {
+        let mut ws = CoreWorkspace::new(1, "w".to_string());
+        ws.set_map_level(4);
+
+        assert!(
+            !ws.set_method(ClusterMethod::Modularity),
+            "re-picking the method already shown is not a change"
+        );
+        assert_eq!(
+            ws.map_level,
+            Some(4),
+            "and so leaves the rung where the user put it"
         );
     }
 
@@ -549,18 +589,15 @@ mod tests {
     }
 
     #[test]
-    fn a_new_scope_starts_with_nothing_opened() {
+    fn a_new_scope_starts_at_the_coarsest_rung() {
         let mut ws = CoreWorkspace::new(1, "w".to_string());
-        ws.toggle_cluster_expanded(ClusterKey {
-            level: 1,
-            anchor: SymbolId::from_content("anchor", "test.c", 1),
-        });
+        ws.set_map_level(5);
 
         ws.set_map_scope(Some(SymbolId::from_content("scope", "s.c", 1)));
 
-        assert!(
-            ws.expanded_clusters.is_empty(),
-            "an open box names a community of the clustering it came from"
+        assert_eq!(
+            ws.map_level, None,
+            "a rung names a place on the ladder the old scope built"
         );
     }
 
