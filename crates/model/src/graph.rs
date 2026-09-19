@@ -95,11 +95,6 @@ impl FunctionNode {
             .collect()
     }
 
-    /// Get reference locations only (for backward compatibility)
-    pub fn get_reference_locations(&self) -> Vec<&Location> {
-        self.references.iter().map(|r| &r.location).collect()
-    }
-
     pub fn add_diagnostic(&mut self, diagnostic: Diagnostic) {
         self.diagnostics.push(diagnostic);
     }
@@ -365,7 +360,6 @@ mod tests {
         assert_eq!(function.references.len(), 2);
         assert_eq!(function.get_referencing_function_names().len(), 1);
         assert_eq!(function.get_referencing_function_names()[0], "caller_func");
-        assert_eq!(function.get_reference_locations().len(), 2);
     }
 
     #[test]

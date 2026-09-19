@@ -536,10 +536,6 @@ function fitGraph() {
 /// other id arrives as a string already and is used verbatim as an element id.
 const clusterId = (key) => `cluster:${key.level}:${key.anchor}`;
 
-/// The bare symbol id inside a `fn:` layout node id — what the cached graph is
-/// keyed by, and what the symbol commands take.
-const symbolOf = (nodeId) => nodeId.slice(3);
-
 const functionsLabel = (n) => `${n} function${n === 1 ? '' : 's'}`;
 
 function rebuildClusterMap(map) {

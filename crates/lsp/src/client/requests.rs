@@ -131,23 +131,6 @@ impl LspClient {
             .await
     }
 
-    /// Hover request helper
-    pub async fn hover(
-        &mut self,
-        text_document: lsp::TextDocumentIdentifier,
-        position: lsp::Position,
-    ) -> Result<i64> {
-        let params = lsp::HoverParams {
-            text_document_position_params: lsp::TextDocumentPositionParams {
-                text_document,
-                position,
-            },
-            work_done_progress_params: Default::default(),
-        };
-        self.send_request("textDocument/hover", serde_json::to_value(params)?)
-            .await
-    }
-
     /// Send initialized notification
     pub async fn send_initialized(&mut self) -> Result<()> {
         self.send_notification("initialized", serde_json::json!({}))

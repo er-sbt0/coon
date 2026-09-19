@@ -306,23 +306,27 @@ pub fn compute_layout(
 // The cluster map
 // ---------------------------------------------------------------------------
 
-/// One element of the cluster map: a function, or a whole cluster standing in
-/// for the functions inside it.
+/// One element of the cluster map: a whole cluster, standing in for the
+/// functions inside it.
 ///
 /// It serialises as a string rather than as serde's usual tagged enum, because
 /// it is a map key on the wire and JSON has no keys but strings. That costs
 /// nothing and buys something: cytoscape needs a stable string element id for
 /// every node it draws, and this is one.
+///
+/// One variant, because a map draws boxes and nothing else — see
+/// [`GraphLayout`] for why that is the whole design. It stays an enum so that
+/// a map which one day drew, say, the isolated functions no cluster claims
+/// would add a variant and a prefix beside `cluster:`, rather than change the
+/// type every position on the wire is keyed by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LayoutNodeId {
-    Symbol(SymbolId),
     Cluster(ClusterKey),
 }
 
 impl fmt::Display for LayoutNodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LayoutNodeId::Symbol(symbol) => write!(f, "fn:{}", symbol.0),
             LayoutNodeId::Cluster(key) => write!(f, "cluster:{}:{}", key.level, key.anchor.0),
         }
     }
@@ -331,10 +335,9 @@ impl fmt::Display for LayoutNodeId {
 /// The order a `LayoutNodeId` sorts in is its `Display` order, and that is not
 /// an accident worth losing: the string is what the client keys its elements
 /// by, so a sort done here and a sort done on the wire agree. It is spelled out
-/// rather than derived because a derive gets two things wrong. `Cluster` sorts
-/// *under* `Symbol`, since `cluster:` is under `fn:`, which is the reverse of
-/// the variant order; and a level is rendered in decimal, so it is compared as
-/// digits and not as a number — `cluster:10:` lands before `cluster:1:`.
+/// rather than derived because a derive gets the level wrong: it is rendered in
+/// decimal, so it is compared as digits and not as a number — `cluster:10:`
+/// lands before `cluster:1:`.
 ///
 /// This exists because the callers used to sort on `to_string()`, which formats
 /// a uuid into a fresh `String` twice per comparison, four times for a full
@@ -346,9 +349,6 @@ impl Ord for LayoutNodeId {
                 level_cmp(mine.level, theirs.level)
                     .then_with(|| mine.anchor.0.cmp(&theirs.anchor.0))
             }
-            (LayoutNodeId::Symbol(mine), LayoutNodeId::Symbol(theirs)) => mine.0.cmp(&theirs.0),
-            (LayoutNodeId::Cluster(_), LayoutNodeId::Symbol(_)) => Ordering::Less,
-            (LayoutNodeId::Symbol(_), LayoutNodeId::Cluster(_)) => Ordering::Greater,
         }
     }
 }
@@ -396,9 +396,6 @@ impl std::str::FromStr for LayoutNodeId {
         let uuid = |raw: &str| {
             uuid::Uuid::parse_str(raw).map_err(|e| format!("`{text}` holds no uuid: {e}"))
         };
-        if let Some(rest) = text.strip_prefix("fn:") {
-            return Ok(LayoutNodeId::Symbol(SymbolId(uuid(rest)?)));
-        }
         if let Some(rest) = text.strip_prefix("cluster:") {
             let (level, anchor) = rest
                 .split_once(':')
@@ -411,7 +408,7 @@ impl std::str::FromStr for LayoutNodeId {
                 anchor: SymbolId(uuid(anchor)?),
             }));
         }
-        Err(format!("`{text}` is neither a function nor a cluster"))
+        Err(format!("`{text}` names no cluster"))
     }
 }
 
@@ -932,18 +929,15 @@ mod tests {
         (graph, ids)
     }
 
-    /// A spread of node ids chosen so that their `Display` order disagrees with
-    /// every cheaper one: `cluster:` sorts under `fn:`, and a level is rendered
-    /// in decimal, so `cluster:10:` lands before both `cluster:1:` (`'0'` is
-    /// under the `':'` that ends the field) and `cluster:9:`.
-    fn mixed_ids(anchors: &[SymbolId]) -> Vec<LayoutNodeId> {
+    /// A spread of node ids chosen so that their `Display` order disagrees
+    /// with the cheaper one: a level is rendered in decimal, so `cluster:10:`
+    /// lands before both `cluster:1:` (`'0'` is under the `':'` that ends the
+    /// field) and `cluster:9:`.
+    fn awkward_ids(anchors: &[SymbolId]) -> Vec<LayoutNodeId> {
         anchors
             .iter()
-            .zip([None, Some(1), Some(9), Some(10), Some(2), None])
-            .map(|(&anchor, level)| match level {
-                Some(level) => LayoutNodeId::Cluster(ClusterKey { level, anchor }),
-                None => LayoutNodeId::Symbol(anchor),
-            })
+            .zip([0, 1, 9, 10, 2, 11])
+            .map(|(&anchor, level)| LayoutNodeId::Cluster(ClusterKey { level, anchor }))
             .collect()
     }
 
@@ -1347,10 +1341,7 @@ mod tests {
         layout
             .nodes
             .keys()
-            .filter_map(|node| match node {
-                LayoutNodeId::Cluster(key) => Some(*key),
-                LayoutNodeId::Symbol(_) => None,
-            })
+            .map(|LayoutNodeId::Cluster(key)| *key)
             .collect()
     }
 
@@ -1536,10 +1527,7 @@ mod tests {
         let mut drawn = 0usize;
         for edge in &layout.edges {
             let (LayoutNodeId::Cluster(source), LayoutNodeId::Cluster(target)) =
-                (edge.source, edge.target)
-            else {
-                panic!("a cluster map draws clusters");
-            };
+                (edge.source, edge.target);
             assert_eq!(
                 Some(edge.weight),
                 expected.get(&(source, target)).copied(),
@@ -1563,7 +1551,7 @@ mod tests {
                 graph.add_call(from, to, Location::new("src/x.c".to_string(), 2, 0));
             }
         }
-        let display = mixed_ids(&ids);
+        let display = awkward_ids(&ids);
         let owner: HashMap<SymbolId, LayoutNodeId> =
             ids.iter().copied().zip(display.iter().copied()).collect();
 
@@ -1870,7 +1858,7 @@ mod tests {
         let anchors: Vec<SymbolId> = (0..6)
             .map(|i| SymbolId::from_content(&format!("b{i}"), "b.c", i))
             .collect();
-        let display = mixed_ids(&anchors);
+        let display = awkward_ids(&anchors);
         let seats = vec![
             Some(Seat {
                 layer: 0,
@@ -1992,14 +1980,14 @@ mod tests {
     }
 
     /// The whole of `Ord`'s claim: sorting by it is sorting by the string, on
-    /// the two cases a derive would have got wrong — `cluster:` under `fn:`,
-    /// and a two-digit level read as digits rather than as a number.
+    /// the case a derive would have got wrong — a two-digit level read as
+    /// digits rather than as a number.
     #[test]
     fn a_node_id_sorts_exactly_as_its_display_string_does() {
         let anchors: Vec<SymbolId> = (0..4)
             .map(|i| SymbolId::from_content(&format!("a{i}"), "a.c", i))
             .collect();
-        let mut ids: Vec<LayoutNodeId> = anchors.iter().map(|&a| LayoutNodeId::Symbol(a)).collect();
+        let mut ids: Vec<LayoutNodeId> = Vec::new();
         for level in [0, 1, 2, 9, 10, 11, 19, 100, 101] {
             ids.extend(
                 anchors
@@ -2017,11 +2005,6 @@ mod tests {
             by_ord.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
             by_string
         );
-        assert!(
-            by_string[0].starts_with("cluster:0:"),
-            "a cluster sorts under every function: {:?}",
-            &by_string[..2]
-        );
         let ten = by_string.iter().position(|s| s.starts_with("cluster:10:"));
         let one = by_string.iter().position(|s| s.starts_with("cluster:1:"));
         assert!(
@@ -2034,30 +2017,24 @@ mod tests {
     /// so its string form is the wire contract, not an implementation detail.
     #[test]
     fn a_layout_node_id_is_a_string_on_the_wire() {
-        let symbol = SymbolId::from_content("a", "a.c", 1);
-        for node in [
-            LayoutNodeId::Symbol(symbol),
-            LayoutNodeId::Cluster(ClusterKey {
-                level: 2,
-                anchor: symbol,
-            }),
-        ] {
-            let json = serde_json::to_value(node).expect("serialises");
-            assert!(json.is_string(), "{json} has to be usable as a map key");
-            assert_eq!(
-                serde_json::from_value::<LayoutNodeId>(json).expect("round-trips"),
-                node
-            );
-        }
+        let anchor = SymbolId::from_content("a", "a.c", 1);
+        let node = LayoutNodeId::Cluster(ClusterKey { level: 2, anchor });
+
+        let json = serde_json::to_value(node).expect("serialises");
+        assert!(json.is_string(), "{json} has to be usable as a map key");
+        assert_eq!(
+            serde_json::from_value::<LayoutNodeId>(json).expect("round-trips"),
+            node
+        );
 
         let mut nodes = HashMap::new();
-        nodes.insert(LayoutNodeId::Symbol(symbol), NodePos { x: 1.0, y: 2.0 });
+        nodes.insert(node, NodePos { x: 1.0, y: 2.0 });
         let layout = GraphLayout {
             nodes,
             metas: Vec::new(),
             edges: Vec::new(),
         };
         let json = serde_json::to_value(&layout).expect("a whole layout serialises");
-        assert!(json["nodes"][format!("fn:{}", symbol.0)].is_object());
+        assert!(json["nodes"][format!("cluster:2:{}", anchor.0)].is_object());
     }
 }

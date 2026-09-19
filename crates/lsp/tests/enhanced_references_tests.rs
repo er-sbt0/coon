@@ -72,7 +72,6 @@ fn test_function_node_enhanced_references() {
 
     // Test the enhanced functionality
     assert_eq!(function.references.len(), 3);
-    assert_eq!(function.get_reference_locations().len(), 3);
 
     let function_references = function.get_referencing_function_names();
     assert_eq!(function_references.len(), 1);

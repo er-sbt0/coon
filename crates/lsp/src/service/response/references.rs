@@ -230,7 +230,7 @@ async fn parse_enhanced_references_response(
     let _lsp_request_id = message.get("id").and_then(|i| i.as_i64());
 
     log::debug!(
-        "Enhancing {} reference locations with symbol information using hover requests",
+        "Enhancing {} reference locations with symbol information using document symbol requests",
         locations.len()
     );
 
