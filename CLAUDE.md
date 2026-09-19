@@ -140,7 +140,7 @@ Every frontend's `main.rs` — `crates/desktop/src/main.rs`, and `crates/coon/sr
 1. **Demo mode** (`cargo run`): builds a synthetic `CallGraph` and hands it straight to the frontend.
 2. **LSP mode** (`cargo run -- <path>`): spins up a background `lsp_loader_task` that connects to clangd, opens every source file in the compilation database, and builds a `CallGraph` via workspace symbol queries. Those documents do not stay open — see **Open documents are a cache, not the project** below. The frontend starts immediately while loading proceeds asynchronously. A Tokio MPSC bridge forwards `LspRequest` messages to `LspService` and returns `LspResponse`/`LspUiMessage` results back. `core::boot::spawn_lsp_bridge` performs this wiring for every frontend.
 
-The web and desktop backends both poll `CoreApp::tick()` every 100ms and translate the resulting events through `core::protocol::EventRouter`, which decides what to forward verbatim and when to push a fresh snapshot.
+The web and desktop backends both poll `CoreApp::tick()` every 100ms and translate the resulting events through `core::protocol::EventRouter`, which decides what to forward verbatim and when to push a fresh snapshot. The desktop also ticks the moment a clangd reply lands, by awaiting `LspBridge::response_ready` beside its interval: the interval is a ceiling on latency, not the app's pace. The edge warmup ran in lockstep with the poll — eight prepares, wait a tick, eight follow-ups, wait a tick — so 100ms was the whole step: 5.6s on the 221-symbol test project, 0.2s once the tick followed the reply.
 
 ### Key Design Patterns
 

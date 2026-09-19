@@ -1,7 +1,8 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 use lsp::{LspRequest, LspResponse};
 use model::{
@@ -165,6 +166,23 @@ pub struct LspBridge {
     request_tx: Option<mpsc::UnboundedSender<LspRequest>>,
     /// Channel to receive responses from the LSP service worker
     response_rx: Option<mpsc::UnboundedReceiver<LspResponse>>,
+    /// Raised whenever a reply is waiting in `response_rx`.
+    ///
+    /// `CoreApp::tick` is polled, and a reply that lands between polls sits
+    /// in the channel until the next one. The edge warmup runs in lockstep
+    /// with those polls — eight prepares, wait a tick, eight follow-ups, wait
+    /// a tick — so at 100 ms it spent about 120 ms of every 200 ms batch with
+    /// clangd idle; on the 221-symbol test project that was 5.6 s for work
+    /// clangd did in about 2. A frontend that awaits this alongside its
+    /// interval ticks as soon as there is something to read instead. It is
+    /// a [`Notify`] rather than a second channel because many replies between
+    /// two ticks want one wake, not one each, and `notify_one` coalesces them
+    /// into a single stored permit. It is *raised*, not signalled by the
+    /// bridge itself: the bridge only ever reads the channel, so whoever feeds
+    /// it — [`crate::boot::spawn_lsp_bridge`]'s relay — is the one that knows
+    /// when a reply has arrived. Never touched by a bridge with no worker, so
+    /// a frontend in demo mode falls back to its interval alone.
+    response_ready: Arc<Notify>,
     /// In-flight requests awaiting responses, keyed by request ID.
     ///
     /// Private because [`LspBridge::dispatch`] is the only thing that may put
@@ -206,6 +224,7 @@ impl LspBridge {
         Self {
             request_tx: None,
             response_rx: None,
+            response_ready: Arc::new(Notify::new()),
             pending_requests: HashMap::new(),
             loading_states: HashMap::new(),
             status: LspLoadPhase::NotStarted,
@@ -225,6 +244,7 @@ impl LspBridge {
         Self {
             request_tx: None,
             response_rx: None,
+            response_ready: Arc::new(Notify::new()),
             pending_requests: HashMap::new(),
             loading_states: HashMap::new(),
             status: LspLoadPhase::NotStarted,
@@ -241,6 +261,15 @@ impl LspBridge {
     ) {
         self.response_rx = Some(response_rx);
         self.request_tx = Some(request_tx);
+    }
+
+    /// The signal raised when a reply is waiting to be drained.
+    ///
+    /// A frontend awaits `notified()` on it beside its poll interval so a
+    /// tick follows a reply at once rather than at the next interval. See
+    /// the field for why the warmup's pace depends on it.
+    pub fn response_ready(&self) -> Arc<Notify> {
+        Arc::clone(&self.response_ready)
     }
 
     /// Poll for LSP channels delivered by the background loader and wire them up.

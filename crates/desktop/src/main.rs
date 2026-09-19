@@ -28,6 +28,12 @@ use model::CallGraph;
 const CHANNEL: &str = "coon://message";
 
 /// Poll interval for `CoreApp::tick`, matching the web frontend's cadence.
+///
+/// The ceiling on how long anything waits to be noticed, not the pace the
+/// app runs at: a clangd reply wakes the tick loop through
+/// `LspBridge::response_ready` the moment it lands, and this interval is
+/// what catches everything else — loader progress, timeouts, a finished
+/// clustering.
 const TICK_MS: u64 = 100;
 
 #[derive(Parser)]
@@ -208,6 +214,10 @@ fn main() {
         }
     };
 
+    // Taken before the app is locked away: the tick loop below awaits it
+    // between ticks, and it cannot take the mutex to ask.
+    let response_ready = core.lsp.response_ready();
+
     let backend = Backend {
         core: Arc::new(Mutex::new(core)),
         router: Arc::new(Mutex::new(EventRouter::new())),
@@ -226,8 +236,18 @@ fn main() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_millis(TICK_MS));
+                // A run of reply-driven ticks must not be followed by a burst
+                // of interval ticks making up for the ones they pre-empted.
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
-                    interval.tick().await;
+                    // Whichever comes first. A reply between two interval
+                    // ticks used to wait for the second; during the edge
+                    // warmup that wait was most of the step — see
+                    // `LspBridge::response_ready`.
+                    tokio::select! {
+                        _ = interval.tick() => {}
+                        _ = response_ready.notified() => {}
+                    }
                     let backend = handle.state::<Backend>();
                     let events = { backend.core.lock().await.tick() };
                     if events
