@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 
@@ -325,6 +326,67 @@ impl fmt::Display for LayoutNodeId {
             LayoutNodeId::Cluster(key) => write!(f, "cluster:{}:{}", key.level, key.anchor.0),
         }
     }
+}
+
+/// The order a `LayoutNodeId` sorts in is its `Display` order, and that is not
+/// an accident worth losing: the string is what the client keys its elements
+/// by, so a sort done here and a sort done on the wire agree. It is spelled out
+/// rather than derived because a derive gets two things wrong. `Cluster` sorts
+/// *under* `Symbol`, since `cluster:` is under `fn:`, which is the reverse of
+/// the variant order; and a level is rendered in decimal, so it is compared as
+/// digits and not as a number — `cluster:10:` lands before `cluster:1:`.
+///
+/// This exists because the callers used to sort on `to_string()`, which formats
+/// a uuid into a fresh `String` twice per comparison, four times for a full
+/// compare, O(n log n) times over.
+impl Ord for LayoutNodeId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (LayoutNodeId::Cluster(mine), LayoutNodeId::Cluster(theirs)) => {
+                level_cmp(mine.level, theirs.level)
+                    .then_with(|| mine.anchor.0.cmp(&theirs.anchor.0))
+            }
+            (LayoutNodeId::Symbol(mine), LayoutNodeId::Symbol(theirs)) => mine.0.cmp(&theirs.0),
+            (LayoutNodeId::Cluster(_), LayoutNodeId::Symbol(_)) => Ordering::Less,
+            (LayoutNodeId::Symbol(_), LayoutNodeId::Cluster(_)) => Ordering::Greater,
+        }
+    }
+}
+
+impl PartialOrd for LayoutNodeId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Two cluster levels compared the way their `Display` strings compare: the
+/// decimal digits, then the `:` that closes the field. `':'` (0x3a) is above
+/// every digit, so a level whose digits are a prefix of another's sorts
+/// *after* it — `cluster:1:` after `cluster:10:`. On the stack, because the
+/// point of having an `Ord` at all is to stop allocating per comparison.
+fn level_cmp(mine: usize, theirs: usize) -> Ordering {
+    let (mut mine_buf, mut theirs_buf) = ([0u8; LEVEL_FIELD], [0u8; LEVEL_FIELD]);
+    level_field(mine, &mut mine_buf).cmp(level_field(theirs, &mut theirs_buf))
+}
+
+/// Twenty digits is a 64-bit `usize` at its widest, and one more for the `:`.
+const LEVEL_FIELD: usize = 21;
+
+/// `level` in decimal followed by its `:`, written into `buf`.
+fn level_field(level: usize, buf: &mut [u8; LEVEL_FIELD]) -> &[u8] {
+    let mut rest = level;
+    let mut len = 0;
+    loop {
+        buf[len] = b'0' + (rest % 10) as u8;
+        len += 1;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    buf[..len].reverse();
+    buf[len] = b':';
+    &buf[..len + 1]
 }
 
 impl std::str::FromStr for LayoutNodeId {
@@ -714,11 +776,13 @@ fn place_boxes(
             })
             .collect();
         // Ties are broken on the node id so that two boxes whose members
-        // average to the same spot do not swap places between runs.
+        // average to the same spot do not swap places between runs. On the id
+        // itself, whose `Ord` is its `Display` order: rendering the string here
+        // instead would format two uuids for every comparison of every box.
         wanted.sort_by(|a, b| {
             a.1.partial_cmp(&b.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| display[a.0].to_string().cmp(&display[b.0].to_string()))
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| display[a.0].cmp(&display[b.0]))
         });
 
         let before: f32 = wanted.iter().map(|(_, cross)| *cross).sum::<f32>();
@@ -818,14 +882,16 @@ fn aggregate_calls(
         })
         .collect();
 
-    // `graph.function_ids()` is a HashMap iteration, so the aggregate has to be
-    // sorted before it decides node order in the DAG — otherwise the same graph
-    // lays out differently from one run to the next.
+    // `graph.function_ids()` is a HashMap iteration, so the aggregate comes out
+    // in a different order every run. These edges go straight to the wire and
+    // the client draws them as given, so sorting them is what makes one graph
+    // ship one way — and an export of the map diff against the last one. The
+    // order is the ids' `Display` order, which their `Ord` is, without a uuid
+    // formatted into a fresh `String` twice per comparison.
     edges.sort_by(|a, b| {
         a.source
-            .to_string()
-            .cmp(&b.source.to_string())
-            .then_with(|| a.target.to_string().cmp(&b.target.to_string()))
+            .cmp(&b.source)
+            .then_with(|| a.target.cmp(&b.target))
     });
     edges
 }
@@ -854,6 +920,21 @@ mod tests {
             graph.add_call(pair[0], pair[1], Location::new("src/x.c".to_string(), 1, 0));
         }
         (graph, ids)
+    }
+
+    /// A spread of node ids chosen so that their `Display` order disagrees with
+    /// every cheaper one: `cluster:` sorts under `fn:`, and a level is rendered
+    /// in decimal, so `cluster:10:` lands before both `cluster:1:` (`'0'` is
+    /// under the `':'` that ends the field) and `cluster:9:`.
+    fn mixed_ids(anchors: &[SymbolId]) -> Vec<LayoutNodeId> {
+        anchors
+            .iter()
+            .zip([None, Some(1), Some(9), Some(10), Some(2), None])
+            .map(|(&anchor, level)| match level {
+                Some(level) => LayoutNodeId::Cluster(ClusterKey { level, anchor }),
+                None => LayoutNodeId::Symbol(anchor),
+            })
+            .collect()
     }
 
     #[test]
@@ -1459,6 +1540,42 @@ mod tests {
         assert_eq!(drawn, expected.len(), "one line per ordered pair");
     }
 
+    /// The aggregate is walked out of a `HashMap`, so its order is imposed —
+    /// and it is the node ids' `Display` order, the string the client keys its
+    /// elements by. Nothing downstream re-sorts it, so this is the wire order.
+    #[test]
+    fn the_aggregate_ships_in_the_node_ids_display_order() {
+        let (mut graph, ids) = graph_with_chain(&["a", "b", "c", "d", "e", "f"]);
+        // Every function calls every later one, so a source repeats and the
+        // target is what breaks the tie.
+        for (nth, &from) in ids.iter().enumerate() {
+            for &to in &ids[nth + 1..] {
+                graph.add_call(from, to, Location::new("src/x.c".to_string(), 2, 0));
+            }
+        }
+        let display = mixed_ids(&ids);
+        let owner: HashMap<SymbolId, LayoutNodeId> =
+            ids.iter().copied().zip(display.iter().copied()).collect();
+
+        let shipped: Vec<(String, String)> =
+            aggregate_calls(&graph, &owner, CallDirection::Outgoing)
+                .iter()
+                .map(|edge| (edge.source.to_string(), edge.target.to_string()))
+                .collect();
+
+        assert_eq!(shipped.len(), 15, "every ordered pair crosses a boundary");
+        let mut expected = shipped.clone();
+        expected.sort();
+        assert_eq!(
+            shipped, expected,
+            "sorted on the ids as the client sees them"
+        );
+        assert!(
+            shipped.windows(2).any(|pair| pair[0].0 == pair[1].0),
+            "and a repeated source, or the target tie-break went untested"
+        );
+    }
+
     /// The map never draws a boundary crossed both ways: `logic::cluster`
     /// refuses the grouping, so there is nothing here to fold.
     #[test]
@@ -1735,6 +1852,41 @@ mod tests {
         );
     }
 
+    /// Boxes whose members average to one spot have nothing to order them but
+    /// their ids, and two runs that disagree would swap them on the canvas. The
+    /// order is the ids' `Display` order, the same one the aggregate ships in.
+    #[test]
+    fn boxes_wanting_one_spot_are_ordered_by_node_id() {
+        let anchors: Vec<SymbolId> = (0..6)
+            .map(|i| SymbolId::from_content(&format!("b{i}"), "b.c", i))
+            .collect();
+        let display = mixed_ids(&anchors);
+        let seats = vec![
+            Some(Seat {
+                layer: 0,
+                cross: 4.0
+            });
+            6
+        ];
+
+        let out = place_boxes(
+            &display,
+            &seats,
+            CallDirection::Outgoing,
+            LayoutOrientation::LeftRight,
+        );
+        let mut down_the_column: Vec<(String, f32)> = display
+            .iter()
+            .map(|node| (node.to_string(), out[node].y))
+            .collect();
+        down_the_column.sort_by(|a, b| a.1.partial_cmp(&b.1).expect("no box is at NaN"));
+
+        let placed: Vec<String> = down_the_column.into_iter().map(|(id, _)| id).collect();
+        let mut expected = placed.clone();
+        expected.sort();
+        assert_eq!(placed, expected);
+    }
+
     /// Order is the part of the frame worth defending to the last: it is what a
     /// reader recognises from the call tree, and absolute position is what
     /// gives way when the boxes will not fit.
@@ -1827,6 +1979,45 @@ mod tests {
                 "rung {level}: the entry point reads before the allocator"
             );
         }
+    }
+
+    /// The whole of `Ord`'s claim: sorting by it is sorting by the string, on
+    /// the two cases a derive would have got wrong — `cluster:` under `fn:`,
+    /// and a two-digit level read as digits rather than as a number.
+    #[test]
+    fn a_node_id_sorts_exactly_as_its_display_string_does() {
+        let anchors: Vec<SymbolId> = (0..4)
+            .map(|i| SymbolId::from_content(&format!("a{i}"), "a.c", i))
+            .collect();
+        let mut ids: Vec<LayoutNodeId> = anchors.iter().map(|&a| LayoutNodeId::Symbol(a)).collect();
+        for level in [0, 1, 2, 9, 10, 11, 19, 100, 101] {
+            ids.extend(
+                anchors
+                    .iter()
+                    .map(|&anchor| LayoutNodeId::Cluster(ClusterKey { level, anchor })),
+            );
+        }
+
+        let mut by_ord = ids.clone();
+        by_ord.sort();
+        let mut by_string: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        by_string.sort();
+
+        assert_eq!(
+            by_ord.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+            by_string
+        );
+        assert!(
+            by_string[0].starts_with("cluster:0:"),
+            "a cluster sorts under every function: {:?}",
+            &by_string[..2]
+        );
+        let ten = by_string.iter().position(|s| s.starts_with("cluster:10:"));
+        let one = by_string.iter().position(|s| s.starts_with("cluster:1:"));
+        assert!(
+            ten < one,
+            "the level is digits, not a number: {ten:?} {one:?}"
+        );
     }
 
     /// A `LayoutNodeId` is a JSON *map key*, and JSON has no keys but strings —

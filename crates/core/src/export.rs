@@ -119,7 +119,7 @@ fn rooted_dot(core: &CoreApp) -> Option<String> {
     // `positions` is a HashMap, so an order has to be imposed or the same graph
     // exports to a different file every time and no two are diffable.
     let mut visible: Vec<SymbolId> = positions.keys().copied().collect();
-    visible.sort_by_key(|id| sort_key(graph, id));
+    visible.sort_by_cached_key(|id| sort_key(graph, id));
     let index_of: HashMap<SymbolId, usize> =
         visible.iter().enumerate().map(|(i, id)| (*id, i)).collect();
 
@@ -437,15 +437,20 @@ fn header(out: &mut String, orientation: LayoutOrientation, label: &str) {
 /// Sort functions into an order two runs agree on. The name first so the file
 /// reads sensibly, the location and then the id to break the ties C++ hands out
 /// freely — jemalloc has nine distinct `thd_start`s.
-fn sort_key(graph: &CallGraph, id: &SymbolId) -> (String, String, u32, uuid::Uuid) {
+///
+/// It borrows out of the graph rather than cloning two `String`s, and the
+/// caller reaches it through `sort_by_cached_key`, which asks for the key once
+/// per function instead of once per comparison. `&str` compares byte for byte
+/// exactly as `String` did, so the order is the same one.
+fn sort_key<'a>(graph: &'a CallGraph, id: &SymbolId) -> (&'a str, &'a str, u32, uuid::Uuid) {
     match graph.get_function(id) {
         Some(func) => (
-            func.qualified_name.clone(),
-            func.definition_location.file_path.clone(),
+            func.qualified_name.as_str(),
+            func.definition_location.file_path.as_str(),
             func.definition_location.line,
             id.0,
         ),
-        None => (String::new(), String::new(), 0, id.0),
+        None => ("", "", 0, id.0),
     }
 }
 
@@ -620,6 +625,135 @@ mod tests {
             out.contains("  +"),
             "a picture that stops short has to say so; got:\n{out}"
         );
+    }
+
+    /// The order is not merely deterministic, it is a *particular* order —
+    /// qualified name, then where the definition is — and the file is diffed
+    /// against the last one somebody kept. Pinning the whole list is what
+    /// catches a cheaper sort that is stable but no longer alphabetical.
+    #[test]
+    fn the_export_lists_functions_in_name_order() {
+        let mut core = rooted_at("main");
+        core.dispatch(crate::Command::SetGraphDepth(crate::layout::MAX_DEPTH));
+
+        assert_eq!(
+            labels(&dot(&core)),
+            vec![
+                "buf_append",
+                "buf_free",
+                "buf_init",
+                "buf_reserve",
+                "config_free",
+                "config_get_int",
+                "config_get_str",
+                "config_load",
+                "config_parse_line",
+                "conn_close",
+                "crc32_update",
+                "handle_client",
+                "hash_key",
+                "index_insert",
+                "index_lookup",
+                "index_rehash",
+                "index_remove",
+                "install_signal_handlers",
+                "log_close",
+                "log_init",
+                "log_rotate",
+                "log_write",
+                "main",
+                "oom_die",
+                "parse_args",
+                "parse_integer",
+                "parse_request",
+                "parse_token",
+                "print_usage",
+                "request_free",
+                "response_write_error",
+                "response_write_ok",
+                "response_write_value",
+                "run_server",
+                "server_accept_loop",
+                "server_start",
+                "server_stop",
+                "shutdown_gracefully",
+                "socket_accept",
+                "socket_close",
+                "socket_listen",
+                "socket_read",
+                "socket_set_nonblocking",
+                "socket_write",
+                "store_close",
+                "store_compact",
+                "store_delete",
+                "store_get",
+                "store_open",
+                "store_put",
+                "wal_append",
+                "wal_replay",
+                "wal_sync",
+                "wal_truncate",
+                "xmalloc",
+                "xrealloc",
+            ]
+        );
+    }
+
+    /// C++ hands out the same qualified name freely, so the order past it is
+    /// load-bearing too: file, then line. Only `name` reaches the label, so
+    /// three `ns::dup`s are told apart by the tooltip.
+    #[test]
+    fn functions_sharing_a_name_are_ordered_by_where_they_are_defined() {
+        let mut graph = CallGraph::new();
+        let root = FunctionNode::new(
+            "aaa_root".to_string(),
+            "aaa_root".to_string(),
+            Location::new("root.c".to_string(), 1, 0),
+        );
+        let from = root.id;
+        graph.add_function(root);
+        for (file, line) in [("b.c", 1), ("a.c", 9), ("a.c", 2)] {
+            let dup = FunctionNode::new(
+                "dup".to_string(),
+                "ns::dup".to_string(),
+                Location::new(file.to_string(), line, 0),
+            );
+            let to = dup.id;
+            graph.add_function(dup);
+            graph.add_call(from, to, Location::new("root.c".to_string(), 2, 0));
+        }
+
+        let mut core = CoreApp::new(graph);
+        core.dispatch(crate::Command::StartGraphFromFunction(from));
+        core.workspaces.current_mut().unwrap().view = ViewMode::Rooted;
+
+        assert_eq!(
+            tooltips(&dot(&core)),
+            vec![
+                "aaa_root\\nroot.c:1",
+                "ns::dup\\na.c:2",
+                "ns::dup\\na.c:9",
+                "ns::dup\\nb.c:1",
+            ]
+        );
+    }
+
+    /// The `label=` of every node declaration, in the order the file declares
+    /// them — which is the order `rooted_dot` sorted the visible symbols into.
+    fn labels(out: &str) -> Vec<&str> {
+        field(out, "[label=\"")
+    }
+
+    fn tooltips(out: &str) -> Vec<&str> {
+        field(out, ", tooltip=\"")
+    }
+
+    fn field<'a>(out: &'a str, marker: &str) -> Vec<&'a str> {
+        out.lines()
+            .filter_map(|line| line.trim().strip_prefix('n'))
+            .filter_map(|line| line.split_once(marker))
+            .map(|(_, rest)| rest.split('"').next().unwrap_or_default())
+            .collect()
     }
 
     #[test]
