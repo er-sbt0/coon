@@ -596,10 +596,30 @@ impl LspBridge {
         self.loading_states.insert(symbol_id, state);
     }
 
-    /// Clear all pending requests and loading states (used on refresh).
-    pub fn clear(&mut self) {
+    /// Drop everything in flight, and hand back the requests that were
+    /// dropped so the caller can put the work they stood for somewhere it will
+    /// be picked up again.
+    ///
+    /// Clearing is not free, and the cost is invisible from here. A reply to a
+    /// request that is no longer pending is unrecognisable: `take_pending`
+    /// answers `None`, `CoreApp::handle_lsp_response` only does anything
+    /// inside the `Some`, and the whole reply goes on the floor. The symbol's
+    /// `loading_states` entry goes with it, so it reads `NotLoaded` again —
+    /// a function in the graph with no edges, nothing on its way, and nothing
+    /// that will ask a second time, which is exactly the isolated node
+    /// `logic::cluster` drops from the map.
+    ///
+    /// So the discarded requests come back rather than being cleaned up in the
+    /// caller: the caller is the only place that knows where unfinished work
+    /// goes — for `CoreApp` that is the edge-warmup queue, which this module
+    /// knows nothing about — and `#[must_use]` makes the next caller of
+    /// `clear` say in code what happens to it. Reading `pending_requests`
+    /// before calling this would work just as well and would be just as easy
+    /// to forget, which is the bug this had.
+    #[must_use = "these requests are unfinished work: requeue the symbols they name, or say why not"]
+    pub fn clear(&mut self) -> Vec<PendingRequest> {
         self.loading_states.clear();
-        self.pending_requests.clear();
+        self.pending_requests.drain().map(|(_, req)| req).collect()
     }
 }
 

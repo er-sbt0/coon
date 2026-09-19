@@ -9,7 +9,7 @@ use model::{CallDirection, CallGraph, FunctionNode, Location, LspLoadPhase, Symb
 use crate::command::Command;
 use crate::events::AppEvent;
 use crate::layout::{compute_map_frame, LayoutOrientation, MapFrame};
-use crate::lsp_bridge::{LoadingState, LspBridge, RequestOrigin};
+use crate::lsp_bridge::{LoadingState, LspBridge, PendingRequest, RequestOrigin};
 use crate::workspace::{CoreWorkspace, CoreWorkspaceManager, ViewMode};
 
 /// How many call-hierarchy requests to keep in flight while warming up edges.
@@ -190,6 +190,11 @@ pub struct CoreApp {
     /// reading — the work really did get bigger — and beats the alternative of
     /// resolving those symbols silently, outside the number the status bar is
     /// showing.
+    ///
+    /// The one invariant it has to keep is `warmup_total >= edge_warmup.len()`,
+    /// since `done` is the difference: work put *back* on the queue by
+    /// `requeue_discarded` therefore lowers `done` rather than raising this,
+    /// because those places were counted when they were first queued.
     warmup_total: usize,
     /// Whether the closing `ResolvingCalls { done: total, .. }` has gone out.
     /// Without it the end would be announced on every tick thereafter, since
@@ -682,7 +687,11 @@ impl CoreApp {
 
     fn cmd_refresh(&mut self) -> Vec<AppEvent> {
         let direction = self.current_direction();
-        self.lsp.clear();
+        // Everything in flight is about to become unanswerable — see
+        // `LspBridge::clear` — so the symbols those requests named go back on
+        // the warmup queue before anything else happens.
+        let discarded = self.lsp.clear();
+        self.requeue_discarded(discarded);
         let mut events = Vec::new();
         if let Some(ev) = self.lsp.send_workspace_symbols() {
             events.push(ev);
@@ -1195,6 +1204,78 @@ impl CoreApp {
         id
     }
 
+    /// Put the symbols of discarded in-flight requests back on the warmup
+    /// queue.
+    ///
+    /// A cleared request is work that was started and will never finish: the
+    /// reply is dropped as unrecognised and the symbol's loading state goes
+    /// with it, so it sits in the graph with no edges, reading `NotLoaded`,
+    /// with nothing on its way. Nothing else picks it up — `ingest_symbol`
+    /// queues a symbol only the first time the graph sees it, and the refresh
+    /// that caused this re-adds the very same functions — so before this the
+    /// refresh stranded up to `WARMUP_IN_FLIGHT` symbols permanently, and an
+    /// edgeless symbol is what `logic::cluster` drops, so they went missing
+    /// from the map rather than showing up wrong.
+    ///
+    /// Every discarded request that names a symbol is requeued, whoever asked
+    /// for it. The queue's question is "does this function still need its
+    /// edges fetched", and a cleared request leaves the answer at yes
+    /// regardless of which question was outstanding or who wanted it. The
+    /// asymmetry decides it: requeuing a [`RequestOrigin::User`] request costs
+    /// one round trip and answers it as `Warmup`, so its edges land without
+    /// the redraw the user's own answer would have carried — and the user's
+    /// affordance survives that, because the cleared loading state puts the
+    /// node back to `NotLoaded` and its `+` asks again on the next click, in
+    /// the direction the tab is actually reading. Dropping it instead loses
+    /// the edges with no second chance at all.
+    fn requeue_discarded(&mut self, discarded: Vec<PendingRequest>) {
+        // Nothing to put work back on yet. The seeding sweep in
+        // `pump_edge_warmup` *replaces* the queue with every function in the
+        // graph — which is where these symbols are — so queueing here would be
+        // counted and then thrown away by that assignment.
+        if !self.warmup_seeded {
+            return;
+        }
+
+        let mut requeued = 0usize;
+        for pending in discarded {
+            // A workspace-symbol sweep names no symbol, and the refresh is
+            // sending a fresh one of those anyway.
+            let Some(id) = pending.symbol_id else {
+                continue;
+            };
+            // Two requests can name one function — a find-references asked for
+            // while the warmup's prepare was still out — and a symbol still
+            // waiting its turn is on the queue already. Either way the queue
+            // holds places, and a second place is a second request and a
+            // fraction that never reaches its total.
+            if self.edge_warmup.contains(&id) {
+                continue;
+            }
+            self.edge_warmup.push_back(id);
+            requeued += 1;
+        }
+        if requeued == 0 {
+            return;
+        }
+
+        // `done` is `warmup_total - edge_warmup.len()`, so the total has to
+        // stay at least as large as the queue or the fraction saturates at a
+        // zero it never leaves. A symbol counted when it was first queued must
+        // not be counted twice — its place is coming back, not being added —
+        // and that is all of them bar one case: a function the warmup never
+        // queued at all, reached as some reply's callee and then expanded by
+        // hand. Raising the total to the queue's length covers that without
+        // keeping a second record of which symbols have been counted.
+        self.warmup_total = self.warmup_total.max(self.edge_warmup.len());
+        log::info!(
+            "CoreApp: requeued {} in-flight symbol(s) discarded by a refresh, {} queued of {}",
+            requeued,
+            self.edge_warmup.len(),
+            self.warmup_total
+        );
+    }
+
     /// Fetch call hierarchies for the symbols the initial load handed us, so the
     /// graph has edges before anything tries to cluster or draw it.
     ///
@@ -1536,7 +1617,6 @@ fn cluster_within(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lsp_bridge::{PendingRequest, RequestOrigin};
     use model::Location;
     use tokio::sync::mpsc;
 
@@ -2265,6 +2345,221 @@ mod tests {
         app.stale.insert(target);
         app.sync_clusterings();
         assert!(app.clustering_job.is_some());
+    }
+
+    /// The lines the prepare requests waiting on `rx` name, 1-based as the
+    /// definition locations are. `loaded_app` puts `f{i}` on line `i + 1`, so
+    /// this is how a test says *which* symbols the warmup just asked about.
+    fn prepared_lines(rx: &mut mpsc::UnboundedReceiver<lsp::LspRequest>) -> Vec<u32> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|req| match req {
+                lsp::LspRequest::PrepareCallHierarchy { position, .. } => Some(position.line + 1),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Where a symbol is defined, to match against [`prepared_lines`].
+    fn line_of(app: &CoreApp, id: &SymbolId) -> u32 {
+        app.call_graph
+            .get_function(id)
+            .expect("in the graph")
+            .definition_location
+            .line
+    }
+
+    /// A refresh discards everything in flight, and the symbols those requests
+    /// named have to come back as work.
+    ///
+    /// `LspBridge::clear` drops the pending entries, so when clangd answers
+    /// them `take_pending` returns `None` and `handle_lsp_response` throws the
+    /// reply away; it drops the loading states too, so each of those symbols
+    /// reads `NotLoaded` again with nothing on its way. Nothing requeues them
+    /// — the refresh's own symbol sweep re-adds functions already in the graph,
+    /// which `ingest_symbol` leaves alone — so up to `WARMUP_IN_FLIGHT` of them
+    /// stayed in the graph edgeless for the life of the process, and isolated
+    /// is exactly what `logic::cluster` drops from the map.
+    #[test]
+    fn a_refresh_puts_the_symbols_it_had_in_flight_back_on_the_queue() {
+        let (mut app, mut rx) = loaded_app(WARMUP_IN_FLIGHT * 2);
+        app.tick();
+        let in_flight: Vec<SymbolId> = app
+            .lsp
+            .pending_requests
+            .values()
+            .filter_map(|p| p.symbol_id)
+            .collect();
+        assert_eq!(
+            in_flight.len(),
+            WARMUP_IN_FLIGHT,
+            "the first batch went out"
+        );
+        let queued_before = app.edge_warmup.len();
+        prepared_lines(&mut rx);
+
+        app.dispatch(Command::Refresh);
+
+        for id in &in_flight {
+            assert!(
+                app.edge_warmup.contains(id),
+                "a symbol whose answer the refresh made undeliverable is asked again"
+            );
+        }
+        assert_eq!(
+            app.edge_warmup.len(),
+            queued_before + in_flight.len(),
+            "and the ones that had not been sent yet are still there, once each"
+        );
+
+        // Back on the queue is only half of it: the queue has to get round to
+        // them. Answer everything each round so the pump keeps drawing.
+        let mut asked: HashSet<u32> = HashSet::new();
+        for _ in 0..6 {
+            app.lsp.pending_requests.clear();
+            app.tick();
+            asked.extend(prepared_lines(&mut rx));
+            if app.edge_warmup.is_empty() {
+                break;
+            }
+        }
+        assert!(app.edge_warmup.is_empty(), "the queue drained");
+        for id in &in_flight {
+            assert!(
+                asked.contains(&line_of(&app, id)),
+                "and a fresh request went out for every stranded symbol"
+            );
+        }
+    }
+
+    /// The fraction the status bar shows has to survive the refresh.
+    ///
+    /// `report_warmup_progress` computes `done` as `warmup_total -
+    /// edge_warmup.len()`, so putting work back on the queue without keeping
+    /// the total in step reads as a fraction that runs backwards past zero and
+    /// saturates there. Symbols that go back on the queue were counted when
+    /// they were first queued, so the total stays put and `done` — correctly —
+    /// falls: nothing they were asked about was ever answered.
+    #[test]
+    fn the_warmup_fraction_stays_honest_across_a_refresh() {
+        let (mut app, mut rx) = loaded_app(WARMUP_IN_FLIGHT * 2);
+        app.tick();
+        prepared_lines(&mut rx);
+        assert_eq!(
+            app.warmup_progress(),
+            Some((WARMUP_IN_FLIGHT, WARMUP_IN_FLIGHT * 2))
+        );
+
+        app.dispatch(Command::Refresh);
+
+        let (done, total) = app.warmup_progress().expect("still warming up");
+        assert_eq!(
+            total,
+            WARMUP_IN_FLIGHT * 2,
+            "the same symbols, not a bigger project"
+        );
+        assert_eq!(done, 0, "and not one of them has been resolved");
+        assert!(
+            app.warmup_total >= app.edge_warmup.len(),
+            "or `done` underflows to a zero it never leaves"
+        );
+
+        // And the end is still reachable, at the count it started with.
+        for _ in 0..6 {
+            app.lsp.pending_requests.clear();
+            app.tick();
+            prepared_lines(&mut rx);
+            if app.edge_warmup.is_empty() {
+                break;
+            }
+        }
+        // The last batch is still out; answering it is what ends the warmup.
+        app.lsp.pending_requests.clear();
+        assert!(!app.warming_up());
+        assert_eq!(app.warmup_total, WARMUP_IN_FLIGHT * 2);
+    }
+
+    /// Requeuing must not put a symbol on the queue twice: the queue's length
+    /// is the denominator's other half, so a duplicate is a fraction that never
+    /// reaches its total and a second request nobody needed.
+    ///
+    /// Two requests can name one symbol — a find-references the user asked for
+    /// while the warmup's prepare for the same function was still out — and the
+    /// symbols still waiting their turn are on the queue already.
+    #[test]
+    fn a_refresh_does_not_queue_a_symbol_twice() {
+        let (mut app, mut rx) = loaded_app(WARMUP_IN_FLIGHT * 2);
+        app.tick();
+        prepared_lines(&mut rx);
+        let doubled = *app
+            .lsp
+            .pending_requests
+            .values()
+            .find_map(|p| p.symbol_id.as_ref())
+            .expect("a symbol in flight");
+        app.lsp.pending_requests.insert(
+            "references-for-the-same-symbol".to_string(),
+            PendingRequest::new(Some(doubled), "references", RequestOrigin::User),
+        );
+
+        app.dispatch(Command::Refresh);
+
+        let mut seen = HashSet::new();
+        for id in &app.edge_warmup {
+            assert!(seen.insert(*id), "{id:?} is queued twice");
+        }
+        assert_eq!(
+            seen.len(),
+            WARMUP_IN_FLIGHT * 2,
+            "every symbol of the project, once each"
+        );
+    }
+
+    /// With nothing outstanding there is nothing to put back, and a refresh
+    /// that shuffles the queue anyway would re-ask for edges already in hand.
+    #[test]
+    fn a_refresh_with_nothing_in_flight_leaves_the_queue_alone() {
+        let (mut app, mut rx) = loaded_app(WARMUP_IN_FLIGHT * 2);
+        app.tick();
+        prepared_lines(&mut rx);
+        // Every request answered.
+        app.lsp.pending_requests.clear();
+        let queued: Vec<SymbolId> = app.edge_warmup.iter().copied().collect();
+        let total = app.warmup_total;
+
+        app.dispatch(Command::Refresh);
+
+        assert_eq!(
+            app.edge_warmup.iter().copied().collect::<Vec<_>>(),
+            queued,
+            "same symbols, same order"
+        );
+        assert_eq!(app.warmup_total, total);
+    }
+
+    /// A refresh before the queue has ever opened has nowhere to put work, and
+    /// needs none: the seeding sweep in `pump_edge_warmup` *replaces* the queue
+    /// with every function in the graph, which is where these symbols are.
+    /// Queueing them here would be counted, then thrown away by that
+    /// assignment.
+    #[test]
+    fn a_refresh_before_the_warmup_opens_queues_nothing() {
+        let (mut app, mut rx) = loaded_app(2);
+        let id = *app.call_graph.function_ids().next().expect("a symbol");
+        app.lsp.pending_requests.insert(
+            "in-flight-before-the-warmup".to_string(),
+            PendingRequest::new(Some(id), "prepare f0", RequestOrigin::User),
+        );
+        assert!(!app.warmup_seeded);
+
+        app.dispatch(Command::Refresh);
+
+        assert!(app.edge_warmup.is_empty(), "nothing to put it on yet");
+        assert_eq!(app.warmup_total, 0);
+
+        // And the sweep that does open the queue still accounts for it once.
+        app.tick();
+        assert_eq!(app.warmup_total, 2);
+        assert_eq!(prepared_lines(&mut rx).len(), 2);
     }
 
     #[test]
