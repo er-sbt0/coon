@@ -411,21 +411,27 @@ impl CoreWorkspaceManager {
         Ok(AppEvent::WorkspaceClosed)
     }
 
-    /// Switch to a specific workspace by index. Returns an optional event.
+    /// Switch to a specific workspace by index. Returns an optional event, and
+    /// `None` for an index that names no workspace — in which case nothing
+    /// moves.
+    ///
+    /// The one place the current index changes by navigation, and so the one
+    /// place that touches the workspace and announces the move.
+    /// [`Self::next_workspace`] and [`Self::previous`] are index arithmetic in
+    /// front of it: they used to be copies of this body, each with its own
+    /// bounds check, its own `touch()` and its own `WorkspaceSwitched`, and an
+    /// `else { None }` after a bounds check that had already ruled it out.
     pub fn switch_to(&mut self, index: usize) -> Option<AppEvent> {
-        if index >= self.workspaces.len() {
-            return None;
-        }
+        // `get_mut` *is* the bounds check, so there is no unreachable arm for
+        // the index the check already rejected.
+        let workspace = self.workspaces.get_mut(index)?;
+        workspace.touch();
+        let event = AppEvent::WorkspaceSwitched {
+            id: workspace.id,
+            name: workspace.name.clone(),
+        };
         self.current_index = index;
-        if let Some(workspace) = self.workspaces.get_mut(index) {
-            workspace.touch();
-            Some(AppEvent::WorkspaceSwitched {
-                id: workspace.id,
-                name: workspace.name.clone(),
-            })
-        } else {
-            None
-        }
+        Some(event)
     }
 
     /// Switch to the next workspace (wrapping). Returns an optional event.
@@ -433,16 +439,7 @@ impl CoreWorkspaceManager {
         if self.workspaces.is_empty() {
             return None;
         }
-        self.current_index = (self.current_index + 1) % self.workspaces.len();
-        if let Some(workspace) = self.workspaces.get_mut(self.current_index) {
-            workspace.touch();
-            Some(AppEvent::WorkspaceSwitched {
-                id: workspace.id,
-                name: workspace.name.clone(),
-            })
-        } else {
-            None
-        }
+        self.switch_to((self.current_index + 1) % self.workspaces.len())
     }
 
     /// Switch to the previous workspace (wrapping). Returns an optional event.
@@ -450,20 +447,12 @@ impl CoreWorkspaceManager {
         if self.workspaces.is_empty() {
             return None;
         }
-        if self.current_index == 0 {
-            self.current_index = self.workspaces.len() - 1;
+        let index = if self.current_index == 0 {
+            self.workspaces.len() - 1
         } else {
-            self.current_index -= 1;
-        }
-        if let Some(workspace) = self.workspaces.get_mut(self.current_index) {
-            workspace.touch();
-            Some(AppEvent::WorkspaceSwitched {
-                id: workspace.id,
-                name: workspace.name.clone(),
-            })
-        } else {
-            None
-        }
+            self.current_index - 1
+        };
+        self.switch_to(index)
     }
 
     /// Rename a workspace. Returns an optional event.

@@ -4,7 +4,6 @@ use lsp_types::{CallHierarchyItem, CallHierarchyOutgoingCall, DocumentSymbol, Po
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use uuid::Uuid;
 
 mod document;
 mod request;
@@ -56,12 +55,40 @@ pub enum LspRequest {
         request_id: String,
         document_uris: Vec<Url>,
     },
-    /// Close every document the server currently has open.
+    /// Close every document the server currently has open, freeing its
+    /// per-document state.
+    ///
+    /// Fire-and-forget: `didClose` is a notification, and this travels the same
+    /// channel as everything queued after it, so a reopen cannot overtake it.
     CloseDocuments,
     SetProjectFiles {
         project_files: Vec<String>,
     },
     Shutdown,
+}
+
+impl LspRequest {
+    /// The id the worker's reply will carry, or `None` for the three requests
+    /// that are answered by nothing.
+    ///
+    /// Exists for the failure path in `loader::run_tui_lsp_bridge`, which has
+    /// to tell whoever is waiting that their request never went out — and by
+    /// then the request itself has been moved into [`LspService::send`]. The
+    /// id-less three are the ones nobody is waiting on: a close, a
+    /// project-file list and the shutdown.
+    pub fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::PrepareCallHierarchy { request_id, .. }
+            | Self::GetOutgoingCalls { request_id, .. }
+            | Self::GetIncomingCalls { request_id, .. }
+            | Self::FindReferences { request_id, .. }
+            | Self::FindReferencesWithSymbols { request_id, .. }
+            | Self::GetDocumentSymbols { request_id, .. }
+            | Self::GetWorkspaceSymbols { request_id, .. }
+            | Self::PreloadDocuments { request_id, .. } => Some(request_id),
+            Self::CloseDocuments | Self::SetProjectFiles { .. } | Self::Shutdown => None,
+        }
+    }
 }
 
 /// How far clangd's background indexer has got.
@@ -142,149 +169,31 @@ impl LspService {
         })
     }
 
-    /// Request references for a symbol
-    pub async fn request_references(
-        &self,
-        request_id: String,
-        document_uri: Url,
-        position: Position,
-    ) -> Result<()> {
-        self.request_tx
-            .send(LspRequest::FindReferences {
-                request_id,
-                document_uri,
-                position,
-            })
-            .await?;
-        Ok(())
-    }
-
-    /// Request enhanced references with symbol information
-    pub async fn request_references_with_symbols(
-        &self,
-        request_id: String,
-        document_uri: Url,
-        position: Position,
-    ) -> Result<()> {
-        self.request_tx
-            .send(LspRequest::FindReferencesWithSymbols {
-                request_id,
-                document_uri,
-                position,
-            })
-            .await?;
-        Ok(())
-    }
-
-    /// Request document symbols
-    pub async fn request_document_symbols(
-        &self,
-        request_id: String,
-        document_uri: Url,
-    ) -> Result<()> {
-        self.request_tx
-            .send(LspRequest::GetDocumentSymbols {
-                request_id,
-                document_uri,
-            })
-            .await?;
-        Ok(())
-    }
-
-    /// Request workspace symbols for project refresh
-    pub async fn request_workspace_symbols(&self, request_id: String, query: String) -> Result<()> {
-        self.request_tx
-            .send(LspRequest::GetWorkspaceSymbols { request_id, query })
-            .await?;
-        Ok(())
-    }
-
-    /// Request outgoing calls for a call hierarchy item
-    pub async fn request_outgoing_calls(
-        &self,
-        request_id: String,
-        call_hierarchy_item: lsp_types::CallHierarchyItem,
-    ) -> Result<()> {
-        self.request_tx
-            .send(LspRequest::GetOutgoingCalls {
-                request_id,
-                call_hierarchy_item,
-            })
-            .await?;
-        Ok(())
-    }
-
-    pub async fn request_incoming_calls(
-        &self,
-        request_id: String,
-        call_hierarchy_item: lsp_types::CallHierarchyItem,
-    ) -> Result<()> {
-        self.request_tx
-            .send(LspRequest::GetIncomingCalls {
-                request_id,
-                call_hierarchy_item,
-            })
-            .await?;
-        Ok(())
-    }
-
-    /// Preload multiple documents to avoid "non-added document" errors
-    pub async fn preload_documents(&self, document_uris: Vec<Url>) -> Result<String> {
-        let request_id = Uuid::new_v4().to_string();
-        self.request_tx
-            .send(LspRequest::PreloadDocuments {
-                request_id: request_id.clone(),
-                document_uris,
-            })
-            .await?;
-        Ok(request_id)
-    }
-
-    pub async fn request_prepare_call_hierarchy(
-        &self,
-        request_id: String,
-        document_uri: Url,
-        position: Position,
-    ) -> Result<()> {
-        self.request_tx
-            .send(LspRequest::PrepareCallHierarchy {
-                request_id,
-                document_uri,
-                position,
-            })
-            .await?;
-        Ok(())
-    }
-
-    pub async fn request_preload_documents(
-        &self,
-        request_id: String,
-        document_uris: Vec<Url>,
-    ) -> Result<()> {
-        self.request_tx
-            .send(LspRequest::PreloadDocuments {
-                request_id,
-                document_uris,
-            })
-            .await?;
-        Ok(())
-    }
-
-    /// Close every open document, freeing the server's per-document state.
+    /// Queue a request for the worker.
     ///
-    /// Fire-and-forget: `didClose` is a notification, and the request travels
-    /// the same channel as everything after it, so a reopen queued later cannot
-    /// overtake it.
-    pub async fn close_documents(&self) -> Result<()> {
-        self.request_tx.send(LspRequest::CloseDocuments).await?;
-        Ok(())
-    }
-
-    /// Set project files for symbol filtering
-    pub async fn set_project_files(&self, project_files: Vec<String>) -> Result<()> {
-        self.request_tx
-            .send(LspRequest::SetProjectFiles { project_files })
-            .await?;
+    /// This replaced eleven one-line methods — `request_outgoing_calls`,
+    /// `request_workspace_symbols`, `preload_documents` and the rest — each of
+    /// which took one variant's fields apart as parameters, put them straight
+    /// back together and sent the result down this channel. Naming a variant
+    /// twice bought nothing and cost the crate's one forwarder its shape:
+    /// `loader::run_tui_lsp_bridge` takes an `LspRequest` off the frontend's
+    /// channel, and it had to destructure it arm by arm purely to call the
+    /// wrapper that rebuilt the identical value. With a single `send` it
+    /// passes the request through whole, and a variant added to [`LspRequest`]
+    /// costs neither a method here nor an arm there.
+    ///
+    /// Two of the eleven sent the *same* variant, which is the duplication read
+    /// from the other end: `preload_documents` minted a request id and
+    /// returned it, `request_preload_documents` took one that already existed.
+    /// Minting belongs to whoever is going to match the reply against it, so
+    /// it moved to the two call sites that wait for a `PreloadComplete`.
+    ///
+    /// Fire-and-forget from here: a request that has an answer is answered on
+    /// the response channel [`Self::recv_response`] drains, matched by its
+    /// `request_id`. The channel keeps order, so nothing queued after a
+    /// [`LspRequest::CloseDocuments`] can overtake it.
+    pub async fn send(&self, request: LspRequest) -> Result<()> {
+        self.request_tx.send(request).await?;
         Ok(())
     }
 
