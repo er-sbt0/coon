@@ -17,8 +17,11 @@ use crate::events::AppEvent;
 /// It lives beside the workspace rather than beside `LayoutOrientation` in
 /// `layout` because it is not a layout parameter. Orientation says how to draw
 /// a view; the view mode says which view there is to draw at all, and the
-/// workspace is the thing that remembers it. Layout will read it in Phase 3,
-/// the way it already reads `depth` and `collapsed`, without owning it.
+/// workspace is the thing that remembers it. `protocol::cluster_layout_of`
+/// reads it to pick between `compute_cluster_layout` and `compute_layout` —
+/// the way `protocol::layout_options` reads `depth` and `collapsed` — so
+/// `layout` stays two functions with no mode flag between them, and neither
+/// owns the answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ViewMode {
     /// The default. A workspace has no root until the user picks one, so a tab
@@ -56,8 +59,13 @@ pub struct CoreWorkspace {
     /// Which view this workspace is showing.
     pub view: ViewMode,
     /// Which rung of the coarsening ladder the map is drawn at, or `None` for
-    /// the coarsest — which is where a map should open, and which rung that is
-    /// depends on a clustering the workspace does not hold.
+    /// wherever the ladder says a map should open — which is *not* the
+    /// coarsest: `Clustering::opening_level` is the last rung built at plain
+    /// modularity, and the rungs above it exist only to force a wide optimum
+    /// down to a box count, so they are where a user zooms out *to* rather than
+    /// where they should land. Which rung that is depends on a clustering the
+    /// workspace does not hold, so `None` is resolved in
+    /// `CoreApp::map_level_for`.
     ///
     /// Held as a level rather than as a set of opened boxes because the ladder
     /// is a zoom: every rung partitions the same functions, so the map shows
@@ -170,9 +178,10 @@ impl CoreWorkspace {
     /// Switches to the map for the same reason [`Self::set_root`] switches away
     /// from it: naming what a map should be drawn from *is* asking to see that
     /// map, and leaving each frontend to pair the two commands is how a
-    /// frontend stops being a transport. The zoom goes back to the coarsest
-    /// with it: a new scope is a new ladder, of a different height, and rung 6
-    /// of the old one names nothing in particular on the new.
+    /// frontend stops being a transport. The zoom goes back to the new ladder's
+    /// opening rung with it: a new scope is a new ladder, of a different
+    /// height, and rung 6 of the old one names nothing in particular on the
+    /// new.
     pub fn set_map_scope(&mut self, scope: Option<SymbolId>) -> bool {
         let changed = scope != self.map_scope || self.view != ViewMode::ClusterMap;
         self.map_scope = scope;

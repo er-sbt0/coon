@@ -1969,10 +1969,11 @@ mod tests {
     #[test]
     fn a_scope_whose_clustering_is_still_coming_draws_nothing_not_everything() {
         // Turning a scoped tab around asks for a pairing nothing has computed:
-        // `sync_scoped_clusterings` drops the entry for the direction just left
-        // and starts the new one on a worker. Until it lands there is no map for
-        // this tab, and the whole program's is not a stand-in for one — the
-        // breadcrumb still says these are the communities under one function.
+        // the cache is keyed by (scope, direction, method), so the new
+        // direction is a target with no entry and `sync_clusterings` starts it
+        // on a worker. Until it lands there is no map for this tab, and the
+        // whole program's is not a stand-in for one — the breadcrumb still
+        // says these are the communities under one function.
         // `left[2]` has both callers and callees, so its neighbourhood is
         // non-empty whichever way the arrows are read — `left[0]` is a source,
         // and turning it around leaves one isolated node and so, correctly, no

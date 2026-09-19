@@ -445,8 +445,13 @@ pub struct MetaNode {
 pub struct LayoutEdge {
     pub source: LayoutNodeId,
     pub target: LayoutNodeId,
-    /// How many individual calls this one line stands for, so the client can
-    /// draw a heavily used relation more heavily than a stray one.
+    /// How many individual calls this one line stands for.
+    ///
+    /// The client scaled the line width by it until 8408323, when the map went
+    /// back to drawing every edge the way the rooted view draws a call, so
+    /// nothing on the canvas reads it now. It stays on the wire as the only
+    /// record of what a line aggregates, which is what `aggregate_calls`'s
+    /// tests assert on.
     pub weight: usize,
 }
 
@@ -835,9 +840,14 @@ fn place_boxes(
 
 /// Roll every call up to the pair of clusters it runs between.
 ///
-/// `CallGraph` exposes no `edges()`, so the calls have to be walked the way
-/// `logic::cluster` walks them: `callee_ids` per function, which returns one
-/// entry per distinct call *site* and so counts multiplicity for free.
+/// [`CallGraph::edges`] would report the same calls one entry per call *site*,
+/// but the walk goes the way `logic::cluster` walks them — `callee_ids` per
+/// function — for what it costs: `owner` holds only the functions the rung has
+/// boxed, which for a map scoped to one neighbourhood is a few dozen of a
+/// project's thousands, and a caller with no box is skipped before its calls
+/// are looked at. `edges()` would read every call site in the project to find
+/// the ones crossing between two boxes. Either way the duplicates in the slice
+/// are the multiplicity, counted for free.
 ///
 /// Calls whose two ends land in the same cluster are dropped. Those are the
 /// ones internal to a box whose whole purpose is to not show its insides.

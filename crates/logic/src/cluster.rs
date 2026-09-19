@@ -478,10 +478,12 @@ struct Base {
 /// `CallGraph::callee_ids` returns one entry per distinct *call site*, not per
 /// distinct callee — the graph deduplicates on (caller, callee, location). So
 /// the duplicates in that slice are exactly the number of times the caller calls
-/// the callee, and counting them is how we get an edge weight out of an API that
-/// exposes no weights and no `edges()` accessor. Those counts are the whole
-/// input to "heaviest": two functions that call each other twenty times merge
-/// before either merges with something it touches once.
+/// the callee, and counting them is how we get an edge weight out of an API
+/// that stores none: `CallGraph::edges` exists but reports the same call sites
+/// one at a time and aggregates nothing either, and walking per symbol is what
+/// makes `scope` below cost the scope's calls rather than the project's. Those
+/// counts are the whole input to the objective: two functions that call each
+/// other twenty times are twenty times the reason to put them in one box.
 ///
 /// The objective reads the calls undirected — a call is a reason to put two
 /// functions in one box whichever way it runs — and the direction is kept

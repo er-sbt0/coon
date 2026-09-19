@@ -31,9 +31,8 @@
 //! Deliberately absent: colour. The canvas reads its palette from the CSS
 //! custom properties so the graph and the chrome stay on one theme, and there
 //! is no way to write those into a `.dot` file without forking the palette and
-//! letting the copy drift. So the export carries shape, dash and pen weight —
-//! the parts that mean something — and leaves the colours to whoever renders
-//! it.
+//! letting the copy drift. So the export carries shape and dash — the parts
+//! that mean something — and leaves the colours to whoever renders it.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -45,12 +44,6 @@ use crate::app::CoreApp;
 use crate::layout::{compute_cluster_layout, compute_layout, LayoutOrientation};
 use crate::protocol::layout_options;
 use crate::workspace::{CoreWorkspace, ViewMode};
-
-/// Heaviest line an aggregated cluster edge is drawn with, and the lightest.
-/// The same log scale the client uses for the same edges (`edgeWidth` in
-/// `app.js`), so a rendered export and the canvas weight a relation alike.
-const EDGE_PEN_MIN: f32 = 1.0;
-const EDGE_PEN_MAX: f32 = 6.0;
 
 /// The formats a graph can be exported as.
 ///
@@ -329,14 +322,23 @@ fn cluster_dot(core: &CoreApp) -> Option<String> {
     }
 
     out.push('\n');
+    // Every line at one width, with the count of calls in the tooltip rather
+    // than in the ink. The pen used to scale with the count on a log curve, to
+    // match a client that scaled its own; the client stopped (8408323) because
+    // a weighted map read as a different kind of picture from the graph it
+    // summarises. That argument is stronger here, not weaker: these are
+    // function-to-function calls, the very edges `rooted_dot` writes plain, so
+    // the variance made two exports of one project two kinds of drawing. And
+    // the count is not lost for want of a hover — DOT is text, so it is legible
+    // in the source, becomes a tooltip in a rendered SVG, and comes back as an
+    // attribute through `networkx` or `gvpr`, which a line width never did.
     for edge in call_edges(&core.call_graph, &name_of, ws.direction) {
         let (Some(source), Some(target)) = (name_of.get(&edge.0), name_of.get(&edge.1)) else {
             continue;
         };
         writeln!(
             &mut out,
-            "  {source} -> {target} [penwidth={:.1}, tooltip={}];",
-            pen_width(edge.2),
+            "  {source} -> {target} [tooltip={}];",
             quote(&count_of("call", edge.2))
         )
         .ok();
@@ -348,9 +350,15 @@ fn cluster_dot(core: &CoreApp) -> Option<String> {
 
 /// Every call between two exported functions, as (from, to, how many), sorted.
 ///
-/// `CallGraph` exposes no `edges()` accessor that counts multiplicity, so the
-/// calls are walked the way `logic::cluster` and `layout` walk them:
-/// `callee_ids` per function, which returns one entry per distinct call site.
+/// [`CallGraph::edges`] yields exactly this multiplicity — one entry per call
+/// site — and `rooted_dot` above walks it. This one walks the functions
+/// instead, the way `logic::cluster` and `layout` do, because `exported` is a
+/// rung of a clustering rather than the whole graph: a map scoped to one
+/// function's neighbourhood holds a few dozen symbols out of a project's
+/// thousands, and `callee_ids` per exported function then costs the node count
+/// plus those functions' own calls, where `edges()` would read every call site
+/// in the project to find the few that land inside.
+///
 /// Calls inside a box are kept — that is what the box is for here — and the
 /// ones leaving the exported set are dropped, exactly as an isolated function
 /// is absent from the map it was never clustered into.
@@ -461,12 +469,6 @@ fn count_of(noun: &str, n: usize) -> String {
     } else {
         format!("{n} {noun}s")
     }
-}
-
-/// The same log scale the client draws these edges on, so an exported map and
-/// the canvas weight the same relation alike.
-fn pen_width(weight: usize) -> f32 {
-    (EDGE_PEN_MIN + (weight.max(1) as f32).log2()).min(EDGE_PEN_MAX)
 }
 
 /// A DOT quoted string. Backslash and quote are the only two characters the
@@ -836,6 +838,52 @@ mod tests {
             out.contains("rung "),
             "and which rung of the ladder it is; got:\n{out}"
         );
+    }
+
+    /// What a cluster-map edge stands for is written in words, not drawn as
+    /// ink. The pen width used to scale with the count to match a client that
+    /// has since gone back to one width for every edge, and these are the same
+    /// function-to-function calls a rooted export writes plain.
+    #[test]
+    fn a_map_edge_carries_its_count_in_the_tooltip_not_in_its_width() {
+        let core = CoreApp::new(create_demo_call_graph());
+        let out = dot(&core);
+
+        assert!(
+            !out.contains("penwidth"),
+            "a weighted line makes the map a different kind of drawing from a \
+             rooted export of the same calls; got:\n{out}"
+        );
+        assert!(
+            out.contains("[tooltip=\"1 call\"]"),
+            "and the count it used to carry is still on the edge; got:\n{out}"
+        );
+
+        // A pair called twice, so the tooltip is reporting a number rather
+        // than printing a constant.
+        let mut graph = CallGraph::new();
+        let caller = FunctionNode::new(
+            "a".to_string(),
+            "a".to_string(),
+            Location::new("a.c".to_string(), 1, 0),
+        );
+        let callee = FunctionNode::new(
+            "b".to_string(),
+            "b".to_string(),
+            Location::new("b.c".to_string(), 1, 0),
+        );
+        let (from, to) = (caller.id, callee.id);
+        graph.add_function(caller);
+        graph.add_function(callee);
+        graph.add_call(from, to, Location::new("a.c".to_string(), 2, 0));
+        graph.add_call(from, to, Location::new("a.c".to_string(), 3, 0));
+
+        let twice = dot(&CoreApp::new(graph));
+        assert!(
+            twice.contains("[tooltip=\"2 calls\"]"),
+            "two call sites, one line, and the file says which; got:\n{twice}"
+        );
+        assert!(!twice.contains("penwidth"), "still no ink for it:\n{twice}");
     }
 
     #[test]
