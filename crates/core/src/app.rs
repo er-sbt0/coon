@@ -2231,6 +2231,42 @@ mod tests {
         );
     }
 
+    /// A request that could not be sent must not read as one still in flight.
+    ///
+    /// `warming_up` counts `pending_requests`, so an entry left behind by a
+    /// failed send holds `loading()` true and stops `sync_clusterings` starting
+    /// any clustering at all — the cluster map stays blank and the status bar
+    /// stays on "Resolving calls" until the entry times out 30s later. See
+    /// `LspBridge::dispatch`.
+    #[test]
+    fn a_send_that_fails_does_not_stall_the_warmup() {
+        let (mut app, rx) = loaded_app(2);
+        // The LSP worker is gone; every send from here on fails.
+        drop(rx);
+
+        let events = app.tick();
+
+        assert!(app.warmup_seeded, "the warmup opened its queue");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AppEvent::FailedToSendRequest)),
+            "and said so"
+        );
+        assert!(app.edge_warmup.is_empty(), "every symbol was taken off");
+        assert!(
+            app.lsp.pending_requests.is_empty(),
+            "and nothing is waiting for an answer that was never asked for"
+        );
+        assert!(!app.warming_up());
+        assert!(!app.loading(), "so a map can be computed straight away");
+
+        let target = ClusterTarget::of(app.workspaces.current().expect("a workspace"));
+        app.stale.insert(target);
+        app.sync_clusterings();
+        assert!(app.clustering_job.is_some());
+    }
+
     #[test]
     fn demo_mode_never_warms_up() {
         // No loader, so no `Completed`, so nothing to ask and nobody to ask.

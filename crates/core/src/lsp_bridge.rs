@@ -268,6 +268,55 @@ impl LspBridge {
         events
     }
 
+    /// Hand a request to the LSP worker, and record it as in flight only once
+    /// the channel has taken it. Returns whether it went.
+    ///
+    /// This is the only place anything is put into `pending_requests`, and the
+    /// order — send first, register second — is the whole reason it exists.
+    /// Every sender used to insert its entry before the send and then return
+    /// an event on the failure paths, leaving the entry behind with nothing in
+    /// the world that would ever answer it. That is not untidy, it is a stall:
+    /// `CoreApp::warming_up` reads a non-empty `pending_requests` as an answer
+    /// still being on its way, which holds `CoreApp::loading` true, which stops
+    /// `sync_clusterings` starting *any* clustering and pins the status bar on
+    /// "Resolving calls". One failed send therefore cost the cluster map the
+    /// whole `LSP_REQUEST_TIMEOUT_SECS` it takes `check_timed_out_requests` to
+    /// retire the entry. Four senders each remembering to clean up on three
+    /// paths is the kind of invariant that survives exactly until the fifth is
+    /// written, so the send is the registration.
+    ///
+    /// Registering afterwards cannot lose a reply. The answer comes back over
+    /// `response_rx`, which is read in exactly one place — `drain_responses`,
+    /// itself called only from `CoreApp::tick` — so nothing looks a response up
+    /// in `pending_requests` until a later tick, long after this has returned.
+    /// The worker is a separate task and the channel is unbounded, so `send`
+    /// only queues; it never runs a receiver inline and can never re-enter us.
+    ///
+    /// Takes a builder rather than a finished request so that the id the entry
+    /// is filed under is by construction the one the request was built with.
+    fn dispatch(
+        &mut self,
+        request_tx: &mpsc::UnboundedSender<LspRequest>,
+        pending: PendingRequest,
+        build: impl FnOnce(String) -> LspRequest,
+    ) -> bool {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        if let Err(e) = request_tx.send(build(request_id.clone())) {
+            log::error!("Failed to send LSP request ({}): {}", pending.label, e);
+            return false;
+        }
+        log::info!(
+            "core::LspBridge sent {} (request_id={}, direction={:?}, origin={:?}, {} in flight)",
+            pending.label,
+            request_id,
+            pending.direction,
+            pending.origin,
+            self.pending_requests.len() + 1
+        );
+        self.pending_requests.insert(request_id, pending);
+        true
+    }
+
     /// Send a call hierarchy request for the given function.
     ///
     /// `direction` is the way the *asker* was reading the graph at this moment,
@@ -323,37 +372,20 @@ impl LspBridge {
             character: column.saturating_sub(1),
         };
 
-        let request_id = uuid::Uuid::new_v4().to_string();
+        let pending = PendingRequest::new(
+            Some(*function_id),
+            format!("prepare {} ({}:{}:{})", _name, file_path, line, column),
+            origin,
+        )
+        .in_direction(direction);
 
-        self.pending_requests.insert(
-            request_id.clone(),
-            PendingRequest::new(
-                Some(*function_id),
-                format!("prepare {} ({}:{})", _name, file_path, line),
-                origin,
-            )
-            .in_direction(direction),
-        );
-
-        log::info!(
-            "core::LspBridge prepare call hierarchy: request_id={} symbol={} at {}:{}:{} direction={:?} ({} in flight)",
-            request_id,
-            _name,
-            file_path,
-            line,
-            column,
-            direction,
-            self.pending_requests.len()
-        );
-
-        let request = LspRequest::PrepareCallHierarchy {
-            request_id,
-            document_uri,
-            position,
-        };
-
-        if let Err(e) = request_tx.send(request) {
-            log::error!("Failed to send LSP request: {}", e);
+        if !self.dispatch(&request_tx, pending, |request_id| {
+            LspRequest::PrepareCallHierarchy {
+                request_id,
+                document_uri,
+                position,
+            }
+        }) {
             self.loading_states.insert(
                 *function_id,
                 LoadingState::Failed("Failed to send request".to_string()),
@@ -399,25 +431,19 @@ impl LspBridge {
             character: column.saturating_sub(1),
         };
 
-        let request_id = uuid::Uuid::new_v4().to_string();
-
-        self.pending_requests.insert(
-            request_id.clone(),
-            PendingRequest::new(
-                Some(*function_id),
-                format!("references {}", name),
-                RequestOrigin::User,
-            ),
+        let pending = PendingRequest::new(
+            Some(*function_id),
+            format!("references {}", name),
+            RequestOrigin::User,
         );
 
-        let request = LspRequest::FindReferencesWithSymbols {
-            request_id,
-            document_uri,
-            position,
-        };
-
-        if let Err(e) = request_tx.send(request) {
-            log::error!("Failed to send LSP request: {}", e);
+        if !self.dispatch(&request_tx, pending, |request_id| {
+            LspRequest::FindReferencesWithSymbols {
+                request_id,
+                document_uri,
+                position,
+            }
+        }) {
             return Some(AppEvent::FailedToSendRequest);
         }
         Some(AppEvent::FindingReferences { name })
@@ -430,28 +456,17 @@ impl LspBridge {
             None => return None,
         };
 
-        let request_id = uuid::Uuid::new_v4().to_string();
+        let pending = PendingRequest::new(None, "workspace symbols", RequestOrigin::User);
 
-        self.pending_requests.insert(
-            request_id.clone(),
-            PendingRequest::new(None, "workspace symbols", RequestOrigin::User),
-        );
-
-        let request = LspRequest::GetWorkspaceSymbols {
-            request_id: request_id.clone(),
-            query: "".to_string(),
-        };
-
-        log::info!(
-            "core::LspBridge sending workspace symbols request: {}",
-            request_id
-        );
-        if let Err(e) = request_tx.send(request) {
-            log::error!("Failed to send LSP request: {}", e);
-            Some(AppEvent::FailedToSendRequest)
-        } else {
-            log::info!("Successfully sent workspace symbols request");
+        if self.dispatch(&request_tx, pending, |request_id| {
+            LspRequest::GetWorkspaceSymbols {
+                request_id,
+                query: "".to_string(),
+            }
+        }) {
             Some(AppEvent::RefreshingWorkspaceSymbols)
+        } else {
+            Some(AppEvent::FailedToSendRequest)
         }
     }
 
@@ -468,40 +483,35 @@ impl LspBridge {
         direction: CallDirection,
         origin: RequestOrigin,
     ) -> Option<AppEvent> {
-        let request_id = uuid::Uuid::new_v4().to_string();
         let which = match direction {
             CallDirection::Outgoing => "outgoing",
             CallDirection::Incoming => "incoming",
         };
 
-        self.pending_requests.insert(
-            request_id.clone(),
-            PendingRequest::new(
-                Some(*symbol_id),
-                format!("{} calls {}", which, item.name),
-                // The prepare and its follow-up are two halves of one question,
-                // so the second half is asked by whoever asked the first.
-                origin,
-            )
-            // And in the direction the first half was asked in, so a reply that
-            // is itself slow cannot drift onto a different tab's reading either.
-            .in_direction(direction),
-        );
-
-        let request_tx = match self.request_tx.as_ref() {
-            Some(tx) => tx,
-            None => {
-                log::error!("No LSP request channel available");
-                self.loading_states.insert(
-                    *symbol_id,
-                    LoadingState::Failed("No LSP channel".to_string()),
-                );
-                return Some(AppEvent::NoLspChannel);
-            }
+        // Cloned, and resolved before anything is recorded: a request only
+        // becomes pending once `dispatch` has handed it over, and there is
+        // nothing to hand it to on this path. See [`LspBridge::dispatch`].
+        let Some(request_tx) = self.request_tx.clone() else {
+            log::error!("No LSP request channel available");
+            self.loading_states.insert(
+                *symbol_id,
+                LoadingState::Failed("No LSP channel".to_string()),
+            );
+            return Some(AppEvent::NoLspChannel);
         };
 
-        log::info!("Requesting {} calls for: {}", which, item.name);
-        let request = match direction {
+        let pending = PendingRequest::new(
+            Some(*symbol_id),
+            format!("{} calls {}", which, item.name),
+            // The prepare and its follow-up are two halves of one question,
+            // so the second half is asked by whoever asked the first.
+            origin,
+        )
+        // And in the direction the first half was asked in, so a reply that
+        // is itself slow cannot drift onto a different tab's reading either.
+        .in_direction(direction);
+
+        if self.dispatch(&request_tx, pending, |request_id| match direction {
             CallDirection::Outgoing => lsp::LspRequest::GetOutgoingCalls {
                 request_id,
                 call_hierarchy_item: item,
@@ -510,19 +520,16 @@ impl LspBridge {
                 request_id,
                 call_hierarchy_item: item,
             },
-        };
-
-        if let Err(e) = request_tx.send(request) {
-            log::error!("Failed to send calls request: {}", e);
+        }) {
+            Some(AppEvent::LoadingCalls {
+                direction: which.to_string(),
+            })
+        } else {
             self.loading_states.insert(
                 *symbol_id,
                 LoadingState::Failed(format!("Failed to request {} calls", which)),
             );
             None
-        } else {
-            Some(AppEvent::LoadingCalls {
-                direction: which.to_string(),
-            })
         }
     }
 
@@ -593,5 +600,200 @@ impl LspBridge {
     pub fn clear(&mut self) {
         self.loading_states.clear();
         self.pending_requests.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use model::{FunctionNode, Location};
+
+    /// A graph holding one function, at an *absolute* path: the senders turn a
+    /// definition location into a `file://` URL, and a relative path fails that
+    /// conversion before a request is ever built.
+    fn one_function() -> (CallGraph, SymbolId) {
+        let mut graph = CallGraph::new();
+        let id = graph.add_function(FunctionNode::new(
+            "alpha".to_string(),
+            "alpha".to_string(),
+            Location::new("/src/test.c".to_string(), 1, 1),
+        ));
+        (graph, id)
+    }
+
+    fn hierarchy_item() -> lsp_types::CallHierarchyItem {
+        let position = lsp_types::Position {
+            line: 0,
+            character: 0,
+        };
+        let range = lsp_types::Range {
+            start: position,
+            end: position,
+        };
+        lsp_types::CallHierarchyItem {
+            name: "alpha".to_string(),
+            kind: lsp_types::SymbolKind::FUNCTION,
+            tags: None,
+            detail: None,
+            uri: lsp_types::Url::parse("file:///src/test.c").expect("a valid file url"),
+            range,
+            selection_range: range,
+            data: None,
+        }
+    }
+
+    /// A bridge whose worker has died: the sender is live, so every caller gets
+    /// past its channel check, and the receiving half is gone, so every `send`
+    /// fails — which is what this happens to be in the field, an LSP service
+    /// that exited while the app kept asking it questions.
+    fn dead_worker() -> LspBridge {
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let mut bridge = LspBridge::new();
+        bridge.request_tx = Some(tx);
+        bridge
+    }
+
+    /// A bridge wired to a worker that is listening. The receiver is handed
+    /// back because dropping it here would turn every send into a failure.
+    fn live_worker() -> (LspBridge, mpsc::UnboundedReceiver<LspRequest>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut bridge = LspBridge::new();
+        bridge.request_tx = Some(tx);
+        (bridge, rx)
+    }
+
+    /// A request that never left is not in flight, and saying it is stalls the
+    /// app: see [`LspBridge::dispatch`]. Every sender, every failure path.
+    #[test]
+    fn a_send_that_fails_leaves_nothing_pending() {
+        let (graph, id) = one_function();
+
+        let mut bridge = dead_worker();
+        let event =
+            bridge.send_call_hierarchy(&graph, &id, RequestOrigin::Warmup, CallDirection::Outgoing);
+        assert!(matches!(event, Some(AppEvent::FailedToSendRequest)));
+        assert!(bridge.pending_requests.is_empty(), "prepare");
+
+        let mut bridge = dead_worker();
+        let event = bridge.send_references(&graph, &id);
+        assert!(matches!(event, Some(AppEvent::FailedToSendRequest)));
+        assert!(bridge.pending_requests.is_empty(), "references");
+
+        let mut bridge = dead_worker();
+        let event = bridge.send_workspace_symbols();
+        assert!(matches!(event, Some(AppEvent::FailedToSendRequest)));
+        assert!(bridge.pending_requests.is_empty(), "workspace symbols");
+
+        let mut bridge = dead_worker();
+        let event = bridge.send_follow_up_call(
+            &id,
+            hierarchy_item(),
+            CallDirection::Outgoing,
+            RequestOrigin::Warmup,
+        );
+        // `None` here is this sender's spelling of failure, and deliberately
+        // the opposite way round from the three above.
+        assert!(event.is_none());
+        assert!(bridge.pending_requests.is_empty(), "follow-up");
+    }
+
+    /// The follow-up is the one sender that used to record the request before
+    /// it had even looked for a channel to send it on, so a bridge with no
+    /// worker at all — demo mode, or a loader that has not handed its channels
+    /// over yet — left an entry behind without a single byte going anywhere.
+    #[test]
+    fn a_follow_up_with_no_channel_leaves_nothing_pending() {
+        let (_, id) = one_function();
+        let mut bridge = LspBridge::new();
+
+        let event = bridge.send_follow_up_call(
+            &id,
+            hierarchy_item(),
+            CallDirection::Incoming,
+            RequestOrigin::User,
+        );
+
+        assert!(matches!(event, Some(AppEvent::NoLspChannel)));
+        assert!(bridge.pending_requests.is_empty());
+        assert!(matches!(
+            bridge.get_loading_state(&id),
+            LoadingState::Failed(_)
+        ));
+    }
+
+    /// The other half of the fix: a request that *did* go out is still tracked.
+    /// Untracking everything would pass the tests above and lose every reply,
+    /// since `take_pending` is what tells a response which symbol it answers.
+    #[test]
+    fn a_send_that_works_records_exactly_one_request() {
+        let (graph, id) = one_function();
+
+        let (mut bridge, mut rx) = live_worker();
+        assert!(bridge
+            .send_call_hierarchy(&graph, &id, RequestOrigin::Warmup, CallDirection::Incoming)
+            .is_none());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(LspRequest::PrepareCallHierarchy { .. })
+        ));
+        assert_eq!(bridge.pending_requests.len(), 1, "prepare");
+        let pending = bridge.pending_requests.values().next().expect("one entry");
+        assert_eq!(pending.symbol_id, Some(id));
+        assert_eq!(pending.origin, RequestOrigin::Warmup);
+        assert_eq!(pending.direction, Some(CallDirection::Incoming));
+
+        let (mut bridge, mut rx) = live_worker();
+        assert!(matches!(
+            bridge.send_references(&graph, &id),
+            Some(AppEvent::FindingReferences { .. })
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(LspRequest::FindReferencesWithSymbols { .. })
+        ));
+        assert_eq!(bridge.pending_requests.len(), 1, "references");
+
+        let (mut bridge, mut rx) = live_worker();
+        assert!(matches!(
+            bridge.send_workspace_symbols(),
+            Some(AppEvent::RefreshingWorkspaceSymbols)
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(LspRequest::GetWorkspaceSymbols { .. })
+        ));
+        assert_eq!(bridge.pending_requests.len(), 1, "workspace symbols");
+
+        let (mut bridge, mut rx) = live_worker();
+        assert!(matches!(
+            bridge.send_follow_up_call(
+                &id,
+                hierarchy_item(),
+                CallDirection::Outgoing,
+                RequestOrigin::User
+            ),
+            Some(AppEvent::LoadingCalls { .. })
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(LspRequest::GetOutgoingCalls { .. })
+        ));
+        assert_eq!(bridge.pending_requests.len(), 1, "follow-up");
+    }
+
+    /// The id a request is filed under has to be the id it was sent with, or
+    /// the reply matches nothing and `take_pending` logs it as unknown.
+    #[test]
+    fn a_request_is_filed_under_the_id_it_was_sent_with() {
+        let (mut bridge, mut rx) = live_worker();
+        bridge.send_workspace_symbols();
+
+        let sent = match rx.try_recv().expect("the request went out") {
+            LspRequest::GetWorkspaceSymbols { request_id, .. } => request_id,
+            other => panic!("expected a workspace symbol query, got {other:?}"),
+        };
+        assert!(bridge.take_pending(&sent).is_some());
+        assert!(bridge.pending_requests.is_empty());
     }
 }
