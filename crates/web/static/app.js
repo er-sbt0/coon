@@ -132,6 +132,7 @@ let mapLevels        = 0;             // how many rungs there are; 0 while nothi
 let mapClusters      = 0;             // how many boxes this rung holds — what the zoom control reads out
 let clusterMethod    = null;          // which algorithm built the map
 let clusterMethods   = [];            // every algorithm on offer, for the picker
+let selectedClusterId = null;         // the box pointed at on the map, if it is still on this rung
 let lastFitKey       = null;                      // refit only on root/direction change
 
 const MAX_FIT_ZOOM = 1.15;
@@ -578,6 +579,18 @@ function rebuildClusterMap(map) {
     cy.add({ group: 'edges', data: { id, source: edge.source, target: edge.target } });
   }
 
+  // Put the mark back on the box the user pointed at. A snapshot tears the
+  // canvas down for reasons that have nothing to do with them — a batch of
+  // warmup edges landing, a regrouping — and a mark that vanished then would
+  // read as a click that stopped working. The rung is part of the element id,
+  // so a zoom step clears it without a rule of its own: the box that was
+  // pointed at is not on this map any more.
+  if (selectedClusterId) {
+    const marked = cy.$id(selectedClusterId);
+    if (marked.length) marked.addClass('focused');
+    else selectedClusterId = null;
+  }
+
   // The rung is deliberately *not* part of the key. Every box is placed where
   // the functions it holds sit (`core::layout::MapFrame`), so a zoom step
   // merges boxes in place rather than redrawing a different picture of the same
@@ -601,8 +614,14 @@ function rebuildClusterMap(map) {
 function clusterTap(node) {
   const key = node.data('key');
   if (!key) return;
-  cy.nodes().removeClass('selected');
-  node.addClass('selected');
+  // The same accent border a pointed-at node wears in the rooted view, and for
+  // the same reason: the info line alone leaves the box the user just hit
+  // looking exactly like every other one. One mark, one meaning — a second
+  // class for "selected here" would be a second signal saying the first one's
+  // thing. Exactly one box wears it, so the old one gives it up first.
+  selectedClusterId = node.id();
+  cy.nodes().removeClass('focused');
+  node.addClass('focused');
   setInfo(node.data('full'));
 }
 
