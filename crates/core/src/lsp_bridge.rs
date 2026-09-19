@@ -400,7 +400,7 @@ impl LspBridge {
         origin: RequestOrigin,
         direction: CallDirection,
     ) -> SendOutcome {
-        let (file_path, line, column, _name) = {
+        let (file_path, line, column, name) = {
             if let Some(function) = call_graph.get_function(function_id) {
                 (
                     function.definition_location.file_path.clone(),
@@ -422,7 +422,7 @@ impl LspBridge {
         let Some(request_tx) = self.request_tx.clone() else {
             log::warn!(
                 "core::LspBridge no call hierarchy for {}: LSP channel not wired up yet",
-                _name
+                name
             );
             return SendOutcome::Declined;
         };
@@ -445,7 +445,7 @@ impl LspBridge {
 
         let pending = PendingRequest::new(
             Some(*function_id),
-            format!("prepare {} ({}:{}:{})", _name, file_path, line, column),
+            format!("prepare {} ({}:{}:{})", name, file_path, line, column),
             origin,
         )
         .in_direction(direction);

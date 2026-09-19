@@ -113,11 +113,24 @@ pub(super) async fn ensure_document_opened(
         file_path.display()
     );
 
+    // Advisory only: clangd takes the real language from the file's
+    // `compile_commands.json` entry — or, for a header, from the entry it
+    // infers from a similar translation unit — so this is what we claim, not
+    // what gets parsed. It is still worth getting right, because a server that
+    // *does* honour `languageId` parses a C++ header as C and reports every
+    // template as a syntax error.
+    //
+    // `.hpp` and `.hxx` are C++ by construction — nobody writes a C header
+    // with either. `.h` is the genuinely ambiguous one and stays `c`: in a C
+    // project it is a C header, in a C++ project it usually is not, and the
+    // extension cannot tell the two apart. Since the compile database decides
+    // anyway, the honest answer is to keep the answer this tool has always
+    // given rather than to guess the other way.
     let language_id = match file_path.extension().and_then(|ext| ext.to_str()) {
         Some("rs") => "rust",
-        Some("c") => "c",
+        Some("c") | Some("h") => "c",
         Some("cpp") | Some("cxx") | Some("cc") => "cpp",
-        Some("h") | Some("hpp") | Some("hxx") => "c",
+        Some("hpp") | Some("hxx") => "cpp",
         Some("py") => "python",
         Some("js") => "javascript",
         Some("ts") => "typescript",

@@ -196,8 +196,6 @@ pub struct CoreApp {
     /// thread every tick for as long as the app runs. Cleared by
     /// `mark_graph_changed`: a different graph is a different question.
     clustering_failed: HashSet<ClusterTarget>,
-    /// When the graph last changed. The settling period is measured from here.
-    graph_changed_at: Option<Instant>,
     /// Functions still awaiting their first call-hierarchy fetch.
     ///
     /// clangd's workspace symbols carry no edges, so a freshly loaded project is
@@ -285,7 +283,6 @@ impl CoreApp {
             map_frame,
             frame_stale: false,
             clustering_failed: HashSet::new(),
-            graph_changed_at: None,
             edge_warmup: VecDeque::new(),
             warmup_seeded: false,
             warmup_total: 0,
@@ -1113,16 +1110,16 @@ impl CoreApp {
 
     /// Record that the call graph gained nodes or edges.
     ///
-    /// The timestamp restarts on every change rather than being stamped once
-    /// when the cache goes dirty: the settling period is about the stream
-    /// having gone quiet, not about how long ago it started talking.
+    /// This only marks; it never recomputes. What is owed is worked out from
+    /// the marks in [`Self::sync_clusterings`], which starts nothing while the
+    /// project is still arriving — so the settling a growing graph needs comes
+    /// from `loading()` going false, not from a timestamp taken here.
     fn mark_graph_changed(&mut self) {
         // Every map cached describes the graph as it was a moment ago.
         let cached: Vec<ClusterTarget> = self.clusterings.keys().copied().collect();
         self.stale.extend(cached);
         // And so does the frame they are placed in.
         self.frame_stale = true;
-        self.graph_changed_at = Some(Instant::now());
         // A new graph is a new question, so whatever failed against the old one
         // is worth asking again.
         self.clustering_failed.clear();

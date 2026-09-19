@@ -516,24 +516,24 @@ fn filename(core: &CoreApp, format: ExportFormat) -> Option<String> {
 /// for `:`, `<`, `>`, `*` and spaces, all of which are either illegal or
 /// annoying somewhere.
 fn slug(text: &str) -> String {
-    let mut out: String = text
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    while out.contains("--") {
-        out = out.replace("--", "-");
+    // One pass: a run of illegal characters becomes a single `-`, because
+    // `operator<<` should read `operator-` and not `operator---`. Collapsing
+    // afterwards means rescanning and reallocating the whole string once per
+    // doubled dash, which for `std::map<std::string, int>::at` is several
+    // passes to reach a fixed point the writer already knew.
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
+            out.push(c);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
     }
-    let trimmed = out.trim_matches('-').to_string();
+    let trimmed = out.trim_matches('-');
     if trimmed.is_empty() {
         "graph".to_string()
     } else {
-        trimmed
+        trimmed.to_string()
     }
 }
 
@@ -1000,6 +1000,23 @@ mod tests {
         assert_eq!(
             out.filename, "operator-_kb.dot",
             "a filename keeps none of that"
+        );
+    }
+
+    /// A run of illegal characters is one dash however long it is, and the
+    /// dashes a run leaves at either end are not part of the name. The
+    /// interesting case is three or more in a row: the collapse has to reach a
+    /// fixed point, not merely halve.
+    #[test]
+    fn slug_collapses_runs_of_separators() {
+        assert_eq!(slug("std::map<int, char>::at"), "std-map-int-char-at");
+        assert_eq!(slug("a <<< b"), "a-b");
+        assert_eq!(slug("  leading and trailing  "), "leading-and-trailing");
+        assert_eq!(slug("<<<>>>"), "graph", "nothing legal left to name it");
+        assert_eq!(
+            slug("keeps_word.chars"),
+            "keeps_word.chars",
+            "`_` and `.` are legal in a filename and survive"
         );
     }
 }
