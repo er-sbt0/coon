@@ -68,6 +68,24 @@
 //! is where they belong anyway. On the project above the constraint cost 0.04
 //! of modularity and four boxes at the opening rung.
 //!
+//! **Markov clustering is the second method.** [`ClusterMethod::Markov`] runs
+//! van Dongen's MCL (2000) instead of Louvain: a random walk over the calls,
+//! alternately *expanded* — the transition matrix squared, so flow follows
+//! every two-step path at once — and *inflated* — every entry raised to a
+//! power and the column renormalised, so strong currents are fed and weak
+//! ones starved — until the flow settles and every function drains into an
+//! attractor. Functions sharing an attractor share a box. Closeness is how
+//! many short paths join two functions rather than whether any one call does,
+//! which is what keeps a single stray call from gluing two groups together;
+//! the inflation is the only knob, higher splitting finer, and no count of
+//! boxes is asked for. Its ladder is built the same way as modularity's: the
+//! opening rung is MCL at [`MARKOV_INFLATION`], and the rungs above it re-run
+//! MCL on the quotient with the inflation eased towards one until the top
+//! fits. It is held to the acyclicity rule at the one step that admits it —
+//! where the settled flow is read off into boxes ([`markov_pass`]) — and the
+//! flow itself is computed sparsely, because dense squaring is cubic in the
+//! function count.
+//!
 //! The implementation works in index space — every hot loop indexes `Vec`s
 //! rather than hashing `SymbolId`s — so it stays usable on the ~10k-node graphs
 //! a mid-sized C++ project produces.
@@ -129,30 +147,72 @@ const GAIN_EPSILON: f64 = 1e-9;
 /// costs a BFS per member. Fall back to out-degree, which is one pass.
 const REACHABILITY_MEMBER_LIMIT: usize = 200;
 
+/// The inflation Markov clustering runs at: the power every column of the
+/// flow matrix is raised to between expansions.
+///
+/// MCL's one knob. Higher starves weak flow sooner and the walk settles into
+/// more, smaller boxes; lower lets it spread and settles into fewer. Two is
+/// van Dongen's default, and the grain the map opens on.
+pub const MARKOV_INFLATION: f64 = 2.0;
+
+/// How close to one the inflation is eased, above the opening rung, to reach
+/// [`TARGET_TOP_CLUSTERS`].
+///
+/// At one exactly MCL is a plain random walk, which settles into one box per
+/// connected component; just above it a few attractors survive. Each easing
+/// halves the distance to one, and this is the floor, for the same reason
+/// [`MIN_RESOLUTION`] is one: a graph of disconnected components has nothing
+/// any inflation will merge, and the ladder has to stop wide rather than spin.
+const MIN_INFLATION: f64 = 1.0 + 1.0 / 32.0;
+
+/// Expansion–inflation rounds before the flow is read off whether it has
+/// settled or not. On a call graph it settles in a few dozen; the cap bounds
+/// the graphs it oscillates on, and what it reads off then is still a
+/// partition.
+const MARKOV_MAX_ITERATIONS: usize = 100;
+
+/// The flow has settled when no entry moved by more than this in a round.
+const MARKOV_CONVERGENCE: f64 = 1e-6;
+
+/// An entry below this share of its column is dropped after every round.
+///
+/// This is what keeps the matrix sparse: the entries pruned are the ones
+/// inflation was about to starve anyway, and without it every column fills in
+/// after a few expansions and a round costs the cube of the function count.
+const MARKOV_PRUNE_THRESHOLD: f64 = 1e-4;
+
+/// At most this many entries survive in a column, the heaviest kept, which
+/// bounds one round at `n · K²` however dense the graph is.
+const MARKOV_PRUNE_KEEP: usize = 100;
+
 /// Which algorithm builds the coarsening ladder.
 ///
-/// One entry today, and named anyway. A clustering is a claim about a program's
-/// shape, and every method makes a different one — a community detector answers
-/// "what belongs together", where a coarsener answers "what merges cheaply".
-/// Which claim is on screen is the user's to pick, so it is a value that
-/// travels with the workspace and the snapshot rather than a constant compiled
-/// into one call site.
+/// A clustering is a claim about a program's shape, and every method makes a
+/// different one — modularity answers "who calls each other more than chance
+/// would", flow answers "where does a walk along the calls end up". Which
+/// claim is on screen is the user's to pick, so it is a value that travels
+/// with the workspace and the snapshot rather than a constant compiled into
+/// one call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum ClusterMethod {
     /// Modularity optimised by the Louvain method, described at the top of
     /// this module.
     #[default]
     Modularity,
+    /// Markov clustering — flow simulation with inflation — also described
+    /// at the top of this module.
+    Markov,
 }
 
 impl ClusterMethod {
     /// Every method, in the order a picker should list them.
-    pub const ALL: &'static [ClusterMethod] = &[ClusterMethod::Modularity];
+    pub const ALL: &'static [ClusterMethod] = &[ClusterMethod::Modularity, ClusterMethod::Markov];
 
     /// What to write in the picker.
     pub fn label(self) -> &'static str {
         match self {
             ClusterMethod::Modularity => "Modularity",
+            ClusterMethod::Markov => "Markov flow",
         }
     }
 
@@ -161,6 +221,9 @@ impl ClusterMethod {
         match self {
             ClusterMethod::Modularity => {
                 "Groups functions that call each other more than chance would"
+            }
+            ClusterMethod::Markov => {
+                "Groups functions a random walk along the calls drains into together"
             }
         }
     }
@@ -302,9 +365,7 @@ impl Clustering {
             };
         }
 
-        let mut ladder = match method {
-            ClusterMethod::Modularity => coarsen(base.graph, base.sizes),
-        };
+        let mut ladder = coarsen(base.graph, base.sizes, method);
         // The ladder's first rung maps condensed nodes; `build_clustering`
         // reads a map from symbols, so the condensation is composed in.
         let first: Vec<usize> = base
@@ -341,10 +402,11 @@ impl Clustering {
 
     /// The rung a map should open on.
     ///
-    /// The last rung built at plain modularity, γ = 1: the grouping the
-    /// objective itself stands behind. Coarser rungs exist only when that one
-    /// was wider than [`TARGET_TOP_CLUSTERS`], and they are where a user zooms
-    /// out *to*, not where they should land. See [`Ladder::opening`].
+    /// The last rung built at the method's own grain — plain modularity,
+    /// γ = 1, or MCL at [`MARKOV_INFLATION`]: the grouping the method itself
+    /// stands behind. Coarser rungs exist only when that one was wider than
+    /// [`TARGET_TOP_CLUSTERS`], and they are where a user zooms out *to*, not
+    /// where they should land. See [`Ladder::opening`].
     pub fn opening_level(&self) -> usize {
         self.opening.min(self.levels.len().saturating_sub(1))
     }
@@ -641,28 +703,21 @@ fn condense(out: &[Vec<usize>]) -> (Vec<usize>, usize) {
 // Modularity
 // ---------------------------------------------------------------------------
 
-/// Run passes of the Louvain method down the resolution ladder until the top
-/// is at most [`TARGET_TOP_CLUSTERS`] wide.
+/// Run passes of `method` until the top is at most [`TARGET_TOP_CLUSTERS`]
+/// wide.
 ///
 /// The return is the ladder in the shape [`build_clustering`] reads: entry 0
 /// maps a base node to its level-0 cluster, and entry `l` maps a level-`l - 1`
 /// cluster to its level-`l` one. So the number of entries is the number of
-/// productive passes, and every entry is one rung of zoom.
-///
-/// Three phases, each a resolution regime:
-///
-/// 1. One pass per entry of [`RESOLUTION_LADDER`], finest first. A pass that
-///    merges nothing adds no rung.
-/// 2. Passes at γ = 1 until one merges nothing — the standard Louvain run to
-///    its optimum. The last rung this leaves is the opening rung.
-/// 3. Only while the top is still wider than the target: halve γ and pass
-///    again, down to [`MIN_RESOLUTION`].
+/// productive passes, and every entry is one rung of zoom. Which passes, in
+/// which regimes, is the method's — [`Coarsening::by_modularity`] and
+/// [`Coarsening::by_flow`] — and everything around them is shared.
 ///
 /// A graph already at or below the target still gets a rung, made of
 /// singletons. A map has to have something to draw, and "every function is its
 /// own box" is the honest answer for a graph that small — grouping it further
 /// would merge a program small enough to read whole.
-fn coarsen(base: WeightedGraph, sizes: Vec<usize>) -> Ladder {
+fn coarsen(base: WeightedGraph, sizes: Vec<usize>, method: ClusterMethod) -> Ladder {
     let mut run = Coarsening {
         levels: Vec::new(),
         sizes,
@@ -671,14 +726,9 @@ fn coarsen(base: WeightedGraph, sizes: Vec<usize>) -> Ladder {
     };
 
     if run.current.node_count() > TARGET_TOP_CLUSTERS {
-        for &resolution in RESOLUTION_LADDER {
-            run.pass(resolution);
-        }
-        while run.pass(1.0) {}
-        let mut resolution = 0.5;
-        while run.current.node_count() > TARGET_TOP_CLUSTERS && resolution >= MIN_RESOLUTION {
-            run.pass(resolution);
-            resolution /= 2.0;
+        match method {
+            ClusterMethod::Modularity => run.by_modularity(),
+            ClusterMethod::Markov => run.by_flow(),
         }
     }
 
@@ -717,25 +767,77 @@ struct Coarsening {
     /// How many base functions each node of `current` holds.
     sizes: Vec<usize>,
     current: WeightedGraph,
-    /// The last rung built at γ ≥ 1.
+    /// The last rung built at the method's own grain.
     opening: usize,
 }
 
 impl Coarsening {
-    /// One pass at `resolution`, kept as a rung if it merged anything.
-    /// Returns whether it did.
-    fn pass(&mut self, resolution: f64) -> bool {
+    /// The Louvain ladder, in three phases, each a resolution regime:
+    ///
+    /// 1. One pass per entry of [`RESOLUTION_LADDER`], finest first. A pass
+    ///    that merges nothing adds no rung.
+    /// 2. Passes at γ = 1 until one merges nothing — the standard Louvain run
+    ///    to its optimum. The last rung this leaves is the opening rung.
+    /// 3. Only while the top is still wider than the target: halve γ and pass
+    ///    again, down to [`MIN_RESOLUTION`].
+    fn by_modularity(&mut self) {
+        for &resolution in RESOLUTION_LADDER {
+            self.pass(resolution >= 1.0, |graph| louvain_pass(graph, resolution));
+        }
+        while self.pass(true, |graph| louvain_pass(graph, 1.0)) {}
+        let mut resolution = 0.5;
+        while self.current.node_count() > TARGET_TOP_CLUSTERS && resolution >= MIN_RESOLUTION {
+            self.pass(false, |graph| louvain_pass(graph, resolution));
+            resolution /= 2.0;
+        }
+    }
+
+    /// The Markov ladder, in two phases:
+    ///
+    /// 1. One pass of MCL at [`MARKOV_INFLATION`] over the base graph. That
+    ///    is the grouping the method stands behind and the rung the map opens
+    ///    on. One pass, not passes until nothing merges: MCL is not an
+    ///    optimiser climbing towards an optimum, a run *is* the answer, and a
+    ///    run over the quotient is a different, coarser question.
+    /// 2. Only while the top is still wider than the target: pass again over
+    ///    the quotient, at the same inflation for as long as that merges
+    ///    anything, then with the inflation eased halfway to one each time it
+    ///    stops, down to [`MIN_INFLATION`]. Easing is the analogue of lowering
+    ///    γ — a weaker inflation starves less, so the flow spreads further
+    ///    before it settles and fewer attractors survive.
+    ///
+    /// There are no rungs finer than the opening. MCL at a higher inflation
+    /// on the base graph is not a refinement of MCL at a lower one — the two
+    /// partitions need not nest — and a ladder is a chain of refinements.
+    fn by_flow(&mut self) {
+        self.pass(true, |graph| markov_pass(graph, MARKOV_INFLATION));
+        let mut inflation = MARKOV_INFLATION;
+        while self.current.node_count() > TARGET_TOP_CLUSTERS && inflation >= MIN_INFLATION {
+            if !self.pass(false, |graph| markov_pass(graph, inflation)) {
+                inflation = 1.0 + (inflation - 1.0) / 2.0;
+            }
+        }
+    }
+
+    /// One pass of `partition` over the quotient so far, kept as a rung if it
+    /// merged anything, and marked as the opening rung if it did and `opens`
+    /// says the pass ran at the method's own grain. Returns whether it merged.
+    fn pass(
+        &mut self,
+        opens: bool,
+        partition: impl FnOnce(&WeightedGraph) -> (Vec<usize>, usize),
+    ) -> bool {
         if self.levels.len() >= MAX_ROUNDS {
             return false;
         }
-        let (groups, count) = louvain_pass(&self.current, resolution);
+        let (groups, count) = partition(&self.current);
         if count == self.current.node_count() {
             return false;
         }
         self.sizes = merged_sizes(&self.sizes, &groups, count);
         self.current = aggregate(&self.current, &groups, count);
         self.levels.push(groups);
-        if resolution >= 1.0 {
+        if opens {
             self.opening = self.levels.len() - 1;
         }
         true
@@ -747,7 +849,7 @@ struct Ladder {
     /// Entry 0 maps a base node to its level-0 cluster, and entry `l` maps a
     /// level-`l - 1` cluster to its level-`l` one.
     levels: Vec<Vec<usize>>,
-    /// The last rung built at plain modularity.
+    /// The last rung built at the method's own grain.
     opening: usize,
 }
 
@@ -756,10 +858,12 @@ impl Ladder {
     ///
     /// How far the ladder goes and where it opens are separate questions. The
     /// top is bounded by [`TARGET_TOP_CLUSTERS`] so a user has somewhere to zoom
-    /// out to; the opening rung is the last one plain modularity built, because
-    /// that is the grouping the objective stands behind — the rungs above it
-    /// merge modules that did not want to merge, to fit a count, and the rungs
-    /// below it are the same modules cut finer, for looking inside.
+    /// out to; the opening rung is the last one the method built at its own
+    /// grain — plain modularity, or MCL at [`MARKOV_INFLATION`] — because that
+    /// is the grouping the method stands behind. The rungs above it merge
+    /// modules that did not want to merge, to fit a count, and the rungs below
+    /// it, where there are any, are the same modules cut finer, for looking
+    /// inside.
     fn opening(&self) -> usize {
         self.opening.min(self.levels.len().saturating_sub(1))
     }
@@ -872,6 +976,319 @@ fn louvain_pass(graph: &WeightedGraph, resolution: f64) -> (Vec<usize>, usize) {
 
     renumber(&community)
 }
+// ---------------------------------------------------------------------------
+// Markov clustering
+// ---------------------------------------------------------------------------
+
+/// One pass of Markov clustering at `inflation`: settle the flow over the
+/// graph, then put every node in the box of the attractor it drains into.
+///
+/// Returns the assignment of nodes to boxes, renumbered so they are `0..count`
+/// in order of lowest member, like [`louvain_pass`].
+///
+/// Reading the settled matrix off is where MCL's interpretation lives, and
+/// where this one differs from the textbook's. An *attractor* is a node whose
+/// column still holds flow to itself; attractors that feed each other are one
+/// system; and every other node belongs to the system its column sends the
+/// most flow to. Textbook MCL stops there, and can put a system on both ends
+/// of a one-way path — the objective is flow, which runs both ways over calls
+/// that run one. So the read-off is held to the same rule as a Louvain move:
+/// two attractors are united only if the quotient stays a DAG, and a node
+/// drains into the best system that keeps it one, falling through to the next
+/// by flow and staying alone if none does. Systems are formed first, in index
+/// order, and then the rest are placed, in index order, so the result is a
+/// function of the flow alone. A node whose column reaches no attractor —
+/// which only happens when [`MARKOV_MAX_ITERATIONS`] ran out first — is left
+/// as a box of its own.
+fn markov_pass(graph: &WeightedGraph, inflation: f64) -> (Vec<usize>, usize) {
+    let n = graph.node_count();
+    let flow = markov_flow(graph, inflation);
+    let holds = |column: &[(usize, f64)], row: usize| {
+        column.binary_search_by_key(&row, |entry| entry.0).is_ok()
+    };
+    let attractor: Vec<bool> = flow
+        .iter()
+        .enumerate()
+        .map(|(node, column)| holds(column, node))
+        .collect();
+
+    let mut group: Vec<usize> = (0..n).collect();
+    let mut members: Vec<Vec<usize>> = (0..n).map(|node| vec![node]).collect();
+    let mut scratch = CycleScratch::new(n);
+
+    // Attractors that feed each other are one system. Mutual flow rather than
+    // one-way, because a column that has not quite settled can still carry a
+    // trace towards an attractor it will not end up with.
+    for node in 0..n {
+        if !attractor[node] {
+            continue;
+        }
+        for &(other, _) in &flow[node] {
+            if other <= node || !attractor[other] || !holds(&flow[other], node) {
+                continue;
+            }
+            let (mine, theirs) = (group[other], group[node]);
+            if mine == theirs {
+                continue;
+            }
+            let after = |member: usize| {
+                if group[member] == mine {
+                    theirs
+                } else {
+                    group[member]
+                }
+            };
+            if joins_a_cycle(graph, after, &members, &members[mine], theirs, &mut scratch) {
+                continue;
+            }
+            let moving = std::mem::take(&mut members[mine]);
+            for &member in &moving {
+                group[member] = theirs;
+            }
+            members[theirs].extend(moving);
+        }
+    }
+
+    // Everything else drains into the system it sends the most flow to, and
+    // failing that into the system it shares the most calls with. Settled flow
+    // is all or nothing — a column holds its whole mass on one attractor —
+    // so when the flow's answer would close a cycle there is no second answer
+    // in the flow to fall through to, and the node's own calls are asked
+    // instead, the way the singleton fold asks them at the top. `BTreeMap`s
+    // so equal weights fall to the lower system, and stable sorts keep that
+    // order among ties.
+    //
+    // Swept to a fixed point rather than once, because the cycle test is
+    // against the boxes as they stand: `a` calling `b` calling `d` cannot
+    // join `d`'s box while `b` is still outside it — that is a cycle between
+    // two boxes — and can once `b` is in. One sweep in index order left such
+    // nodes alone for no better reason than their position in the order.
+    let mut by_flow: BTreeMap<usize, f64> = BTreeMap::new();
+    let mut by_calls: BTreeMap<usize, f64> = BTreeMap::new();
+    for _ in 0..MAX_SWEEPS {
+        let mut moved = false;
+        for node in 0..n {
+            if attractor[node] || group[node] != node {
+                continue;
+            }
+            if drain(
+                graph,
+                node,
+                &flow,
+                &attractor,
+                &mut group,
+                &mut members,
+                &mut scratch,
+                &mut by_flow,
+                &mut by_calls,
+            ) {
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+
+    renumber(&group)
+}
+
+/// Place one node that is not an attractor into the best system the DAG rule
+/// allows — see [`markov_pass`]. Returns whether it found one.
+#[allow(clippy::too_many_arguments)]
+fn drain(
+    graph: &WeightedGraph,
+    node: usize,
+    flow: &[Vec<(usize, f64)>],
+    attractor: &[bool],
+    group: &mut [usize],
+    members: &mut [Vec<usize>],
+    scratch: &mut CycleScratch,
+    by_flow: &mut BTreeMap<usize, f64>,
+    by_calls: &mut BTreeMap<usize, f64>,
+) -> bool {
+    {
+        by_flow.clear();
+        for &(row, weight) in &flow[node] {
+            if attractor[row] {
+                *by_flow.entry(group[row]).or_insert(0.0) += weight;
+            }
+        }
+        by_calls.clear();
+        for &(neighbour, weight) in &graph.adj[node] {
+            let system = group[neighbour];
+            if attractor[system] && !by_flow.contains_key(&system) {
+                *by_calls.entry(system).or_insert(0.0) += weight;
+            }
+        }
+        let mut candidates: Vec<(usize, f64)> = by_flow.iter().map(|(&g, &w)| (g, w)).collect();
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let mut fallbacks: Vec<(usize, f64)> = by_calls.iter().map(|(&g, &w)| (g, w)).collect();
+        fallbacks.sort_by(|a, b| b.1.total_cmp(&a.1));
+        candidates.extend(fallbacks);
+        for (candidate, _) in candidates {
+            let after = |member: usize| {
+                if member == node {
+                    candidate
+                } else {
+                    group[member]
+                }
+            };
+            if joins_a_cycle(graph, after, members, &[node], candidate, scratch) {
+                continue;
+            }
+            // A node that is not an attractor was never united with anything
+            // above, so it is still the only member of its own box.
+            members[node].clear();
+            group[node] = candidate;
+            members[candidate].push(node);
+            return true;
+        }
+    }
+    false
+}
+
+/// The settled flow matrix, one column per node, each sorted by row and
+/// summing to one — or as settled as [`MARKOV_MAX_ITERATIONS`] rounds get it.
+///
+/// A column starts as the node's calls, each way, plus a self-loop, all
+/// normalised: where one step of a walk from the node lands. The loop is the
+/// walker's chance of staying put. Without one a walk on a bipartite piece of
+/// the graph never settles, and with one out of scale with the node's edges it
+/// either never leaves or barely stays, so it weighs as much as the node's
+/// heaviest edge, on top of whatever calls the quotient has already turned
+/// inward — a box of thirty tightly knit functions should be harder to draw
+/// flow out of than a box of two.
+///
+/// Then rounds of expansion — the column becomes the flow-weighted sum of the
+/// columns it points at, which is one column of the matrix squared, computed
+/// sparsely — inflation, and pruning, until no entry moves.
+fn markov_flow(graph: &WeightedGraph, inflation: f64) -> Vec<Vec<(usize, f64)>> {
+    let n = graph.node_count();
+    let mut columns: Vec<Vec<(usize, f64)>> = (0..n)
+        .map(|node| {
+            let heaviest = graph.adj[node]
+                .iter()
+                .map(|(_, weight)| *weight)
+                .fold(0.0, f64::max);
+            let stay = graph.self_loops[node] + if heaviest > 0.0 { heaviest } else { 1.0 };
+            // `adj` is sorted by index and never holds the node itself, so the
+            // loop goes in at its place in the order.
+            let mut column: Vec<(usize, f64)> = Vec::with_capacity(graph.adj[node].len() + 1);
+            let mut placed = false;
+            for &(neighbour, weight) in &graph.adj[node] {
+                if !placed && neighbour > node {
+                    column.push((node, stay));
+                    placed = true;
+                }
+                column.push((neighbour, weight));
+            }
+            if !placed {
+                column.push((node, stay));
+            }
+            normalise(&mut column);
+            column
+        })
+        .collect();
+
+    // Scratch for the sparse accumulation: a dense row of sums, and which of
+    // its entries the column under construction has touched.
+    let mut sum = vec![0.0f64; n];
+    let mut touched: Vec<usize> = Vec::new();
+    let mut is_touched = vec![false; n];
+
+    for _ in 0..MARKOV_MAX_ITERATIONS {
+        let mut change = 0.0f64;
+        let next: Vec<Vec<(usize, f64)>> = (0..n)
+            .map(|node| {
+                touched.clear();
+                for &(via, weight) in &columns[node] {
+                    for &(row, flow) in &columns[via] {
+                        if !is_touched[row] {
+                            is_touched[row] = true;
+                            touched.push(row);
+                            sum[row] = 0.0;
+                        }
+                        sum[row] += weight * flow;
+                    }
+                }
+                touched.sort_unstable();
+                let mut column: Vec<(usize, f64)> = touched
+                    .iter()
+                    .map(|&row| {
+                        is_touched[row] = false;
+                        (row, sum[row].powf(inflation))
+                    })
+                    .collect();
+                prune(&mut column);
+                change = change.max(largest_difference(&columns[node], &column));
+                column
+            })
+            .collect();
+        columns = next;
+        if change < MARKOV_CONVERGENCE {
+            break;
+        }
+    }
+    columns
+}
+
+/// Scale a column to sum to one.
+fn normalise(column: &mut [(usize, f64)]) {
+    let total: f64 = column.iter().map(|(_, weight)| weight).sum();
+    if total > 0.0 {
+        for (_, weight) in column.iter_mut() {
+            *weight /= total;
+        }
+    }
+}
+
+/// Drop what inflation has starved — entries under [`MARKOV_PRUNE_THRESHOLD`]
+/// of the column, and everything past the [`MARKOV_PRUNE_KEEP`] heaviest —
+/// and renormalise what is left. Ties among the heaviest keep the lower row,
+/// so the cut is the same every run.
+fn prune(column: &mut Vec<(usize, f64)>) {
+    normalise(column);
+    column.retain(|(_, weight)| *weight >= MARKOV_PRUNE_THRESHOLD);
+    if column.len() > MARKOV_PRUNE_KEEP {
+        column.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        column.truncate(MARKOV_PRUNE_KEEP);
+        column.sort_unstable_by_key(|(row, _)| *row);
+    }
+    normalise(column);
+}
+
+/// The largest change in any entry between two sorted columns, an entry
+/// missing from one side counting as zero there.
+fn largest_difference(before: &[(usize, f64)], after: &[(usize, f64)]) -> f64 {
+    let mut largest = 0.0f64;
+    let (mut i, mut j) = (0, 0);
+    while i < before.len() || j < after.len() {
+        let delta = match (before.get(i), after.get(j)) {
+            (Some(&(row_b, weight_b)), Some(&(row_a, weight_a))) if row_b == row_a => {
+                i += 1;
+                j += 1;
+                weight_b - weight_a
+            }
+            (Some(&(row_b, weight_b)), Some(&(row_a, _))) if row_b < row_a => {
+                i += 1;
+                weight_b
+            }
+            (Some(&(_, weight_b)), None) => {
+                i += 1;
+                weight_b
+            }
+            (_, Some(&(_, weight_a))) => {
+                j += 1;
+                weight_a
+            }
+            (None, None) => unreachable!("the loop condition keeps one side non-empty"),
+        };
+        largest = largest.max(delta.abs());
+    }
+    largest
+}
+
 /// Scratch for [`joins_a_cycle`], reused across the checks of one pass so a
 /// check allocates nothing.
 struct CycleScratch {
@@ -1420,8 +1837,21 @@ mod tests {
     /// `Clustering::compute`, which stops before the first pass on a graph this
     /// small.
     fn one_pass(graph: &CallGraph, resolution: f64) -> Vec<Vec<String>> {
+        partition_names(graph, |base| louvain_pass(base, resolution))
+    }
+
+    /// How one MCL pass at `inflation` groups a graph, as names.
+    fn one_flow_pass(graph: &CallGraph, inflation: f64) -> Vec<Vec<String>> {
+        partition_names(graph, |base| markov_pass(base, inflation))
+    }
+
+    /// The boxes one `partition` of the base graph makes, as sorted names.
+    fn partition_names(
+        graph: &CallGraph,
+        partition: impl FnOnce(&WeightedGraph) -> (Vec<usize>, usize),
+    ) -> Vec<Vec<String>> {
         let base = build_base_graph(graph, None);
-        let (groups, count) = louvain_pass(&base.graph, resolution);
+        let (groups, count) = partition(&base.graph);
 
         let mut buckets = vec![Vec::new(); count];
         for (node, &unit) in base.units.iter().enumerate() {
@@ -1594,25 +2024,27 @@ mod tests {
             call(&mut graph, pair[0], pair[1], 1000 + i as u32);
         }
 
-        let clustering = Clustering::compute(&graph, ClusterMethod::Modularity);
-        assert!(
-            clustering.level_count() > 1,
-            "200 functions should take more than one round"
-        );
-
-        let widths: Vec<usize> = (0..clustering.level_count())
-            .map(|level| clustering.level(level).len())
-            .collect();
-        for pair in widths.windows(2) {
+        for &method in ClusterMethod::ALL {
+            let clustering = Clustering::compute(&graph, method);
             assert!(
-                pair[1] < pair[0],
-                "every rung must be coarser than the one below: {widths:?}"
+                clustering.level_count() > 1,
+                "{method:?}: 200 functions should take more than one round"
+            );
+
+            let widths: Vec<usize> = (0..clustering.level_count())
+                .map(|level| clustering.level(level).len())
+                .collect();
+            for pair in widths.windows(2) {
+                assert!(
+                    pair[1] < pair[0],
+                    "{method:?}: every rung must be coarser than the one below: {widths:?}"
+                );
+            }
+            assert!(
+                *widths.last().unwrap() <= TARGET_TOP_CLUSTERS,
+                "{method:?}: the top should be at most {TARGET_TOP_CLUSTERS} boxes wide: {widths:?}"
             );
         }
-        assert!(
-            *widths.last().unwrap() <= TARGET_TOP_CLUSTERS,
-            "the top should be at most {TARGET_TOP_CLUSTERS} boxes wide: {widths:?}"
-        );
     }
 
     // -- where the map opens -------------------------------------------------
@@ -1857,24 +2289,31 @@ mod tests {
         graph
     }
 
-    /// The property this module now promises: over a call graph with no cycle,
-    /// no rung of the ladder has one either.
+    /// The property this module now promises, of every method: over a call
+    /// graph with no cycle, no rung of the ladder has one either.
     #[test]
     fn every_rung_of_a_dag_is_a_dag() {
         let crossing = crossing_graph();
         let (layered, _) = layered_dag(60);
         for (name, graph) in [("crossing", &crossing), ("layered", &layered)] {
-            let clustering = Clustering::compute(graph, ClusterMethod::Modularity);
-            assert!(
-                clustering.level_count() > 1,
-                "{name}: the fixture should coarsen"
-            );
-            for level in 0..clustering.level_count() {
+            for &method in ClusterMethod::ALL {
+                let clustering = Clustering::compute(graph, method);
+                let connected = clustering
+                    .clusters()
+                    .filter(|c| c.level == 0)
+                    .map(|c| c.members.len())
+                    .sum::<usize>();
                 assert!(
-                    rung_is_a_dag(graph, &clustering, level),
-                    "{name}: rung {level} has a cycle: {:?}",
-                    grouping_at(graph, &clustering, level)
+                    clustering.level(0).len() < connected,
+                    "{name} by {method:?}: the fixture should coarsen"
                 );
+                for level in 0..clustering.level_count() {
+                    assert!(
+                        rung_is_a_dag(graph, &clustering, level),
+                        "{name} by {method:?}: rung {level} has a cycle: {:?}",
+                        grouping_at(graph, &clustering, level)
+                    );
+                }
             }
         }
     }
@@ -1976,20 +2415,25 @@ mod tests {
     #[test]
     fn every_level_partitions_the_connected_symbols() {
         let (graph, _) = chain_of(60);
-        let clustering = Clustering::compute(&graph, ClusterMethod::Modularity);
-
         let expected: HashSet<SymbolId> = graph.function_ids().copied().collect();
-        for level in 0..clustering.level_count() {
-            let mut seen: HashSet<SymbolId> = HashSet::new();
-            for id in clustering.level(level) {
-                for member in &clustering.cluster(*id).unwrap().members {
-                    assert!(
-                        seen.insert(*member),
-                        "{member:?} is in two clusters at {level}"
-                    );
+
+        for &method in ClusterMethod::ALL {
+            let clustering = Clustering::compute(&graph, method);
+            for level in 0..clustering.level_count() {
+                let mut seen: HashSet<SymbolId> = HashSet::new();
+                for id in clustering.level(level) {
+                    for member in &clustering.cluster(*id).unwrap().members {
+                        assert!(
+                            seen.insert(*member),
+                            "{method:?}: {member:?} is in two clusters at {level}"
+                        );
+                    }
                 }
+                assert_eq!(
+                    seen, expected,
+                    "{method:?}: level {level} does not cover the graph"
+                );
             }
-            assert_eq!(seen, expected, "level {level} does not cover the graph");
         }
     }
 
@@ -2032,16 +2476,13 @@ mod tests {
     #[test]
     fn recomputing_gives_identical_output() {
         let (graph, _) = chain_of(60);
-        assert_eq!(
-            fingerprint(
-                &graph,
-                &Clustering::compute(&graph, ClusterMethod::Modularity)
-            ),
-            fingerprint(
-                &graph,
-                &Clustering::compute(&graph, ClusterMethod::Modularity)
-            ),
-        );
+        for &method in ClusterMethod::ALL {
+            assert_eq!(
+                fingerprint(&graph, &Clustering::compute(&graph, method)),
+                fingerprint(&graph, &Clustering::compute(&graph, method)),
+                "{method:?}"
+            );
+        }
     }
 
     #[test]
@@ -2386,5 +2827,139 @@ mod tests {
         let clustering =
             Clustering::compute_within(&graph, &HashSet::new(), ClusterMethod::Modularity);
         assert!(clustering.is_empty());
+    }
+
+    // -- Markov flow ----------------------------------------------------------
+
+    /// Two tightly knit groups joined by one call. Each group is an ordered
+    /// clique — every function calls every later one — so the base graph is
+    /// a DAG and the groups are as cohesive as a DAG allows.
+    fn two_groups_one_stray_call() -> CallGraph {
+        let mut graph = CallGraph::new();
+        let left: Vec<SymbolId> = ["a", "b", "c", "d"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| add(&mut graph, name, i as u32 + 1))
+            .collect();
+        let right: Vec<SymbolId> = ["e", "f", "g", "h"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| add(&mut graph, name, i as u32 + 10))
+            .collect();
+        let mut line = 100;
+        for group in [&left, &right] {
+            for i in 0..group.len() {
+                for j in i + 1..group.len() {
+                    call(&mut graph, group[i], group[j], line);
+                    line += 1;
+                }
+            }
+        }
+        call(&mut graph, left[3], right[0], line);
+        graph
+    }
+
+    /// The property the method is for: proximity is many short paths, not one
+    /// call, so a single stray call between two groups does not glue them.
+    #[test]
+    fn a_stray_call_does_not_glue_two_groups_together() {
+        let graph = two_groups_one_stray_call();
+        assert_eq!(
+            one_flow_pass(&graph, MARKOV_INFLATION),
+            vec![vec!["a", "b", "c", "d"], vec!["e", "f", "g", "h"]]
+                .into_iter()
+                .map(|g| g.into_iter().map(String::from).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The knob: a higher inflation starves weak flow sooner and the walk
+    /// settles into more boxes.
+    #[test]
+    fn a_higher_inflation_splits_finer() {
+        let (graph, _) = layered_dag(60);
+        let coarse = one_flow_pass(&graph, 1.4).len();
+        let fine = one_flow_pass(&graph, 4.0).len();
+        assert!(
+            fine > coarse,
+            "inflation 4 made {fine} boxes, inflation 1.4 made {coarse}"
+        );
+    }
+
+    /// Every column of the settled flow is a distribution over rows in
+    /// ascending order — what [`markov_pass`] reads off relies on both.
+    #[test]
+    fn settled_flow_columns_are_sorted_distributions() {
+        let (graph, _) = layered_dag(60);
+        let base = build_base_graph(&graph, None);
+        for (node, column) in markov_flow(&base.graph, MARKOV_INFLATION)
+            .iter()
+            .enumerate()
+        {
+            let total: f64 = column.iter().map(|(_, w)| w).sum();
+            assert!((total - 1.0).abs() < 1e-9, "column {node} sums to {total}");
+            assert!(
+                column.windows(2).all(|pair| pair[0].0 < pair[1].0),
+                "column {node} is not sorted: {column:?}"
+            );
+        }
+    }
+
+    /// The map opens on the first pass — one run of MCL at the default
+    /// inflation is the method's answer — and that rung is what the pass
+    /// said, up to the singleton fold, which only ever merges.
+    #[test]
+    fn the_markov_map_opens_on_its_first_pass() {
+        let (graph, _) = layered_dag(60);
+        let clustering = Clustering::compute(&graph, ClusterMethod::Markov);
+        assert_eq!(clustering.opening_level(), 0);
+
+        let opening = grouping_at(&graph, &clustering, 0);
+        for pure in one_flow_pass(&graph, MARKOV_INFLATION) {
+            assert!(
+                opening
+                    .iter()
+                    .any(|rung| pure.iter().all(|name| rung.contains(name))),
+                "{pure:?} was split across boxes of the opening rung {opening:?}"
+            );
+        }
+    }
+
+    /// A node whose flow drains into a system it may not join for the DAG
+    /// rule takes the legal system it shares the most calls with instead,
+    /// rather than staying alone: `x` calls into the pair and is called back
+    /// by it, and both of its callees are wanted by the same attractor.
+    #[test]
+    fn a_node_blocked_from_its_attractor_drains_by_its_calls() {
+        let graph = crossing_graph();
+        let clustering = Clustering::compute(&graph, ClusterMethod::Markov);
+        assert!(rung_is_a_dag(&graph, &clustering, 0));
+        let groups = grouping_at(&graph, &clustering, 0);
+        let boxed = |x: &str, y: &str| {
+            groups
+                .iter()
+                .any(|g| g.iter().any(|m| m == x) && g.iter().any(|m| m == y))
+        };
+        assert!(
+            boxed("a", "c") || boxed("b", "d"),
+            "at least one heavy pair shares a box: {groups:?}"
+        );
+    }
+
+    #[test]
+    fn markov_is_listed_after_modularity() {
+        assert_eq!(
+            ClusterMethod::ALL,
+            &[ClusterMethod::Modularity, ClusterMethod::Markov]
+        );
+        assert_ne!(
+            ClusterMethod::Markov.label(),
+            ClusterMethod::Modularity.label()
+        );
+        assert!(!ClusterMethod::Markov.description().is_empty());
+        assert_eq!(
+            Clustering::compute(&layered_dag(60).0, ClusterMethod::Markov).method(),
+            ClusterMethod::Markov
+        );
     }
 }

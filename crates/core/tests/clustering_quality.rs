@@ -69,11 +69,17 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// The modularity clustering — the default method, and the one the
+    /// asserting tests hold to their thresholds.
     fn new() -> Self {
+        Self::with(ClusterMethod::Modularity)
+    }
+
+    fn with(method: ClusterMethod) -> Self {
         // `::core::` rather than `core::`: the workspace crate of that name
         // shadows Rust's built-in one, and the leading `::` picks ours.
         let graph = ::core::create_demo_call_graph();
-        let clustering = Clustering::compute(&graph, ClusterMethod::Modularity);
+        let clustering = Clustering::compute(&graph, method);
 
         let mut directories = HashMap::new();
         let mut names = HashMap::new();
@@ -169,6 +175,23 @@ impl Fixture {
         pairs.len() as f64 / (n * (n - 1) / 2) as f64
     }
 
+    /// The share of clustered functions that sit in their top-level box's
+    /// majority directory — the number `top_level_clusters_mostly_follow_the_
+    /// source_tree` asserts on, for the report to print beside every method.
+    fn weighted_purity(&self) -> f64 {
+        let (mut dominant, mut total) = (0usize, 0usize);
+        for cluster in self.top_level_clusters() {
+            let histogram = self.directory_histogram(&cluster.members);
+            dominant += histogram.first().map(|(_, n)| *n).unwrap_or(0);
+            total += cluster.members.len();
+        }
+        if total == 0 {
+            0.0
+        } else {
+            dominant as f64 / total as f64
+        }
+    }
+
     fn top_level_clusters(&self) -> Vec<&Cluster> {
         self.clustering
             .top_level()
@@ -196,10 +219,19 @@ impl Fixture {
 /// when the algorithm changes.
 #[test]
 fn report_cluster_composition() {
-    let fixture = Fixture::new();
+    for &method in ClusterMethod::ALL {
+        report_composition(method);
+    }
+}
+
+fn report_composition(method: ClusterMethod) {
+    let fixture = Fixture::with(method);
 
     println!();
-    println!("=== clustering of the demo call graph ===");
+    println!(
+        "=== clustering of the demo call graph by {} ===",
+        method.label()
+    );
     println!(
         "{} functions, {} calls, {} levels, {} top-level clusters",
         fixture.graph.node_count(),
@@ -213,6 +245,11 @@ fn report_cluster_composition() {
     for cluster in fixture.top_level_clusters() {
         println!("  {}", fixture.describe(cluster));
     }
+    println!(
+        "  weighted directory purity {:.3}, crossing density {:.2}",
+        fixture.weighted_purity(),
+        fixture.crossing_density(fixture.clustering.top_level_index().unwrap_or(0))
+    );
 
     println!();
     println!("--- one level finer ---");
@@ -410,7 +447,12 @@ fn every_top_level_cluster_is_usefully_named() {
 /// hierarchy is not actually a partition refinement.
 #[test]
 fn the_hierarchy_is_a_well_formed_partition_refinement() {
-    let fixture = Fixture::new();
+    for &method in ClusterMethod::ALL {
+        hierarchy_is_well_formed(&Fixture::with(method));
+    }
+}
+
+fn hierarchy_is_well_formed(fixture: &Fixture) {
     let clustering = &fixture.clustering;
 
     assert!(
@@ -750,23 +792,25 @@ fn clustering_is_deterministic() {
     let names: HashMap<SymbolId, String> =
         graph.functions().map(|f| (f.id, f.name.clone())).collect();
 
-    let first = Clustering::compute(&graph, ClusterMethod::Modularity);
-    let second = Clustering::compute(&graph, ClusterMethod::Modularity);
+    for &method in ClusterMethod::ALL {
+        let first = Clustering::compute(&graph, method);
+        let second = Clustering::compute(&graph, method);
 
-    assert_eq!(
-        first.level_count(),
-        second.level_count(),
-        "two runs over the same graph built ladders of different heights"
-    );
-    // Every rung, not just the top: a round that merged a different pair
-    // low down can still come out the same width at the top.
-    for level in 0..first.level_count() {
         assert_eq!(
-            partition(&first, level, &names),
-            partition(&second, level, &names),
-            "two runs over the same graph disagree at rung {level}; the \
+            first.level_count(),
+            second.level_count(),
+            "two runs over the same graph built ladders of different heights"
+        );
+        // Every rung, not just the top: a round that merged a different pair
+        // low down can still come out the same width at the top.
+        for level in 0..first.level_count() {
+            assert_eq!(
+                partition(&first, level, &names),
+                partition(&second, level, &names),
+                "two runs over the same graph disagree at rung {level}; the \
              clustering is not deterministic, which makes every quality check \
              here a coin flip"
-        );
+            );
+        }
     }
 }
