@@ -41,6 +41,56 @@ pub enum RequestOrigin {
     Warmup,
 }
 
+/// What became of a request, and the one thing the frontend is told about it.
+///
+/// This is the convention every `LspBridge::send_*` method answers in, and it
+/// has exactly three outcomes: the request went out, there was nothing to ask
+/// or nowhere to ask it, or it could not be made. Each of the two that reach
+/// the worker's door carries the single [`AppEvent`] a frontend should hear —
+/// a status line naming what is being fetched, or a failure worth reporting.
+/// A `None` inside a variant means "and nothing to say about it"; it never
+/// means "and it worked". The outcome says that.
+///
+/// The outcome is in the type because it used to be inferred from a bare
+/// `Option<AppEvent>`, and `Some` meant failure in [`LspBridge::send_call_hierarchy`],
+/// success in [`LspBridge::send_follow_up_call`], and either one in the other
+/// two. Every call site read all four with the same `if let Some(ev)`, which
+/// was right only by coincidence: the one caller that *branches* on the
+/// outcome — `CoreApp::cmd_expand_function`, which redraws a failed fetch even
+/// when the expansion itself moved nothing — spelled "did this fail" as "did
+/// an event come back", and that is true only while the success path of that
+/// one sender stays silent. The first success event added to it would have
+/// turned a working expansion into a spurious redraw, with nothing in the type
+/// to catch it.
+#[derive(Debug)]
+#[must_use = "the event inside is the frontend's whole report of this request"]
+pub enum SendOutcome {
+    /// The request is with the worker and recorded in flight.
+    Sent(Option<AppEvent>),
+    /// Nothing was asked and nothing went wrong: the symbol is not in the
+    /// graph, or no channel is wired up yet (demo mode, or a loader that has
+    /// not handed its channels over). Nothing is coming, and nothing failed.
+    Declined,
+    /// The request could not be made. Whatever per-symbol [`LoadingState`] the
+    /// failure deserves has already been recorded by the sender; this carries
+    /// only what to tell the user.
+    Failed(Option<AppEvent>),
+}
+
+impl SendOutcome {
+    /// The event to emit, whichever outcome this is.
+    ///
+    /// What most call sites want: they append it to the events they were
+    /// returning anyway, and the outcome itself changes nothing for them. The
+    /// two that do care which outcome it was match on the variants.
+    pub fn event(self) -> Option<AppEvent> {
+        match self {
+            SendOutcome::Sent(event) | SendOutcome::Failed(event) => event,
+            SendOutcome::Declined => None,
+        }
+    }
+}
+
 /// Pending LSP request information.
 #[derive(Debug, Clone)]
 pub struct PendingRequest {
@@ -322,13 +372,18 @@ impl LspBridge {
     /// `direction` is the way the *asker* was reading the graph at this moment,
     /// and it is recorded on the pending entry rather than looked up again when
     /// the reply lands. See [`PendingRequest::direction`].
+    ///
+    /// Answers in the convention of [`SendOutcome`]. The one sender whose
+    /// success says nothing: by the time this returns the caller has already
+    /// set the symbol `Loading` and is about to redraw for its own reasons, so
+    /// a second event would only be the same news twice.
     pub fn send_call_hierarchy(
         &mut self,
         call_graph: &CallGraph,
         function_id: &SymbolId,
         origin: RequestOrigin,
         direction: CallDirection,
-    ) -> Option<AppEvent> {
+    ) -> SendOutcome {
         let (file_path, line, column, _name) = {
             if let Some(function) = call_graph.get_function(function_id) {
                 (
@@ -344,7 +399,7 @@ impl LspBridge {
                     "core::LspBridge no call hierarchy for {:?}: not in the call graph",
                     function_id
                 );
-                return None;
+                return SendOutcome::Declined;
             }
         };
 
@@ -353,7 +408,7 @@ impl LspBridge {
                 "core::LspBridge no call hierarchy for {}: LSP channel not wired up yet",
                 _name
             );
-            return None;
+            return SendOutcome::Declined;
         };
 
         let document_uri = match lsp_types::Url::from_file_path(&file_path) {
@@ -363,7 +418,7 @@ impl LspBridge {
                     *function_id,
                     LoadingState::Failed("Invalid file path".to_string()),
                 );
-                return Some(AppEvent::InvalidFilePath);
+                return SendOutcome::Failed(Some(AppEvent::InvalidFilePath));
             }
         };
 
@@ -390,39 +445,37 @@ impl LspBridge {
                 *function_id,
                 LoadingState::Failed("Failed to send request".to_string()),
             );
-            return Some(AppEvent::FailedToSendRequest);
+            return SendOutcome::Failed(Some(AppEvent::FailedToSendRequest));
         }
-        None
+        SendOutcome::Sent(None)
     }
 
     /// Send a find-references request for the given function.
+    ///
+    /// Answers in the convention of [`SendOutcome`].
     pub fn send_references(
         &mut self,
         call_graph: &CallGraph,
         function_id: &SymbolId,
-    ) -> Option<AppEvent> {
-        let (file_path, line, column, name) = {
-            if let Some(function) = call_graph.get_function(function_id) {
-                (
-                    function.definition_location.file_path.clone(),
-                    function.definition_location.line,
-                    function.definition_location.column,
-                    function.name.clone(),
-                )
-            } else {
-                return None;
-            }
+    ) -> SendOutcome {
+        let (file_path, line, column, name) = match call_graph.get_function(function_id) {
+            Some(function) => (
+                function.definition_location.file_path.clone(),
+                function.definition_location.line,
+                function.definition_location.column,
+                function.name.clone(),
+            ),
+            None => return SendOutcome::Declined,
         };
 
-        let request_tx = match self.request_tx.as_ref() {
-            Some(tx) => tx.clone(),
-            None => return None,
+        let Some(request_tx) = self.request_tx.clone() else {
+            return SendOutcome::Declined;
         };
 
         let document_uri = match lsp_types::Url::from_file_path(&file_path) {
             Ok(uri) => uri,
             Err(_) => {
-                return Some(AppEvent::FailedToCreateUri);
+                return SendOutcome::Failed(Some(AppEvent::FailedToCreateUri));
             }
         };
 
@@ -444,16 +497,17 @@ impl LspBridge {
                 position,
             }
         }) {
-            return Some(AppEvent::FailedToSendRequest);
+            return SendOutcome::Failed(Some(AppEvent::FailedToSendRequest));
         }
-        Some(AppEvent::FindingReferences { name })
+        SendOutcome::Sent(Some(AppEvent::FindingReferences { name }))
     }
 
     /// Send a workspace symbols request.
-    pub fn send_workspace_symbols(&mut self) -> Option<AppEvent> {
-        let request_tx = match self.request_tx.as_ref() {
-            Some(tx) => tx.clone(),
-            None => return None,
+    ///
+    /// Answers in the convention of [`SendOutcome`].
+    pub fn send_workspace_symbols(&mut self) -> SendOutcome {
+        let Some(request_tx) = self.request_tx.clone() else {
+            return SendOutcome::Declined;
         };
 
         let pending = PendingRequest::new(None, "workspace symbols", RequestOrigin::User);
@@ -464,9 +518,9 @@ impl LspBridge {
                 query: "".to_string(),
             }
         }) {
-            Some(AppEvent::RefreshingWorkspaceSymbols)
+            SendOutcome::Sent(Some(AppEvent::RefreshingWorkspaceSymbols))
         } else {
-            Some(AppEvent::FailedToSendRequest)
+            SendOutcome::Failed(Some(AppEvent::FailedToSendRequest))
         }
     }
 
@@ -476,13 +530,18 @@ impl LspBridge {
     /// bool was spelled back out as the string `"outgoing"` or `"incoming"` in
     /// three places in this one function — the label, the failure message and
     /// the event the status bar reads — which is the shape a type is for.
+    ///
+    /// Answers in the convention of [`SendOutcome`]. It has no `Declined`: a
+    /// missing channel is a failure here rather than a polite no, because this
+    /// is the second half of a question whose first half already went out, and
+    /// the symbol is sitting in `LoadingState::Loading` waiting for it.
     pub fn send_follow_up_call(
         &mut self,
         symbol_id: &SymbolId,
         item: lsp_types::CallHierarchyItem,
         direction: CallDirection,
         origin: RequestOrigin,
-    ) -> Option<AppEvent> {
+    ) -> SendOutcome {
         let which = match direction {
             CallDirection::Outgoing => "outgoing",
             CallDirection::Incoming => "incoming",
@@ -497,7 +556,7 @@ impl LspBridge {
                 *symbol_id,
                 LoadingState::Failed("No LSP channel".to_string()),
             );
-            return Some(AppEvent::NoLspChannel);
+            return SendOutcome::Failed(Some(AppEvent::NoLspChannel));
         };
 
         let pending = PendingRequest::new(
@@ -521,15 +580,20 @@ impl LspBridge {
                 call_hierarchy_item: item,
             },
         }) {
-            Some(AppEvent::LoadingCalls {
+            SendOutcome::Sent(Some(AppEvent::LoadingCalls {
                 direction: which.to_string(),
-            })
+            }))
         } else {
             self.loading_states.insert(
                 *symbol_id,
                 LoadingState::Failed(format!("Failed to request {} calls", which)),
             );
-            None
+            // The one failure that says nothing: the symbol's `LoadingState`
+            // is the whole report. Kept silent deliberately — what a frontend
+            // shows is not this convention's business to change — but now
+            // spelled as a failure with nothing to add, rather than as a bare
+            // `None` indistinguishable from the success of its neighbour.
+            SendOutcome::Failed(None)
         }
     }
 
@@ -690,31 +754,40 @@ mod tests {
         let (graph, id) = one_function();
 
         let mut bridge = dead_worker();
-        let event =
+        let outcome =
             bridge.send_call_hierarchy(&graph, &id, RequestOrigin::Warmup, CallDirection::Outgoing);
-        assert!(matches!(event, Some(AppEvent::FailedToSendRequest)));
+        assert!(matches!(
+            outcome,
+            SendOutcome::Failed(Some(AppEvent::FailedToSendRequest))
+        ));
         assert!(bridge.pending_requests.is_empty(), "prepare");
 
         let mut bridge = dead_worker();
-        let event = bridge.send_references(&graph, &id);
-        assert!(matches!(event, Some(AppEvent::FailedToSendRequest)));
+        let outcome = bridge.send_references(&graph, &id);
+        assert!(matches!(
+            outcome,
+            SendOutcome::Failed(Some(AppEvent::FailedToSendRequest))
+        ));
         assert!(bridge.pending_requests.is_empty(), "references");
 
         let mut bridge = dead_worker();
-        let event = bridge.send_workspace_symbols();
-        assert!(matches!(event, Some(AppEvent::FailedToSendRequest)));
+        let outcome = bridge.send_workspace_symbols();
+        assert!(matches!(
+            outcome,
+            SendOutcome::Failed(Some(AppEvent::FailedToSendRequest))
+        ));
         assert!(bridge.pending_requests.is_empty(), "workspace symbols");
 
         let mut bridge = dead_worker();
-        let event = bridge.send_follow_up_call(
+        let outcome = bridge.send_follow_up_call(
             &id,
             hierarchy_item(),
             CallDirection::Outgoing,
             RequestOrigin::Warmup,
         );
-        // `None` here is this sender's spelling of failure, and deliberately
-        // the opposite way round from the three above.
-        assert!(event.is_none());
+        // This one reports the failure and has nothing to add to it: the
+        // symbol's `LoadingState` is where it lands. See [`SendOutcome`].
+        assert!(matches!(outcome, SendOutcome::Failed(None)));
         assert!(bridge.pending_requests.is_empty(), "follow-up");
     }
 
@@ -727,14 +800,17 @@ mod tests {
         let (_, id) = one_function();
         let mut bridge = LspBridge::new();
 
-        let event = bridge.send_follow_up_call(
+        let outcome = bridge.send_follow_up_call(
             &id,
             hierarchy_item(),
             CallDirection::Incoming,
             RequestOrigin::User,
         );
 
-        assert!(matches!(event, Some(AppEvent::NoLspChannel)));
+        assert!(matches!(
+            outcome,
+            SendOutcome::Failed(Some(AppEvent::NoLspChannel))
+        ));
         assert!(bridge.pending_requests.is_empty());
         assert!(matches!(
             bridge.get_loading_state(&id),
@@ -750,9 +826,12 @@ mod tests {
         let (graph, id) = one_function();
 
         let (mut bridge, mut rx) = live_worker();
-        assert!(bridge
-            .send_call_hierarchy(&graph, &id, RequestOrigin::Warmup, CallDirection::Incoming)
-            .is_none());
+        assert!(matches!(
+            bridge.send_call_hierarchy(&graph, &id, RequestOrigin::Warmup, CallDirection::Incoming),
+            // Sent, and with nothing to say about it: the caller has already
+            // told the user it is fetching. See [`SendOutcome`].
+            SendOutcome::Sent(None)
+        ));
         assert!(matches!(
             rx.try_recv(),
             Ok(LspRequest::PrepareCallHierarchy { .. })
@@ -766,7 +845,7 @@ mod tests {
         let (mut bridge, mut rx) = live_worker();
         assert!(matches!(
             bridge.send_references(&graph, &id),
-            Some(AppEvent::FindingReferences { .. })
+            SendOutcome::Sent(Some(AppEvent::FindingReferences { .. }))
         ));
         assert!(matches!(
             rx.try_recv(),
@@ -777,7 +856,7 @@ mod tests {
         let (mut bridge, mut rx) = live_worker();
         assert!(matches!(
             bridge.send_workspace_symbols(),
-            Some(AppEvent::RefreshingWorkspaceSymbols)
+            SendOutcome::Sent(Some(AppEvent::RefreshingWorkspaceSymbols))
         ));
         assert!(matches!(
             rx.try_recv(),
@@ -793,7 +872,7 @@ mod tests {
                 CallDirection::Outgoing,
                 RequestOrigin::User
             ),
-            Some(AppEvent::LoadingCalls { .. })
+            SendOutcome::Sent(Some(AppEvent::LoadingCalls { .. }))
         ));
         assert!(matches!(
             rx.try_recv(),
@@ -807,7 +886,7 @@ mod tests {
     #[test]
     fn a_request_is_filed_under_the_id_it_was_sent_with() {
         let (mut bridge, mut rx) = live_worker();
-        bridge.send_workspace_symbols();
+        let _ = bridge.send_workspace_symbols();
 
         let sent = match rx.try_recv().expect("the request went out") {
             LspRequest::GetWorkspaceSymbols { request_id, .. } => request_id,

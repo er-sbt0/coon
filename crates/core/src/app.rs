@@ -9,7 +9,7 @@ use model::{CallDirection, CallGraph, FunctionNode, Location, LspLoadPhase, Symb
 use crate::command::Command;
 use crate::events::AppEvent;
 use crate::layout::{compute_map_frame, LayoutOrientation, MapFrame};
-use crate::lsp_bridge::{LoadingState, LspBridge, PendingRequest, RequestOrigin};
+use crate::lsp_bridge::{LoadingState, LspBridge, PendingRequest, RequestOrigin, SendOutcome};
 use crate::workspace::{CoreWorkspace, CoreWorkspaceManager, ViewMode};
 
 /// How many call-hierarchy requests to keep in flight while warming up edges.
@@ -611,14 +611,16 @@ impl CoreApp {
                             // either way, `cmd_expand_function`'s guard then
                             // refused to ever ask again.
                             let direction = pending.direction.unwrap_or(CallDirection::Outgoing);
-                            if let Some(ev) = self.lsp.send_follow_up_call(
-                                &symbol_id,
-                                first_item,
-                                direction,
-                                pending.origin,
-                            ) {
-                                events.push(ev);
-                            }
+                            events.extend(
+                                self.lsp
+                                    .send_follow_up_call(
+                                        &symbol_id,
+                                        first_item,
+                                        direction,
+                                        pending.origin,
+                                    )
+                                    .event(),
+                            );
                         } else {
                             self.lsp.set_loading_state(symbol_id, LoadingState::Loaded);
                             events.push(AppEvent::FunctionHasNoCallees);
@@ -643,17 +645,20 @@ impl CoreApp {
             ws.set_root(id);
         }
         let direction = self.current_direction();
-        // Kick off call hierarchy loading if not already done
+        // Kick off call hierarchy loading if not already done. The redraw is
+        // unconditional — the root moved — and whatever the fetch has to say
+        // leads, so the status line is written before the canvas is.
+        let mut events = Vec::new();
         if !self.lsp.is_function_loaded(&id) && !self.lsp.is_function_loading(&id) {
             self.lsp.set_loading_state(id, LoadingState::Loading);
-            if let Some(ev) =
+            events.extend(
                 self.lsp
                     .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User, direction)
-            {
-                return vec![ev, AppEvent::LayoutDirty];
-            }
+                    .event(),
+            );
         }
-        vec![AppEvent::LayoutDirty]
+        events.push(AppEvent::LayoutDirty);
+        events
     }
 
     fn cmd_expand_or_collapse(&mut self) -> Vec<AppEvent> {
@@ -661,13 +666,14 @@ impl CoreApp {
         // Here we just request call hierarchy for the currently selected function.
         let direction = self.current_direction();
         if let Some(id) = self.selected_function {
-            if let Some(ev) =
-                self.lsp
-                    .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User, direction)
-            {
-                return vec![ev, AppEvent::LayoutDirty];
-            }
-            return vec![AppEvent::LayoutDirty];
+            let mut events: Vec<AppEvent> = self
+                .lsp
+                .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User, direction)
+                .event()
+                .into_iter()
+                .collect();
+            events.push(AppEvent::LayoutDirty);
+            return events;
         }
         vec![]
     }
@@ -675,11 +681,13 @@ impl CoreApp {
     fn cmd_find_references(&mut self) -> Vec<AppEvent> {
         let symbol_id = self.workspaces.current().and_then(|w| w.root_symbol);
         if let Some(id) = symbol_id {
-            let mut events = Vec::new();
-            if let Some(ev) = self.lsp.send_references(&self.call_graph, &id) {
-                events.push(ev);
-            }
-            events
+            // Nothing on the canvas changes, so there is no `LayoutDirty`
+            // here: the answer arrives as its own event later.
+            self.lsp
+                .send_references(&self.call_graph, &id)
+                .event()
+                .into_iter()
+                .collect()
         } else {
             vec![]
         }
@@ -693,16 +701,13 @@ impl CoreApp {
         let discarded = self.lsp.clear();
         self.requeue_discarded(discarded);
         let mut events = Vec::new();
-        if let Some(ev) = self.lsp.send_workspace_symbols() {
-            events.push(ev);
-        }
+        events.extend(self.lsp.send_workspace_symbols().event());
         if let Some(id) = self.selected_function {
-            if let Some(ev) =
+            events.extend(
                 self.lsp
                     .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User, direction)
-            {
-                events.push(ev);
-            }
+                    .event(),
+            );
         }
         events
     }
@@ -979,13 +984,14 @@ impl CoreApp {
         // After the create, not before: the tab that will show this graph is
         // the one just made, and it is that tab's reading the fetch answers.
         let direction = self.current_direction();
-        let lsp_event =
+        let outcome =
             self.lsp
                 .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User, direction);
+        // The tab and its redraw come first here, and anything the fetch has
+        // to say trails them: the new tab is the news, and a failure to load
+        // it is a footnote on a tab that exists either way.
         let mut events = vec![ws_event, AppEvent::LayoutDirty];
-        if let Some(ev) = lsp_event {
-            events.push(ev);
-        }
+        events.extend(outcome.event());
         events
     }
 
@@ -1045,11 +1051,19 @@ impl CoreApp {
         let direction = self.current_direction();
         if !self.lsp.is_function_loaded(&id) && !self.lsp.is_function_loading(&id) {
             self.lsp.set_loading_state(id, LoadingState::Loading);
-            if let Some(ev) =
+            // The one call site that branches on the outcome rather than just
+            // forwarding its event, and why [`SendOutcome`] spells the outcome
+            // out: a fetch that never went redraws whether or not the
+            // expansion moved anything, because the node has just been put
+            // into a loading state the canvas is showing and has to come back
+            // out of it. A fetch that *did* go leaves the decision below.
+            if let SendOutcome::Failed(event) =
                 self.lsp
                     .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User, direction)
             {
-                return vec![ev, AppEvent::LayoutDirty];
+                let mut events: Vec<AppEvent> = event.into_iter().collect();
+                events.push(AppEvent::LayoutDirty);
+                return events;
             }
         }
         // A second click on a node already expanded and already loaded has
@@ -1320,7 +1334,7 @@ impl CoreApp {
             sent += 1;
             // Warmup, not user: nobody is watching for this one symbol's edges,
             // so its reply must not redraw the client. See `RequestOrigin`.
-            if let Some(ev) = self.lsp.send_call_hierarchy(
+            let outcome = self.lsp.send_call_hierarchy(
                 &self.call_graph,
                 &id,
                 RequestOrigin::Warmup,
@@ -1335,9 +1349,10 @@ impl CoreApp {
                 // which tab happened to be in front, and change direction
                 // mid-sweep every time the user hit `t`, for no gain at all.
                 CallDirection::Outgoing,
-            ) {
-                events.push(ev);
-            }
+            );
+            // A warmup request that goes out is silent by design — see
+            // `RequestOrigin` — so this only ever carries a failure.
+            events.extend(outcome.event());
         }
         if sent > 0 || skipped > 0 {
             log::debug!(
@@ -3075,6 +3090,220 @@ mod tests {
             scoped(&app),
             0,
             "closing the only tab that wanted it drops the clustering"
+        );
+    }
+
+    // ---- What a call site emits for each send outcome ---------------------
+    //
+    // Every `LspBridge::send_*` call site turns one outcome into events, and
+    // that translation is the whole of what a frontend sees: a status line, a
+    // redraw, or silence. These pin it — which events, in which order, for a
+    // request that goes out and for one that cannot — so that reshaping the
+    // senders' return type cannot move it without a test saying so.
+
+    /// The variant names of a run of events, in order.
+    ///
+    /// `AppEvent` has no `PartialEq` and needs none for this: what is under
+    /// test is which events came out and in what order, never their payloads,
+    /// which no sender touches on the paths below.
+    fn shapes(events: &[AppEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| {
+                format!("{event:?}")
+                    .split(['(', '{', ' '])
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn failures(events: &[AppEvent]) -> usize {
+        shapes(events)
+            .iter()
+            .filter(|name| *name == "FailedToSendRequest")
+            .count()
+    }
+
+    /// The one symbol of a `loaded_app(1)`: in the graph, at an absolute path,
+    /// so every sender gets all the way to the channel before deciding.
+    fn only_symbol(app: &CoreApp) -> SymbolId {
+        *app.call_graph.function_ids().next().expect("one symbol")
+    }
+
+    #[test]
+    fn selecting_a_root_redraws_and_says_so_only_when_the_fetch_did_not_go() {
+        let (mut app, _rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        assert_eq!(
+            shapes(&app.dispatch(Command::SelectFunction(id))),
+            ["LayoutDirty"],
+            "a fetch on its way is not news"
+        );
+
+        let (mut app, rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        drop(rx);
+        assert_eq!(
+            shapes(&app.dispatch(Command::SelectFunction(id))),
+            ["FailedToSendRequest", "LayoutDirty"]
+        );
+    }
+
+    #[test]
+    fn expand_or_collapse_redraws_either_way() {
+        let (mut app, _rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        app.selected_function = Some(id);
+        assert_eq!(
+            shapes(&app.dispatch(Command::ExpandOrCollapse)),
+            ["LayoutDirty"]
+        );
+
+        let (mut app, rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        app.selected_function = Some(id);
+        drop(rx);
+        assert_eq!(
+            shapes(&app.dispatch(Command::ExpandOrCollapse)),
+            ["FailedToSendRequest", "LayoutDirty"]
+        );
+    }
+
+    #[test]
+    fn find_references_reports_the_search_or_the_failure_and_never_redraws() {
+        let (mut app, _rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        app.dispatch(Command::SelectFunction(id));
+        assert_eq!(
+            shapes(&app.dispatch(Command::FindReferences)),
+            ["FindingReferences"]
+        );
+
+        let (mut app, rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        app.dispatch(Command::SelectFunction(id));
+        drop(rx);
+        assert_eq!(
+            shapes(&app.dispatch(Command::FindReferences)),
+            ["FailedToSendRequest"]
+        );
+    }
+
+    #[test]
+    fn a_refresh_announces_the_sweep_and_reports_each_send_separately() {
+        let (mut app, _rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        app.selected_function = Some(id);
+        assert_eq!(
+            shapes(&app.dispatch(Command::Refresh)),
+            ["RefreshingWorkspaceSymbols"],
+            "the root's hierarchy goes out silently behind the sweep"
+        );
+
+        let (mut app, rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        app.selected_function = Some(id);
+        drop(rx);
+        assert_eq!(
+            shapes(&app.dispatch(Command::Refresh)),
+            ["FailedToSendRequest", "FailedToSendRequest"],
+            "two requests, two failures"
+        );
+    }
+
+    #[test]
+    fn starting_a_graph_trails_a_failed_fetch_behind_the_new_tab() {
+        let (mut app, _rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        assert_eq!(
+            shapes(&app.dispatch(Command::StartGraphFromFunction(id))),
+            ["WorkspaceCreated", "LayoutDirty"]
+        );
+
+        let (mut app, rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        drop(rx);
+        assert_eq!(
+            shapes(&app.dispatch(Command::StartGraphFromFunction(id))),
+            ["WorkspaceCreated", "LayoutDirty", "FailedToSendRequest"],
+            "this one appends the failure where the others lead with it"
+        );
+    }
+
+    #[test]
+    fn expanding_redraws_when_the_view_moved_and_whenever_the_fetch_failed() {
+        let (mut app, _rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        assert_eq!(
+            shapes(&app.dispatch(Command::ExpandFunction(id))),
+            ["LayoutDirty"]
+        );
+        assert!(
+            app.dispatch(Command::ExpandFunction(id)).is_empty(),
+            "already expanded and already being fetched: nothing to do or say"
+        );
+
+        // The case the convention turns on: the expansion changes nothing, so
+        // there is nothing to redraw, and the redraw happens anyway because
+        // the fetch failed.
+        let (mut app, rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        app.dispatch(Command::ExpandFunction(id));
+        app.lsp.set_loading_state(id, LoadingState::NotLoaded);
+        drop(rx);
+        assert_eq!(
+            shapes(&app.dispatch(Command::ExpandFunction(id))),
+            ["FailedToSendRequest", "LayoutDirty"]
+        );
+    }
+
+    #[test]
+    fn the_warmup_is_silent_unless_a_send_fails() {
+        let (mut app, _rx) = loaded_app(2);
+        assert_eq!(
+            failures(&app.tick()),
+            0,
+            "nobody is waiting on a warmup reply, so nothing is reported"
+        );
+
+        let (mut app, rx) = loaded_app(2);
+        drop(rx);
+        assert_eq!(failures(&app.tick()), 2, "one per symbol it could not ask");
+    }
+
+    #[test]
+    fn a_prepared_hierarchy_announces_its_follow_up_and_is_quiet_when_it_fails() {
+        let prepared = |request_id: String| LspResponse::CallHierarchyPrepared {
+            request_id,
+            items: vec![hierarchy_item("f0", 0)],
+        };
+        let sent_prepare = |rx: &mut mpsc::UnboundedReceiver<lsp::LspRequest>| match rx
+            .try_recv()
+            .expect("the prepare went out")
+        {
+            lsp::LspRequest::PrepareCallHierarchy { request_id, .. } => request_id,
+            other => panic!("expected a prepare, got {other:?}"),
+        };
+
+        let (mut app, mut rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        app.dispatch(Command::SelectFunction(id));
+        let request_id = sent_prepare(&mut rx);
+        assert_eq!(
+            shapes(&app.handle_lsp_response(prepared(request_id))),
+            ["LoadingCalls"]
+        );
+
+        let (mut app, mut rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        app.dispatch(Command::SelectFunction(id));
+        let request_id = sent_prepare(&mut rx);
+        drop(rx);
+        assert!(
+            app.handle_lsp_response(prepared(request_id)).is_empty(),
+            "a follow-up that could not be sent tells the frontend nothing"
         );
     }
 }

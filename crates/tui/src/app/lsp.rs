@@ -15,12 +15,17 @@ impl App {
         // The core workspace is the authority: `t` dispatches
         // `Command::ToggleCallDirection`, so that is where the toggle lands.
         let direction = self.core.current_direction();
-        if let Some(ev) = self.core.lsp.send_call_hierarchy(
-            &self.core.call_graph,
-            function_id,
-            RequestOrigin::User,
-            direction,
-        ) {
+        if let Some(ev) = self
+            .core
+            .lsp
+            .send_call_hierarchy(
+                &self.core.call_graph,
+                function_id,
+                RequestOrigin::User,
+                direction,
+            )
+            .event()
+        {
             apply_event_to_status(&mut self.status_message, &ev);
         }
     }
