@@ -54,12 +54,19 @@
 //! with no other edges counts as isolated too, since self-loops are dropped
 //! when the base graph is built, and what is left connects it to nothing.
 //!
-//! The quotient of a level is **not** acyclic, and is not made so. A community
-//! can sit on both ends of a one-way path, so a level can draw `A -> B`
-//! alongside `B -> A` over code where nothing calls back. Cohesive boxes make
-//! that rare — a layered program grouped by module is nearly a DAG of boxes —
-//! but it is not forbidden, and the map answers it where it shows, by drawing
-//! such a pair as one double-headed edge rather than as two arrows.
+//! **The quotient of every rung is acyclic.** Modularity alone puts no
+//! constraint on direction: a community can sit on both ends of a one-way
+//! path, and left to itself the optimiser drew `A -> B` beside `B -> A` over
+//! code where nothing calls back — on a real project 19 of the 55 lines on the
+//! top rung ran both ways, over a call graph with no cycle in it. So a move is
+//! legal only if the community it joins sits on no directed cycle of the
+//! quotient afterwards ([`joins_a_cycle`]); a candidate that would close one
+//! is skipped and the next best is scored. Every pass starts from a DAG and
+//! hands one on, and the singleton fold is held to the same rule. The base
+//! graph is made a DAG first by condensing its strongly connected components:
+//! mutually recursive functions are one unit from the finest rung up, which
+//! is where they belong anyway. On the project above the constraint cost 0.04
+//! of modularity and four boxes at the opening rung.
 //!
 //! The implementation works in index space — every hot loop indexes `Vec`s
 //! rather than hashing `SymbolId`s — so it stays usable on the ~10k-node graphs
@@ -287,19 +294,27 @@ impl Clustering {
         scope: Option<&HashSet<SymbolId>>,
         method: ClusterMethod,
     ) -> Self {
-        let (symbols, base) = build_base_graph(graph, scope);
-        if symbols.is_empty() {
+        let base = build_base_graph(graph, scope);
+        if base.symbols.is_empty() {
             return Self {
                 method,
                 ..Self::default()
             };
         }
 
-        let ladder = match method {
-            ClusterMethod::Modularity => coarsen(base),
+        let mut ladder = match method {
+            ClusterMethod::Modularity => coarsen(base.graph, base.sizes),
         };
+        // The ladder's first rung maps condensed nodes; `build_clustering`
+        // reads a map from symbols, so the condensation is composed in.
+        let first: Vec<usize> = base
+            .units
+            .iter()
+            .map(|&unit| ladder.levels[0][unit])
+            .collect();
+        ladder.levels[0] = first;
         let opening = ladder.opening();
-        let mut clustering = build_clustering(graph, &symbols, &ladder.levels);
+        let mut clustering = build_clustering(graph, &base.symbols, &ladder.levels);
         clustering.opening = opening;
         clustering.method = method;
         clustering
@@ -405,10 +420,19 @@ struct WeightedGraph {
     /// heavy external one, and so nothing about the original graph is lost as
     /// the ladder climbs.
     self_loops: Vec<f64>,
+    /// Successors of each node, sorted and deduplicated: the direction `adj`
+    /// dropped, kept so a move can be tested for closing a cycle in the
+    /// quotient. Weights are not carried — the test is reachability, and the
+    /// objective reads `adj`.
+    out: Vec<Vec<usize>>,
 }
 
 impl WeightedGraph {
-    fn new(adj_maps: Vec<HashMap<usize, f64>>, self_loops: Vec<f64>) -> Self {
+    fn new(
+        adj_maps: Vec<HashMap<usize, f64>>,
+        self_loops: Vec<f64>,
+        mut out: Vec<Vec<usize>>,
+    ) -> Self {
         let mut adj: Vec<Vec<(usize, f64)>> = adj_maps
             .into_iter()
             .map(|m| m.into_iter().collect::<Vec<_>>())
@@ -419,8 +443,16 @@ impl WeightedGraph {
         for neighbours in &mut adj {
             neighbours.sort_unstable_by_key(|(index, _)| *index);
         }
+        for successors in &mut out {
+            successors.sort_unstable();
+            successors.dedup();
+        }
 
-        Self { adj, self_loops }
+        Self {
+            adj,
+            self_loops,
+            out,
+        }
     }
 
     fn node_count(&self) -> usize {
@@ -428,8 +460,20 @@ impl WeightedGraph {
     }
 }
 
-/// Build the undirected weighted graph the coarsening runs on, plus the symbol
-/// list that gives every index its meaning.
+/// The graph the coarsening runs on: the connected symbols, condensed so that
+/// it is a DAG.
+struct Base {
+    /// Every connected symbol, in id order — the meaning of every index.
+    symbols: Vec<SymbolId>,
+    /// The condensed node each symbol is, indexed like `symbols`.
+    units: Vec<usize>,
+    /// How many symbols each node of `graph` holds.
+    sizes: Vec<usize>,
+    graph: WeightedGraph,
+}
+
+/// Build the weighted graph the coarsening runs on, plus the symbol list that
+/// gives every index its meaning.
 ///
 /// `CallGraph::get_callees` returns one entry per distinct *call site*, not per
 /// distinct callee — the graph deduplicates on (caller, callee, location). So
@@ -439,18 +483,19 @@ impl WeightedGraph {
 /// input to "heaviest": two functions that call each other twenty times merge
 /// before either merges with something it touches once.
 ///
-/// Direction is dropped here. Matching has no use for it — a call is a reason
-/// to put two functions in one box whichever way it runs — and keeping it would
-/// mean a node had two heaviest edges to choose between.
+/// The objective reads the calls undirected — a call is a reason to put two
+/// functions in one box whichever way it runs — and the direction is kept
+/// beside them in `out`, for the cycle test alone. The graph is then condensed:
+/// every strongly connected component becomes one node, so what the coarsening
+/// starts from is a DAG and [`joins_a_cycle`] has an invariant to keep rather
+/// than one to hope for. Self-loops are dropped before that, so plain
+/// recursion is not a component of its own.
 ///
 /// `scope`, when given, is the set of functions to consider; everything else is
 /// left out, and so are the calls that would have reached it. Restricting the
 /// symbol list is enough to restrict the edges too, because a call whose other
 /// end has no index is skipped exactly as a call to an unknown symbol is.
-fn build_base_graph(
-    graph: &CallGraph,
-    scope: Option<&HashSet<SymbolId>>,
-) -> (Vec<SymbolId>, WeightedGraph) {
+fn build_base_graph(graph: &CallGraph, scope: Option<&HashSet<SymbolId>>) -> Base {
     let mut all: Vec<SymbolId> = graph
         .function_ids()
         .filter(|id| scope.is_none_or(|s| s.contains(id)))
@@ -463,6 +508,7 @@ fn build_base_graph(
     let position: HashMap<SymbolId, usize> = all.iter().enumerate().map(|(i, s)| (*s, i)).collect();
 
     let mut weights: Vec<HashMap<usize, f64>> = vec![HashMap::new(); all.len()];
+    let mut out: Vec<Vec<usize>> = vec![Vec::new(); all.len()];
     for (i, symbol) in all.iter().enumerate() {
         for callee in graph.get_callees(symbol) {
             let Some(&j) = position.get(&callee.id) else {
@@ -475,6 +521,7 @@ fn build_base_graph(
             }
             *weights[i].entry(j).or_insert(0.0) += 1.0;
             *weights[j].entry(i).or_insert(0.0) += 1.0;
+            out[i].push(j);
         }
     }
 
@@ -495,9 +542,97 @@ fn build_base_graph(
                 .collect()
         })
         .collect();
+    let out: Vec<Vec<usize>> = kept
+        .iter()
+        .map(|&old| out[old].iter().map(|&j| compacted[j]).collect())
+        .collect();
     let self_loops = vec![0.0; symbols.len()];
+    let graph = WeightedGraph::new(adj_maps, self_loops, out);
 
-    (symbols, WeightedGraph::new(adj_maps, self_loops))
+    let (units, count) = condense(&graph.out);
+    let sizes = merged_sizes(&vec![1; symbols.len()], &units, count);
+    let graph = if count == symbols.len() {
+        graph
+    } else {
+        aggregate(&graph, &units, count)
+    };
+
+    Base {
+        symbols,
+        units,
+        sizes,
+        graph,
+    }
+}
+
+/// The strongly connected components of a graph given as successor lists,
+/// numbered in order of lowest member so that the units come out in the same
+/// order as the nodes. Returns the component of each node and the count.
+///
+/// Tarjan's algorithm with an explicit stack: a call chain a few thousand
+/// functions deep is an ordinary thing in a real project, and a recursive walk
+/// over it would overflow the thread's stack.
+fn condense(out: &[Vec<usize>]) -> (Vec<usize>, usize) {
+    let n = out.len();
+    let mut index = vec![usize::MAX; n];
+    let mut low = vec![0usize; n];
+    let mut on_stack = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut component = vec![usize::MAX; n];
+    let mut count = 0usize;
+    let mut next = 0usize;
+    // The call stack: a node and how many of its successors it has visited.
+    let mut work: Vec<(usize, usize)> = Vec::new();
+
+    for start in 0..n {
+        if index[start] != usize::MAX {
+            continue;
+        }
+        index[start] = next;
+        low[start] = next;
+        next += 1;
+        stack.push(start);
+        on_stack[start] = true;
+        work.push((start, 0));
+
+        while let Some(&mut (node, ref mut position)) = work.last_mut() {
+            if *position < out[node].len() {
+                let successor = out[node][*position];
+                *position += 1;
+                if index[successor] == usize::MAX {
+                    index[successor] = next;
+                    low[successor] = next;
+                    next += 1;
+                    stack.push(successor);
+                    on_stack[successor] = true;
+                    work.push((successor, 0));
+                } else if on_stack[successor] {
+                    low[node] = low[node].min(index[successor]);
+                }
+                continue;
+            }
+
+            work.pop();
+            if let Some(&(parent, _)) = work.last() {
+                low[parent] = low[parent].min(low[node]);
+            }
+            if low[node] == index[node] {
+                loop {
+                    let member = stack
+                        .pop()
+                        .expect("the root of a component is on the stack");
+                    on_stack[member] = false;
+                    component[member] = count;
+                    if member == node {
+                        break;
+                    }
+                }
+                count += 1;
+            }
+        }
+    }
+
+    renumber(&component)
 }
 
 // ---------------------------------------------------------------------------
@@ -525,11 +660,10 @@ fn build_base_graph(
 /// singletons. A map has to have something to draw, and "every function is its
 /// own box" is the honest answer for a graph that small — grouping it further
 /// would merge a program small enough to read whole.
-fn coarsen(base: WeightedGraph) -> Ladder {
-    let functions = base.node_count();
+fn coarsen(base: WeightedGraph, sizes: Vec<usize>) -> Ladder {
     let mut run = Coarsening {
         levels: Vec::new(),
-        sizes: vec![1; functions],
+        sizes,
         current: base,
         opening: 0,
     };
@@ -645,6 +779,12 @@ impl Ladder {
 /// needs a strictly better gain than staying, and candidates are tried in
 /// ascending community id, so ties are deterministic and lean towards leaving
 /// things be.
+///
+/// A candidate that would put its community on a directed cycle of the
+/// quotient is skipped, however much it gains — see [`joins_a_cycle`]. The
+/// graph handed in is a DAG, by construction at the base and by this rule at
+/// every rung above it, and every community starts as one node, so the
+/// quotient is acyclic before the first move and stays so after each.
 fn louvain_pass(graph: &WeightedGraph, resolution: f64) -> (Vec<usize>, usize) {
     let n = graph.node_count();
 
@@ -662,6 +802,8 @@ fn louvain_pass(graph: &WeightedGraph, resolution: f64) -> (Vec<usize>, usize) {
 
     let mut community: Vec<usize> = (0..n).collect();
     let mut community_degree: Vec<f64> = degree.clone();
+    let mut members: Vec<Vec<usize>> = (0..n).map(|node| vec![node]).collect();
+    let mut scratch = CycleScratch::new(n);
     // Calls from the node being placed into each neighbouring community.
     // A `BTreeMap` so the candidates come out in ascending id — the tie-break.
     let mut links: BTreeMap<usize, f64> = BTreeMap::new();
@@ -691,15 +833,33 @@ fn louvain_pass(graph: &WeightedGraph, resolution: f64) -> (Vec<usize>, usize) {
                     continue;
                 }
                 let candidate_gain = gain(candidate, into, &community_degree);
-                if candidate_gain > best_gain + GAIN_EPSILON {
-                    best = candidate;
-                    best_gain = candidate_gain;
+                if candidate_gain <= best_gain + GAIN_EPSILON {
+                    continue;
                 }
+                // Better — but only legal if the quotient stays a DAG.
+                let after = |other: usize| {
+                    if other == node {
+                        candidate
+                    } else {
+                        community[other]
+                    }
+                };
+                if joins_a_cycle(graph, after, &members, &[node], candidate, &mut scratch) {
+                    continue;
+                }
+                best = candidate;
+                best_gain = candidate_gain;
             }
 
             community_degree[best] += degree[node];
             if best != own {
                 community[node] = best;
+                let at = members[own]
+                    .iter()
+                    .position(|&member| member == node)
+                    .expect("a node is listed in its own community");
+                members[own].swap_remove(at);
+                members[best].push(node);
                 moved = true;
             }
         }
@@ -710,6 +870,85 @@ fn louvain_pass(graph: &WeightedGraph, resolution: f64) -> (Vec<usize>, usize) {
 
     renumber(&community)
 }
+/// Scratch for [`joins_a_cycle`], reused across the checks of one pass so a
+/// check allocates nothing.
+struct CycleScratch {
+    /// Stamped rather than cleared: a group is visited when its entry carries
+    /// the current stamp.
+    seen: Vec<u32>,
+    stamp: u32,
+    queue: Vec<usize>,
+}
+
+impl CycleScratch {
+    fn new(groups: usize) -> Self {
+        Self {
+            seen: vec![0; groups],
+            stamp: 0,
+            queue: Vec::new(),
+        }
+    }
+}
+
+/// Whether the quotient would have a directed cycle through `target` once the
+/// nodes in `joining` count as its members.
+///
+/// `group_of` is the assignment *after* the move — it has to answer `target`
+/// for every node in `joining` — and `members` is the assignment before it,
+/// which is why a listed member is walked only when `group_of` still agrees it
+/// belongs. The quotient before the move is acyclic, and a move adds only
+/// edges that touch `target`, so any new cycle runs through `target`: the
+/// search starts there and asks whether it gets back.
+///
+/// A breadth-first walk over the quotient, so it costs the part of the
+/// program downstream of `target`, per candidate move. On a graph the size of
+/// a mid-sized C++ project that is the cost to watch; the standard remedy —
+/// keeping a topological order of the quotient, so a move that adds only
+/// forward edges needs no search at all — is worth reaching for if it shows.
+fn joins_a_cycle(
+    graph: &WeightedGraph,
+    group_of: impl Fn(usize) -> usize,
+    members: &[Vec<usize>],
+    joining: &[usize],
+    target: usize,
+    scratch: &mut CycleScratch,
+) -> bool {
+    let CycleScratch { seen, stamp, queue } = scratch;
+    *stamp = stamp.wrapping_add(1);
+    if *stamp == 0 {
+        seen.fill(0);
+        *stamp = 1;
+    }
+    let stamp = *stamp;
+
+    queue.clear();
+    queue.push(target);
+    seen[target] = stamp;
+
+    while let Some(group) = queue.pop() {
+        let extra: &[usize] = if group == target { joining } else { &[] };
+        for &node in members[group].iter().chain(extra) {
+            if group_of(node) != group {
+                continue;
+            }
+            for &successor in &graph.out[node] {
+                let other = group_of(successor);
+                if other == group {
+                    continue;
+                }
+                if other == target {
+                    return true;
+                }
+                if seen[other] != stamp {
+                    seen[other] = stamp;
+                    queue.push(other);
+                }
+            }
+        }
+    }
+    false
+}
+
 /// How many base functions each merged group holds.
 fn merged_sizes(sizes: &[usize], groups: &[usize], count: usize) -> Vec<usize> {
     let mut merged = vec![0usize; count];
@@ -734,50 +973,57 @@ fn merged_sizes(sizes: &[usize], groups: &[usize], count: usize) -> Vec<usize> {
 /// the null model expects of it — but a function whose few calls all go to a
 /// very busy box can come out that way, and it is only at the last rung that
 /// it has nowhere further to go. So this is the one place the objective is
-/// overruled, and it is overruled by the heaviest edge.
+/// overruled, and it is overruled by the heaviest edge. The cycle rule is not
+/// overruled with it: a neighbour the fold would close a quotient cycle by
+/// joining is passed over for the next heaviest, and a singleton with no legal
+/// neighbour stays alone.
 fn fold_singletons(graph: &WeightedGraph, sizes: &[usize]) -> Option<(Vec<usize>, usize)> {
     let n = graph.node_count();
-    let mut parent: Vec<usize> = (0..n).collect();
-
-    fn root(parent: &mut [usize], mut node: usize) -> usize {
-        while parent[node] != node {
-            parent[node] = parent[parent[node]];
-            node = parent[node];
-        }
-        node
-    }
+    let mut group: Vec<usize> = (0..n).collect();
+    let mut members: Vec<Vec<usize>> = (0..n).map(|node| vec![node]).collect();
+    let mut scratch = CycleScratch::new(n);
 
     let mut folded = false;
     for (node, &size) in sizes.iter().enumerate() {
         if size != 1 {
             continue;
         }
-        // `adj` is sorted by index and the comparison is strict, so among
-        // equally heavy candidates the lowest index wins.
-        let mut best: Option<(usize, f64)> = None;
-        for &(neighbour, weight) in &graph.adj[node] {
-            if best.is_none_or(|(_, heaviest)| weight > heaviest) {
-                best = Some((neighbour, weight));
-            }
-        }
+        // Heaviest first. `adj` is sorted by index and the sort is stable, so
+        // among equally heavy candidates the lowest index comes first.
+        let mut candidates: Vec<(usize, f64)> = graph.adj[node].clone();
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
         // A cluster with no neighbours at all is a whole connected component
         // that merged into one box. There is nothing to fold it into.
-        let Some((partner, _)) = best else {
-            continue;
-        };
-
-        let (mine, theirs) = (root(&mut parent, node), root(&mut parent, partner));
-        if mine != theirs {
-            parent[mine] = theirs;
+        for (partner, _) in candidates {
+            let (mine, theirs) = (group[node], group[partner]);
+            if mine == theirs {
+                // An earlier fold already put the two together.
+                break;
+            }
+            let after = |other: usize| {
+                if group[other] == mine {
+                    theirs
+                } else {
+                    group[other]
+                }
+            };
+            if joins_a_cycle(graph, after, &members, &members[mine], theirs, &mut scratch) {
+                continue;
+            }
+            let moving = std::mem::take(&mut members[mine]);
+            for &member in &moving {
+                group[member] = theirs;
+            }
+            members[theirs].extend(moving);
             folded = true;
+            break;
         }
     }
 
     if !folded {
         return None;
     }
-    let roots: Vec<usize> = (0..n).map(|node| root(&mut parent, node)).collect();
-    Some(renumber(&roots))
+    Some(renumber(&group))
 }
 
 fn renumber(groups: &[usize]) -> (Vec<usize>, usize) {
@@ -806,6 +1052,7 @@ fn renumber(groups: &[usize]) -> (Vec<usize>, usize) {
 fn aggregate(graph: &WeightedGraph, groups: &[usize], count: usize) -> WeightedGraph {
     let mut adj_maps: Vec<HashMap<usize, f64>> = vec![HashMap::new(); count];
     let mut self_loops = vec![0.0f64; count];
+    let mut out: Vec<Vec<usize>> = vec![Vec::new(); count];
 
     for (node, &group) in groups.iter().enumerate() {
         self_loops[group] += graph.self_loops[node];
@@ -818,9 +1065,15 @@ fn aggregate(graph: &WeightedGraph, groups: &[usize], count: usize) -> WeightedG
                 *adj_maps[group].entry(other).or_insert(0.0) += weight;
             }
         }
+        for &successor in &graph.out[node] {
+            let other = groups[successor];
+            if other != group {
+                out[group].push(other);
+            }
+        }
     }
 
-    WeightedGraph::new(adj_maps, self_loops)
+    WeightedGraph::new(adj_maps, self_loops, out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,12 +1382,12 @@ mod tests {
     /// `Clustering::compute`, which stops before the first pass on a graph this
     /// small.
     fn one_pass(graph: &CallGraph, resolution: f64) -> Vec<Vec<String>> {
-        let (symbols, base) = build_base_graph(graph, None);
-        let (groups, count) = louvain_pass(&base, resolution);
+        let base = build_base_graph(graph, None);
+        let (groups, count) = louvain_pass(&base.graph, resolution);
 
         let mut buckets = vec![Vec::new(); count];
-        for (node, &group) in groups.iter().enumerate() {
-            buckets[group].push(named(graph, &symbols[node]));
+        for (node, &unit) in base.units.iter().enumerate() {
+            buckets[groups[unit]].push(named(graph, &base.symbols[node]));
         }
         for bucket in &mut buckets {
             bucket.sort();
@@ -1267,7 +1520,12 @@ mod tests {
             adj[left].insert(right, 1.0);
             adj[right].insert(left, 1.0);
         }
-        let graph = WeightedGraph::new(adj, vec![0.0; 4]);
+        // Directed 0 -> 1, 2 -> 3, 0 -> 2, 1 -> 3: a DAG whose pairs can merge.
+        let graph = WeightedGraph::new(
+            adj,
+            vec![0.0; 4],
+            vec![vec![1, 2], vec![3], vec![3], vec![]],
+        );
 
         let (groups, count) = louvain_pass(&graph, 1.0);
         assert_eq!(count, 2, "two pairs should merge into two nodes");
@@ -1422,7 +1680,7 @@ mod tests {
             adj[0].insert(other, weight);
             adj[other].insert(0, weight);
         }
-        let graph = WeightedGraph::new(adj, vec![0.0; 3]);
+        let graph = WeightedGraph::new(adj, vec![0.0; 3], vec![vec![1, 2], vec![], vec![]]);
 
         let (fold, count) = fold_singletons(&graph, &[1, 5, 5]).expect("a singleton to fold");
 
@@ -1439,9 +1697,221 @@ mod tests {
         let mut adj = vec![HashMap::new(); 2];
         adj[0].insert(1usize, 3.0f64);
         adj[1].insert(0usize, 3.0f64);
-        let graph = WeightedGraph::new(adj, vec![0.0; 2]);
+        let graph = WeightedGraph::new(adj, vec![0.0; 2], vec![vec![1], vec![]]);
 
         assert!(fold_singletons(&graph, &[4, 6]).is_none());
+    }
+
+    /// The fold is overruled by the heaviest edge, and the cycle rule overrules
+    /// the fold: a neighbour it cannot legally join is passed over.
+    #[test]
+    fn a_singleton_folds_past_a_neighbour_that_would_close_a_cycle() {
+        // 2 -> 0 heavily, 1 -> 0 lightly, 2 -> 1. Joining 2 makes a box that
+        // calls 1 and is called by it; joining 1 does not.
+        let mut adj = vec![HashMap::new(); 3];
+        for (a, b, weight) in [(2usize, 0usize, 9.0f64), (1, 0, 1.0), (2, 1, 1.0)] {
+            adj[a].insert(b, weight);
+            adj[b].insert(a, weight);
+        }
+        let graph = WeightedGraph::new(adj, vec![0.0; 3], vec![vec![], vec![0], vec![0, 1]]);
+
+        let (fold, count) = fold_singletons(&graph, &[1, 5, 5]).expect("a singleton to fold");
+
+        assert_eq!(count, 2);
+        assert_eq!(
+            fold[0], fold[1],
+            "the singleton takes the next neighbour down"
+        );
+        assert_ne!(fold[0], fold[2]);
+    }
+
+    // -- the quotient is a DAG ------------------------------------------------
+
+    /// Whether the boxes at `level`, with the calls between them, form a DAG.
+    fn rung_is_a_dag(graph: &CallGraph, clustering: &Clustering, level: usize) -> bool {
+        let ids = clustering.level(level);
+        let mut successors: HashMap<ClusterId, HashSet<ClusterId>> = HashMap::new();
+        for id in ids {
+            for member in &clustering.cluster(*id).unwrap().members {
+                for callee in graph.get_callees(member) {
+                    if let Some(other) = clustering.cluster_of_at(&callee.id, level) {
+                        if other != *id {
+                            successors.entry(*id).or_default().insert(other);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut indegree: HashMap<ClusterId, usize> = ids.iter().map(|id| (*id, 0)).collect();
+        for targets in successors.values() {
+            for target in targets {
+                *indegree.get_mut(target).unwrap() += 1;
+            }
+        }
+        let mut ready: Vec<ClusterId> = indegree
+            .iter()
+            .filter(|(_, degree)| **degree == 0)
+            .map(|(id, _)| *id)
+            .collect();
+        let mut removed = 0usize;
+        while let Some(id) = ready.pop() {
+            removed += 1;
+            for target in successors.get(&id).into_iter().flatten() {
+                let degree = indegree.get_mut(target).unwrap();
+                *degree -= 1;
+                if *degree == 0 {
+                    ready.push(*target);
+                }
+            }
+        }
+        removed == ids.len()
+    }
+
+    /// A layered DAG with some structure to find: `n` functions where each
+    /// calls one to three of the next eight, chosen by a fixed generator so
+    /// the fixture is the same every run.
+    fn layered_dag(n: u32) -> (CallGraph, Vec<SymbolId>) {
+        let mut graph = CallGraph::new();
+        let ids: Vec<SymbolId> = (0..n)
+            .map(|i| add(&mut graph, &format!("f{i}"), i + 1))
+            .collect();
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut line = 1000u32;
+        for i in 0..n as usize {
+            let fan = 1 + (next() % 3) as usize;
+            for _ in 0..fan {
+                let j = i + 1 + (next() % 8) as usize;
+                if j < n as usize {
+                    let times = 1 + (next() % 3) as u32;
+                    call_often(&mut graph, ids[i], ids[j], line, times);
+                    line += times;
+                }
+            }
+        }
+        (graph, ids)
+    }
+
+    /// Two pairs that pay to merge, and a one-way chain that crosses between
+    /// them in both directions: exactly the shape modularity alone draws as a
+    /// pair of boxes calling each other.
+    fn crossing_graph() -> CallGraph {
+        let mut graph = CallGraph::new();
+        let a = add(&mut graph, "a", 1);
+        let b = add(&mut graph, "b", 2);
+        let c = add(&mut graph, "c", 3);
+        let d = add(&mut graph, "d", 4);
+        call_often(&mut graph, a, c, 100, 5);
+        call_often(&mut graph, b, d, 150, 5);
+        call(&mut graph, a, b, 200);
+        call(&mut graph, b, c, 201);
+        for i in 0..5 {
+            let left = add(&mut graph, &format!("spare{i}l"), 300 + i * 2);
+            let right = add(&mut graph, &format!("spare{i}r"), 301 + i * 2);
+            call_often(&mut graph, left, right, 400 + i * 10, 5);
+        }
+        graph
+    }
+
+    /// The property this module now promises: over a call graph with no cycle,
+    /// no rung of the ladder has one either.
+    #[test]
+    fn every_rung_of_a_dag_is_a_dag() {
+        let crossing = crossing_graph();
+        let (layered, _) = layered_dag(60);
+        for (name, graph) in [("crossing", &crossing), ("layered", &layered)] {
+            let clustering = Clustering::compute(graph, ClusterMethod::Modularity);
+            assert!(
+                clustering.level_count() > 1,
+                "{name}: the fixture should coarsen"
+            );
+            for level in 0..clustering.level_count() {
+                assert!(
+                    rung_is_a_dag(graph, &clustering, level),
+                    "{name}: rung {level} has a cycle: {:?}",
+                    grouping_at(graph, &clustering, level)
+                );
+            }
+        }
+    }
+
+    /// The pairs still merge; the crossing is what is refused.
+    #[test]
+    fn a_move_that_would_close_a_quotient_cycle_is_refused() {
+        let graph = crossing_graph();
+        let clustering = Clustering::compute(&graph, ClusterMethod::Modularity);
+        let groups = grouping_at(&graph, &clustering, 0);
+        let boxed = |x: &str, y: &str| {
+            groups
+                .iter()
+                .any(|g| g.iter().any(|m| m == x) && g.iter().any(|m| m == y))
+        };
+
+        assert!(
+            boxed("a", "c") || boxed("b", "d"),
+            "at least one heavy pair merges: {groups:?}"
+        );
+        assert!(rung_is_a_dag(&graph, &clustering, 0), "{groups:?}");
+    }
+
+    /// Functions that call each other are one unit from the finest rung up,
+    /// so the quotient of a graph with a real cycle in it is still a DAG.
+    #[test]
+    fn mutually_recursive_functions_share_a_box_at_every_rung() {
+        let (mut graph, ids) = layered_dag(60);
+        // The farthest function f10 reaches, then a call back from it: every
+        // function on a path between the two is now in one strongly connected
+        // component.
+        let mut reach: Vec<SymbolId> = vec![ids[10]];
+        let mut seen: HashSet<SymbolId> = reach.iter().copied().collect();
+        let mut at = 0;
+        while at < reach.len() {
+            for callee in graph.get_callees(&reach[at]) {
+                if seen.insert(callee.id) {
+                    reach.push(callee.id);
+                }
+            }
+            at += 1;
+        }
+        let far = *reach.last().unwrap();
+        assert_ne!(far, ids[10], "f10 should reach something");
+        call(&mut graph, far, ids[10], 9000);
+
+        let clustering = Clustering::compute(&graph, ClusterMethod::Modularity);
+        assert!(clustering.level_count() > 1);
+        for level in 0..clustering.level_count() {
+            assert_eq!(
+                clustering.cluster_of_at(&ids[10], level),
+                clustering.cluster_of_at(&far, level),
+                "a cycle is never split across boxes, at rung {level}"
+            );
+            assert!(rung_is_a_dag(&graph, &clustering, level), "rung {level}");
+        }
+    }
+
+    #[test]
+    fn a_small_graph_with_a_cycle_condenses_it_into_one_box() {
+        let mut graph = CallGraph::new();
+        let a = add(&mut graph, "a", 1);
+        let b = add(&mut graph, "b", 2);
+        let c = add(&mut graph, "c", 3);
+        call(&mut graph, a, b, 10);
+        call(&mut graph, b, a, 11);
+        call(&mut graph, b, c, 12);
+
+        let clustering = Clustering::compute(&graph, ClusterMethod::Modularity);
+
+        assert_eq!(clustering.level_count(), 1);
+        assert_eq!(
+            grouping_at(&graph, &clustering, 0),
+            vec![vec!["a", "b"], vec!["c"]]
+        );
     }
 
     /// The finest rung of a graph small enough to read whole is the graph

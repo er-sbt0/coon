@@ -384,21 +384,8 @@ pub struct LayoutEdge {
     pub source: LayoutNodeId,
     pub target: LayoutNodeId,
     /// How many individual calls this one line stands for, so the client can
-    /// draw a heavily used relation more heavily than a stray one. For a mutual
-    /// pair it is both directions added together, because the line is both.
+    /// draw a heavily used relation more heavily than a stray one.
     pub weight: usize,
-    /// Calls run both ways between these two clusters.
-    ///
-    /// Pair merging puts no constraint on direction — a round can perfectly
-    /// well put a cluster on both ends of a one-way path — so the quotient of a
-    /// level is freely cyclic even over a call graph that is a clean DAG.
-    /// Drawing that as two opposed arrows reads as "these call each other" over
-    /// code where nothing does; drawing it as one double-headed line says the
-    /// true thing, which is that the boundary is crossed in both directions.
-    /// `source` and `target` still name the heavier direction, because the
-    /// layout has to place the two somehow and the heavier flow is the better
-    /// guess at which comes first.
-    pub mutual: bool,
 }
 
 /// A laid-out cluster map: one node per cluster at the level being shown, what
@@ -782,8 +769,7 @@ fn place_boxes(
         .collect()
 }
 
-/// Roll every call up to the pair of clusters it runs between, folding a pair
-/// that calls both ways into a single line.
+/// Roll every call up to the pair of clusters it runs between.
 ///
 /// `CallGraph` exposes no `edges()`, so the calls have to be walked the way
 /// `logic::cluster` walks them: `get_callees` per function, which returns one
@@ -791,6 +777,9 @@ fn place_boxes(
 ///
 /// Calls whose two ends land in the same cluster are dropped. Those are the
 /// ones internal to a box whose whole purpose is to not show its insides.
+///
+/// One line per ordered pair, and never both orders: a rung's quotient is a
+/// DAG, which `logic::cluster` guarantees rather than this function checking.
 fn aggregate_calls(
     graph: &CallGraph,
     owner: &HashMap<SymbolId, LayoutNodeId>,
@@ -820,34 +809,14 @@ fn aggregate_calls(
         }
     }
 
-    let mut edges: Vec<LayoutEdge> = Vec::with_capacity(weights.len());
-    for (&(source, target), &weight) in &weights {
-        let back = weights.get(&(target, source)).copied();
-        match back {
-            // Emitted once, from whichever end carries more calls. Equal
-            // weights are broken on the id so the choice is stable rather than
-            // whichever way the HashMap happened to be walked.
-            Some(back_weight) => {
-                let heavier = weight > back_weight
-                    || (weight == back_weight && source.to_string() < target.to_string());
-                if !heavier {
-                    continue;
-                }
-                edges.push(LayoutEdge {
-                    source,
-                    target,
-                    weight: weight + back_weight,
-                    mutual: true,
-                });
-            }
-            None => edges.push(LayoutEdge {
-                source,
-                target,
-                weight,
-                mutual: false,
-            }),
-        }
-    }
+    let mut edges: Vec<LayoutEdge> = weights
+        .iter()
+        .map(|(&(source, target), &weight)| LayoutEdge {
+            source,
+            target,
+            weight,
+        })
+        .collect();
 
     // `graph.function_ids()` is a HashMap iteration, so the aggregate has to be
     // sorted before it decides node order in the DAG — otherwise the same graph
@@ -1396,13 +1365,12 @@ mod tests {
 
     // -- edges --------------------------------------------------------------
 
-    /// Two clusters that call each other, in a graph big enough to coarsen.
-    ///
-    /// `a` and `c` merge, `b` and `d` merge, and the chain `a -> b -> c` then
-    /// crosses between the two in both directions — the shape pair merging
-    /// produces freely, and the reason a rung's quotient is not acyclic. The
-    /// ten spare functions are there only to put the graph over
-    /// `TARGET_TOP_CLUSTERS`, so that a round of merging happens at all.
+    /// Two heavy pairs and a one-way chain `a -> b -> c` that would cross
+    /// between them in both directions if both pairs merged — the shape
+    /// modularity alone draws as two boxes calling each other, and the one
+    /// `logic::cluster` refuses. The ten spare functions are there only to put
+    /// the graph over `TARGET_TOP_CLUSTERS`, so that a round of merging
+    /// happens at all.
     fn crossing_graph() -> (CallGraph, Clustering) {
         let mut graph = CallGraph::new();
         let add = |graph: &mut CallGraph, name: &str, line: u32| {
@@ -1481,53 +1449,35 @@ mod tests {
             else {
                 panic!("a cluster map draws clusters");
             };
-            let forward = expected.get(&(source, target)).copied().unwrap_or(0);
-            let back = expected.get(&(target, source)).copied().unwrap_or(0);
             assert_eq!(
-                edge.weight,
-                forward + back,
-                "a line stands for every call it draws, both ways when it is mutual"
+                Some(edge.weight),
+                expected.get(&(source, target)).copied(),
+                "a line stands for every call across its boundary"
             );
-            assert_eq!(edge.mutual, forward > 0 && back > 0);
             drawn += 1;
         }
-        // Mutual pairs are one line, so the count is pairs, not directions.
-        let unordered: HashSet<(String, String)> = expected
-            .keys()
-            .map(|(a, b)| {
-                let (a, b) = (format!("{:?}", a), format!("{:?}", b));
-                if a < b {
-                    (a, b)
-                } else {
-                    (b, a)
-                }
-            })
-            .collect();
-        assert_eq!(drawn, unordered.len());
+        assert_eq!(drawn, expected.len(), "one line per ordered pair");
     }
 
-    /// Pair merging puts no constraint on direction, so a rung's quotient is
-    /// freely cyclic. Two opposed arrows read as "these call each other"; one
-    /// double-headed line says the true thing.
+    /// The map never draws a boundary crossed both ways: `logic::cluster`
+    /// refuses the grouping, so there is nothing here to fold.
     #[test]
-    fn a_pair_that_calls_both_ways_is_drawn_once() {
+    fn no_boundary_on_the_map_is_crossed_both_ways() {
         let (graph, clustering) = crossing_graph();
-        let layout = map_at(&graph, &clustering, 0);
-
-        assert_eq!(layout.edges.len(), 1, "one line, not two opposed arrows");
-        let edge = &layout.edges[0];
-        assert!(edge.mutual, "calls cross this boundary in both directions");
-        assert_eq!(edge.weight, 2, "one call out and one back");
-    }
-
-    #[test]
-    fn a_one_way_crossing_is_not_mutual() {
-        let (graph, clustering) = demo();
-        let layout = map_at(&graph, &clustering, 0);
-        assert!(
-            layout.edges.iter().any(|e| !e.mutual),
-            "the demo graph is mostly a DAG; some crossing has to run one way"
-        );
+        for level in 0..clustering.level_count() {
+            let layout = map_at(&graph, &clustering, level);
+            let pairs: HashSet<(String, String)> = layout
+                .edges
+                .iter()
+                .map(|e| (e.source.to_string(), e.target.to_string()))
+                .collect();
+            for (source, target) in &pairs {
+                assert!(
+                    !pairs.contains(&(target.clone(), source.clone())),
+                    "rung {level} draws {source} -> {target} both ways"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1552,31 +1502,18 @@ mod tests {
             LayoutOrientation::LeftRight,
         );
 
-        let pairs = |layout: &GraphLayout| -> HashSet<(String, String, bool)> {
+        let pairs = |layout: &GraphLayout| -> HashSet<(String, String)> {
             layout
                 .edges
                 .iter()
-                .map(|e| (e.source.to_string(), e.target.to_string(), e.mutual))
+                .map(|e| (e.source.to_string(), e.target.to_string()))
                 .collect()
         };
-        // Compared as unordered pairs. A one-way line plainly flips; a mutual
-        // one is already both ways, and which of its two ends the layout put
-        // first is decided by the heavier direction — which reversing the map
-        // swaps. The claim is that the same boundaries are drawn, carrying the
-        // same mutuality, not that the tuples match.
-        let unordered = |layout: &GraphLayout| -> HashSet<(String, String, bool)> {
-            pairs(layout)
-                .into_iter()
-                .map(|(source, target, mutual)| {
-                    if source < target {
-                        (source, target, mutual)
-                    } else {
-                        (target, source, mutual)
-                    }
-                })
-                .collect()
-        };
-        assert_eq!(unordered(&incoming), unordered(&out));
+        let reversed: HashSet<(String, String)> = pairs(&out)
+            .into_iter()
+            .map(|(source, target)| (target, source))
+            .collect();
+        assert_eq!(pairs(&incoming), reversed);
     }
 
     #[test]

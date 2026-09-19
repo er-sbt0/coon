@@ -112,16 +112,6 @@ function graphStyle() {
         'text-max-width': NODE_W - 16,
       }
     },
-    // Calls cross this boundary in both directions. Pair merging puts no
-    // constraint on direction, so a rung of the ladder is freely cyclic even
-    // over a call graph that is a clean DAG — and two opposed arrows between
-    // the same two boxes read as "these call each other" over code where
-    // nothing of the sort happens. One line with a head at each end says the
-    // true thing: the boundary is crossed both ways.
-    {
-      selector: 'edge.mutual',
-      style: { 'source-arrow-shape': 'triangle', 'source-arrow-color': css('--edge') }
-    },
     { selector: 'edge.aggregate', style: { 'width': 'data(width)' } },
   ];
 }
@@ -596,7 +586,7 @@ function rebuildClusterMap(map) {
       group: 'edges',
       data: { id, source: edge.source, target: edge.target, width: edgeWidth(edge.weight) },
     });
-    cy.$id(id).addClass(edge.mutual ? 'aggregate mutual' : 'aggregate');
+    cy.$id(id).addClass('aggregate');
   }
 
   // The rung is deliberately *not* part of the key. Every box is placed where
