@@ -52,8 +52,8 @@ struct ClusterTarget {
 impl ClusterTarget {
     fn of(ws: &CoreWorkspace) -> Self {
         Self {
-            scope: ws.map_scope.map(|scope| (scope, ws.direction)),
-            method: ws.method,
+            scope: ws.map_scope().map(|scope| (scope, ws.direction())),
+            method: ws.method(),
         }
     }
 
@@ -310,7 +310,7 @@ impl CoreApp {
     pub fn map_level_for(&self, ws: &CoreWorkspace) -> usize {
         let clustering = self.clustering_for(ws);
         let top = clustering.top_level_index().unwrap_or_default();
-        ws.map_level
+        ws.map_level()
             .unwrap_or_else(|| clustering.opening_level())
             .min(top)
     }
@@ -349,7 +349,7 @@ impl CoreApp {
     pub fn current_direction(&self) -> CallDirection {
         self.workspaces
             .current()
-            .map(|w| w.direction)
+            .map(|w| w.direction())
             .unwrap_or(CallDirection::Outgoing)
     }
 
@@ -425,7 +425,7 @@ impl CoreApp {
         }
 
         // Emit current LSP phase as a progress event
-        events.push(AppEvent::LspProgress(self.lsp.status.clone()));
+        events.push(AppEvent::LspProgress(self.lsp.status().clone()));
 
         // Drain pending LSP responses
         let (responses, timeout_events) = self.lsp.drain_responses();
@@ -679,7 +679,7 @@ impl CoreApp {
     }
 
     fn cmd_find_references(&mut self) -> Vec<AppEvent> {
-        let symbol_id = self.workspaces.current().and_then(|w| w.root_symbol);
+        let symbol_id = self.workspaces.current().and_then(|w| w.root_symbol());
         if let Some(id) = symbol_id {
             // Nothing on the canvas changes, so there is no `LayoutDirty`
             // here: the answer arrives as its own event later.
@@ -714,17 +714,12 @@ impl CoreApp {
 
     fn cmd_toggle_call_direction(&mut self) -> Vec<AppEvent> {
         if let Some(ws) = self.workspaces.current_mut() {
-            ws.direction = match ws.direction {
-                CallDirection::Outgoing => CallDirection::Incoming,
-                CallDirection::Incoming => CallDirection::Outgoing,
-            };
-            // Reversing the arrows is a different tree; the nodes walked past
-            // the depth limit in the old one have nothing to say about it.
-            ws.expanded.clear();
-            log::info!(
-                "CoreApp: direction toggled to {:?}, expansions cleared",
-                ws.direction
-            );
+            // Reversing the arrows is a different tree, so the nodes walked
+            // past the depth limit in the old one are dropped with it — by
+            // `toggle_direction`, which owns both halves. Clearing `expanded`
+            // here instead is what let the two drift apart.
+            let direction = ws.toggle_direction();
+            log::info!("CoreApp: direction toggled to {direction:?}, expansions cleared");
         }
         vec![AppEvent::LayoutDirty]
     }
@@ -819,10 +814,10 @@ impl CoreApp {
         // by a user already waiting on the map they just asked for — where the
         // recompute this replaced fired on a timer for as long as the graph
         // kept growing.
-        let direction = ws.direction;
+        let direction = ws.direction();
         let target = ClusterTarget {
             scope: Some((symbol, direction)),
-            method: ws.method,
+            method: ws.method(),
         };
         let clustering = cluster_within(&self.call_graph, symbol, direction, target.method);
         // And the frame it will be placed in, if no worker has been round yet —
@@ -1126,7 +1121,7 @@ impl CoreApp {
                     ClusterTarget::of(ws),
                     ClusterTarget {
                         scope: None,
-                        method: ws.method,
+                        method: ws.method(),
                     },
                 ]
             })
@@ -1179,7 +1174,7 @@ impl CoreApp {
     /// `CoreApp::new` is the whole of it and nothing is pending at all.
     fn loading(&self) -> bool {
         let phase_done = matches!(
-            self.lsp.status,
+            self.lsp.status(),
             LspLoadPhase::NotStarted | LspLoadPhase::Completed | LspLoadPhase::Failed(_)
         );
         !phase_done || self.warming_up()
@@ -1187,8 +1182,7 @@ impl CoreApp {
 
     /// Whether the initial edge warmup is still running.
     fn warming_up(&self) -> bool {
-        self.warmup_seeded
-            && (!self.edge_warmup.is_empty() || !self.lsp.pending_requests.is_empty())
+        self.warmup_seeded && (!self.edge_warmup.is_empty() || self.lsp.pending_count() > 0)
     }
 
     /// Add a function that came from a symbol query, and queue its edges.
@@ -1302,8 +1296,8 @@ impl CoreApp {
         // the graph goes in here; everything arriving after queues itself
         // through `ingest_symbol`.
         if !self.warmup_seeded
-            && matches!(self.lsp.status, LspLoadPhase::Completed)
-            && self.lsp.request_tx.is_some()
+            && matches!(self.lsp.status(), LspLoadPhase::Completed)
+            && self.lsp.has_worker()
         {
             self.warmup_seeded = true;
             self.edge_warmup = self.call_graph.function_ids().copied().collect();
@@ -1313,7 +1307,7 @@ impl CoreApp {
             log::info!(
                 "CoreApp: warming up call hierarchy for {} symbol(s), {} in flight, {} node(s) in the graph",
                 self.edge_warmup.len(),
-                self.lsp.pending_requests.len(),
+                self.lsp.pending_count(),
                 self.call_graph.node_count()
             );
         }
@@ -1321,7 +1315,7 @@ impl CoreApp {
         let mut events = Vec::new();
         let mut sent = 0usize;
         let mut skipped = 0usize;
-        while self.lsp.pending_requests.len() < WARMUP_IN_FLIGHT {
+        while self.lsp.pending_count() < WARMUP_IN_FLIGHT {
             let Some(id) = self.edge_warmup.pop_front() else {
                 break;
             };
@@ -1407,7 +1401,7 @@ impl CoreApp {
             done,
             self.warmup_total,
             self.edge_warmup.len(),
-            self.lsp.pending_requests.len(),
+            self.lsp.pending_count(),
             WARMUP_IN_FLIGHT,
             still.as_secs_f32(),
             self.lsp.pending_summary()
@@ -1635,6 +1629,21 @@ mod tests {
     use model::Location;
     use tokio::sync::mpsc;
 
+    /// Wire the bridge to a worker that is listening, and hand back the
+    /// requests it sends.
+    ///
+    /// Both halves go in together, which is what `LspBridge::set_channels`
+    /// takes: a bridge that can ask and never hear is a state no loader
+    /// produces. Nothing here answers over the wire — these tests hand
+    /// responses to `handle_lsp_response` directly — so the reply channel is
+    /// left to close behind us.
+    fn wire_worker(app: &mut CoreApp) -> mpsc::UnboundedReceiver<lsp::LspRequest> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (_replies_tx, replies_rx) = mpsc::unbounded_channel();
+        app.lsp.set_channels(replies_rx, tx);
+        rx
+    }
+
     /// Distinct lines keep the generated `SymbolId`s distinct.
     fn add(graph: &mut CallGraph, name: &str, line: u32) -> SymbolId {
         graph.add_function(FunctionNode::new(
@@ -1717,7 +1726,7 @@ mod tests {
 
         let after = placed(&app);
         assert_eq!(
-            app.workspaces.current().and_then(|ws| ws.root_symbol),
+            app.workspaces.current().and_then(|ws| ws.root_symbol()),
             Some(root),
             "expanding does not re-root the workspace"
         );
@@ -1749,7 +1758,7 @@ mod tests {
         );
         assert_eq!(app.selected_function, Some(mid), "the selection moved");
         assert_eq!(
-            app.workspaces.current().and_then(|ws| ws.root_symbol),
+            app.workspaces.current().and_then(|ws| ws.root_symbol()),
             Some(root),
             "the root did not"
         );
@@ -1767,9 +1776,9 @@ mod tests {
 
     /// Say the load has finished, which is what lets a recompute start at all.
     fn loaded(app: &mut CoreApp) {
-        app.lsp.status = LspLoadPhase::Completed;
+        app.lsp.set_status(LspLoadPhase::Completed);
         app.edge_warmup.clear();
-        app.lsp.pending_requests.clear();
+        app.lsp.clear_pending();
     }
 
     /// Tick until every map the app owes has been computed and installed.
@@ -1837,7 +1846,8 @@ mod tests {
         // Symbols are still arriving. Coarsening is not incremental, so a map
         // built now is one that will be thrown away — after moving every box
         // under whoever was reading it.
-        app.lsp.status = LspLoadPhase::LoadingWorkspaceSymbols { loaded: 3 };
+        app.lsp
+            .set_status(LspLoadPhase::LoadingWorkspaceSymbols { loaded: 3 });
         let (graph, left, _) = two_triangles();
         app.call_graph = graph;
         app.mark_graph_changed();
@@ -2038,9 +2048,8 @@ mod tests {
             ));
         }
         let mut app = CoreApp::new(graph);
-        let (tx, rx) = mpsc::unbounded_channel();
-        app.lsp.request_tx = Some(tx);
-        app.lsp.status = LspLoadPhase::Completed;
+        let rx = wire_worker(&mut app);
+        app.lsp.set_status(LspLoadPhase::Completed);
         (app, rx)
     }
 
@@ -2073,7 +2082,7 @@ mod tests {
         assert!(!app.edge_warmup.is_empty(), "the rest waits its turn");
 
         // Answering them frees the slots for the next batch.
-        app.lsp.pending_requests.clear();
+        app.lsp.clear_pending();
         app.tick();
         assert_eq!(
             std::iter::from_fn(|| rx.try_recv().ok()).count(),
@@ -2110,7 +2119,7 @@ mod tests {
         });
 
         assert_eq!(app.warmup_total, 2, "the work grew, and says so");
-        app.lsp.pending_requests.clear();
+        app.lsp.clear_pending();
         app.tick();
         assert_eq!(
             std::iter::from_fn(|| rx.try_recv().ok()).count(),
@@ -2272,7 +2281,7 @@ mod tests {
         // Drained: the end is announced exactly once, so a frontend can put the
         // indicator away without every later tick re-announcing it.
         app.edge_warmup.clear();
-        app.lsp.pending_requests.clear();
+        app.lsp.clear_pending();
 
         let done_events: Vec<_> = app
             .tick()
@@ -2325,7 +2334,7 @@ mod tests {
 
         // Drained: the graph has stopped moving.
         app.edge_warmup.clear();
-        app.lsp.pending_requests.clear();
+        app.lsp.clear_pending();
         assert!(!app.warming_up());
         assert!(!app.loading());
         app.sync_clusterings();
@@ -2359,7 +2368,7 @@ mod tests {
         );
         assert!(app.edge_warmup.is_empty(), "every symbol was taken off");
         assert!(
-            app.lsp.pending_requests.is_empty(),
+            app.lsp.pending_count() == 0,
             "and nothing is waiting for an answer that was never asked for"
         );
         assert!(!app.warming_up());
@@ -2407,12 +2416,7 @@ mod tests {
     fn a_refresh_puts_the_symbols_it_had_in_flight_back_on_the_queue() {
         let (mut app, mut rx) = loaded_app(WARMUP_IN_FLIGHT * 2);
         app.tick();
-        let in_flight: Vec<SymbolId> = app
-            .lsp
-            .pending_requests
-            .values()
-            .filter_map(|p| p.symbol_id)
-            .collect();
+        let in_flight: Vec<SymbolId> = app.lsp.pending().filter_map(|p| p.symbol_id).collect();
         assert_eq!(
             in_flight.len(),
             WARMUP_IN_FLIGHT,
@@ -2439,7 +2443,7 @@ mod tests {
         // them. Answer everything each round so the pump keeps drawing.
         let mut asked: HashSet<u32> = HashSet::new();
         for _ in 0..6 {
-            app.lsp.pending_requests.clear();
+            app.lsp.clear_pending();
             app.tick();
             asked.extend(prepared_lines(&mut rx));
             if app.edge_warmup.is_empty() {
@@ -2489,7 +2493,7 @@ mod tests {
 
         // And the end is still reachable, at the count it started with.
         for _ in 0..6 {
-            app.lsp.pending_requests.clear();
+            app.lsp.clear_pending();
             app.tick();
             prepared_lines(&mut rx);
             if app.edge_warmup.is_empty() {
@@ -2497,7 +2501,7 @@ mod tests {
             }
         }
         // The last batch is still out; answering it is what ends the warmup.
-        app.lsp.pending_requests.clear();
+        app.lsp.clear_pending();
         assert!(!app.warming_up());
         assert_eq!(app.warmup_total, WARMUP_IN_FLIGHT * 2);
     }
@@ -2516,12 +2520,11 @@ mod tests {
         prepared_lines(&mut rx);
         let doubled = *app
             .lsp
-            .pending_requests
-            .values()
+            .pending()
             .find_map(|p| p.symbol_id.as_ref())
             .expect("a symbol in flight");
-        app.lsp.pending_requests.insert(
-            "references-for-the-same-symbol".to_string(),
+        app.lsp.insert_pending(
+            "references-for-the-same-symbol",
             PendingRequest::new(Some(doubled), "references", RequestOrigin::User),
         );
 
@@ -2546,7 +2549,7 @@ mod tests {
         app.tick();
         prepared_lines(&mut rx);
         // Every request answered.
-        app.lsp.pending_requests.clear();
+        app.lsp.clear_pending();
         let queued: Vec<SymbolId> = app.edge_warmup.iter().copied().collect();
         let total = app.warmup_total;
 
@@ -2569,8 +2572,8 @@ mod tests {
     fn a_refresh_before_the_warmup_opens_queues_nothing() {
         let (mut app, mut rx) = loaded_app(2);
         let id = *app.call_graph.function_ids().next().expect("a symbol");
-        app.lsp.pending_requests.insert(
-            "in-flight-before-the-warmup".to_string(),
+        app.lsp.insert_pending(
+            "in-flight-before-the-warmup",
             PendingRequest::new(Some(id), "prepare f0", RequestOrigin::User),
         );
         assert!(!app.warmup_seeded);
@@ -2603,7 +2606,7 @@ mod tests {
         // forwarded to us with an id we have no pending entry for — and it still
         // has to populate the graph, or the frontend comes up empty.
         let mut app = CoreApp::new(CallGraph::new());
-        assert!(app.lsp.pending_requests.is_empty());
+        assert_eq!(app.lsp.pending_count(), 0);
 
         let events = app.handle_lsp_response(LspResponse::WorkspaceSymbols {
             request_id: "issued-by-the-loader".to_string(),
@@ -2626,8 +2629,8 @@ mod tests {
         let mut app = CoreApp::new(CallGraph::new());
         assert!(app.stale.is_empty());
 
-        app.lsp.pending_requests.insert(
-            "symbols".to_string(),
+        app.lsp.insert_pending(
+            "symbols",
             PendingRequest::new(None, "workspace symbols", RequestOrigin::User),
         );
         app.handle_lsp_response(LspResponse::WorkspaceSymbols {
@@ -2642,8 +2645,8 @@ mod tests {
 
         app.stale.clear();
         let caller = *app.call_graph.function_ids().next().expect("one symbol");
-        app.lsp.pending_requests.insert(
-            "calls".to_string(),
+        app.lsp.insert_pending(
+            "calls",
             PendingRequest::new(Some(caller), "outgoing calls", RequestOrigin::User),
         );
         app.handle_lsp_response(LspResponse::OutgoingCalls {
@@ -2673,8 +2676,8 @@ mod tests {
                 )],
             });
             let caller = *app.call_graph.function_ids().next().expect("one symbol");
-            app.lsp.pending_requests.insert(
-                "calls".to_string(),
+            app.lsp.insert_pending(
+                "calls",
                 PendingRequest::new(Some(caller), "outgoing calls", origin),
             );
 
@@ -2711,8 +2714,8 @@ mod tests {
             )],
         });
         let leaf = *app.call_graph.function_ids().next().expect("one symbol");
-        app.lsp.pending_requests.insert(
-            "calls".to_string(),
+        app.lsp.insert_pending(
+            "calls",
             PendingRequest::new(Some(leaf), "outgoing calls", RequestOrigin::Warmup),
         );
 
@@ -2731,9 +2734,8 @@ mod tests {
     /// survive the hop or the gate above never fires.
     #[test]
     fn the_follow_up_request_is_asked_by_whoever_asked_the_prepare() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = CoreApp::new(CallGraph::new());
-        app.lsp.request_tx = Some(tx);
+        let mut rx = wire_worker(&mut app);
         app.handle_lsp_response(LspResponse::WorkspaceSymbols {
             request_id: "symbols".to_string(),
             symbols: vec![FunctionNode::new(
@@ -2743,8 +2745,8 @@ mod tests {
             )],
         });
         let id = *app.call_graph.function_ids().next().expect("one symbol");
-        app.lsp.pending_requests.insert(
-            "prepare".to_string(),
+        app.lsp.insert_pending(
+            "prepare",
             PendingRequest::new(Some(id), "prepare alpha", RequestOrigin::Warmup),
         );
 
@@ -2755,10 +2757,7 @@ mod tests {
 
         rx.try_recv().expect("the follow-up went out");
         assert!(
-            app.lsp
-                .pending_requests
-                .values()
-                .all(|p| p.origin == RequestOrigin::Warmup),
+            app.lsp.pending().all(|p| p.origin == RequestOrigin::Warmup),
             "the follow-up inherits the prepare's origin"
         );
     }
@@ -2771,7 +2770,6 @@ mod tests {
     /// `+` on that node never did anything again.
     #[test]
     fn a_follow_up_asks_in_the_direction_its_prepare_was_asked_in() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
         let mut graph = CallGraph::new();
         // An absolute path, unlike the rest of these tests: `send_call_hierarchy`
         // turns the definition location into a `file://` URL, and a relative
@@ -2782,7 +2780,7 @@ mod tests {
             Location::new("/test.c".to_string(), 1, 0),
         ));
         let mut app = CoreApp::new(graph);
-        app.lsp.request_tx = Some(tx);
+        let mut rx = wire_worker(&mut app);
         assert_eq!(app.current_direction(), CallDirection::Outgoing);
 
         // The click: expand a node while the tab reads outgoing.
@@ -2823,8 +2821,8 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, AppEvent::LayoutDirty)));
 
         let ws = app.workspaces.current().expect("a workspace");
-        assert_eq!(ws.root_symbol, Some(entry));
-        assert_eq!(ws.view, ViewMode::Rooted);
+        assert_eq!(ws.root_symbol(), Some(entry));
+        assert_eq!(ws.view(), ViewMode::Rooted);
         assert_eq!(app.selected_function, Some(entry));
     }
 
@@ -2843,8 +2841,8 @@ mod tests {
 
         assert!(events.is_empty());
         let ws = app.workspaces.current().expect("a workspace");
-        assert_eq!(ws.root_symbol, None);
-        assert_eq!(ws.view, ViewMode::ClusterMap);
+        assert_eq!(ws.root_symbol(), None);
+        assert_eq!(ws.view(), ViewMode::ClusterMap);
     }
 
     #[test]
@@ -2853,11 +2851,14 @@ mod tests {
         let mut app = CoreApp::new(graph);
 
         app.dispatch(Command::DrillIntoCluster(key_of(&app, right[0])));
-        assert_eq!(app.workspaces.current().unwrap().view, ViewMode::Rooted);
+        assert_eq!(app.workspaces.current().unwrap().view(), ViewMode::Rooted);
 
         let events = app.dispatch(Command::ZoomOutToClusters);
         assert!(events.iter().any(|e| matches!(e, AppEvent::LayoutDirty)));
-        assert_eq!(app.workspaces.current().unwrap().view, ViewMode::ClusterMap);
+        assert_eq!(
+            app.workspaces.current().unwrap().view(),
+            ViewMode::ClusterMap
+        );
 
         assert!(
             app.dispatch(Command::ZoomOutToClusters).is_empty(),
@@ -2874,13 +2875,13 @@ mod tests {
 
         let events = app.dispatch(Command::SetMapLevel(0));
         assert!(events.iter().any(|e| matches!(e, AppEvent::LayoutDirty)));
-        assert_eq!(app.workspaces.current().unwrap().map_level, Some(0));
+        assert_eq!(app.workspaces.current().unwrap().map_level(), Some(0));
 
         // A level from a taller ladder lands on the coarsest rung rather than
         // on a blank canvas.
         app.dispatch(Command::SetMapLevel(rungs + 10));
         assert_eq!(
-            app.workspaces.current().unwrap().map_level,
+            app.workspaces.current().unwrap().map_level(),
             Some(rungs - 1),
             "a level past the top is clamped to the top"
         );
@@ -2891,7 +2892,7 @@ mod tests {
 
         app.dispatch(Command::SelectFunction(left[0]));
         assert_eq!(
-            app.workspaces.current().unwrap().map_level,
+            app.workspaces.current().unwrap().map_level(),
             None,
             "the zoom described the old view"
         );
@@ -2925,9 +2926,9 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, AppEvent::LayoutDirty)));
 
         let ws = app.workspaces.current().expect("a default workspace");
-        assert_eq!(ws.map_scope, Some(right[0]));
+        assert_eq!(ws.map_scope(), Some(right[0]));
         assert_eq!(
-            ws.view,
+            ws.view(),
             ViewMode::ClusterMap,
             "naming what to draw a map from is asking to see that map"
         );
@@ -2992,9 +2993,9 @@ mod tests {
             "the refusal has to be reported, or the click looks broken"
         );
         let ws = app.workspaces.current().expect("a default workspace");
-        assert_eq!(ws.map_scope, None);
+        assert_eq!(ws.map_scope(), None);
         assert_eq!(
-            ws.view,
+            ws.view(),
             ViewMode::Rooted,
             "and the user is left on the view they were already reading"
         );
@@ -3009,7 +3010,7 @@ mod tests {
         app.dispatch(Command::SetMapScope(None));
 
         assert_eq!(
-            app.workspaces.current().expect("a workspace").map_scope,
+            app.workspaces.current().expect("a workspace").map_scope(),
             None
         );
         assert!(
@@ -3033,7 +3034,7 @@ mod tests {
         app.dispatch(Command::DrillIntoCluster(elsewhere));
 
         assert_eq!(
-            app.workspaces.current().expect("a workspace").view,
+            app.workspaces.current().expect("a workspace").view(),
             ViewMode::ClusterMap,
             "a key for a community not on this map roots nothing"
         );
@@ -3047,13 +3048,13 @@ mod tests {
         app.dispatch(Command::DrillIntoCluster(here));
 
         let ws = app.workspaces.current().expect("a workspace");
-        assert_eq!(ws.view, ViewMode::Rooted);
+        assert_eq!(ws.view(), ViewMode::Rooted);
         assert!(
-            ws.root_symbol.is_some_and(|root| right.contains(&root)),
+            ws.root_symbol().is_some_and(|root| right.contains(&root)),
             "rooted at the front door of a community that is on this map"
         );
         assert_eq!(
-            ws.map_scope,
+            ws.map_scope(),
             Some(right[0]),
             "and the way back still leads to the map it was entered from"
         );

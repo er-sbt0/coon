@@ -82,7 +82,7 @@ pub struct Export {
 /// a tab with no root, or a map of a graph whose edges have not arrived yet.
 pub fn export(core: &CoreApp, format: ExportFormat) -> Option<Export> {
     let ws = core.workspaces.current()?;
-    let contents = match ws.view {
+    let contents = match ws.view() {
         ViewMode::ClusterMap => cluster_dot(core),
         ViewMode::Rooted => rooted_dot(core),
     }?;
@@ -98,13 +98,13 @@ pub fn export(core: &CoreApp, format: ExportFormat) -> Option<Export> {
 
 fn rooted_dot(core: &CoreApp) -> Option<String> {
     let ws = core.workspaces.current()?;
-    let root = ws.root_symbol?;
+    let root = ws.root_symbol()?;
     let graph = &core.call_graph;
 
     // The same call that builds the canvas, so the file holds the subgraph the
     // user is looking at rather than a second interpretation of the same
     // settings. Its keys are exactly the visible nodes.
-    let positions = compute_layout(graph, Some(root), ws.direction, &layout_options(core));
+    let positions = compute_layout(graph, Some(root), ws.direction(), &layout_options(core));
     if positions.is_empty() {
         return None;
     }
@@ -121,17 +121,17 @@ fn rooted_dot(core: &CoreApp) -> Option<String> {
         .get_function(&root)
         .map(|f| f.qualified_name.as_str())
         .unwrap_or("unknown");
-    let direction = match ws.direction {
+    let direction = match ws.direction() {
         CallDirection::Outgoing => "callees",
         CallDirection::Incoming => "callers",
     };
 
     header(
         &mut out,
-        ws.orientation,
+        ws.orientation(),
         &format!(
             "{root_label} — {direction}, {} levels, {} functions",
-            ws.depth,
+            ws.depth(),
             visible.len()
         ),
     );
@@ -189,11 +189,11 @@ fn rooted_dot(core: &CoreApp) -> Option<String> {
         // stay on screen because another caller reaches them. Dropping the
         // edges *leaving* it is what makes the gesture show, and the client
         // does the same.
-        let parent = match ws.direction {
+        let parent = match ws.direction() {
             CallDirection::Outgoing => edge.caller,
             CallDirection::Incoming => edge.callee,
         };
-        if ws.collapsed.contains(&parent) {
+        if ws.collapsed().contains(&parent) {
             continue;
         }
         if !seen.insert((edge.caller, edge.callee)) {
@@ -218,14 +218,14 @@ fn hidden_children(
     visible: &HashMap<SymbolId, crate::layout::NodePos>,
     ws: &CoreWorkspace,
 ) -> usize {
-    let children = match ws.direction {
+    let children = match ws.direction() {
         CallDirection::Outgoing => graph.callee_ids(id),
         CallDirection::Incoming => graph.caller_ids(id),
     };
     if children.is_empty() {
         return 0;
     }
-    if ws.collapsed.contains(id) {
+    if ws.collapsed().contains(id) {
         return children.len();
     }
     children
@@ -260,8 +260,8 @@ fn cluster_dot(core: &CoreApp) -> Option<String> {
         clustering,
         core.map_frame(),
         core.map_level_for(ws),
-        ws.direction,
-        ws.orientation,
+        ws.direction(),
+        ws.orientation(),
     );
     if layout.nodes.is_empty() {
         return None;
@@ -288,17 +288,20 @@ fn cluster_dot(core: &CoreApp) -> Option<String> {
     }
 
     let mut out = String::new();
-    let scope = match ws.map_scope.and_then(|s| core.call_graph.get_function(&s)) {
+    let scope = match ws
+        .map_scope()
+        .and_then(|s| core.call_graph.get_function(&s))
+    {
         Some(func) => format!("{} — neighbourhood", func.qualified_name),
         None => "Whole project".to_string(),
     };
     header(
         &mut out,
-        ws.orientation,
+        ws.orientation(),
         &format!(
             "Cluster map: {scope}, {} clusters ({}, rung {} of {})",
             boxes.len(),
-            ws.method.label(),
+            ws.method().label(),
             core.map_level_for(ws) + 1,
             clustering.level_count(),
         ),
@@ -332,7 +335,7 @@ fn cluster_dot(core: &CoreApp) -> Option<String> {
     // the count is not lost for want of a hover — DOT is text, so it is legible
     // in the source, becomes a tooltip in a rendered SVG, and comes back as an
     // attribute through `networkx` or `gvpr`, which a line width never did.
-    for edge in call_edges(&core.call_graph, &name_of, ws.direction) {
+    for edge in call_edges(&core.call_graph, &name_of, ws.direction()) {
         let (Some(source), Some(target)) = (name_of.get(&edge.0), name_of.get(&edge.1)) else {
             continue;
         };
@@ -492,13 +495,16 @@ fn quote(text: &str) -> String {
 /// Name the file after what is in it, so a directory of exports is readable.
 fn filename(core: &CoreApp, format: ExportFormat) -> Option<String> {
     let ws = core.workspaces.current()?;
-    let subject = match ws.view {
-        ViewMode::ClusterMap => match ws.map_scope.and_then(|s| core.call_graph.get_function(&s)) {
+    let subject = match ws.view() {
+        ViewMode::ClusterMap => match ws
+            .map_scope()
+            .and_then(|s| core.call_graph.get_function(&s))
+        {
             Some(func) => format!("{}-clusters", func.name),
             None => "clusters".to_string(),
         },
         ViewMode::Rooted => ws
-            .root_symbol
+            .root_symbol()
             .and_then(|s| core.call_graph.get_function(&s))
             .map(|f| f.name.clone())
             .unwrap_or_else(|| "graph".to_string()),
@@ -547,8 +553,7 @@ mod tests {
         let mut core = CoreApp::new(graph);
         core.dispatch(crate::Command::StartGraphFromFunction(id));
         let ws = core.workspaces.current_mut().unwrap();
-        ws.view = ViewMode::Rooted;
-        ws.root_symbol = Some(id);
+        ws.set_root(id);
         core
     }
 
@@ -599,7 +604,7 @@ mod tests {
 
         // `main`'s own first callee: collapsing it must cost the file at least
         // the edges out of it, the same way it costs the canvas them.
-        let main = core.workspaces.current().unwrap().root_symbol.unwrap();
+        let main = core.workspaces.current().unwrap().root_symbol().unwrap();
         let callee = core.call_graph.get_callees(&main)[0].id;
         core.dispatch(crate::Command::ToggleCollapsed(callee));
         let collapsed = dot(&core);
@@ -727,7 +732,10 @@ mod tests {
 
         let mut core = CoreApp::new(graph);
         core.dispatch(crate::Command::StartGraphFromFunction(from));
-        core.workspaces.current_mut().unwrap().view = ViewMode::Rooted;
+        core.workspaces
+            .current_mut()
+            .unwrap()
+            .set_view(ViewMode::Rooted);
 
         assert_eq!(
             tooltips(&dot(&core)),
@@ -774,7 +782,7 @@ mod tests {
         let core = CoreApp::new(create_demo_call_graph());
         // A fresh workspace opens on the whole-program map.
         assert_eq!(
-            core.workspaces.current().unwrap().view,
+            core.workspaces.current().unwrap().view(),
             ViewMode::ClusterMap
         );
 
@@ -894,7 +902,7 @@ mod tests {
         // The scoped clustering is computed off the tick loop.
         for _ in 0..50 {
             core.tick();
-            if core.workspaces.current().unwrap().map_scope.is_some()
+            if core.workspaces.current().unwrap().map_scope().is_some()
                 && !core
                     .clustering_for(core.workspaces.current().unwrap())
                     .is_empty()
@@ -950,7 +958,10 @@ mod tests {
         // A rooted workspace with no root: the canvas is blank, and a blank
         // file is worse than being told there is nothing to save.
         let mut core = CoreApp::new(CallGraph::new());
-        core.workspaces.current_mut().unwrap().view = ViewMode::Rooted;
+        core.workspaces
+            .current_mut()
+            .unwrap()
+            .set_view(ViewMode::Rooted);
         assert!(export(&core, ExportFormat::Dot).is_none());
     }
 
@@ -974,7 +985,10 @@ mod tests {
 
         let mut core = CoreApp::new(graph);
         core.dispatch(crate::Command::StartGraphFromFunction(from));
-        core.workspaces.current_mut().unwrap().view = ViewMode::Rooted;
+        core.workspaces
+            .current_mut()
+            .unwrap()
+            .set_view(ViewMode::Rooted);
 
         let out = export(&core, ExportFormat::Dot).unwrap();
         assert!(out.contents.contains(r#"label="operator\"\"_kb""#));

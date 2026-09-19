@@ -130,7 +130,7 @@ pub fn apply_events(app: &mut App, events: Vec<AppEvent>) {
                     .workspaces
                     .iter()
                     .find(|w| w.id == *id)
-                    .and_then(|w| w.root_symbol);
+                    .and_then(|w| w.root_symbol());
                 let mut vs = GraphViewState::new(&app.layout_settings);
                 if let Some(sym) = root {
                     vs.set_root(sym);
@@ -159,7 +159,7 @@ pub fn apply_events(app: &mut App, events: Vec<AppEvent>) {
                 // Sync direction from the domain workspace into the view state
                 // and mark it dirty so the renderer recomputes the layout.
                 if let Some(core_ws) = app.core.workspaces.current() {
-                    let dir = core_ws.direction;
+                    let dir = core_ws.direction();
                     let id = core_ws.id;
                     if let Some(vs) = app.view_states.get_mut(&id) {
                         vs.direction = dir;

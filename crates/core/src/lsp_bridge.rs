@@ -157,20 +157,36 @@ impl PendingRequest {
 ///
 /// Lives in `core` so it can be shared by any frontend.
 pub struct LspBridge {
-    /// Channel to send requests to the LSP service worker
-    pub request_tx: Option<mpsc::UnboundedSender<LspRequest>>,
+    /// Channel to send requests to the LSP service worker.
+    ///
+    /// Private, and paired with `response_rx` by [`LspBridge::set_channels`]:
+    /// a bridge that can ask questions but has nowhere to hear the answers is
+    /// a state no loader ever produces, and every reply sent into one is lost.
+    request_tx: Option<mpsc::UnboundedSender<LspRequest>>,
     /// Channel to receive responses from the LSP service worker
-    pub response_rx: Option<mpsc::UnboundedReceiver<LspResponse>>,
-    /// In-flight requests awaiting responses, keyed by request ID
-    pub pending_requests: HashMap<String, PendingRequest>,
-    /// Per-symbol loading state
-    pub loading_states: HashMap<SymbolId, LoadingState>,
+    response_rx: Option<mpsc::UnboundedReceiver<LspResponse>>,
+    /// In-flight requests awaiting responses, keyed by request ID.
+    ///
+    /// Private because [`LspBridge::dispatch`] is the only thing that may put
+    /// an entry in here, and the reason is spelled out there: an entry with no
+    /// request behind it is read by `CoreApp::warming_up` as an answer still
+    /// on its way, which holds `CoreApp::loading` true and stops every
+    /// clustering for the whole `LSP_REQUEST_TIMEOUT_SECS` it takes
+    /// [`LspBridge::check_timed_out_requests`] to retire it. While the field
+    /// was `pub` that was a convention; now nothing outside this module can
+    /// break it. Callers get [`LspBridge::pending_count`] and
+    /// [`LspBridge::pending_summary`], which is all any of them read.
+    pending_requests: HashMap<String, PendingRequest>,
+    /// Per-symbol loading state. Reached through `is_function_loaded`,
+    /// `is_function_loading`, `get_loading_state` and `set_loading_state`,
+    /// which is the whole of what anyone outside has ever wanted from it.
+    loading_states: HashMap<SymbolId, LoadingState>,
     /// Current phase of the background LSP loading process
-    pub status: LspLoadPhase,
+    status: LspLoadPhase,
     /// Channel for progress/add-function messages from the background loader
-    pub loader_rx: Option<mpsc::UnboundedReceiver<LspUiMessage>>,
+    loader_rx: Option<mpsc::UnboundedReceiver<LspUiMessage>>,
     /// One-shot channel to receive the LSP request/response channels once the loader is ready
-    pub channels_rx: Option<
+    channels_rx: Option<
         oneshot::Receiver<(
             mpsc::UnboundedReceiver<LspResponse>,
             mpsc::UnboundedSender<LspRequest>,
@@ -636,6 +652,39 @@ impl LspBridge {
 
     // ---- Query helpers ----
 
+    /// How far the background load has got.
+    pub fn status(&self) -> &LspLoadPhase {
+        &self.status
+    }
+
+    /// Report a new phase.
+    ///
+    /// The phase is the loader's to say: in a running app the only caller is
+    /// [`LspBridge::poll_loader_messages`], which sets it from the messages it
+    /// drains. It is a method rather than a public field so that anywhere a
+    /// phase is claimed that no loader reported — a test standing a finished
+    /// load up, a frontend's fixture — is one grep away.
+    pub fn set_status(&mut self, phase: LspLoadPhase) {
+        self.status = phase;
+    }
+
+    /// Whether there is a worker to send requests to at all.
+    ///
+    /// Demo mode has none, and neither does a project whose loader has not
+    /// handed its channels over yet — in both, every sender declines.
+    pub fn has_worker(&self) -> bool {
+        self.request_tx.is_some()
+    }
+
+    /// How many requests are outstanding.
+    ///
+    /// The warmup reads this as its in-flight ceiling and `CoreApp` reads it
+    /// as "is the graph still arriving"; see [`LspBridge::pending_summary`]
+    /// for what they are when it stops moving.
+    pub fn pending_count(&self) -> usize {
+        self.pending_requests.len()
+    }
+
     pub fn is_function_loaded(&self, symbol_id: &SymbolId) -> bool {
         matches!(
             self.loading_states.get(symbol_id),
@@ -684,6 +733,41 @@ impl LspBridge {
     pub fn clear(&mut self) -> Vec<PendingRequest> {
         self.loading_states.clear();
         self.pending_requests.drain().map(|(_, req)| req).collect()
+    }
+
+    // ---- Test scaffolding ----
+    //
+    // `pending_requests` is private so that [`LspBridge::dispatch`] is the
+    // only thing that can fill it. A test that wants a reply handled has to
+    // put the entry there some other way, and these three are that way:
+    // `pub(crate)` and `#[cfg(test)]`, so they exist for `core`'s own unit
+    // tests and for nothing that ships.
+
+    /// Pretend a request went out under `request_id`.
+    #[cfg(test)]
+    pub(crate) fn insert_pending(
+        &mut self,
+        request_id: impl Into<String>,
+        pending: PendingRequest,
+    ) {
+        self.pending_requests.insert(request_id.into(), pending);
+    }
+
+    /// Pretend everything in flight was answered.
+    ///
+    /// Not [`LspBridge::clear`], which also drops every `loading_states`
+    /// entry: a symbol that reads `NotLoaded` again is one the warmup will
+    /// ask about a second time, which is a different situation from the one
+    /// these tests are setting up.
+    #[cfg(test)]
+    pub(crate) fn clear_pending(&mut self) {
+        self.pending_requests.clear();
+    }
+
+    /// Everything currently in flight.
+    #[cfg(test)]
+    pub(crate) fn pending(&self) -> impl Iterator<Item = &PendingRequest> {
+        self.pending_requests.values()
     }
 }
 

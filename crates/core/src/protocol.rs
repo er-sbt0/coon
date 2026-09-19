@@ -202,8 +202,8 @@ pub struct WorkspaceInfo {
 /// symbols to get there was pure cost.
 pub fn snapshot_of(core: &CoreApp) -> ServerMsg<'_> {
     let ws = core.workspaces.current();
-    let root = ws.and_then(|w| w.root_symbol);
-    let direction = ws.map(|w| w.direction).unwrap_or(CallDirection::Outgoing);
+    let root = ws.and_then(|w| w.root_symbol());
+    let direction = ws.map(|w| w.direction()).unwrap_or(CallDirection::Outgoing);
     let layout = layout_of(core);
 
     log::info!(
@@ -212,7 +212,7 @@ pub fn snapshot_of(core: &CoreApp) -> ServerMsg<'_> {
         core.call_graph.edge_count(),
         layout.as_ref().map_or(0, |l| l.len()),
         root,
-        ws.map_or(0, |w| w.expanded.len()),
+        ws.map_or(0, |w| w.expanded().len()),
         direction,
         core.selected_function,
     );
@@ -255,13 +255,13 @@ pub fn snapshot_of(core: &CoreApp) -> ServerMsg<'_> {
 /// `LayoutOptions::expanded`), so the graph grows rather than changing.
 fn layout_of(core: &CoreApp) -> Option<HashMap<SymbolId, NodePos>> {
     let ws = core.workspaces.current()?;
-    if ws.view != ViewMode::Rooted {
+    if ws.view() != ViewMode::Rooted {
         return None;
     }
     Some(compute_layout(
         &core.call_graph,
-        ws.root_symbol,
-        ws.direction,
+        ws.root_symbol(),
+        ws.direction(),
         &layout_options(core),
     ))
 }
@@ -277,7 +277,7 @@ fn layout_of(core: &CoreApp) -> Option<HashMap<SymbolId, NodePos>> {
 /// a function has its own clustering, and `clustering_for` is what knows which.
 fn cluster_layout_of(core: &CoreApp) -> Option<GraphLayout> {
     let ws = core.workspaces.current()?;
-    if ws.view != ViewMode::ClusterMap {
+    if ws.view() != ViewMode::ClusterMap {
         return None;
     }
     Some(compute_cluster_layout(
@@ -285,8 +285,8 @@ fn cluster_layout_of(core: &CoreApp) -> Option<GraphLayout> {
         core.clustering_for(ws),
         core.map_frame(),
         core.map_level_for(ws),
-        ws.direction,
-        ws.orientation,
+        ws.direction(),
+        ws.orientation(),
     ))
 }
 
@@ -294,10 +294,10 @@ fn cluster_layout_of(core: &CoreApp) -> Option<GraphLayout> {
 pub(crate) fn layout_options(core: &CoreApp) -> LayoutOptions<'_> {
     match core.workspaces.current() {
         Some(ws) => LayoutOptions {
-            depth: ws.depth,
-            collapsed: &ws.collapsed,
-            expanded: &ws.expanded,
-            orientation: ws.orientation,
+            depth: ws.depth(),
+            collapsed: ws.collapsed(),
+            expanded: ws.expanded(),
+            orientation: ws.orientation(),
         },
         None => LayoutOptions::default(),
     }
@@ -310,17 +310,17 @@ pub fn workspace_infos(core: &CoreApp) -> Vec<WorkspaceInfo> {
         .map(|ws| WorkspaceInfo {
             id: ws.id,
             name: ws.name.clone(),
-            direction: ws.direction,
-            selected: ws.root_symbol,
-            depth: ws.depth,
-            collapsed: ws.collapsed.iter().copied().collect(),
-            orientation: ws.orientation,
-            view: ws.view,
+            direction: ws.direction(),
+            selected: ws.root_symbol(),
+            depth: ws.depth(),
+            collapsed: ws.collapsed().iter().copied().collect(),
+            orientation: ws.orientation(),
+            view: ws.view(),
             map_level: core.map_level_for(ws),
             map_levels: core.clustering_for(ws).level_count(),
             map_clusters: core.clustering_for(ws).level(core.map_level_for(ws)).len(),
-            method: ws.method,
-            map_scope: ws.map_scope,
+            method: ws.method(),
+            map_scope: ws.map_scope(),
         })
         .collect()
 }
@@ -893,7 +893,7 @@ mod tests {
         // the tree — which is the case this is about.
         core.dispatch(Command::SetViewMode(ViewMode::ClusterMap));
         assert_eq!(
-            core.workspaces.current().and_then(|ws| ws.root_symbol),
+            core.workspaces.current().and_then(|ws| ws.root_symbol()),
             Some(main),
             "the workspace still has a root; it is simply not what is drawn"
         );
