@@ -494,6 +494,9 @@ impl CoreApp {
                         for call in calls {
                             self.process_call_entry(symbol_id, &call.to, &call.from_ranges, true);
                         }
+                        if count > 0 {
+                            self.mark_graph_changed();
+                        }
                         self.lsp.set_loading_state(symbol_id, LoadingState::Loaded);
                         log::info!(
                             "CoreApp: OutgoingCalls loaded for {:?}: {} callee(s)",
@@ -528,6 +531,9 @@ impl CoreApp {
                                 &call.from_ranges,
                                 false,
                             );
+                        }
+                        if count > 0 {
+                            self.mark_graph_changed();
                         }
                         self.lsp.set_loading_state(symbol_id, LoadingState::Loaded);
                         log::info!(
@@ -1580,6 +1586,13 @@ impl CoreApp {
         });
     }
 
+    /// Add one entry of a call-hierarchy reply: the function on the other end,
+    /// and an edge per call site.
+    ///
+    /// Marking the graph changed is the caller's job, once for the whole reply.
+    /// A reply carrying fifty callees is one change to the graph, not fifty,
+    /// and doing it here made the warmup rebuild the stale set per call in the
+    /// project.
     fn process_call_entry(
         &mut self,
         symbol_id: SymbolId,
@@ -1624,7 +1637,6 @@ impl CoreApp {
             };
             self.call_graph.add_call(caller, callee, call_location);
         }
-        self.mark_graph_changed();
     }
 }
 
@@ -2688,6 +2700,76 @@ mod tests {
             }],
         });
         assert!(!app.stale.is_empty(), "new calls are new graph edges");
+    }
+
+    /// One reply is one change to the graph. The mark is hoisted out of the
+    /// per-entry loop — a reply with fifty callees used to rebuild the stale
+    /// set fifty times — so what has to be pinned is that it still happens,
+    /// and still only when the reply carried something.
+    #[test]
+    fn a_reply_marks_the_graph_changed_once_it_has_carried_anything() {
+        for (calls, expected) in [
+            (Vec::new(), false),
+            (
+                vec!["beta", "gamma", "delta"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, name)| lsp_types::CallHierarchyOutgoingCall {
+                        to: hierarchy_item(name, i as u32 + 2),
+                        from_ranges: vec![hierarchy_item(name, i as u32 + 2).range],
+                    })
+                    .collect(),
+                true,
+            ),
+        ] {
+            for outgoing in [true, false] {
+                let mut app = CoreApp::new(CallGraph::new());
+                let caller = app.call_graph.add_function(FunctionNode::new(
+                    "alpha".to_string(),
+                    "alpha".to_string(),
+                    Location::new("test.c".to_string(), 1, 0),
+                ));
+                app.stale.clear();
+                app.frame_stale = false;
+                app.lsp.insert_pending(
+                    "calls",
+                    PendingRequest::new(Some(caller), "calls", RequestOrigin::Warmup),
+                );
+
+                let response = if outgoing {
+                    LspResponse::OutgoingCalls {
+                        request_id: "calls".to_string(),
+                        calls: calls.clone(),
+                    }
+                } else {
+                    LspResponse::IncomingCalls {
+                        request_id: "calls".to_string(),
+                        calls: calls
+                            .iter()
+                            .map(|call| lsp_types::CallHierarchyIncomingCall {
+                                from: call.to.clone(),
+                                from_ranges: call.from_ranges.clone(),
+                            })
+                            .collect(),
+                    }
+                };
+                app.handle_lsp_response(response);
+
+                let what = if outgoing { "outgoing" } else { "incoming" };
+                assert_eq!(
+                    !app.stale.is_empty(),
+                    expected,
+                    "{what} reply of {} call(s): the cached map",
+                    calls.len()
+                );
+                assert_eq!(
+                    app.frame_stale,
+                    expected,
+                    "{what} reply of {} call(s): the frame",
+                    calls.len()
+                );
+            }
+        }
     }
 
     /// The bootstrap warmup asks for every symbol's edges. Answering each of
