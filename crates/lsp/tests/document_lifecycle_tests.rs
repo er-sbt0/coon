@@ -4,7 +4,7 @@
 //! symbol sweep is in. Neither may cost the caller a request — a position-based
 //! request against a document clangd no longer has must reopen it, not fail.
 
-use lsp::{LspResponse, LspService};
+use lsp::{LspRequest, LspResponse, LspService};
 use lsp_types::{Position, Url};
 use serde_json::Value;
 use tempfile::tempdir;
@@ -54,7 +54,11 @@ async fn await_response(service: &mut LspService, request_id: &str) -> LspRespon
 async fn outgoing_call_names(service: &mut LspService, uri: &Url) -> Vec<String> {
     let prepare_id = uuid_like("prepare");
     service
-        .request_prepare_call_hierarchy(prepare_id.clone(), uri.clone(), ENTRY_POSITION)
+        .send(LspRequest::PrepareCallHierarchy {
+            request_id: prepare_id.clone(),
+            document_uri: uri.clone(),
+            position: ENTRY_POSITION,
+        })
         .await
         .expect("prepare call hierarchy could not be sent");
 
@@ -69,7 +73,10 @@ async fn outgoing_call_names(service: &mut LspService, uri: &Url) -> Vec<String>
 
     let calls_id = uuid_like("calls");
     service
-        .request_outgoing_calls(calls_id.clone(), items[0].clone())
+        .send(LspRequest::GetOutgoingCalls {
+            request_id: calls_id.clone(),
+            call_hierarchy_item: items[0].clone(),
+        })
         .await
         .expect("outgoing calls could not be sent");
 
@@ -131,7 +138,14 @@ async fn a_closed_document_is_reopened_on_demand() {
     let mut service = LspService::new(client, rx).await.unwrap();
 
     // Opening more documents than the limit is what evicts the earliest ones.
-    let preload_id = service.preload_documents(uris.clone()).await.unwrap();
+    let preload_id = uuid_like("preload");
+    service
+        .send(LspRequest::PreloadDocuments {
+            request_id: preload_id.clone(),
+            document_uris: uris.clone(),
+        })
+        .await
+        .unwrap();
     match await_response(&mut service, &preload_id).await {
         LspResponse::PreloadComplete { loaded_count, .. } => {
             assert_eq!(
@@ -143,7 +157,7 @@ async fn a_closed_document_is_reopened_on_demand() {
     }
 
     // And this is the loader's post-sweep close, which drops the rest.
-    service.close_documents().await.unwrap();
+    service.send(LspRequest::CloseDocuments).await.unwrap();
 
     // The first file was evicted by the limit, the last by the close. Both must
     // still answer, which they can only do if the service reopened them.

@@ -11,10 +11,19 @@ use std::collections::VecDeque;
 /// leaving it open runs to gigabytes on a 217-file tree like jemalloc.
 ///
 /// The floor is `core`'s warmup concurrency: evicting a document with a request
-/// still in flight would answer it against a file clangd no longer has. Anything
-/// in flight was touched within the last few requests, so it sits at the recent
-/// end of the queue, and a limit several times that concurrency is enough.
-const OPEN_DOCUMENT_LIMIT: usize = 32;
+/// still in flight would answer it against a file clangd no longer has
+/// ("trying to get AST for non-added document"). A call hierarchy is two round
+/// trips and only the first one opens anything — `GetOutgoingCalls` neither
+/// reopens the item's file nor touches it here — so a document has to outlive
+/// *both* legs, and everything dispatched while they are outstanding can open
+/// a fresh one. That puts the floor at twice the concurrency, not once, and
+/// the margin above it pays for replies arriving out of order and for the
+/// user's own requests, which draw on the same in-flight budget.
+///
+/// `lsp` cannot name `core`, so the relationship is checked from the other
+/// side: see the `const` assertion next to `WARMUP_IN_FLIGHT` in `core::app`,
+/// which is why this is public.
+pub const OPEN_DOCUMENT_LIMIT: usize = 32;
 
 /// The documents clangd currently has open, least-recently-used first.
 ///
@@ -104,11 +113,24 @@ pub(super) async fn ensure_document_opened(
         file_path.display()
     );
 
+    // Advisory only: clangd takes the real language from the file's
+    // `compile_commands.json` entry — or, for a header, from the entry it
+    // infers from a similar translation unit — so this is what we claim, not
+    // what gets parsed. It is still worth getting right, because a server that
+    // *does* honour `languageId` parses a C++ header as C and reports every
+    // template as a syntax error.
+    //
+    // `.hpp` and `.hxx` are C++ by construction — nobody writes a C header
+    // with either. `.h` is the genuinely ambiguous one and stays `c`: in a C
+    // project it is a C header, in a C++ project it usually is not, and the
+    // extension cannot tell the two apart. Since the compile database decides
+    // anyway, the honest answer is to keep the answer this tool has always
+    // given rather than to guess the other way.
     let language_id = match file_path.extension().and_then(|ext| ext.to_str()) {
         Some("rs") => "rust",
-        Some("c") => "c",
+        Some("c") | Some("h") => "c",
         Some("cpp") | Some("cxx") | Some("cc") => "cpp",
-        Some("h") | Some("hpp") | Some("hxx") => "c",
+        Some("hpp") | Some("hxx") => "cpp",
         Some("py") => "python",
         Some("js") => "javascript",
         Some("ts") => "typescript",

@@ -1,8 +1,5 @@
 use std::collections::BTreeMap;
 
-use petgraph::algo::toposort;
-use petgraph::graph::DiGraph;
-
 use crate::config::LayoutConfig;
 use crate::dag::Dag;
 use crate::edge_router::{compute_orthogonal_routing, compute_orthogonal_routing_with_mid};
@@ -14,15 +11,17 @@ use crate::types::{EdgePath, LayoutBounds, Position};
 ///
 /// Real nodes occupy indices `0..dag_len`; dummy nodes occupy `dag_len..`.
 /// This convention makes `all_positions[..dag_len]` the slice of real-node
-/// coordinates that goes into `LayoutResult`.
+/// coordinates that goes into `LayoutResult` — and it is the *only* record of
+/// which nodes are dummies. There used to be an `is_dummy` flag beside it, but
+/// nothing downstream ever asked: routing groups segments by the original
+/// `(u, v)` they belong to, so a dummy is never an endpoint it can see, and
+/// `split_merged_edges` keys on `child_id`, which is a real node by
+/// construction. Two answers to one question is one too many.
 struct SugiyamaGraph {
     /// `layers[layer_idx]` = ordered list of node indices in that layer
     layers: Vec<Vec<usize>>,
     /// `positions[node_idx]` = position of node within its layer (for barycenter)
     positions: Vec<Option<usize>>,
-    /// `is_dummy[node_idx]` — true for inserted dummy nodes (used in Phase 4 rendering)
-    #[allow(dead_code)]
-    is_dummy: Vec<bool>,
     /// `groups[node_idx]` — optional group membership, used in Phase 3b to keep
     /// the members of one group contiguous within a layer. `None` = ungrouped.
     groups: Vec<Option<u32>>,
@@ -48,8 +47,12 @@ pub(crate) fn compute_sugiyama_grouped<T>(
     }
 
     let all_dag_edges: Vec<(usize, usize)> = dag.edges().collect();
-    let (forward_edges, back_edges) = remove_cycles(dag.len(), &all_dag_edges);
-    let layers = assign_layers(dag.len(), &forward_edges);
+    let Acyclic {
+        forward: forward_edges,
+        back: back_edges,
+        topo,
+    } = remove_cycles(dag.len(), &all_dag_edges);
+    let layers = assign_layers(dag.len(), &forward_edges, &topo);
     let mut sg = insert_dummy_nodes(dag.len(), &layers, &forward_edges, groups);
 
     let passes = config.crossing_minimization_passes.unwrap_or(2);
@@ -95,9 +98,28 @@ pub(crate) fn compute_sugiyama_grouped<T>(
 // Phase 1: Cycle removal
 // ---------------------------------------------------------------------------
 
+/// What one DFS over the input graph yields: the edges that survive, the ones
+/// that had to go, and an order the survivors respect.
+struct Acyclic {
+    /// Every edge that is not a back-edge, in the input's order.
+    forward: Vec<(usize, usize)>,
+    /// The back-edges, drawn separately as cross-edges rather than layered.
+    back: Vec<(usize, usize)>,
+    /// A topological order of `forward`, covering every node `0..n`.
+    topo: Vec<usize>,
+}
+
 /// Classify edges into forward edges (DAG) and back-edges (cycle-forming) using
 /// iterative DFS. Back-edges are the minimum set needed to make the graph acyclic.
-fn remove_cycles(n: usize, edges: &[(usize, usize)]) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+///
+/// The same DFS hands back a topological order for free, which is why
+/// [`assign_layers`] takes one rather than computing its own. Reverse
+/// postorder *is* that order: for any edge `(u, v)` the DFS did not call a
+/// back-edge, `v` finishes before `u` — it is either a descendant reached from
+/// `u`, or a node already off the stack when `u` looked at it — so ordering by
+/// descending finish time puts every tail before its head. The back-edges are
+/// exactly the pairs that break that, and they are the ones being removed.
+fn remove_cycles(n: usize, edges: &[(usize, usize)]) -> Acyclic {
     let mut adj: Vec<Vec<usize>> = vec![vec![]; n];
     for &(from, to) in edges {
         if from < n && to < n {
@@ -108,6 +130,7 @@ fn remove_cycles(n: usize, edges: &[(usize, usize)]) -> (Vec<(usize, usize)>, Ve
     let mut visited = vec![false; n];
     let mut in_stack = vec![false; n];
     let mut back_set = std::collections::HashSet::new();
+    let mut postorder: Vec<usize> = Vec::with_capacity(n);
 
     for start in 0..n {
         if visited[start] {
@@ -132,6 +155,9 @@ fn remove_cycles(n: usize, edges: &[(usize, usize)]) -> (Vec<(usize, usize)>, Ve
             } else {
                 in_stack[u] = false;
                 stack.pop();
+                // `u` is finished: everything reachable from it that was not
+                // behind a back-edge is already in `postorder`.
+                postorder.push(u);
             }
         }
     }
@@ -145,40 +171,49 @@ fn remove_cycles(n: usize, edges: &[(usize, usize)]) -> (Vec<(usize, usize)>, Ve
             forward.push(e);
         }
     }
-    (forward, back)
+    // Reverse postorder. The outer loop visits every node, so this names all
+    // `n` of them whether or not any edge touches them.
+    postorder.reverse();
+    Acyclic {
+        forward,
+        back,
+        topo: postorder,
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Phase 2: Layer assignment (longest-path ranking)
 // ---------------------------------------------------------------------------
 
-fn assign_layers(n: usize, forward_edges: &[(usize, usize)]) -> Vec<usize> {
+/// Longest-path ranking: `layer[u] = max(layer[pred] + 1)`, over the whole
+/// predecessor set.
+///
+/// `topo` is [`Acyclic::topo`], a topological order of `forward_edges`, and it
+/// has to be one: the rank of a node is read off its predecessors, so they
+/// must already be final when it is reached. *Which* valid order it is does
+/// not matter — the longest path to a node is a property of the graph, not of
+/// the walk — so building one here from scratch, as this used to do with a
+/// throwaway `petgraph::DiGraph` and `toposort`, allocated a second copy of
+/// the graph to recover something the cycle-removal DFS had just computed and
+/// dropped.
+///
+/// There is no fallback for "the order was not topological" any more, and
+/// nothing to fall back *to*: the old `Err(_) => (0..n)` arm silently produced
+/// a wrong layering for a graph that still had a cycle, which is a layout bug
+/// that looks like a layout. The order now comes from the same pass that
+/// removed the cycles, so it is correct by construction.
+fn assign_layers(n: usize, forward_edges: &[(usize, usize)], topo: &[usize]) -> Vec<usize> {
     if n == 0 {
         return vec![];
     }
 
-    // Use petgraph toposort to get a valid processing order
-    let mut pg: DiGraph<(), ()> = DiGraph::with_capacity(n, forward_edges.len());
-    let pg_nodes: Vec<_> = (0..n).map(|_| pg.add_node(())).collect();
-    for &(from, to) in forward_edges {
-        pg.add_edge(pg_nodes[from], pg_nodes[to], ());
-    }
-
-    let topo = match toposort(&pg, None) {
-        Ok(order) => order,
-        // Shouldn't happen after remove_cycles, but fall back gracefully
-        Err(_) => (0..n).map(petgraph::graph::NodeIndex::new).collect(),
-    };
-
-    // Longest-path rank: layer[u] = max(layer[pred] + 1) for all predecessors
     let mut preds: Vec<Vec<usize>> = vec![vec![]; n];
     for &(from, to) in forward_edges {
         preds[to].push(from);
     }
 
     let mut layer = vec![0usize; n];
-    for node_idx in &topo {
-        let u = node_idx.index();
+    for &u in topo {
         for &pred in &preds[u] {
             layer[u] = layer[u].max(layer[pred] + 1);
         }
@@ -201,7 +236,6 @@ fn insert_dummy_nodes(
         return SugiyamaGraph {
             layers: vec![],
             positions: vec![],
-            is_dummy: vec![],
             groups: vec![],
             edges: vec![],
             original_edge: vec![],
@@ -216,7 +250,6 @@ fn insert_dummy_nodes(
         layer_nodes[layers[i]].push(i);
     }
 
-    let mut is_dummy = vec![false; dag_len];
     // Group membership for the expanded graph: real nodes take theirs from the
     // caller, dummies inherit below.
     let mut node_groups: Vec<Option<u32>> = (0..dag_len).map(|i| group_of(groups, i)).collect();
@@ -245,7 +278,6 @@ fn insert_dummy_nodes(
             for l in (lu + 1)..lv {
                 let dummy = next_id;
                 next_id += 1;
-                is_dummy.push(true);
                 node_groups.push(dummy_group);
                 layer_nodes[l].push(dummy);
                 all_edges.push((prev, dummy));
@@ -272,7 +304,6 @@ fn insert_dummy_nodes(
     SugiyamaGraph {
         layers: layer_nodes,
         positions,
-        is_dummy,
         groups: node_groups,
         edges: all_edges,
         original_edge,
@@ -781,22 +812,71 @@ mod tests {
         compute_sugiyama_grouped(dag, config, &[])
     }
 
+    /// Whether `topo` lists every tail before its head.
+    fn topo_respects(topo: &[usize], edges: &[(usize, usize)]) -> bool {
+        let mut rank = vec![usize::MAX; topo.len()];
+        for (i, &u) in topo.iter().enumerate() {
+            rank[u] = i;
+        }
+        edges.iter().all(|&(u, v)| rank[u] < rank[v])
+    }
+
+    /// The ranking is a property of the graph, not of the walk that reached
+    /// it: any topological order gives the same layers. This is what lets the
+    /// order come from the cycle-removal DFS instead of a second pass.
+    #[test]
+    fn assign_layers_is_independent_of_the_topological_order() {
+        // A diamond with a long span: 0→1→2→4, 0→3→4, 0→4.
+        let fwd = vec![(0, 1), (1, 2), (2, 4), (0, 3), (3, 4), (0, 4)];
+        let from_dfs = remove_cycles(5, &fwd).topo;
+        assert!(topo_respects(&from_dfs, &fwd));
+        let expected = assign_layers(5, &fwd, &from_dfs);
+        assert_eq!(expected, vec![0, 1, 2, 1, 3]);
+
+        // Every other valid order of the same five nodes must agree.
+        let mut perm = [0usize, 1, 2, 3, 4];
+        let mut checked = 0;
+        permutations(&mut perm, 0, &mut |order: &[usize]| {
+            if topo_respects(order, &fwd) {
+                checked += 1;
+                assert_eq!(assign_layers(5, &fwd, order), expected, "order {order:?}");
+            }
+        });
+        assert!(checked > 1, "the fixture has only one valid order");
+    }
+
+    /// Every permutation of `slice`, handed to `f` one at a time.
+    fn permutations(slice: &mut [usize], k: usize, f: &mut impl FnMut(&[usize])) {
+        if k == slice.len() {
+            f(slice);
+            return;
+        }
+        for i in k..slice.len() {
+            slice.swap(k, i);
+            permutations(slice, k + 1, f);
+            slice.swap(k, i);
+        }
+    }
+
     #[test]
     fn remove_cycles_linear_chain_no_back_edges() {
         // 0 → 1 → 2: no cycles
         let edges = vec![(0, 1), (1, 2)];
-        let (fwd, back) = remove_cycles(3, &edges);
-        assert_eq!(fwd.len(), 2);
-        assert!(back.is_empty());
+        let out = remove_cycles(3, &edges);
+        assert_eq!(out.forward.len(), 2);
+        assert!(out.back.is_empty());
+        assert_eq!(out.topo, vec![0, 1, 2], "reverse postorder is the chain");
     }
 
     #[test]
     fn remove_cycles_simple_cycle() {
         // 0 → 1 → 0: one back-edge
         let edges = vec![(0, 1), (1, 0)];
-        let (fwd, back) = remove_cycles(2, &edges);
-        assert_eq!(fwd.len() + back.len(), 2);
-        assert_eq!(back.len(), 1);
+        let out = remove_cycles(2, &edges);
+        assert_eq!(out.forward.len() + out.back.len(), 2);
+        assert_eq!(out.back.len(), 1);
+        // The order has to respect what survived, not what was cut.
+        assert!(topo_respects(&out.topo, &out.forward));
     }
 
     #[test]
@@ -804,7 +884,7 @@ mod tests {
         // root(0) → A(1) → C(3)
         // root(0) → B(2) → C(3)
         let fwd = vec![(0, 1), (0, 2), (1, 3), (2, 3)];
-        let layers = assign_layers(4, &fwd);
+        let layers = assign_layers(4, &fwd, &remove_cycles(4, &fwd).topo);
         assert_eq!(layers[0], 0);
         assert_eq!(layers[1], 1);
         assert_eq!(layers[2], 1);
@@ -816,7 +896,7 @@ mod tests {
         // 0 → 1, 0 → 3, 1 → 2, 2 → 3
         // Longest path to 3: 0→1→2→3 = layer 3
         let fwd = vec![(0, 1), (0, 3), (1, 2), (2, 3)];
-        let layers = assign_layers(4, &fwd);
+        let layers = assign_layers(4, &fwd, &remove_cycles(4, &fwd).topo);
         assert_eq!(layers[0], 0);
         assert_eq!(layers[1], 1);
         assert_eq!(layers[2], 2);
@@ -831,8 +911,10 @@ mod tests {
         let sg = insert_dummy_nodes(2, &layers, &fwd, &[]);
 
         // 3 nodes total: 0, 1, dummy
+        // Three nodes for two real ones: index 2 is past `dag_len`, which is
+        // the whole of what marks it a dummy.
         assert_eq!(sg.positions.len(), 3);
-        assert!(sg.is_dummy[2]);
+        assert_eq!(sg.layers[1], vec![2], "the dummy sits on the skipped layer");
 
         // 2 edges: 0→dummy, dummy→1 (both with original_edge (0,1))
         assert_eq!(sg.edges.len(), 2);

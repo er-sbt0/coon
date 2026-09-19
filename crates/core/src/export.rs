@@ -31,9 +31,8 @@
 //! Deliberately absent: colour. The canvas reads its palette from the CSS
 //! custom properties so the graph and the chrome stay on one theme, and there
 //! is no way to write those into a `.dot` file without forking the palette and
-//! letting the copy drift. So the export carries shape, dash and pen weight —
-//! the parts that mean something — and leaves the colours to whoever renders
-//! it.
+//! letting the copy drift. So the export carries shape and dash — the parts
+//! that mean something — and leaves the colours to whoever renders it.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -45,12 +44,6 @@ use crate::app::CoreApp;
 use crate::layout::{compute_cluster_layout, compute_layout, LayoutOrientation};
 use crate::protocol::layout_options;
 use crate::workspace::{CoreWorkspace, ViewMode};
-
-/// Heaviest line an aggregated cluster edge is drawn with, and the lightest.
-/// The same log scale the client uses for the same edges (`edgeWidth` in
-/// `app.js`), so a rendered export and the canvas weight a relation alike.
-const EDGE_PEN_MIN: f32 = 1.0;
-const EDGE_PEN_MAX: f32 = 6.0;
 
 /// The formats a graph can be exported as.
 ///
@@ -89,7 +82,7 @@ pub struct Export {
 /// a tab with no root, or a map of a graph whose edges have not arrived yet.
 pub fn export(core: &CoreApp, format: ExportFormat) -> Option<Export> {
     let ws = core.workspaces.current()?;
-    let contents = match ws.view {
+    let contents = match ws.view() {
         ViewMode::ClusterMap => cluster_dot(core),
         ViewMode::Rooted => rooted_dot(core),
     }?;
@@ -105,13 +98,13 @@ pub fn export(core: &CoreApp, format: ExportFormat) -> Option<Export> {
 
 fn rooted_dot(core: &CoreApp) -> Option<String> {
     let ws = core.workspaces.current()?;
-    let root = ws.root_symbol?;
+    let root = ws.root_symbol()?;
     let graph = &core.call_graph;
 
     // The same call that builds the canvas, so the file holds the subgraph the
     // user is looking at rather than a second interpretation of the same
     // settings. Its keys are exactly the visible nodes.
-    let positions = compute_layout(graph, Some(root), ws.direction, &layout_options(core));
+    let positions = compute_layout(graph, Some(root), ws.direction(), &layout_options(core));
     if positions.is_empty() {
         return None;
     }
@@ -119,7 +112,7 @@ fn rooted_dot(core: &CoreApp) -> Option<String> {
     // `positions` is a HashMap, so an order has to be imposed or the same graph
     // exports to a different file every time and no two are diffable.
     let mut visible: Vec<SymbolId> = positions.keys().copied().collect();
-    visible.sort_by_key(|id| sort_key(graph, id));
+    visible.sort_by_cached_key(|id| sort_key(graph, id));
     let index_of: HashMap<SymbolId, usize> =
         visible.iter().enumerate().map(|(i, id)| (*id, i)).collect();
 
@@ -128,17 +121,17 @@ fn rooted_dot(core: &CoreApp) -> Option<String> {
         .get_function(&root)
         .map(|f| f.qualified_name.as_str())
         .unwrap_or("unknown");
-    let direction = match ws.direction {
+    let direction = match ws.direction() {
         CallDirection::Outgoing => "callees",
         CallDirection::Incoming => "callers",
     };
 
     header(
         &mut out,
-        ws.orientation,
+        ws.orientation(),
         &format!(
             "{root_label} — {direction}, {} levels, {} functions",
-            ws.depth,
+            ws.depth(),
             visible.len()
         ),
     );
@@ -196,11 +189,11 @@ fn rooted_dot(core: &CoreApp) -> Option<String> {
         // stay on screen because another caller reaches them. Dropping the
         // edges *leaving* it is what makes the gesture show, and the client
         // does the same.
-        let parent = match ws.direction {
+        let parent = match ws.direction() {
             CallDirection::Outgoing => edge.caller,
             CallDirection::Incoming => edge.callee,
         };
-        if ws.collapsed.contains(&parent) {
+        if ws.collapsed().contains(&parent) {
             continue;
         }
         if !seen.insert((edge.caller, edge.callee)) {
@@ -225,19 +218,19 @@ fn hidden_children(
     visible: &HashMap<SymbolId, crate::layout::NodePos>,
     ws: &CoreWorkspace,
 ) -> usize {
-    let children = match ws.direction {
-        CallDirection::Outgoing => graph.get_callees(id),
-        CallDirection::Incoming => graph.get_callers(id),
+    let children = match ws.direction() {
+        CallDirection::Outgoing => graph.callee_ids(id),
+        CallDirection::Incoming => graph.caller_ids(id),
     };
     if children.is_empty() {
         return 0;
     }
-    if ws.collapsed.contains(id) {
+    if ws.collapsed().contains(id) {
         return children.len();
     }
     children
         .iter()
-        .filter(|child| !visible.contains_key(&child.id))
+        .filter(|child| !visible.contains_key(*child))
         .count()
 }
 
@@ -267,8 +260,8 @@ fn cluster_dot(core: &CoreApp) -> Option<String> {
         clustering,
         core.map_frame(),
         core.map_level_for(ws),
-        ws.direction,
-        ws.orientation,
+        ws.direction(),
+        ws.orientation(),
     );
     if layout.nodes.is_empty() {
         return None;
@@ -295,17 +288,20 @@ fn cluster_dot(core: &CoreApp) -> Option<String> {
     }
 
     let mut out = String::new();
-    let scope = match ws.map_scope.and_then(|s| core.call_graph.get_function(&s)) {
+    let scope = match ws
+        .map_scope()
+        .and_then(|s| core.call_graph.get_function(&s))
+    {
         Some(func) => format!("{} — neighbourhood", func.qualified_name),
         None => "Whole project".to_string(),
     };
     header(
         &mut out,
-        ws.orientation,
+        ws.orientation(),
         &format!(
             "Cluster map: {scope}, {} clusters ({}, rung {} of {})",
             boxes.len(),
-            ws.method.label(),
+            ws.method().label(),
             core.map_level_for(ws) + 1,
             clustering.level_count(),
         ),
@@ -329,14 +325,23 @@ fn cluster_dot(core: &CoreApp) -> Option<String> {
     }
 
     out.push('\n');
-    for edge in call_edges(&core.call_graph, &name_of, ws.direction) {
+    // Every line at one width, with the count of calls in the tooltip rather
+    // than in the ink. The pen used to scale with the count on a log curve, to
+    // match a client that scaled its own; the client stopped (8408323) because
+    // a weighted map read as a different kind of picture from the graph it
+    // summarises. That argument is stronger here, not weaker: these are
+    // function-to-function calls, the very edges `rooted_dot` writes plain, so
+    // the variance made two exports of one project two kinds of drawing. And
+    // the count is not lost for want of a hover — DOT is text, so it is legible
+    // in the source, becomes a tooltip in a rendered SVG, and comes back as an
+    // attribute through `networkx` or `gvpr`, which a line width never did.
+    for edge in call_edges(&core.call_graph, &name_of, ws.direction()) {
         let (Some(source), Some(target)) = (name_of.get(&edge.0), name_of.get(&edge.1)) else {
             continue;
         };
         writeln!(
             &mut out,
-            "  {source} -> {target} [penwidth={:.1}, tooltip={}];",
-            pen_width(edge.2),
+            "  {source} -> {target} [tooltip={}];",
             quote(&count_of("call", edge.2))
         )
         .ok();
@@ -348,9 +353,15 @@ fn cluster_dot(core: &CoreApp) -> Option<String> {
 
 /// Every call between two exported functions, as (from, to, how many), sorted.
 ///
-/// `CallGraph` exposes no `edges()` accessor that counts multiplicity, so the
-/// calls are walked the way `logic::cluster` and `layout` walk them:
-/// `get_callees` per function, which returns one entry per distinct call site.
+/// [`CallGraph::edges`] yields exactly this multiplicity — one entry per call
+/// site — and `rooted_dot` above walks it. This one walks the functions
+/// instead, the way `logic::cluster` and `layout` do, because `exported` is a
+/// rung of a clustering rather than the whole graph: a map scoped to one
+/// function's neighbourhood holds a few dozen symbols out of a project's
+/// thousands, and `callee_ids` per exported function then costs the node count
+/// plus those functions' own calls, where `edges()` would read every call site
+/// in the project to find the few that land inside.
+///
 /// Calls inside a box are kept — that is what the box is for here — and the
 /// ones leaving the exported set are dropped, exactly as an isolated function
 /// is absent from the map it was never clustered into.
@@ -364,13 +375,13 @@ fn call_edges(
         if !exported.contains_key(caller) {
             continue;
         }
-        for callee in graph.get_callees(caller) {
-            if !exported.contains_key(&callee.id) || callee.id == *caller {
+        for callee in graph.callee_ids(caller) {
+            if !exported.contains_key(callee) || callee == caller {
                 continue;
             }
             let pair = match direction {
-                CallDirection::Outgoing => (*caller, callee.id),
-                CallDirection::Incoming => (callee.id, *caller),
+                CallDirection::Outgoing => (*caller, *callee),
+                CallDirection::Incoming => (*callee, *caller),
             };
             *weights.entry(pair).or_insert(0) += 1;
         }
@@ -437,15 +448,20 @@ fn header(out: &mut String, orientation: LayoutOrientation, label: &str) {
 /// Sort functions into an order two runs agree on. The name first so the file
 /// reads sensibly, the location and then the id to break the ties C++ hands out
 /// freely — jemalloc has nine distinct `thd_start`s.
-fn sort_key(graph: &CallGraph, id: &SymbolId) -> (String, String, u32, uuid::Uuid) {
+///
+/// It borrows out of the graph rather than cloning two `String`s, and the
+/// caller reaches it through `sort_by_cached_key`, which asks for the key once
+/// per function instead of once per comparison. `&str` compares byte for byte
+/// exactly as `String` did, so the order is the same one.
+fn sort_key<'a>(graph: &'a CallGraph, id: &SymbolId) -> (&'a str, &'a str, u32, uuid::Uuid) {
     match graph.get_function(id) {
         Some(func) => (
-            func.qualified_name.clone(),
-            func.definition_location.file_path.clone(),
+            func.qualified_name.as_str(),
+            func.definition_location.file_path.as_str(),
             func.definition_location.line,
             id.0,
         ),
-        None => (String::new(), String::new(), 0, id.0),
+        None => ("", "", 0, id.0),
     }
 }
 
@@ -456,12 +472,6 @@ fn count_of(noun: &str, n: usize) -> String {
     } else {
         format!("{n} {noun}s")
     }
-}
-
-/// The same log scale the client draws these edges on, so an exported map and
-/// the canvas weight the same relation alike.
-fn pen_width(weight: usize) -> f32 {
-    (EDGE_PEN_MIN + (weight.max(1) as f32).log2()).min(EDGE_PEN_MAX)
 }
 
 /// A DOT quoted string. Backslash and quote are the only two characters the
@@ -485,13 +495,16 @@ fn quote(text: &str) -> String {
 /// Name the file after what is in it, so a directory of exports is readable.
 fn filename(core: &CoreApp, format: ExportFormat) -> Option<String> {
     let ws = core.workspaces.current()?;
-    let subject = match ws.view {
-        ViewMode::ClusterMap => match ws.map_scope.and_then(|s| core.call_graph.get_function(&s)) {
+    let subject = match ws.view() {
+        ViewMode::ClusterMap => match ws
+            .map_scope()
+            .and_then(|s| core.call_graph.get_function(&s))
+        {
             Some(func) => format!("{}-clusters", func.name),
             None => "clusters".to_string(),
         },
         ViewMode::Rooted => ws
-            .root_symbol
+            .root_symbol()
             .and_then(|s| core.call_graph.get_function(&s))
             .map(|f| f.name.clone())
             .unwrap_or_else(|| "graph".to_string()),
@@ -503,24 +516,24 @@ fn filename(core: &CoreApp, format: ExportFormat) -> Option<String> {
 /// for `:`, `<`, `>`, `*` and spaces, all of which are either illegal or
 /// annoying somewhere.
 fn slug(text: &str) -> String {
-    let mut out: String = text
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    while out.contains("--") {
-        out = out.replace("--", "-");
+    // One pass: a run of illegal characters becomes a single `-`, because
+    // `operator<<` should read `operator-` and not `operator---`. Collapsing
+    // afterwards means rescanning and reallocating the whole string once per
+    // doubled dash, which for `std::map<std::string, int>::at` is several
+    // passes to reach a fixed point the writer already knew.
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
+            out.push(c);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
     }
-    let trimmed = out.trim_matches('-').to_string();
+    let trimmed = out.trim_matches('-');
     if trimmed.is_empty() {
         "graph".to_string()
     } else {
-        trimmed
+        trimmed.to_string()
     }
 }
 
@@ -540,8 +553,7 @@ mod tests {
         let mut core = CoreApp::new(graph);
         core.dispatch(crate::Command::StartGraphFromFunction(id));
         let ws = core.workspaces.current_mut().unwrap();
-        ws.view = ViewMode::Rooted;
-        ws.root_symbol = Some(id);
+        ws.set_root(id);
         core
     }
 
@@ -592,7 +604,7 @@ mod tests {
 
         // `main`'s own first callee: collapsing it must cost the file at least
         // the edges out of it, the same way it costs the canvas them.
-        let main = core.workspaces.current().unwrap().root_symbol.unwrap();
+        let main = core.workspaces.current().unwrap().root_symbol().unwrap();
         let callee = core.call_graph.get_callees(&main)[0].id;
         core.dispatch(crate::Command::ToggleCollapsed(callee));
         let collapsed = dot(&core);
@@ -622,6 +634,138 @@ mod tests {
         );
     }
 
+    /// The order is not merely deterministic, it is a *particular* order —
+    /// qualified name, then where the definition is — and the file is diffed
+    /// against the last one somebody kept. Pinning the whole list is what
+    /// catches a cheaper sort that is stable but no longer alphabetical.
+    #[test]
+    fn the_export_lists_functions_in_name_order() {
+        let mut core = rooted_at("main");
+        core.dispatch(crate::Command::SetGraphDepth(crate::layout::MAX_DEPTH));
+
+        assert_eq!(
+            labels(&dot(&core)),
+            vec![
+                "buf_append",
+                "buf_free",
+                "buf_init",
+                "buf_reserve",
+                "config_free",
+                "config_get_int",
+                "config_get_str",
+                "config_load",
+                "config_parse_line",
+                "conn_close",
+                "crc32_update",
+                "handle_client",
+                "hash_key",
+                "index_insert",
+                "index_lookup",
+                "index_rehash",
+                "index_remove",
+                "install_signal_handlers",
+                "log_close",
+                "log_init",
+                "log_rotate",
+                "log_write",
+                "main",
+                "oom_die",
+                "parse_args",
+                "parse_integer",
+                "parse_request",
+                "parse_token",
+                "print_usage",
+                "request_free",
+                "response_write_error",
+                "response_write_ok",
+                "response_write_value",
+                "run_server",
+                "server_accept_loop",
+                "server_start",
+                "server_stop",
+                "shutdown_gracefully",
+                "socket_accept",
+                "socket_close",
+                "socket_listen",
+                "socket_read",
+                "socket_set_nonblocking",
+                "socket_write",
+                "store_close",
+                "store_compact",
+                "store_delete",
+                "store_get",
+                "store_open",
+                "store_put",
+                "wal_append",
+                "wal_replay",
+                "wal_sync",
+                "wal_truncate",
+                "xmalloc",
+                "xrealloc",
+            ]
+        );
+    }
+
+    /// C++ hands out the same qualified name freely, so the order past it is
+    /// load-bearing too: file, then line. Only `name` reaches the label, so
+    /// three `ns::dup`s are told apart by the tooltip.
+    #[test]
+    fn functions_sharing_a_name_are_ordered_by_where_they_are_defined() {
+        let mut graph = CallGraph::new();
+        let root = FunctionNode::new(
+            "aaa_root".to_string(),
+            "aaa_root".to_string(),
+            Location::new("root.c".to_string(), 1, 0),
+        );
+        let from = root.id;
+        graph.add_function(root);
+        for (file, line) in [("b.c", 1), ("a.c", 9), ("a.c", 2)] {
+            let dup = FunctionNode::new(
+                "dup".to_string(),
+                "ns::dup".to_string(),
+                Location::new(file.to_string(), line, 0),
+            );
+            let to = dup.id;
+            graph.add_function(dup);
+            graph.add_call(from, to, Location::new("root.c".to_string(), 2, 0));
+        }
+
+        let mut core = CoreApp::new(graph);
+        core.dispatch(crate::Command::StartGraphFromFunction(from));
+        core.workspaces
+            .current_mut()
+            .unwrap()
+            .set_view(ViewMode::Rooted);
+
+        assert_eq!(
+            tooltips(&dot(&core)),
+            vec![
+                "aaa_root\\nroot.c:1",
+                "ns::dup\\na.c:2",
+                "ns::dup\\na.c:9",
+                "ns::dup\\nb.c:1",
+            ]
+        );
+    }
+
+    /// The `label=` of every node declaration, in the order the file declares
+    /// them — which is the order `rooted_dot` sorted the visible symbols into.
+    fn labels(out: &str) -> Vec<&str> {
+        field(out, "[label=\"")
+    }
+
+    fn tooltips(out: &str) -> Vec<&str> {
+        field(out, ", tooltip=\"")
+    }
+
+    fn field<'a>(out: &'a str, marker: &str) -> Vec<&'a str> {
+        out.lines()
+            .filter_map(|line| line.trim().strip_prefix('n'))
+            .filter_map(|line| line.split_once(marker))
+            .map(|(_, rest)| rest.split('"').next().unwrap_or_default())
+            .collect()
+    }
+
     #[test]
     fn two_exports_of_one_graph_are_byte_identical() {
         let core = rooted_at("main");
@@ -638,7 +782,7 @@ mod tests {
         let core = CoreApp::new(create_demo_call_graph());
         // A fresh workspace opens on the whole-program map.
         assert_eq!(
-            core.workspaces.current().unwrap().view,
+            core.workspaces.current().unwrap().view(),
             ViewMode::ClusterMap
         );
 
@@ -704,6 +848,52 @@ mod tests {
         );
     }
 
+    /// What a cluster-map edge stands for is written in words, not drawn as
+    /// ink. The pen width used to scale with the count to match a client that
+    /// has since gone back to one width for every edge, and these are the same
+    /// function-to-function calls a rooted export writes plain.
+    #[test]
+    fn a_map_edge_carries_its_count_in_the_tooltip_not_in_its_width() {
+        let core = CoreApp::new(create_demo_call_graph());
+        let out = dot(&core);
+
+        assert!(
+            !out.contains("penwidth"),
+            "a weighted line makes the map a different kind of drawing from a \
+             rooted export of the same calls; got:\n{out}"
+        );
+        assert!(
+            out.contains("[tooltip=\"1 call\"]"),
+            "and the count it used to carry is still on the edge; got:\n{out}"
+        );
+
+        // A pair called twice, so the tooltip is reporting a number rather
+        // than printing a constant.
+        let mut graph = CallGraph::new();
+        let caller = FunctionNode::new(
+            "a".to_string(),
+            "a".to_string(),
+            Location::new("a.c".to_string(), 1, 0),
+        );
+        let callee = FunctionNode::new(
+            "b".to_string(),
+            "b".to_string(),
+            Location::new("b.c".to_string(), 1, 0),
+        );
+        let (from, to) = (caller.id, callee.id);
+        graph.add_function(caller);
+        graph.add_function(callee);
+        graph.add_call(from, to, Location::new("a.c".to_string(), 2, 0));
+        graph.add_call(from, to, Location::new("a.c".to_string(), 3, 0));
+
+        let twice = dot(&CoreApp::new(graph));
+        assert!(
+            twice.contains("[tooltip=\"2 calls\"]"),
+            "two call sites, one line, and the file says which; got:\n{twice}"
+        );
+        assert!(!twice.contains("penwidth"), "still no ink for it:\n{twice}");
+    }
+
     #[test]
     fn a_map_scoped_to_a_function_exports_that_map() {
         let mut core = CoreApp::new(create_demo_call_graph());
@@ -712,7 +902,7 @@ mod tests {
         // The scoped clustering is computed off the tick loop.
         for _ in 0..50 {
             core.tick();
-            if core.workspaces.current().unwrap().map_scope.is_some()
+            if core.workspaces.current().unwrap().map_scope().is_some()
                 && !core
                     .clustering_for(core.workspaces.current().unwrap())
                     .is_empty()
@@ -768,7 +958,10 @@ mod tests {
         // A rooted workspace with no root: the canvas is blank, and a blank
         // file is worse than being told there is nothing to save.
         let mut core = CoreApp::new(CallGraph::new());
-        core.workspaces.current_mut().unwrap().view = ViewMode::Rooted;
+        core.workspaces
+            .current_mut()
+            .unwrap()
+            .set_view(ViewMode::Rooted);
         assert!(export(&core, ExportFormat::Dot).is_none());
     }
 
@@ -792,7 +985,10 @@ mod tests {
 
         let mut core = CoreApp::new(graph);
         core.dispatch(crate::Command::StartGraphFromFunction(from));
-        core.workspaces.current_mut().unwrap().view = ViewMode::Rooted;
+        core.workspaces
+            .current_mut()
+            .unwrap()
+            .set_view(ViewMode::Rooted);
 
         let out = export(&core, ExportFormat::Dot).unwrap();
         assert!(out.contents.contains(r#"label="operator\"\"_kb""#));
@@ -804,6 +1000,23 @@ mod tests {
         assert_eq!(
             out.filename, "operator-_kb.dot",
             "a filename keeps none of that"
+        );
+    }
+
+    /// A run of illegal characters is one dash however long it is, and the
+    /// dashes a run leaves at either end are not part of the name. The
+    /// interesting case is three or more in a row: the collapse has to reach a
+    /// fixed point, not merely halve.
+    #[test]
+    fn slug_collapses_runs_of_separators() {
+        assert_eq!(slug("std::map<int, char>::at"), "std-map-int-char-at");
+        assert_eq!(slug("a <<< b"), "a-b");
+        assert_eq!(slug("  leading and trailing  "), "leading-and-trailing");
+        assert_eq!(slug("<<<>>>"), "graph", "nothing legal left to name it");
+        assert_eq!(
+            slug("keeps_word.chars"),
+            "keeps_word.chars",
+            "`_` and `.` are legal in a filename and survive"
         );
     }
 }

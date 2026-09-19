@@ -132,6 +132,7 @@ let mapLevels        = 0;             // how many rungs there are; 0 while nothi
 let mapClusters      = 0;             // how many boxes this rung holds — what the zoom control reads out
 let clusterMethod    = null;          // which algorithm built the map
 let clusterMethods   = [];            // every algorithm on offer, for the picker
+let selectedClusterId = null;         // the box pointed at on the map, if it is still on this rung
 let lastFitKey       = null;                      // refit only on root/direction change
 
 const MAX_FIT_ZOOM = 1.15;
@@ -217,7 +218,10 @@ function handleSnapshot(msg) {
     // answer — before any symbols load there is nothing to cluster.
     rebuildClusterMap(clusterMap ?? {});
   } else {
-    rebuildGraph(currentGraph, msg.layout);
+    // And the rooted layout rides along with this one, on the same terms: it
+    // is absent under the map, and an empty one is a real answer — a tab with
+    // no root yet has an empty canvas.
+    rebuildGraph(currentGraph, msg.layout ?? {});
   }
   renderSidebar(searchEl.value);
   renderBreadcrumb();
@@ -225,9 +229,8 @@ function handleSnapshot(msg) {
   const n = Object.keys(allFunctions).length;
   fnCountEl.textContent = n ? `(${n})` : '';
   statSymbolsEl.textContent = n.toLocaleString();
-  // What is actually on the canvas. The rooted layout ships on every snapshot
-  // whether or not it is the view being drawn, so counting it on the map would
-  // report a number for a graph the user cannot see.
+  // What is actually on the canvas. Only the view being drawn is laid out, so
+  // this reads the one that came with the view — the other is not there at all.
   const placed = currentView === 'ClusterMap'
     ? Object.keys(clusterMap?.nodes || {}).length
     : Object.keys(msg.layout || {}).length;
@@ -413,13 +416,7 @@ function renderBreadcrumb() {
 function pathFromRoot(root, target) {
   if (!target || target === root) return [root];
 
-  const outgoing = currentDirection === 'Outgoing';
-  const adjacency = {};
-  for (const edge of currentGraph.edges || []) {
-    const [from, to] = outgoing ? [edge.caller, edge.callee] : [edge.callee, edge.caller];
-    (adjacency[from] ||= []).push(to);
-  }
-
+  const adj = adjacency();
   const prev = { [root]: null };
   const queue = [root];
   while (queue.length) {
@@ -429,7 +426,7 @@ function pathFromRoot(root, target) {
       for (let at = target; at != null; at = prev[at]) path.unshift(at);
       return path;
     }
-    for (const next of adjacency[node] || []) {
+    for (const next of adj.get(node) || NO_CHILDREN) {
       if (!(next in prev)) { prev[next] = node; queue.push(next); }
     }
   }
@@ -535,10 +532,6 @@ function fitGraph() {
 /// other id arrives as a string already and is used verbatim as an element id.
 const clusterId = (key) => `cluster:${key.level}:${key.anchor}`;
 
-/// The bare symbol id inside a `fn:` layout node id — what the cached graph is
-/// keyed by, and what the symbol commands take.
-const symbolOf = (nodeId) => nodeId.slice(3);
-
 const functionsLabel = (n) => `${n} function${n === 1 ? '' : 's'}`;
 
 function rebuildClusterMap(map) {
@@ -578,6 +571,18 @@ function rebuildClusterMap(map) {
     cy.add({ group: 'edges', data: { id, source: edge.source, target: edge.target } });
   }
 
+  // Put the mark back on the box the user pointed at. A snapshot tears the
+  // canvas down for reasons that have nothing to do with them — a batch of
+  // warmup edges landing, a regrouping — and a mark that vanished then would
+  // read as a click that stopped working. The rung is part of the element id,
+  // so a zoom step clears it without a rule of its own: the box that was
+  // pointed at is not on this map any more.
+  if (selectedClusterId) {
+    const marked = cy.$id(selectedClusterId);
+    if (marked.length) marked.addClass('focused');
+    else selectedClusterId = null;
+  }
+
   // The rung is deliberately *not* part of the key. Every box is placed where
   // the functions it holds sit (`core::layout::MapFrame`), so a zoom step
   // merges boxes in place rather than redrawing a different picture of the same
@@ -601,8 +606,14 @@ function rebuildClusterMap(map) {
 function clusterTap(node) {
   const key = node.data('key');
   if (!key) return;
-  cy.nodes().removeClass('selected');
-  node.addClass('selected');
+  // The same accent border a pointed-at node wears in the rooted view, and for
+  // the same reason: the info line alone leaves the box the user just hit
+  // looking exactly like every other one. One mark, one meaning — a second
+  // class for "selected here" would be a second signal saying the first one's
+  // thing. Exactly one box wears it, so the old one gives it up first.
+  selectedClusterId = node.id();
+  cy.nodes().removeClass('focused');
+  node.addClass('focused');
   setInfo(node.data('full'));
 }
 
@@ -687,15 +698,44 @@ methodSelectEl.addEventListener('change', () => {
 // The client holds the whole call graph, not just the laid-out subset, so it
 // can answer "is there more below this node?" without another round trip.
 
-/// Children of `id` in the current direction, as ids.
-function childrenOf(id) {
-  const outgoing = currentDirection === 'Outgoing';
-  const out = [];
-  for (const edge of currentGraph.edges || []) {
-    if (outgoing && edge.caller === id) out.push(edge.callee);
-    else if (!outgoing && edge.callee === id) out.push(edge.caller);
+/// Adjacency in the current direction, built once per graph and kept.
+///
+/// Both readers come in bursts over edges that are not moving: one click walks
+/// `pathFromRoot` twice — the breadcrumb, then the path highlight — and one
+/// rebuild asks `hiddenChildCount` about every node it places. Building the map
+/// inside each of them made all of that O(edges) apiece, over a graph that
+/// changes only when a snapshot lands.
+///
+/// The graph and the direction it is read in are the whole key, because both
+/// arrive on a snapshot and `currentGraph` is replaced wholesale rather than
+/// edited, so identity is enough. Collapse is deliberately not in here:
+/// `hiddenChildCount` and `rebuildGraph` apply that themselves, so one index
+/// serves a collapsed node and an open one alike.
+const NO_CHILDREN = [];
+let adjacencyCache = null;
+
+function adjacency() {
+  if (adjacencyCache && adjacencyCache.graph === currentGraph && adjacencyCache.direction === currentDirection) {
+    return adjacencyCache.map;
   }
-  return [...new Set(out)];
+  const outgoing = currentDirection === 'Outgoing';
+  const map = new Map();
+  // `core::protocol::wire_graph` already sends one edge per caller/callee pair
+  // rather than one per call site, so there is nothing here to dedupe.
+  for (const edge of currentGraph.edges || []) {
+    const [from, to] = outgoing ? [edge.caller, edge.callee] : [edge.callee, edge.caller];
+    const kids = map.get(from);
+    if (kids) kids.push(to);
+    else map.set(from, [to]);
+  }
+  adjacencyCache = { graph: currentGraph, direction: currentDirection, map };
+  return map;
+}
+
+/// Children of `id` in the current direction, as ids. The array is the index's
+/// own, so callers read it and do not keep or change it.
+function childrenOf(id) {
+  return adjacency().get(id) || NO_CHILDREN;
 }
 
 /// How many of a node's children are not shown *as its children* — because the
@@ -1012,52 +1052,103 @@ function symbolWhere(fn) {
   return loc.line ? `${base}:${loc.line}` : base;
 }
 
-/// Names that more than one symbol answers to.
+/// Everything the sidebar and the symbol finder read off the symbol table,
+/// worked out once: which names are ambiguous, where each symbol lives, what
+/// order the rows go in, and the text the filter matches against.
 ///
-/// Nothing is duplicated when this is non-empty — C gives every `static`
-/// function file-local linkage, so jemalloc's test suite really does define
-/// nine different `thd_start`s, and a C++ overload set is several functions
-/// with one name. They are distinct symbols with distinct call graphs, so the
-/// list must keep all of them; what it must not do is draw them identically.
-function ambiguousNames(fns) {
-  const seen = new Set();
-  const dup = new Set();
-  for (const id in fns) {
-    const name = fns[id].name;
-    if (seen.has(name)) dup.add(name);
-    else seen.add(name);
+/// Both callers run far more often than the table changes — the filter on
+/// every keystroke, `handleSnapshot` on every snapshot, and during the edge
+/// warmup the snapshots keep coming over symbols that stopped arriving long
+/// ago. So a keystroke gets out on the table's identity, and a snapshot, which
+/// always brings a new one, gets out on a fingerprint of what the rows are
+/// drawn from instead: one that only grew edges hands back the same index, and
+/// `renderSidebar` below then leaves the DOM alone as well.
+///
+/// `ambiguous` holds the names more than one symbol answers to. Nothing is
+/// duplicated when it is non-empty — C gives every `static` function
+/// file-local linkage, so jemalloc's test suite really does define nine
+/// different `thd_start`s, and a C++ overload set is several functions with
+/// one name. They are distinct symbols with distinct call graphs, so the list
+/// must keep all of them; what it must not do is draw them identically.
+let symbolIndexCache = null;
+
+function symbolIndex() {
+  if (symbolIndexCache && symbolIndexCache.fns === allFunctions) return symbolIndexCache;
+
+  let fingerprint = '';
+  for (const id in allFunctions) {
+    const fn = allFunctions[id];
+    const loc = fn.definition_location;
+    fingerprint += `${id}\u0000${fn.name}\u0000${fn.qualified_name || ''}` +
+      `\u0000${loc?.file_path || ''}\u0000${loc?.line ?? ''}\u0001`;
   }
-  return dup;
+  if (symbolIndexCache && symbolIndexCache.fingerprint === fingerprint) {
+    // The same symbols in a new envelope. The index stands — keeping its
+    // identity, which is what lets the DOM below stand too — and adopts the
+    // table it now answers for.
+    symbolIndexCache.fns = allFunctions;
+    return symbolIndexCache;
+  }
+
+  const seen = new Set();
+  const ambiguous = new Set();
+  const rows = [];
+  for (const id in allFunctions) {
+    const fn = allFunctions[id];
+    if (seen.has(fn.name)) ambiguous.add(fn.name);
+    else seen.add(fn.name);
+    rows.push({
+      id,
+      fn,
+      name: fn.name,
+      where: symbolWhere(fn),
+      // What the filter matches. Lowercased once here rather than twice per
+      // symbol per keystroke. The NUL is the join: no query anyone can type
+      // spans it, so a match is still a match within one field or the other,
+      // as it was when these were two `includes` calls.
+      haystack: `${fn.name}\u0000${fn.qualified_name || ''}`.toLowerCase(),
+    });
+  }
+
+  // Sorted once, and `where` is precomputed because it splits a path and
+  // allocates — inside the comparator that ran n log n times.
+  const sorted = rows.slice().sort((a, b) => {
+    // Same name: keep the group in a stable, readable order rather than
+    // whatever the id hash happened to give.
+    return a.name.localeCompare(b.name) || a.where.localeCompare(b.where);
+  });
+
+  symbolIndexCache = { fns: allFunctions, fingerprint, rows, sorted, ambiguous };
+  return symbolIndexCache;
 }
+
+// What the list currently shows. The rows are a function of these three and
+// nothing else, so matching them means the DOM below is already right.
+let sidebarShowing = null;
 
 function renderSidebar(filter) {
   const q = (filter || '').toLowerCase();
-  const ambiguous = ambiguousNames(allFunctions);
-  const ids = Object.keys(allFunctions)
-    .filter(id => {
-      const n = allFunctions[id];
-      return !q || n.name.toLowerCase().includes(q) || (n.qualified_name || '').toLowerCase().includes(q);
-    })
-    .sort((a, b) => {
-      const byName = allFunctions[a].name.localeCompare(allFunctions[b].name);
-      // Same name: keep the group in a stable, readable order rather than
-      // whatever the id hash happened to give.
-      return byName || symbolWhere(allFunctions[a]).localeCompare(symbolWhere(allFunctions[b]));
-    });
+  const index = symbolIndex();
+  if (sidebarShowing
+      && sidebarShowing.index === index
+      && sidebarShowing.q === q
+      && sidebarShowing.root === rootNodeId) return;
+  sidebarShowing = { index, q, root: rootNodeId };
+
+  const { ambiguous } = index;
+  const shown = q ? index.sorted.filter((row) => row.haystack.includes(q)) : index.sorted;
 
   fnListEl.innerHTML = '';
 
-  if (ids.length === 0) {
+  if (shown.length === 0) {
     const li = document.createElement('li');
     li.className = 'empty';
-    li.textContent = Object.keys(allFunctions).length === 0 ? 'No symbols loaded yet' : 'No matches';
+    li.textContent = index.sorted.length === 0 ? 'No symbols loaded yet' : 'No matches';
     fnListEl.appendChild(li);
     return;
   }
 
-  for (const id of ids) {
-    const node = allFunctions[id];
-    const where = symbolWhere(node);
+  for (const { id, fn: node, where } of shown) {
     const li = document.createElement('li');
 
     const nameEl = document.createElement('span');
@@ -1451,8 +1542,10 @@ function openCommandPalette() {
 }
 
 function openSymbolFinder() {
-  const ambiguous = ambiguousNames(allFunctions);
-  const items = Object.entries(allFunctions).map(([id, fn]) => ({
+  // `rows`, not `sorted`: the picker scores what it is given and ties fall back
+  // on the order they arrived in, so this stays the table's own order.
+  const { rows, ambiguous } = symbolIndex();
+  const items = rows.map(({ id, fn, where }) => ({
     id,
     label: fn.name,
     // Only worth showing when it adds something beyond the bare name — and
@@ -1460,7 +1553,7 @@ function openSymbolFinder() {
     // `thd_start` out of nine.
     detail: fn.qualified_name && fn.qualified_name !== fn.name
       ? fn.qualified_name
-      : (ambiguous.has(fn.name) ? symbolWhere(fn) : ''),
+      : (ambiguous.has(fn.name) ? where : ''),
     mono: true,
   }));
 

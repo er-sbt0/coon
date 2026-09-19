@@ -10,6 +10,14 @@ use crate::compile_commands;
 use crate::{IndexProgress, LspClient, LspRequest, LspResponse, LspService};
 use model::lsp_status::{LspLoadPhase, LspUiMessage};
 
+/// How long clangd has to answer `initialize`.
+///
+/// Nothing else can start until it does — the compile database is not read,
+/// no document is opened, and the bridge is not wired — so an unanswered
+/// `initialize` is a dead server rather than a slow one, and the budget only
+/// has to be long enough to cover a cold process start.
+const INIT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(10);
+
 /// How long to wait for the initial `workspace/symbol` reply before giving up
 /// and wiring the bridge anyway.
 ///
@@ -84,14 +92,19 @@ pub async fn lsp_loader_task(
 
     let init_id = lsp_client.initialize(root_uri.clone()).await?;
 
-    let mut init_response = None;
-    let timeout = tokio::time::Duration::from_secs(10);
-    let start_time = std::time::Instant::now();
+    // Wait for the reply to `initialize`, and only for that. clangd starts
+    // talking before it answers — `window/workDoneProgress/create`, the first
+    // `$/progress` — so this has to keep reading and discarding until the id
+    // matches, which is why it is a loop and not a single `timeout`. One
+    // deadline covers the whole wait, as it does for every other wait in this
+    // file: polling in 100ms slices re-armed a timer per slice and spun for
+    // the full budget on a server that had simply gone quiet, and the budget
+    // it enforced was the loop's own `elapsed()` check rather than the timer.
+    let init_deadline = tokio::time::Instant::now() + INIT_TIMEOUT;
     let mut rx_for_init = rx;
 
-    while start_time.elapsed() < timeout && init_response.is_none() {
-        match tokio::time::timeout(std::time::Duration::from_millis(100), rx_for_init.recv()).await
-        {
+    loop {
+        match tokio::time::timeout_at(init_deadline, rx_for_init.recv()).await {
             Ok(Some(message)) => {
                 if log::log_enabled!(log::Level::Debug) {
                     debug!(
@@ -99,29 +112,40 @@ pub async fn lsp_loader_task(
                         serde_json::to_string_pretty(&message).unwrap_or_default()
                     );
                 }
-                if let Some(id) = message.get("id").and_then(|i| i.as_i64()) {
-                    if id == init_id {
-                        if let Some(error) = message.get("error") {
-                            let msg = format!("LSP initialization failed: {:?}", error);
-                            ui_tx
-                                .send(LspUiMessage::Progress(LspLoadPhase::Failed(msg.clone())))?;
-                            return Err(msg.into());
-                        }
-                        init_response = Some(message);
-                        info!("LSP initialization complete");
-                        ui_tx.send(LspUiMessage::Progress(LspLoadPhase::Initialized))?;
-                    }
+                // Anything that is not the answer to `initialize` is startup
+                // chatter: drop it and keep waiting. The `method` check is not
+                // redundant with the id — `window/workDoneProgress/create` is
+                // a *request from the server*, so it carries an id of
+                // clangd's own choosing out of a counter that starts where
+                // ours does, and a numeric collision would otherwise read as
+                // a successful initialize. A response never names a method.
+                if message.get("method").is_some()
+                    || message.get("id").and_then(|i| i.as_i64()) != Some(init_id)
+                {
+                    continue;
                 }
+                if let Some(error) = message.get("error") {
+                    let msg = format!("LSP initialization failed: {:?}", error);
+                    ui_tx.send(LspUiMessage::Progress(LspLoadPhase::Failed(msg.clone())))?;
+                    return Err(msg.into());
+                }
+                info!("LSP initialization complete");
+                ui_tx.send(LspUiMessage::Progress(LspLoadPhase::Initialized))?;
+                break;
             }
-            Ok(None) => break,
-            Err(_) => continue,
+            // The channel closed, so clangd died before it answered. Waiting
+            // out the rest of the deadline would only delay saying so.
+            Ok(None) => {
+                let msg = "LSP server closed the connection during initialization".to_string();
+                ui_tx.send(LspUiMessage::Progress(LspLoadPhase::Failed(msg.clone())))?;
+                return Err(msg.into());
+            }
+            Err(_) => {
+                let msg = "LSP initialization timed out".to_string();
+                ui_tx.send(LspUiMessage::Progress(LspLoadPhase::Failed(msg.clone())))?;
+                return Err(msg.into());
+            }
         }
-    }
-
-    if init_response.is_none() {
-        let msg = "LSP initialization timed out".to_string();
-        ui_tx.send(LspUiMessage::Progress(LspLoadPhase::Failed(msg.clone())))?;
-        return Err(msg.into());
     }
 
     info!("Sending initialized notification...");
@@ -143,7 +167,9 @@ pub async fn lsp_loader_task(
         .map(|path| path.to_string_lossy().to_string())
         .collect();
     lsp_service
-        .set_project_files(project_file_paths.clone())
+        .send(LspRequest::SetProjectFiles {
+            project_files: project_file_paths.clone(),
+        })
         .await?;
     info!(
         "Set {} project files for symbol filtering",
@@ -169,7 +195,15 @@ pub async fn lsp_loader_task(
             total,
         }))?;
 
-        let preload_request_id = lsp_service.preload_documents(document_uris.clone()).await?;
+        // The id is minted here, not by the service, because this is the end
+        // that matches it against the `PreloadComplete` below.
+        let preload_request_id = Uuid::new_v4().to_string();
+        lsp_service
+            .send(LspRequest::PreloadDocuments {
+                request_id: preload_request_id.clone(),
+                document_uris: document_uris.clone(),
+            })
+            .await?;
 
         // Wait for the service worker to confirm all didOpen notifications were sent.
         let preload_timeout = tokio::time::Duration::from_secs(30);
@@ -233,13 +267,16 @@ pub async fn lsp_loader_task(
     // contents depend on which of the open files have finished building their
     // ASTs — timing that `backgroundIndexProgress` says nothing about. Querying
     // with nothing open is what makes the answer the same twice running.
-    if let Err(e) = lsp_service.close_documents().await {
+    if let Err(e) = lsp_service.send(LspRequest::CloseDocuments).await {
         log::warn!("Failed to close documents before the symbol sweep: {}", e);
     }
 
     let initial_request_id = Uuid::new_v4().to_string();
     lsp_service
-        .request_workspace_symbols(initial_request_id.clone(), "".to_string())
+        .send(LspRequest::GetWorkspaceSymbols {
+            request_id: initial_request_id.clone(),
+            query: String::new(),
+        })
         .await?;
     info!("Requested initial workspace symbols for overview");
     ui_tx.send(LspUiMessage::Progress(
@@ -301,7 +338,10 @@ pub async fn lsp_loader_task(
         let request_id = Uuid::new_v4().to_string();
         info!("Background index finished during the symbol wait; re-querying ({request_id})");
         if let Err(e) = lsp_service
-            .request_workspace_symbols(request_id, String::new())
+            .send(LspRequest::GetWorkspaceSymbols {
+                request_id,
+                query: String::new(),
+            })
             .await
         {
             log::error!("Failed to re-query workspace symbols: {}", e);
@@ -440,62 +480,39 @@ async fn run_tui_lsp_bridge(
     tui_response_tx: mpsc::UnboundedSender<LspResponse>,
     mut requery_on_index: bool,
 ) {
-    macro_rules! forward_lsp {
-        ($rid:expr, $call:expr) => {{
-            let rid = $rid;
-            if let Err(e) = $call {
-                log::error!("LSP request failed: {}", e);
-                let _ = tui_response_tx.send(LspResponse::Error {
-                    request_id: rid,
-                    error: format!("Request failed: {}", e),
-                });
-            }
-        }};
-    }
-
     loop {
         tokio::select! {
             tui_request = tui_request_rx.recv() => {
                 if let Some(request) = tui_request {
                     log::debug!("Forwarding TUI request to LSP service: {:?}", request);
                     match request {
-                        LspRequest::GetOutgoingCalls { request_id, call_hierarchy_item } =>
-                            forward_lsp!(request_id.clone(),
-                                lsp_service.request_outgoing_calls(request_id, call_hierarchy_item).await),
-                        LspRequest::GetIncomingCalls { request_id, call_hierarchy_item } =>
-                            forward_lsp!(request_id.clone(),
-                                lsp_service.request_incoming_calls(request_id, call_hierarchy_item).await),
-                        LspRequest::FindReferences { request_id, document_uri, position } =>
-                            forward_lsp!(request_id.clone(),
-                                lsp_service.request_references(request_id, document_uri, position).await),
-                        LspRequest::GetWorkspaceSymbols { request_id, query } =>
-                            forward_lsp!(request_id.clone(),
-                                lsp_service.request_workspace_symbols(request_id, query).await),
-                        LspRequest::FindReferencesWithSymbols { request_id, document_uri, position } =>
-                            forward_lsp!(request_id.clone(),
-                                lsp_service.request_references_with_symbols(request_id, document_uri, position).await),
-                        LspRequest::PrepareCallHierarchy { request_id, document_uri, position } =>
-                            forward_lsp!(request_id.clone(),
-                                lsp_service.request_prepare_call_hierarchy(request_id, document_uri, position).await),
-                        LspRequest::GetDocumentSymbols { request_id, document_uri } =>
-                            forward_lsp!(request_id.clone(),
-                                lsp_service.request_document_symbols(request_id, document_uri).await),
-                        LspRequest::PreloadDocuments { request_id, document_uris } =>
-                            forward_lsp!(request_id.clone(),
-                                lsp_service.request_preload_documents(request_id, document_uris).await),
-                        LspRequest::CloseDocuments => {
-                            if let Err(e) = lsp_service.close_documents().await {
-                                log::error!("Failed to forward close documents: {}", e);
-                            }
-                        }
-                        LspRequest::SetProjectFiles { project_files } => {
-                            if let Err(e) = lsp_service.set_project_files(project_files).await {
-                                log::error!("Failed to forward set project files: {}", e);
-                            }
-                        }
+                        // The one request the forwarder acts on rather than
+                        // forwards: the service is shut down below, on the way
+                        // out of this loop.
                         LspRequest::Shutdown => {
                             log::debug!("Received Shutdown from TUI, stopping forwarder");
                             break;
+                        }
+                        // Everything else goes through untouched. This used to
+                        // be eight arms that destructured a request only to
+                        // hand its fields to the `LspService` method that put
+                        // the same variant back together, plus two more for the
+                        // requests nothing replies to.
+                        request => {
+                            // Read before the send, which takes the request:
+                            // it is how the waiter downstream is told that
+                            // their request never went out. `None` means
+                            // nobody is waiting on this one.
+                            let request_id = request.request_id().map(str::to_owned);
+                            if let Err(e) = lsp_service.send(request).await {
+                                log::error!("LSP request failed: {}", e);
+                                if let Some(request_id) = request_id {
+                                    let _ = tui_response_tx.send(LspResponse::Error {
+                                        request_id,
+                                        error: format!("Request failed: {}", e),
+                                    });
+                                }
+                            }
                         }
                     }
                 } else {
@@ -517,7 +534,10 @@ async fn run_tui_lsp_bridge(
                                 request_id
                             );
                             if let Err(e) = lsp_service
-                                .request_workspace_symbols(request_id, String::new())
+                                .send(LspRequest::GetWorkspaceSymbols {
+                                    request_id,
+                                    query: String::new(),
+                                })
                                 .await
                             {
                                 log::error!("Failed to re-query workspace symbols: {}", e);

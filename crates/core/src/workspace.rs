@@ -17,8 +17,11 @@ use crate::events::AppEvent;
 /// It lives beside the workspace rather than beside `LayoutOrientation` in
 /// `layout` because it is not a layout parameter. Orientation says how to draw
 /// a view; the view mode says which view there is to draw at all, and the
-/// workspace is the thing that remembers it. Layout will read it in Phase 3,
-/// the way it already reads `depth` and `collapsed`, without owning it.
+/// workspace is the thing that remembers it. `protocol::layout_of` and
+/// `protocol::cluster_layout_of` each read it to decide whether the view they
+/// build is the one on screen — the way `protocol::layout_options` reads
+/// `depth` and `collapsed` — so `layout` stays two functions with no mode
+/// flag between them, and neither owns the answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ViewMode {
     /// The default. A workspace has no root until the user picks one, so a tab
@@ -38,26 +41,31 @@ pub enum ViewMode {
 pub struct CoreWorkspace {
     pub id: usize,
     pub name: String,
-    pub root_symbol: Option<SymbolId>,
-    pub direction: CallDirection,
+    root_symbol: Option<SymbolId>,
+    direction: CallDirection,
     /// Levels of callees/callers to show from the root.
-    pub depth: usize,
+    depth: usize,
     /// Nodes whose children the user has collapsed. The node stays visible.
-    pub collapsed: HashSet<SymbolId>,
+    collapsed: HashSet<SymbolId>,
     /// Nodes the user asked to load the calls of, so the layout walks one level
     /// past the depth limit at each of them.
     ///
     /// The counterpart of `collapsed`: one says stop short of where the limit
     /// would reach, the other says go one step further. Both describe this
     /// tree, so both are cleared when the root moves.
-    pub expanded: HashSet<SymbolId>,
+    expanded: HashSet<SymbolId>,
     /// Which way the graph flows on the canvas.
-    pub orientation: LayoutOrientation,
+    orientation: LayoutOrientation,
     /// Which view this workspace is showing.
-    pub view: ViewMode,
+    view: ViewMode,
     /// Which rung of the coarsening ladder the map is drawn at, or `None` for
-    /// the coarsest — which is where a map should open, and which rung that is
-    /// depends on a clustering the workspace does not hold.
+    /// wherever the ladder says a map should open — which is *not* the
+    /// coarsest: `Clustering::opening_level` is the last rung built at plain
+    /// modularity, and the rungs above it exist only to force a wide optimum
+    /// down to a box count, so they are where a user zooms out *to* rather than
+    /// where they should land. Which rung that is depends on a clustering the
+    /// workspace does not hold, so `None` is resolved in
+    /// `CoreApp::map_level_for`.
     ///
     /// Held as a level rather than as a set of opened boxes because the ladder
     /// is a zoom: every rung partitions the same functions, so the map shows
@@ -65,9 +73,9 @@ pub struct CoreWorkspace {
     /// survives a recompute on its own terms — rung 4 of the next ladder is
     /// still about as coarse as rung 4 of this one — and `CoreApp` clamps it to
     /// what the current ladder has.
-    pub map_level: Option<usize>,
+    map_level: Option<usize>,
     /// Which algorithm builds the ladder this workspace is looking at.
-    pub method: ClusterMethod,
+    method: ClusterMethod,
     /// The function whose neighbourhood the cluster map is drawn from, or
     /// `None` for the whole program.
     ///
@@ -76,7 +84,7 @@ pub struct CoreWorkspace {
     /// back has to lead to the map the user was actually looking at. Rooting at
     /// a function found inside one function's map and then going back to "the
     /// cluster map" should not silently land on the whole program's.
-    pub map_scope: Option<SymbolId>,
+    map_scope: Option<SymbolId>,
     pub created_at: Instant,
     pub last_accessed: Instant,
 }
@@ -170,9 +178,10 @@ impl CoreWorkspace {
     /// Switches to the map for the same reason [`Self::set_root`] switches away
     /// from it: naming what a map should be drawn from *is* asking to see that
     /// map, and leaving each frontend to pair the two commands is how a
-    /// frontend stops being a transport. The zoom goes back to the coarsest
-    /// with it: a new scope is a new ladder, of a different height, and rung 6
-    /// of the old one names nothing in particular on the new.
+    /// frontend stops being a transport. The zoom goes back to the new ladder's
+    /// opening rung with it: a new scope is a new ladder, of a different
+    /// height, and rung 6 of the old one names nothing in particular on the
+    /// new.
     pub fn set_map_scope(&mut self, scope: Option<SymbolId>) -> bool {
         let changed = scope != self.map_scope || self.view != ViewMode::ClusterMap;
         self.map_scope = scope;
@@ -235,6 +244,99 @@ impl CoreWorkspace {
         self.touch();
         let uncollapsed = self.collapsed.remove(&symbol);
         self.expanded.insert(symbol) || uncollapsed
+    }
+
+    /// Reverse the arrows: read the graph as callers rather than callees, or
+    /// back again. Returns the direction now in force.
+    ///
+    /// The expansion set goes with it. Reading the other way is a different
+    /// tree, and the nodes the old one was walked one level past have nothing
+    /// to say about the new one — the rule [`Self::set_root`] applies when the
+    /// tree moves, applied here for the same reason. It lives on the workspace
+    /// rather than in the command handler that used to do both halves inline,
+    /// so that there is no way to flip one without the other.
+    pub fn toggle_direction(&mut self) -> CallDirection {
+        self.direction = match self.direction {
+            CallDirection::Outgoing => CallDirection::Incoming,
+            CallDirection::Incoming => CallDirection::Outgoing,
+        };
+        self.expanded.clear();
+        self.touch();
+        self.direction
+    }
+
+    // ---- Readers ----
+    //
+    // The fields behind these are private, and the setters above are why. Each
+    // of them is half of a rule — a new root empties `collapsed` and
+    // `expanded`, a new scope or method resets `map_level`, naming either a
+    // root or a scope decides `view`, a depth outside `MIN_DEPTH..=MAX_DEPTH`
+    // is not a depth — and a `pub` field is an invitation to set one half and
+    // forget the other. That is not hypothetical: the direction toggle did
+    // exactly this, clearing `expanded` by hand next to its own assignment,
+    // which is the rule `set_root` owns written out a second time in a place
+    // nothing would keep in step.
+
+    /// Which function the tree is grown from, if the user has picked one.
+    /// Moved by [`Self::set_root`], which takes the rest of the tree with it.
+    pub fn root_symbol(&self) -> Option<SymbolId> {
+        self.root_symbol
+    }
+
+    /// Which way the graph flows. Reversed by [`Self::toggle_direction`].
+    pub fn direction(&self) -> CallDirection {
+        self.direction
+    }
+
+    /// Levels of callees/callers shown from the root, always inside
+    /// `MIN_DEPTH..=MAX_DEPTH`: [`Self::set_depth`] is what keeps it there.
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// Nodes whose children the user has collapsed. Changed by
+    /// [`Self::toggle_collapsed`]; emptied when the tree moves.
+    pub fn collapsed(&self) -> &HashSet<SymbolId> {
+        &self.collapsed
+    }
+
+    /// Nodes the layout walks one level past the depth limit at. Changed by
+    /// [`Self::expand`]; emptied when the tree moves.
+    pub fn expanded(&self) -> &HashSet<SymbolId> {
+        &self.expanded
+    }
+
+    /// Which way the canvas lays the levels out.
+    pub fn orientation(&self) -> LayoutOrientation {
+        self.orientation
+    }
+
+    /// Which of the two views this workspace is showing.
+    ///
+    /// It follows what it is showing rather than moving on its own: naming a
+    /// root switches to the tree, naming a map scope switches to the map. See
+    /// [`Self::set_root`] and [`Self::set_map_scope`].
+    pub fn view(&self) -> ViewMode {
+        self.view
+    }
+
+    /// Which rung of the ladder the map is drawn at, or `None` for wherever
+    /// the ladder says a map should open — resolved in `CoreApp::map_level_for`,
+    /// and reset by anything that builds a different ladder.
+    pub fn map_level(&self) -> Option<usize> {
+        self.map_level
+    }
+
+    /// Which algorithm builds the ladder. Changed by [`Self::set_method`],
+    /// which resets the zoom because the rungs are the method's own.
+    pub fn method(&self) -> ClusterMethod {
+        self.method
+    }
+
+    /// The function whose neighbourhood the map is drawn from, or `None` for
+    /// the whole program. Changed by [`Self::set_map_scope`].
+    pub fn map_scope(&self) -> Option<SymbolId> {
+        self.map_scope
     }
 
     pub fn touch(&mut self) {
@@ -309,21 +411,27 @@ impl CoreWorkspaceManager {
         Ok(AppEvent::WorkspaceClosed)
     }
 
-    /// Switch to a specific workspace by index. Returns an optional event.
+    /// Switch to a specific workspace by index. Returns an optional event, and
+    /// `None` for an index that names no workspace — in which case nothing
+    /// moves.
+    ///
+    /// The one place the current index changes by navigation, and so the one
+    /// place that touches the workspace and announces the move.
+    /// [`Self::next_workspace`] and [`Self::previous`] are index arithmetic in
+    /// front of it: they used to be copies of this body, each with its own
+    /// bounds check, its own `touch()` and its own `WorkspaceSwitched`, and an
+    /// `else { None }` after a bounds check that had already ruled it out.
     pub fn switch_to(&mut self, index: usize) -> Option<AppEvent> {
-        if index >= self.workspaces.len() {
-            return None;
-        }
+        // `get_mut` *is* the bounds check, so there is no unreachable arm for
+        // the index the check already rejected.
+        let workspace = self.workspaces.get_mut(index)?;
+        workspace.touch();
+        let event = AppEvent::WorkspaceSwitched {
+            id: workspace.id,
+            name: workspace.name.clone(),
+        };
         self.current_index = index;
-        if let Some(workspace) = self.workspaces.get_mut(index) {
-            workspace.touch();
-            Some(AppEvent::WorkspaceSwitched {
-                id: workspace.id,
-                name: workspace.name.clone(),
-            })
-        } else {
-            None
-        }
+        Some(event)
     }
 
     /// Switch to the next workspace (wrapping). Returns an optional event.
@@ -331,16 +439,7 @@ impl CoreWorkspaceManager {
         if self.workspaces.is_empty() {
             return None;
         }
-        self.current_index = (self.current_index + 1) % self.workspaces.len();
-        if let Some(workspace) = self.workspaces.get_mut(self.current_index) {
-            workspace.touch();
-            Some(AppEvent::WorkspaceSwitched {
-                id: workspace.id,
-                name: workspace.name.clone(),
-            })
-        } else {
-            None
-        }
+        self.switch_to((self.current_index + 1) % self.workspaces.len())
     }
 
     /// Switch to the previous workspace (wrapping). Returns an optional event.
@@ -348,20 +447,12 @@ impl CoreWorkspaceManager {
         if self.workspaces.is_empty() {
             return None;
         }
-        if self.current_index == 0 {
-            self.current_index = self.workspaces.len() - 1;
+        let index = if self.current_index == 0 {
+            self.workspaces.len() - 1
         } else {
-            self.current_index -= 1;
-        }
-        if let Some(workspace) = self.workspaces.get_mut(self.current_index) {
-            workspace.touch();
-            Some(AppEvent::WorkspaceSwitched {
-                id: workspace.id,
-                name: workspace.name.clone(),
-            })
-        } else {
-            None
-        }
+            self.current_index - 1
+        };
+        self.switch_to(index)
     }
 
     /// Rename a workspace. Returns an optional event.
@@ -461,6 +552,22 @@ mod tests {
             ws.expanded.is_empty(),
             "a new root starts with nothing expanded"
         );
+    }
+
+    #[test]
+    fn reversing_the_direction_drops_the_expansions() {
+        let mut ws = CoreWorkspace::new(1, "w".to_string());
+        let sym = SymbolId::from_content("a", "a.c", 1);
+        ws.expand(sym);
+
+        assert_eq!(ws.toggle_direction(), CallDirection::Incoming);
+        assert!(
+            ws.expanded.is_empty(),
+            "reading the other way is a different tree, and the nodes walked \
+             one level past the limit in the old one say nothing about it"
+        );
+
+        assert_eq!(ws.toggle_direction(), CallDirection::Outgoing);
     }
 
     #[test]

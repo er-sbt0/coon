@@ -9,7 +9,7 @@ use model::{CallDirection, CallGraph, FunctionNode, Location, LspLoadPhase, Symb
 use crate::command::Command;
 use crate::events::AppEvent;
 use crate::layout::{compute_map_frame, LayoutOrientation, MapFrame};
-use crate::lsp_bridge::{LoadingState, LspBridge, RequestOrigin};
+use crate::lsp_bridge::{LoadingState, LspBridge, PendingRequest, RequestOrigin, SendOutcome};
 use crate::workspace::{CoreWorkspace, CoreWorkspaceManager, ViewMode};
 
 /// How many call-hierarchy requests to keep in flight while warming up edges.
@@ -18,7 +18,38 @@ use crate::workspace::{CoreWorkspace, CoreWorkspaceManager, ViewMode};
 /// hundred requests on a 30 s timeout behind a server that answers them at its
 /// own pace — not about parallelism. Eight keeps the pipe busy and leaves room
 /// for a request the user makes while the warmup is still running.
+///
+/// It is also bounded from above by [`lsp::OPEN_DOCUMENT_LIMIT`], and the
+/// `const` assertion below is what enforces that rather than describing it.
 const WARMUP_IN_FLIGHT: usize = 8;
+
+/// The warmup may not outrun the set of documents clangd is holding open.
+///
+/// A call hierarchy is two round trips: the prepare opens the symbol's file
+/// and puts it at the recent end of the LRU, and the follow-up
+/// (`GetOutgoingCalls`) neither reopens it nor touches it again — so the file
+/// has to survive both legs on the position the prepare gave it. Every other
+/// request dispatched in that window can open a file of its own, and a slot
+/// freed by a reply is refilled at once, so under in-order service up to twice
+/// this concurrency of fresh documents lands on top of it: the hard floor is
+/// `2 * WARMUP_IN_FLIGHT + 1`. Replies are not in fact ordered — a slow file
+/// leaves its document sitting while the other slots cycle — and the user's
+/// own expands and find-references draw on the same budget and open files of
+/// their own, neither of which has a bound worth quoting. So the enforced
+/// margin is four times over, which is what the shipping pair already is.
+///
+/// Violating it is silent at runtime: clangd answers the follow-up with
+/// "trying to get AST for non-added document", the symbol keeps no edges, and
+/// the graph merely comes out smaller than it should. Hence a build failure.
+/// Raising the concurrency is allowed — it just has to be paid for in
+/// [`lsp::OPEN_DOCUMENT_LIMIT`], which is clangd's memory, and saying so here
+/// is the point.
+const _: () = assert!(
+    WARMUP_IN_FLIGHT * 4 <= lsp::OPEN_DOCUMENT_LIMIT,
+    "WARMUP_IN_FLIGHT must stay at or below a quarter of lsp::OPEN_DOCUMENT_LIMIT: \
+     a call hierarchy needs its document open across two round trips, and evicting \
+     it mid-flight loses the symbol's edges silently. Raise OPEN_DOCUMENT_LIMIT too."
+);
 
 /// How often the edge warmup writes its state to the log while it runs.
 ///
@@ -52,8 +83,8 @@ struct ClusterTarget {
 impl ClusterTarget {
     fn of(ws: &CoreWorkspace) -> Self {
         Self {
-            scope: ws.map_scope.map(|scope| (scope, ws.direction)),
-            method: ws.method,
+            scope: ws.map_scope().map(|scope| (scope, ws.direction())),
+            method: ws.method(),
         }
     }
 
@@ -165,8 +196,6 @@ pub struct CoreApp {
     /// thread every tick for as long as the app runs. Cleared by
     /// `mark_graph_changed`: a different graph is a different question.
     clustering_failed: HashSet<ClusterTarget>,
-    /// When the graph last changed. The settling period is measured from here.
-    graph_changed_at: Option<Instant>,
     /// Functions still awaiting their first call-hierarchy fetch.
     ///
     /// clangd's workspace symbols carry no edges, so a freshly loaded project is
@@ -190,6 +219,11 @@ pub struct CoreApp {
     /// reading — the work really did get bigger — and beats the alternative of
     /// resolving those symbols silently, outside the number the status bar is
     /// showing.
+    ///
+    /// The one invariant it has to keep is `warmup_total >= edge_warmup.len()`,
+    /// since `done` is the difference: work put *back* on the queue by
+    /// `requeue_discarded` therefore lowers `done` rather than raising this,
+    /// because those places were counted when they were first queued.
     warmup_total: usize,
     /// Whether the closing `ResolvingCalls { done: total, .. }` has gone out.
     /// Without it the end would be announced on every tick thereafter, since
@@ -249,7 +283,6 @@ impl CoreApp {
             map_frame,
             frame_stale: false,
             clustering_failed: HashSet::new(),
-            graph_changed_at: None,
             edge_warmup: VecDeque::new(),
             warmup_seeded: false,
             warmup_total: 0,
@@ -305,7 +338,7 @@ impl CoreApp {
     pub fn map_level_for(&self, ws: &CoreWorkspace) -> usize {
         let clustering = self.clustering_for(ws);
         let top = clustering.top_level_index().unwrap_or_default();
-        ws.map_level
+        ws.map_level()
             .unwrap_or_else(|| clustering.opening_level())
             .min(top)
     }
@@ -344,7 +377,7 @@ impl CoreApp {
     pub fn current_direction(&self) -> CallDirection {
         self.workspaces
             .current()
-            .map(|w| w.direction)
+            .map(|w| w.direction())
             .unwrap_or(CallDirection::Outgoing)
     }
 
@@ -420,7 +453,7 @@ impl CoreApp {
         }
 
         // Emit current LSP phase as a progress event
-        events.push(AppEvent::LspProgress(self.lsp.status.clone()));
+        events.push(AppEvent::LspProgress(self.lsp.status().clone()));
 
         // Drain pending LSP responses
         let (responses, timeout_events) = self.lsp.drain_responses();
@@ -458,6 +491,9 @@ impl CoreApp {
                         for call in calls {
                             self.process_call_entry(symbol_id, &call.to, &call.from_ranges, true);
                         }
+                        if count > 0 {
+                            self.mark_graph_changed();
+                        }
                         self.lsp.set_loading_state(symbol_id, LoadingState::Loaded);
                         log::info!(
                             "CoreApp: OutgoingCalls loaded for {:?}: {} callee(s)",
@@ -492,6 +528,9 @@ impl CoreApp {
                                 &call.from_ranges,
                                 false,
                             );
+                        }
+                        if count > 0 {
+                            self.mark_graph_changed();
                         }
                         self.lsp.set_loading_state(symbol_id, LoadingState::Loaded);
                         log::info!(
@@ -606,14 +645,16 @@ impl CoreApp {
                             // either way, `cmd_expand_function`'s guard then
                             // refused to ever ask again.
                             let direction = pending.direction.unwrap_or(CallDirection::Outgoing);
-                            if let Some(ev) = self.lsp.send_follow_up_call(
-                                &symbol_id,
-                                first_item,
-                                direction,
-                                pending.origin,
-                            ) {
-                                events.push(ev);
-                            }
+                            events.extend(
+                                self.lsp
+                                    .send_follow_up_call(
+                                        &symbol_id,
+                                        first_item,
+                                        direction,
+                                        pending.origin,
+                                    )
+                                    .event(),
+                            );
                         } else {
                             self.lsp.set_loading_state(symbol_id, LoadingState::Loaded);
                             events.push(AppEvent::FunctionHasNoCallees);
@@ -638,17 +679,20 @@ impl CoreApp {
             ws.set_root(id);
         }
         let direction = self.current_direction();
-        // Kick off call hierarchy loading if not already done
+        // Kick off call hierarchy loading if not already done. The redraw is
+        // unconditional — the root moved — and whatever the fetch has to say
+        // leads, so the status line is written before the canvas is.
+        let mut events = Vec::new();
         if !self.lsp.is_function_loaded(&id) && !self.lsp.is_function_loading(&id) {
             self.lsp.set_loading_state(id, LoadingState::Loading);
-            if let Some(ev) =
+            events.extend(
                 self.lsp
                     .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User, direction)
-            {
-                return vec![ev, AppEvent::LayoutDirty];
-            }
+                    .event(),
+            );
         }
-        vec![AppEvent::LayoutDirty]
+        events.push(AppEvent::LayoutDirty);
+        events
     }
 
     fn cmd_expand_or_collapse(&mut self) -> Vec<AppEvent> {
@@ -656,25 +700,28 @@ impl CoreApp {
         // Here we just request call hierarchy for the currently selected function.
         let direction = self.current_direction();
         if let Some(id) = self.selected_function {
-            if let Some(ev) =
-                self.lsp
-                    .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User, direction)
-            {
-                return vec![ev, AppEvent::LayoutDirty];
-            }
-            return vec![AppEvent::LayoutDirty];
+            let mut events: Vec<AppEvent> = self
+                .lsp
+                .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User, direction)
+                .event()
+                .into_iter()
+                .collect();
+            events.push(AppEvent::LayoutDirty);
+            return events;
         }
         vec![]
     }
 
     fn cmd_find_references(&mut self) -> Vec<AppEvent> {
-        let symbol_id = self.workspaces.current().and_then(|w| w.root_symbol);
+        let symbol_id = self.workspaces.current().and_then(|w| w.root_symbol());
         if let Some(id) = symbol_id {
-            let mut events = Vec::new();
-            if let Some(ev) = self.lsp.send_references(&self.call_graph, &id) {
-                events.push(ev);
-            }
-            events
+            // Nothing on the canvas changes, so there is no `LayoutDirty`
+            // here: the answer arrives as its own event later.
+            self.lsp
+                .send_references(&self.call_graph, &id)
+                .event()
+                .into_iter()
+                .collect()
         } else {
             vec![]
         }
@@ -682,35 +729,31 @@ impl CoreApp {
 
     fn cmd_refresh(&mut self) -> Vec<AppEvent> {
         let direction = self.current_direction();
-        self.lsp.clear();
+        // Everything in flight is about to become unanswerable — see
+        // `LspBridge::clear` — so the symbols those requests named go back on
+        // the warmup queue before anything else happens.
+        let discarded = self.lsp.clear();
+        self.requeue_discarded(discarded);
         let mut events = Vec::new();
-        if let Some(ev) = self.lsp.send_workspace_symbols() {
-            events.push(ev);
-        }
+        events.extend(self.lsp.send_workspace_symbols().event());
         if let Some(id) = self.selected_function {
-            if let Some(ev) =
+            events.extend(
                 self.lsp
                     .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User, direction)
-            {
-                events.push(ev);
-            }
+                    .event(),
+            );
         }
         events
     }
 
     fn cmd_toggle_call_direction(&mut self) -> Vec<AppEvent> {
         if let Some(ws) = self.workspaces.current_mut() {
-            ws.direction = match ws.direction {
-                CallDirection::Outgoing => CallDirection::Incoming,
-                CallDirection::Incoming => CallDirection::Outgoing,
-            };
-            // Reversing the arrows is a different tree; the nodes walked past
-            // the depth limit in the old one have nothing to say about it.
-            ws.expanded.clear();
-            log::info!(
-                "CoreApp: direction toggled to {:?}, expansions cleared",
-                ws.direction
-            );
+            // Reversing the arrows is a different tree, so the nodes walked
+            // past the depth limit in the old one are dropped with it — by
+            // `toggle_direction`, which owns both halves. Clearing `expanded`
+            // here instead is what let the two drift apart.
+            let direction = ws.toggle_direction();
+            log::info!("CoreApp: direction toggled to {direction:?}, expansions cleared");
         }
         vec![AppEvent::LayoutDirty]
     }
@@ -805,10 +848,10 @@ impl CoreApp {
         // by a user already waiting on the map they just asked for — where the
         // recompute this replaced fired on a timer for as long as the graph
         // kept growing.
-        let direction = ws.direction;
+        let direction = ws.direction();
         let target = ClusterTarget {
             scope: Some((symbol, direction)),
-            method: ws.method,
+            method: ws.method(),
         };
         let clustering = cluster_within(&self.call_graph, symbol, direction, target.method);
         // And the frame it will be placed in, if no worker has been round yet —
@@ -970,13 +1013,14 @@ impl CoreApp {
         // After the create, not before: the tab that will show this graph is
         // the one just made, and it is that tab's reading the fetch answers.
         let direction = self.current_direction();
-        let lsp_event =
+        let outcome =
             self.lsp
                 .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User, direction);
+        // The tab and its redraw come first here, and anything the fetch has
+        // to say trails them: the new tab is the news, and a failure to load
+        // it is a footnote on a tab that exists either way.
         let mut events = vec![ws_event, AppEvent::LayoutDirty];
-        if let Some(ev) = lsp_event {
-            events.push(ev);
-        }
+        events.extend(outcome.event());
         events
     }
 
@@ -1036,11 +1080,19 @@ impl CoreApp {
         let direction = self.current_direction();
         if !self.lsp.is_function_loaded(&id) && !self.lsp.is_function_loading(&id) {
             self.lsp.set_loading_state(id, LoadingState::Loading);
-            if let Some(ev) =
+            // The one call site that branches on the outcome rather than just
+            // forwarding its event, and why [`SendOutcome`] spells the outcome
+            // out: a fetch that never went redraws whether or not the
+            // expansion moved anything, because the node has just been put
+            // into a loading state the canvas is showing and has to come back
+            // out of it. A fetch that *did* go leaves the decision below.
+            if let SendOutcome::Failed(event) =
                 self.lsp
                     .send_call_hierarchy(&self.call_graph, &id, RequestOrigin::User, direction)
             {
-                return vec![ev, AppEvent::LayoutDirty];
+                let mut events: Vec<AppEvent> = event.into_iter().collect();
+                events.push(AppEvent::LayoutDirty);
+                return events;
             }
         }
         // A second click on a node already expanded and already loaded has
@@ -1058,16 +1110,16 @@ impl CoreApp {
 
     /// Record that the call graph gained nodes or edges.
     ///
-    /// The timestamp restarts on every change rather than being stamped once
-    /// when the cache goes dirty: the settling period is about the stream
-    /// having gone quiet, not about how long ago it started talking.
+    /// This only marks; it never recomputes. What is owed is worked out from
+    /// the marks in [`Self::sync_clusterings`], which starts nothing while the
+    /// project is still arriving — so the settling a growing graph needs comes
+    /// from `loading()` going false, not from a timestamp taken here.
     fn mark_graph_changed(&mut self) {
         // Every map cached describes the graph as it was a moment ago.
         let cached: Vec<ClusterTarget> = self.clusterings.keys().copied().collect();
         self.stale.extend(cached);
         // And so does the frame they are placed in.
         self.frame_stale = true;
-        self.graph_changed_at = Some(Instant::now());
         // A new graph is a new question, so whatever failed against the old one
         // is worth asking again.
         self.clustering_failed.clear();
@@ -1103,7 +1155,7 @@ impl CoreApp {
                     ClusterTarget::of(ws),
                     ClusterTarget {
                         scope: None,
-                        method: ws.method,
+                        method: ws.method(),
                     },
                 ]
             })
@@ -1156,7 +1208,7 @@ impl CoreApp {
     /// `CoreApp::new` is the whole of it and nothing is pending at all.
     fn loading(&self) -> bool {
         let phase_done = matches!(
-            self.lsp.status,
+            self.lsp.status(),
             LspLoadPhase::NotStarted | LspLoadPhase::Completed | LspLoadPhase::Failed(_)
         );
         !phase_done || self.warming_up()
@@ -1164,8 +1216,7 @@ impl CoreApp {
 
     /// Whether the initial edge warmup is still running.
     fn warming_up(&self) -> bool {
-        self.warmup_seeded
-            && (!self.edge_warmup.is_empty() || !self.lsp.pending_requests.is_empty())
+        self.warmup_seeded && (!self.edge_warmup.is_empty() || self.lsp.pending_count() > 0)
     }
 
     /// Add a function that came from a symbol query, and queue its edges.
@@ -1195,6 +1246,78 @@ impl CoreApp {
         id
     }
 
+    /// Put the symbols of discarded in-flight requests back on the warmup
+    /// queue.
+    ///
+    /// A cleared request is work that was started and will never finish: the
+    /// reply is dropped as unrecognised and the symbol's loading state goes
+    /// with it, so it sits in the graph with no edges, reading `NotLoaded`,
+    /// with nothing on its way. Nothing else picks it up — `ingest_symbol`
+    /// queues a symbol only the first time the graph sees it, and the refresh
+    /// that caused this re-adds the very same functions — so before this the
+    /// refresh stranded up to `WARMUP_IN_FLIGHT` symbols permanently, and an
+    /// edgeless symbol is what `logic::cluster` drops, so they went missing
+    /// from the map rather than showing up wrong.
+    ///
+    /// Every discarded request that names a symbol is requeued, whoever asked
+    /// for it. The queue's question is "does this function still need its
+    /// edges fetched", and a cleared request leaves the answer at yes
+    /// regardless of which question was outstanding or who wanted it. The
+    /// asymmetry decides it: requeuing a [`RequestOrigin::User`] request costs
+    /// one round trip and answers it as `Warmup`, so its edges land without
+    /// the redraw the user's own answer would have carried — and the user's
+    /// affordance survives that, because the cleared loading state puts the
+    /// node back to `NotLoaded` and its `+` asks again on the next click, in
+    /// the direction the tab is actually reading. Dropping it instead loses
+    /// the edges with no second chance at all.
+    fn requeue_discarded(&mut self, discarded: Vec<PendingRequest>) {
+        // Nothing to put work back on yet. The seeding sweep in
+        // `pump_edge_warmup` *replaces* the queue with every function in the
+        // graph — which is where these symbols are — so queueing here would be
+        // counted and then thrown away by that assignment.
+        if !self.warmup_seeded {
+            return;
+        }
+
+        let mut requeued = 0usize;
+        for pending in discarded {
+            // A workspace-symbol sweep names no symbol, and the refresh is
+            // sending a fresh one of those anyway.
+            let Some(id) = pending.symbol_id else {
+                continue;
+            };
+            // Two requests can name one function — a find-references asked for
+            // while the warmup's prepare was still out — and a symbol still
+            // waiting its turn is on the queue already. Either way the queue
+            // holds places, and a second place is a second request and a
+            // fraction that never reaches its total.
+            if self.edge_warmup.contains(&id) {
+                continue;
+            }
+            self.edge_warmup.push_back(id);
+            requeued += 1;
+        }
+        if requeued == 0 {
+            return;
+        }
+
+        // `done` is `warmup_total - edge_warmup.len()`, so the total has to
+        // stay at least as large as the queue or the fraction saturates at a
+        // zero it never leaves. A symbol counted when it was first queued must
+        // not be counted twice — its place is coming back, not being added —
+        // and that is all of them bar one case: a function the warmup never
+        // queued at all, reached as some reply's callee and then expanded by
+        // hand. Raising the total to the queue's length covers that without
+        // keeping a second record of which symbols have been counted.
+        self.warmup_total = self.warmup_total.max(self.edge_warmup.len());
+        log::info!(
+            "CoreApp: requeued {} in-flight symbol(s) discarded by a refresh, {} queued of {}",
+            requeued,
+            self.edge_warmup.len(),
+            self.warmup_total
+        );
+    }
+
     /// Fetch call hierarchies for the symbols the initial load handed us, so the
     /// graph has edges before anything tries to cluster or draw it.
     ///
@@ -1207,8 +1330,8 @@ impl CoreApp {
         // the graph goes in here; everything arriving after queues itself
         // through `ingest_symbol`.
         if !self.warmup_seeded
-            && matches!(self.lsp.status, LspLoadPhase::Completed)
-            && self.lsp.request_tx.is_some()
+            && matches!(self.lsp.status(), LspLoadPhase::Completed)
+            && self.lsp.has_worker()
         {
             self.warmup_seeded = true;
             self.edge_warmup = self.call_graph.function_ids().copied().collect();
@@ -1218,7 +1341,7 @@ impl CoreApp {
             log::info!(
                 "CoreApp: warming up call hierarchy for {} symbol(s), {} in flight, {} node(s) in the graph",
                 self.edge_warmup.len(),
-                self.lsp.pending_requests.len(),
+                self.lsp.pending_count(),
                 self.call_graph.node_count()
             );
         }
@@ -1226,7 +1349,7 @@ impl CoreApp {
         let mut events = Vec::new();
         let mut sent = 0usize;
         let mut skipped = 0usize;
-        while self.lsp.pending_requests.len() < WARMUP_IN_FLIGHT {
+        while self.lsp.pending_count() < WARMUP_IN_FLIGHT {
             let Some(id) = self.edge_warmup.pop_front() else {
                 break;
             };
@@ -1239,7 +1362,7 @@ impl CoreApp {
             sent += 1;
             // Warmup, not user: nobody is watching for this one symbol's edges,
             // so its reply must not redraw the client. See `RequestOrigin`.
-            if let Some(ev) = self.lsp.send_call_hierarchy(
+            let outcome = self.lsp.send_call_hierarchy(
                 &self.call_graph,
                 &id,
                 RequestOrigin::Warmup,
@@ -1254,9 +1377,10 @@ impl CoreApp {
                 // which tab happened to be in front, and change direction
                 // mid-sweep every time the user hit `t`, for no gain at all.
                 CallDirection::Outgoing,
-            ) {
-                events.push(ev);
-            }
+            );
+            // A warmup request that goes out is silent by design — see
+            // `RequestOrigin` — so this only ever carries a failure.
+            events.extend(outcome.event());
         }
         if sent > 0 || skipped > 0 {
             log::debug!(
@@ -1311,7 +1435,7 @@ impl CoreApp {
             done,
             self.warmup_total,
             self.edge_warmup.len(),
-            self.lsp.pending_requests.len(),
+            self.lsp.pending_count(),
             WARMUP_IN_FLIGHT,
             still.as_secs_f32(),
             self.lsp.pending_summary()
@@ -1459,6 +1583,13 @@ impl CoreApp {
         });
     }
 
+    /// Add one entry of a call-hierarchy reply: the function on the other end,
+    /// and an edge per call site.
+    ///
+    /// Marking the graph changed is the caller's job, once for the whole reply.
+    /// A reply carrying fifty callees is one change to the graph, not fifty,
+    /// and doing it here made the warmup rebuild the stale set per call in the
+    /// project.
     fn process_call_entry(
         &mut self,
         symbol_id: SymbolId,
@@ -1503,7 +1634,6 @@ impl CoreApp {
             };
             self.call_graph.add_call(caller, callee, call_location);
         }
-        self.mark_graph_changed();
     }
 }
 
@@ -1536,9 +1666,23 @@ fn cluster_within(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lsp_bridge::{PendingRequest, RequestOrigin};
     use model::Location;
     use tokio::sync::mpsc;
+
+    /// Wire the bridge to a worker that is listening, and hand back the
+    /// requests it sends.
+    ///
+    /// Both halves go in together, which is what `LspBridge::set_channels`
+    /// takes: a bridge that can ask and never hear is a state no loader
+    /// produces. Nothing here answers over the wire — these tests hand
+    /// responses to `handle_lsp_response` directly — so the reply channel is
+    /// left to close behind us.
+    fn wire_worker(app: &mut CoreApp) -> mpsc::UnboundedReceiver<lsp::LspRequest> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (_replies_tx, replies_rx) = mpsc::unbounded_channel();
+        app.lsp.set_channels(replies_rx, tx);
+        rx
+    }
 
     /// Distinct lines keep the generated `SymbolId`s distinct.
     fn add(graph: &mut CallGraph, name: &str, line: u32) -> SymbolId {
@@ -1584,9 +1728,17 @@ mod tests {
     }
 
     /// The laid-out nodes of the current snapshot — what the canvas would draw.
+    ///
+    /// Only the rooted view has a layout at all: on the cluster map the
+    /// snapshot ships none, so a caller that has not rooted the workspace is
+    /// asking about a canvas that is drawing something else.
     fn placed(app: &CoreApp) -> Vec<SymbolId> {
         match crate::protocol::snapshot_of(app) {
-            crate::protocol::ServerMsg::Snapshot { layout, .. } => layout.keys().copied().collect(),
+            crate::protocol::ServerMsg::Snapshot { layout, .. } => layout
+                .expect("the workspace is showing the rooted view")
+                .keys()
+                .copied()
+                .collect(),
             other => panic!("snapshot_of returned {other:?}"),
         }
     }
@@ -1614,7 +1766,7 @@ mod tests {
 
         let after = placed(&app);
         assert_eq!(
-            app.workspaces.current().and_then(|ws| ws.root_symbol),
+            app.workspaces.current().and_then(|ws| ws.root_symbol()),
             Some(root),
             "expanding does not re-root the workspace"
         );
@@ -1646,7 +1798,7 @@ mod tests {
         );
         assert_eq!(app.selected_function, Some(mid), "the selection moved");
         assert_eq!(
-            app.workspaces.current().and_then(|ws| ws.root_symbol),
+            app.workspaces.current().and_then(|ws| ws.root_symbol()),
             Some(root),
             "the root did not"
         );
@@ -1664,9 +1816,9 @@ mod tests {
 
     /// Say the load has finished, which is what lets a recompute start at all.
     fn loaded(app: &mut CoreApp) {
-        app.lsp.status = LspLoadPhase::Completed;
+        app.lsp.set_status(LspLoadPhase::Completed);
         app.edge_warmup.clear();
-        app.lsp.pending_requests.clear();
+        app.lsp.clear_pending();
     }
 
     /// Tick until every map the app owes has been computed and installed.
@@ -1734,7 +1886,8 @@ mod tests {
         // Symbols are still arriving. Coarsening is not incremental, so a map
         // built now is one that will be thrown away — after moving every box
         // under whoever was reading it.
-        app.lsp.status = LspLoadPhase::LoadingWorkspaceSymbols { loaded: 3 };
+        app.lsp
+            .set_status(LspLoadPhase::LoadingWorkspaceSymbols { loaded: 3 });
         let (graph, left, _) = two_triangles();
         app.call_graph = graph;
         app.mark_graph_changed();
@@ -1874,10 +2027,11 @@ mod tests {
     #[test]
     fn a_scope_whose_clustering_is_still_coming_draws_nothing_not_everything() {
         // Turning a scoped tab around asks for a pairing nothing has computed:
-        // `sync_scoped_clusterings` drops the entry for the direction just left
-        // and starts the new one on a worker. Until it lands there is no map for
-        // this tab, and the whole program's is not a stand-in for one — the
-        // breadcrumb still says these are the communities under one function.
+        // the cache is keyed by (scope, direction, method), so the new
+        // direction is a target with no entry and `sync_clusterings` starts it
+        // on a worker. Until it lands there is no map for this tab, and the
+        // whole program's is not a stand-in for one — the breadcrumb still
+        // says these are the communities under one function.
         // `left[2]` has both callers and callees, so its neighbourhood is
         // non-empty whichever way the arrows are read — `left[0]` is a source,
         // and turning it around leaves one isolated node and so, correctly, no
@@ -1934,9 +2088,8 @@ mod tests {
             ));
         }
         let mut app = CoreApp::new(graph);
-        let (tx, rx) = mpsc::unbounded_channel();
-        app.lsp.request_tx = Some(tx);
-        app.lsp.status = LspLoadPhase::Completed;
+        let rx = wire_worker(&mut app);
+        app.lsp.set_status(LspLoadPhase::Completed);
         (app, rx)
     }
 
@@ -1969,7 +2122,7 @@ mod tests {
         assert!(!app.edge_warmup.is_empty(), "the rest waits its turn");
 
         // Answering them frees the slots for the next batch.
-        app.lsp.pending_requests.clear();
+        app.lsp.clear_pending();
         app.tick();
         assert_eq!(
             std::iter::from_fn(|| rx.try_recv().ok()).count(),
@@ -2006,7 +2159,7 @@ mod tests {
         });
 
         assert_eq!(app.warmup_total, 2, "the work grew, and says so");
-        app.lsp.pending_requests.clear();
+        app.lsp.clear_pending();
         app.tick();
         assert_eq!(
             std::iter::from_fn(|| rx.try_recv().ok()).count(),
@@ -2168,7 +2321,7 @@ mod tests {
         // Drained: the end is announced exactly once, so a frontend can put the
         // indicator away without every later tick re-announcing it.
         app.edge_warmup.clear();
-        app.lsp.pending_requests.clear();
+        app.lsp.clear_pending();
 
         let done_events: Vec<_> = app
             .tick()
@@ -2221,7 +2374,7 @@ mod tests {
 
         // Drained: the graph has stopped moving.
         app.edge_warmup.clear();
-        app.lsp.pending_requests.clear();
+        app.lsp.clear_pending();
         assert!(!app.warming_up());
         assert!(!app.loading());
         app.sync_clusterings();
@@ -2229,6 +2382,251 @@ mod tests {
             app.clustering_job.is_some(),
             "and the map goes out the moment it has"
         );
+    }
+
+    /// A request that could not be sent must not read as one still in flight.
+    ///
+    /// `warming_up` counts `pending_requests`, so an entry left behind by a
+    /// failed send holds `loading()` true and stops `sync_clusterings` starting
+    /// any clustering at all — the cluster map stays blank and the status bar
+    /// stays on "Resolving calls" until the entry times out 30s later. See
+    /// `LspBridge::dispatch`.
+    #[test]
+    fn a_send_that_fails_does_not_stall_the_warmup() {
+        let (mut app, rx) = loaded_app(2);
+        // The LSP worker is gone; every send from here on fails.
+        drop(rx);
+
+        let events = app.tick();
+
+        assert!(app.warmup_seeded, "the warmup opened its queue");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AppEvent::FailedToSendRequest)),
+            "and said so"
+        );
+        assert!(app.edge_warmup.is_empty(), "every symbol was taken off");
+        assert!(
+            app.lsp.pending_count() == 0,
+            "and nothing is waiting for an answer that was never asked for"
+        );
+        assert!(!app.warming_up());
+        assert!(!app.loading(), "so a map can be computed straight away");
+
+        let target = ClusterTarget::of(app.workspaces.current().expect("a workspace"));
+        app.stale.insert(target);
+        app.sync_clusterings();
+        assert!(app.clustering_job.is_some());
+    }
+
+    /// The lines the prepare requests waiting on `rx` name, 1-based as the
+    /// definition locations are. `loaded_app` puts `f{i}` on line `i + 1`, so
+    /// this is how a test says *which* symbols the warmup just asked about.
+    fn prepared_lines(rx: &mut mpsc::UnboundedReceiver<lsp::LspRequest>) -> Vec<u32> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|req| match req {
+                lsp::LspRequest::PrepareCallHierarchy { position, .. } => Some(position.line + 1),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Where a symbol is defined, to match against [`prepared_lines`].
+    fn line_of(app: &CoreApp, id: &SymbolId) -> u32 {
+        app.call_graph
+            .get_function(id)
+            .expect("in the graph")
+            .definition_location
+            .line
+    }
+
+    /// A refresh discards everything in flight, and the symbols those requests
+    /// named have to come back as work.
+    ///
+    /// `LspBridge::clear` drops the pending entries, so when clangd answers
+    /// them `take_pending` returns `None` and `handle_lsp_response` throws the
+    /// reply away; it drops the loading states too, so each of those symbols
+    /// reads `NotLoaded` again with nothing on its way. Nothing requeues them
+    /// — the refresh's own symbol sweep re-adds functions already in the graph,
+    /// which `ingest_symbol` leaves alone — so up to `WARMUP_IN_FLIGHT` of them
+    /// stayed in the graph edgeless for the life of the process, and isolated
+    /// is exactly what `logic::cluster` drops from the map.
+    #[test]
+    fn a_refresh_puts_the_symbols_it_had_in_flight_back_on_the_queue() {
+        let (mut app, mut rx) = loaded_app(WARMUP_IN_FLIGHT * 2);
+        app.tick();
+        let in_flight: Vec<SymbolId> = app.lsp.pending().filter_map(|p| p.symbol_id).collect();
+        assert_eq!(
+            in_flight.len(),
+            WARMUP_IN_FLIGHT,
+            "the first batch went out"
+        );
+        let queued_before = app.edge_warmup.len();
+        prepared_lines(&mut rx);
+
+        app.dispatch(Command::Refresh);
+
+        for id in &in_flight {
+            assert!(
+                app.edge_warmup.contains(id),
+                "a symbol whose answer the refresh made undeliverable is asked again"
+            );
+        }
+        assert_eq!(
+            app.edge_warmup.len(),
+            queued_before + in_flight.len(),
+            "and the ones that had not been sent yet are still there, once each"
+        );
+
+        // Back on the queue is only half of it: the queue has to get round to
+        // them. Answer everything each round so the pump keeps drawing.
+        let mut asked: HashSet<u32> = HashSet::new();
+        for _ in 0..6 {
+            app.lsp.clear_pending();
+            app.tick();
+            asked.extend(prepared_lines(&mut rx));
+            if app.edge_warmup.is_empty() {
+                break;
+            }
+        }
+        assert!(app.edge_warmup.is_empty(), "the queue drained");
+        for id in &in_flight {
+            assert!(
+                asked.contains(&line_of(&app, id)),
+                "and a fresh request went out for every stranded symbol"
+            );
+        }
+    }
+
+    /// The fraction the status bar shows has to survive the refresh.
+    ///
+    /// `report_warmup_progress` computes `done` as `warmup_total -
+    /// edge_warmup.len()`, so putting work back on the queue without keeping
+    /// the total in step reads as a fraction that runs backwards past zero and
+    /// saturates there. Symbols that go back on the queue were counted when
+    /// they were first queued, so the total stays put and `done` — correctly —
+    /// falls: nothing they were asked about was ever answered.
+    #[test]
+    fn the_warmup_fraction_stays_honest_across_a_refresh() {
+        let (mut app, mut rx) = loaded_app(WARMUP_IN_FLIGHT * 2);
+        app.tick();
+        prepared_lines(&mut rx);
+        assert_eq!(
+            app.warmup_progress(),
+            Some((WARMUP_IN_FLIGHT, WARMUP_IN_FLIGHT * 2))
+        );
+
+        app.dispatch(Command::Refresh);
+
+        let (done, total) = app.warmup_progress().expect("still warming up");
+        assert_eq!(
+            total,
+            WARMUP_IN_FLIGHT * 2,
+            "the same symbols, not a bigger project"
+        );
+        assert_eq!(done, 0, "and not one of them has been resolved");
+        assert!(
+            app.warmup_total >= app.edge_warmup.len(),
+            "or `done` underflows to a zero it never leaves"
+        );
+
+        // And the end is still reachable, at the count it started with.
+        for _ in 0..6 {
+            app.lsp.clear_pending();
+            app.tick();
+            prepared_lines(&mut rx);
+            if app.edge_warmup.is_empty() {
+                break;
+            }
+        }
+        // The last batch is still out; answering it is what ends the warmup.
+        app.lsp.clear_pending();
+        assert!(!app.warming_up());
+        assert_eq!(app.warmup_total, WARMUP_IN_FLIGHT * 2);
+    }
+
+    /// Requeuing must not put a symbol on the queue twice: the queue's length
+    /// is the denominator's other half, so a duplicate is a fraction that never
+    /// reaches its total and a second request nobody needed.
+    ///
+    /// Two requests can name one symbol — a find-references the user asked for
+    /// while the warmup's prepare for the same function was still out — and the
+    /// symbols still waiting their turn are on the queue already.
+    #[test]
+    fn a_refresh_does_not_queue_a_symbol_twice() {
+        let (mut app, mut rx) = loaded_app(WARMUP_IN_FLIGHT * 2);
+        app.tick();
+        prepared_lines(&mut rx);
+        let doubled = *app
+            .lsp
+            .pending()
+            .find_map(|p| p.symbol_id.as_ref())
+            .expect("a symbol in flight");
+        app.lsp.insert_pending(
+            "references-for-the-same-symbol",
+            PendingRequest::new(Some(doubled), "references", RequestOrigin::User),
+        );
+
+        app.dispatch(Command::Refresh);
+
+        let mut seen = HashSet::new();
+        for id in &app.edge_warmup {
+            assert!(seen.insert(*id), "{id:?} is queued twice");
+        }
+        assert_eq!(
+            seen.len(),
+            WARMUP_IN_FLIGHT * 2,
+            "every symbol of the project, once each"
+        );
+    }
+
+    /// With nothing outstanding there is nothing to put back, and a refresh
+    /// that shuffles the queue anyway would re-ask for edges already in hand.
+    #[test]
+    fn a_refresh_with_nothing_in_flight_leaves_the_queue_alone() {
+        let (mut app, mut rx) = loaded_app(WARMUP_IN_FLIGHT * 2);
+        app.tick();
+        prepared_lines(&mut rx);
+        // Every request answered.
+        app.lsp.clear_pending();
+        let queued: Vec<SymbolId> = app.edge_warmup.iter().copied().collect();
+        let total = app.warmup_total;
+
+        app.dispatch(Command::Refresh);
+
+        assert_eq!(
+            app.edge_warmup.iter().copied().collect::<Vec<_>>(),
+            queued,
+            "same symbols, same order"
+        );
+        assert_eq!(app.warmup_total, total);
+    }
+
+    /// A refresh before the queue has ever opened has nowhere to put work, and
+    /// needs none: the seeding sweep in `pump_edge_warmup` *replaces* the queue
+    /// with every function in the graph, which is where these symbols are.
+    /// Queueing them here would be counted, then thrown away by that
+    /// assignment.
+    #[test]
+    fn a_refresh_before_the_warmup_opens_queues_nothing() {
+        let (mut app, mut rx) = loaded_app(2);
+        let id = *app.call_graph.function_ids().next().expect("a symbol");
+        app.lsp.insert_pending(
+            "in-flight-before-the-warmup",
+            PendingRequest::new(Some(id), "prepare f0", RequestOrigin::User),
+        );
+        assert!(!app.warmup_seeded);
+
+        app.dispatch(Command::Refresh);
+
+        assert!(app.edge_warmup.is_empty(), "nothing to put it on yet");
+        assert_eq!(app.warmup_total, 0);
+
+        // And the sweep that does open the queue still accounts for it once.
+        app.tick();
+        assert_eq!(app.warmup_total, 2);
+        assert_eq!(prepared_lines(&mut rx).len(), 2);
     }
 
     #[test]
@@ -2248,7 +2646,7 @@ mod tests {
         // forwarded to us with an id we have no pending entry for — and it still
         // has to populate the graph, or the frontend comes up empty.
         let mut app = CoreApp::new(CallGraph::new());
-        assert!(app.lsp.pending_requests.is_empty());
+        assert_eq!(app.lsp.pending_count(), 0);
 
         let events = app.handle_lsp_response(LspResponse::WorkspaceSymbols {
             request_id: "issued-by-the-loader".to_string(),
@@ -2271,8 +2669,8 @@ mod tests {
         let mut app = CoreApp::new(CallGraph::new());
         assert!(app.stale.is_empty());
 
-        app.lsp.pending_requests.insert(
-            "symbols".to_string(),
+        app.lsp.insert_pending(
+            "symbols",
             PendingRequest::new(None, "workspace symbols", RequestOrigin::User),
         );
         app.handle_lsp_response(LspResponse::WorkspaceSymbols {
@@ -2287,8 +2685,8 @@ mod tests {
 
         app.stale.clear();
         let caller = *app.call_graph.function_ids().next().expect("one symbol");
-        app.lsp.pending_requests.insert(
-            "calls".to_string(),
+        app.lsp.insert_pending(
+            "calls",
             PendingRequest::new(Some(caller), "outgoing calls", RequestOrigin::User),
         );
         app.handle_lsp_response(LspResponse::OutgoingCalls {
@@ -2299,6 +2697,76 @@ mod tests {
             }],
         });
         assert!(!app.stale.is_empty(), "new calls are new graph edges");
+    }
+
+    /// One reply is one change to the graph. The mark is hoisted out of the
+    /// per-entry loop — a reply with fifty callees used to rebuild the stale
+    /// set fifty times — so what has to be pinned is that it still happens,
+    /// and still only when the reply carried something.
+    #[test]
+    fn a_reply_marks_the_graph_changed_once_it_has_carried_anything() {
+        for (calls, expected) in [
+            (Vec::new(), false),
+            (
+                vec!["beta", "gamma", "delta"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, name)| lsp_types::CallHierarchyOutgoingCall {
+                        to: hierarchy_item(name, i as u32 + 2),
+                        from_ranges: vec![hierarchy_item(name, i as u32 + 2).range],
+                    })
+                    .collect(),
+                true,
+            ),
+        ] {
+            for outgoing in [true, false] {
+                let mut app = CoreApp::new(CallGraph::new());
+                let caller = app.call_graph.add_function(FunctionNode::new(
+                    "alpha".to_string(),
+                    "alpha".to_string(),
+                    Location::new("test.c".to_string(), 1, 0),
+                ));
+                app.stale.clear();
+                app.frame_stale = false;
+                app.lsp.insert_pending(
+                    "calls",
+                    PendingRequest::new(Some(caller), "calls", RequestOrigin::Warmup),
+                );
+
+                let response = if outgoing {
+                    LspResponse::OutgoingCalls {
+                        request_id: "calls".to_string(),
+                        calls: calls.clone(),
+                    }
+                } else {
+                    LspResponse::IncomingCalls {
+                        request_id: "calls".to_string(),
+                        calls: calls
+                            .iter()
+                            .map(|call| lsp_types::CallHierarchyIncomingCall {
+                                from: call.to.clone(),
+                                from_ranges: call.from_ranges.clone(),
+                            })
+                            .collect(),
+                    }
+                };
+                app.handle_lsp_response(response);
+
+                let what = if outgoing { "outgoing" } else { "incoming" };
+                assert_eq!(
+                    !app.stale.is_empty(),
+                    expected,
+                    "{what} reply of {} call(s): the cached map",
+                    calls.len()
+                );
+                assert_eq!(
+                    app.frame_stale,
+                    expected,
+                    "{what} reply of {} call(s): the frame",
+                    calls.len()
+                );
+            }
+        }
     }
 
     /// The bootstrap warmup asks for every symbol's edges. Answering each of
@@ -2318,8 +2786,8 @@ mod tests {
                 )],
             });
             let caller = *app.call_graph.function_ids().next().expect("one symbol");
-            app.lsp.pending_requests.insert(
-                "calls".to_string(),
+            app.lsp.insert_pending(
+                "calls",
                 PendingRequest::new(Some(caller), "outgoing calls", origin),
             );
 
@@ -2356,8 +2824,8 @@ mod tests {
             )],
         });
         let leaf = *app.call_graph.function_ids().next().expect("one symbol");
-        app.lsp.pending_requests.insert(
-            "calls".to_string(),
+        app.lsp.insert_pending(
+            "calls",
             PendingRequest::new(Some(leaf), "outgoing calls", RequestOrigin::Warmup),
         );
 
@@ -2376,9 +2844,8 @@ mod tests {
     /// survive the hop or the gate above never fires.
     #[test]
     fn the_follow_up_request_is_asked_by_whoever_asked_the_prepare() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = CoreApp::new(CallGraph::new());
-        app.lsp.request_tx = Some(tx);
+        let mut rx = wire_worker(&mut app);
         app.handle_lsp_response(LspResponse::WorkspaceSymbols {
             request_id: "symbols".to_string(),
             symbols: vec![FunctionNode::new(
@@ -2388,8 +2855,8 @@ mod tests {
             )],
         });
         let id = *app.call_graph.function_ids().next().expect("one symbol");
-        app.lsp.pending_requests.insert(
-            "prepare".to_string(),
+        app.lsp.insert_pending(
+            "prepare",
             PendingRequest::new(Some(id), "prepare alpha", RequestOrigin::Warmup),
         );
 
@@ -2400,10 +2867,7 @@ mod tests {
 
         rx.try_recv().expect("the follow-up went out");
         assert!(
-            app.lsp
-                .pending_requests
-                .values()
-                .all(|p| p.origin == RequestOrigin::Warmup),
+            app.lsp.pending().all(|p| p.origin == RequestOrigin::Warmup),
             "the follow-up inherits the prepare's origin"
         );
     }
@@ -2416,7 +2880,6 @@ mod tests {
     /// `+` on that node never did anything again.
     #[test]
     fn a_follow_up_asks_in_the_direction_its_prepare_was_asked_in() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
         let mut graph = CallGraph::new();
         // An absolute path, unlike the rest of these tests: `send_call_hierarchy`
         // turns the definition location into a `file://` URL, and a relative
@@ -2427,7 +2890,7 @@ mod tests {
             Location::new("/test.c".to_string(), 1, 0),
         ));
         let mut app = CoreApp::new(graph);
-        app.lsp.request_tx = Some(tx);
+        let mut rx = wire_worker(&mut app);
         assert_eq!(app.current_direction(), CallDirection::Outgoing);
 
         // The click: expand a node while the tab reads outgoing.
@@ -2468,8 +2931,8 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, AppEvent::LayoutDirty)));
 
         let ws = app.workspaces.current().expect("a workspace");
-        assert_eq!(ws.root_symbol, Some(entry));
-        assert_eq!(ws.view, ViewMode::Rooted);
+        assert_eq!(ws.root_symbol(), Some(entry));
+        assert_eq!(ws.view(), ViewMode::Rooted);
         assert_eq!(app.selected_function, Some(entry));
     }
 
@@ -2488,8 +2951,8 @@ mod tests {
 
         assert!(events.is_empty());
         let ws = app.workspaces.current().expect("a workspace");
-        assert_eq!(ws.root_symbol, None);
-        assert_eq!(ws.view, ViewMode::ClusterMap);
+        assert_eq!(ws.root_symbol(), None);
+        assert_eq!(ws.view(), ViewMode::ClusterMap);
     }
 
     #[test]
@@ -2498,11 +2961,14 @@ mod tests {
         let mut app = CoreApp::new(graph);
 
         app.dispatch(Command::DrillIntoCluster(key_of(&app, right[0])));
-        assert_eq!(app.workspaces.current().unwrap().view, ViewMode::Rooted);
+        assert_eq!(app.workspaces.current().unwrap().view(), ViewMode::Rooted);
 
         let events = app.dispatch(Command::ZoomOutToClusters);
         assert!(events.iter().any(|e| matches!(e, AppEvent::LayoutDirty)));
-        assert_eq!(app.workspaces.current().unwrap().view, ViewMode::ClusterMap);
+        assert_eq!(
+            app.workspaces.current().unwrap().view(),
+            ViewMode::ClusterMap
+        );
 
         assert!(
             app.dispatch(Command::ZoomOutToClusters).is_empty(),
@@ -2519,13 +2985,13 @@ mod tests {
 
         let events = app.dispatch(Command::SetMapLevel(0));
         assert!(events.iter().any(|e| matches!(e, AppEvent::LayoutDirty)));
-        assert_eq!(app.workspaces.current().unwrap().map_level, Some(0));
+        assert_eq!(app.workspaces.current().unwrap().map_level(), Some(0));
 
         // A level from a taller ladder lands on the coarsest rung rather than
         // on a blank canvas.
         app.dispatch(Command::SetMapLevel(rungs + 10));
         assert_eq!(
-            app.workspaces.current().unwrap().map_level,
+            app.workspaces.current().unwrap().map_level(),
             Some(rungs - 1),
             "a level past the top is clamped to the top"
         );
@@ -2536,7 +3002,7 @@ mod tests {
 
         app.dispatch(Command::SelectFunction(left[0]));
         assert_eq!(
-            app.workspaces.current().unwrap().map_level,
+            app.workspaces.current().unwrap().map_level(),
             None,
             "the zoom described the old view"
         );
@@ -2570,9 +3036,9 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, AppEvent::LayoutDirty)));
 
         let ws = app.workspaces.current().expect("a default workspace");
-        assert_eq!(ws.map_scope, Some(right[0]));
+        assert_eq!(ws.map_scope(), Some(right[0]));
         assert_eq!(
-            ws.view,
+            ws.view(),
             ViewMode::ClusterMap,
             "naming what to draw a map from is asking to see that map"
         );
@@ -2637,9 +3103,9 @@ mod tests {
             "the refusal has to be reported, or the click looks broken"
         );
         let ws = app.workspaces.current().expect("a default workspace");
-        assert_eq!(ws.map_scope, None);
+        assert_eq!(ws.map_scope(), None);
         assert_eq!(
-            ws.view,
+            ws.view(),
             ViewMode::Rooted,
             "and the user is left on the view they were already reading"
         );
@@ -2654,7 +3120,7 @@ mod tests {
         app.dispatch(Command::SetMapScope(None));
 
         assert_eq!(
-            app.workspaces.current().expect("a workspace").map_scope,
+            app.workspaces.current().expect("a workspace").map_scope(),
             None
         );
         assert!(
@@ -2678,7 +3144,7 @@ mod tests {
         app.dispatch(Command::DrillIntoCluster(elsewhere));
 
         assert_eq!(
-            app.workspaces.current().expect("a workspace").view,
+            app.workspaces.current().expect("a workspace").view(),
             ViewMode::ClusterMap,
             "a key for a community not on this map roots nothing"
         );
@@ -2692,13 +3158,13 @@ mod tests {
         app.dispatch(Command::DrillIntoCluster(here));
 
         let ws = app.workspaces.current().expect("a workspace");
-        assert_eq!(ws.view, ViewMode::Rooted);
+        assert_eq!(ws.view(), ViewMode::Rooted);
         assert!(
-            ws.root_symbol.is_some_and(|root| right.contains(&root)),
+            ws.root_symbol().is_some_and(|root| right.contains(&root)),
             "rooted at the front door of a community that is on this map"
         );
         assert_eq!(
-            ws.map_scope,
+            ws.map_scope(),
             Some(right[0]),
             "and the way back still leads to the map it was entered from"
         );
@@ -2744,6 +3210,220 @@ mod tests {
             scoped(&app),
             0,
             "closing the only tab that wanted it drops the clustering"
+        );
+    }
+
+    // ---- What a call site emits for each send outcome ---------------------
+    //
+    // Every `LspBridge::send_*` call site turns one outcome into events, and
+    // that translation is the whole of what a frontend sees: a status line, a
+    // redraw, or silence. These pin it — which events, in which order, for a
+    // request that goes out and for one that cannot — so that reshaping the
+    // senders' return type cannot move it without a test saying so.
+
+    /// The variant names of a run of events, in order.
+    ///
+    /// `AppEvent` has no `PartialEq` and needs none for this: what is under
+    /// test is which events came out and in what order, never their payloads,
+    /// which no sender touches on the paths below.
+    fn shapes(events: &[AppEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| {
+                format!("{event:?}")
+                    .split(['(', '{', ' '])
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn failures(events: &[AppEvent]) -> usize {
+        shapes(events)
+            .iter()
+            .filter(|name| *name == "FailedToSendRequest")
+            .count()
+    }
+
+    /// The one symbol of a `loaded_app(1)`: in the graph, at an absolute path,
+    /// so every sender gets all the way to the channel before deciding.
+    fn only_symbol(app: &CoreApp) -> SymbolId {
+        *app.call_graph.function_ids().next().expect("one symbol")
+    }
+
+    #[test]
+    fn selecting_a_root_redraws_and_says_so_only_when_the_fetch_did_not_go() {
+        let (mut app, _rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        assert_eq!(
+            shapes(&app.dispatch(Command::SelectFunction(id))),
+            ["LayoutDirty"],
+            "a fetch on its way is not news"
+        );
+
+        let (mut app, rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        drop(rx);
+        assert_eq!(
+            shapes(&app.dispatch(Command::SelectFunction(id))),
+            ["FailedToSendRequest", "LayoutDirty"]
+        );
+    }
+
+    #[test]
+    fn expand_or_collapse_redraws_either_way() {
+        let (mut app, _rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        app.selected_function = Some(id);
+        assert_eq!(
+            shapes(&app.dispatch(Command::ExpandOrCollapse)),
+            ["LayoutDirty"]
+        );
+
+        let (mut app, rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        app.selected_function = Some(id);
+        drop(rx);
+        assert_eq!(
+            shapes(&app.dispatch(Command::ExpandOrCollapse)),
+            ["FailedToSendRequest", "LayoutDirty"]
+        );
+    }
+
+    #[test]
+    fn find_references_reports_the_search_or_the_failure_and_never_redraws() {
+        let (mut app, _rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        app.dispatch(Command::SelectFunction(id));
+        assert_eq!(
+            shapes(&app.dispatch(Command::FindReferences)),
+            ["FindingReferences"]
+        );
+
+        let (mut app, rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        app.dispatch(Command::SelectFunction(id));
+        drop(rx);
+        assert_eq!(
+            shapes(&app.dispatch(Command::FindReferences)),
+            ["FailedToSendRequest"]
+        );
+    }
+
+    #[test]
+    fn a_refresh_announces_the_sweep_and_reports_each_send_separately() {
+        let (mut app, _rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        app.selected_function = Some(id);
+        assert_eq!(
+            shapes(&app.dispatch(Command::Refresh)),
+            ["RefreshingWorkspaceSymbols"],
+            "the root's hierarchy goes out silently behind the sweep"
+        );
+
+        let (mut app, rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        app.selected_function = Some(id);
+        drop(rx);
+        assert_eq!(
+            shapes(&app.dispatch(Command::Refresh)),
+            ["FailedToSendRequest", "FailedToSendRequest"],
+            "two requests, two failures"
+        );
+    }
+
+    #[test]
+    fn starting_a_graph_trails_a_failed_fetch_behind_the_new_tab() {
+        let (mut app, _rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        assert_eq!(
+            shapes(&app.dispatch(Command::StartGraphFromFunction(id))),
+            ["WorkspaceCreated", "LayoutDirty"]
+        );
+
+        let (mut app, rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        drop(rx);
+        assert_eq!(
+            shapes(&app.dispatch(Command::StartGraphFromFunction(id))),
+            ["WorkspaceCreated", "LayoutDirty", "FailedToSendRequest"],
+            "this one appends the failure where the others lead with it"
+        );
+    }
+
+    #[test]
+    fn expanding_redraws_when_the_view_moved_and_whenever_the_fetch_failed() {
+        let (mut app, _rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        assert_eq!(
+            shapes(&app.dispatch(Command::ExpandFunction(id))),
+            ["LayoutDirty"]
+        );
+        assert!(
+            app.dispatch(Command::ExpandFunction(id)).is_empty(),
+            "already expanded and already being fetched: nothing to do or say"
+        );
+
+        // The case the convention turns on: the expansion changes nothing, so
+        // there is nothing to redraw, and the redraw happens anyway because
+        // the fetch failed.
+        let (mut app, rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        app.dispatch(Command::ExpandFunction(id));
+        app.lsp.set_loading_state(id, LoadingState::NotLoaded);
+        drop(rx);
+        assert_eq!(
+            shapes(&app.dispatch(Command::ExpandFunction(id))),
+            ["FailedToSendRequest", "LayoutDirty"]
+        );
+    }
+
+    #[test]
+    fn the_warmup_is_silent_unless_a_send_fails() {
+        let (mut app, _rx) = loaded_app(2);
+        assert_eq!(
+            failures(&app.tick()),
+            0,
+            "nobody is waiting on a warmup reply, so nothing is reported"
+        );
+
+        let (mut app, rx) = loaded_app(2);
+        drop(rx);
+        assert_eq!(failures(&app.tick()), 2, "one per symbol it could not ask");
+    }
+
+    #[test]
+    fn a_prepared_hierarchy_announces_its_follow_up_and_is_quiet_when_it_fails() {
+        let prepared = |request_id: String| LspResponse::CallHierarchyPrepared {
+            request_id,
+            items: vec![hierarchy_item("f0", 0)],
+        };
+        let sent_prepare = |rx: &mut mpsc::UnboundedReceiver<lsp::LspRequest>| match rx
+            .try_recv()
+            .expect("the prepare went out")
+        {
+            lsp::LspRequest::PrepareCallHierarchy { request_id, .. } => request_id,
+            other => panic!("expected a prepare, got {other:?}"),
+        };
+
+        let (mut app, mut rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        app.dispatch(Command::SelectFunction(id));
+        let request_id = sent_prepare(&mut rx);
+        assert_eq!(
+            shapes(&app.handle_lsp_response(prepared(request_id))),
+            ["LoadingCalls"]
+        );
+
+        let (mut app, mut rx) = loaded_app(1);
+        let id = only_symbol(&app);
+        app.dispatch(Command::SelectFunction(id));
+        let request_id = sent_prepare(&mut rx);
+        drop(rx);
+        assert!(
+            app.handle_lsp_response(prepared(request_id)).is_empty(),
+            "a follow-up that could not be sent tells the frontend nothing"
         );
     }
 }

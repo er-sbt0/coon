@@ -475,13 +475,15 @@ struct Base {
 /// Build the weighted graph the coarsening runs on, plus the symbol list that
 /// gives every index its meaning.
 ///
-/// `CallGraph::get_callees` returns one entry per distinct *call site*, not per
+/// `CallGraph::callee_ids` returns one entry per distinct *call site*, not per
 /// distinct callee — the graph deduplicates on (caller, callee, location). So
-/// the duplicates in that `Vec` are exactly the number of times the caller calls
-/// the callee, and counting them is how we get an edge weight out of an API that
-/// exposes no weights and no `edges()` accessor. Those counts are the whole
-/// input to "heaviest": two functions that call each other twenty times merge
-/// before either merges with something it touches once.
+/// the duplicates in that slice are exactly the number of times the caller calls
+/// the callee, and counting them is how we get an edge weight out of an API
+/// that stores none: `CallGraph::edges` exists but reports the same call sites
+/// one at a time and aggregates nothing either, and walking per symbol is what
+/// makes `scope` below cost the scope's calls rather than the project's. Those
+/// counts are the whole input to the objective: two functions that call each
+/// other twenty times are twenty times the reason to put them in one box.
 ///
 /// The objective reads the calls undirected — a call is a reason to put two
 /// functions in one box whichever way it runs — and the direction is kept
@@ -510,8 +512,8 @@ fn build_base_graph(graph: &CallGraph, scope: Option<&HashSet<SymbolId>>) -> Bas
     let mut weights: Vec<HashMap<usize, f64>> = vec![HashMap::new(); all.len()];
     let mut out: Vec<Vec<usize>> = vec![Vec::new(); all.len()];
     for (i, symbol) in all.iter().enumerate() {
-        for callee in graph.get_callees(symbol) {
-            let Some(&j) = position.get(&callee.id) else {
+        for callee in graph.callee_ids(symbol) {
+            let Some(&j) = position.get(callee) else {
                 continue;
             };
             // A function cannot be merged with itself, so recursion is weight
@@ -1223,78 +1225,109 @@ fn choose_entry_point(graph: &CallGraph, members: &[SymbolId]) -> Option<SymbolI
 
     let inside: HashSet<SymbolId> = members.iter().copied().collect();
 
-    // Multiplicity matters: five calls into a function from outside make it more
-    // of an entrance than one does.
-    let external: Vec<usize> = members
+    // Above the limit a BFS per member gets expensive, and how many members a
+    // function calls directly stands in well enough for how much it fronts.
+    let by_reach = members.len() <= REACHABILITY_MEMBER_LIMIT;
+
+    // One scratch pair for the whole cluster. This is called once per cluster
+    // per rung, so on a real project it runs over roughly every function at
+    // every level of the ladder, and a `HashSet` and a `VecDeque` allocated
+    // and dropped per member is the bulk of that.
+    let mut seen: HashSet<SymbolId> = HashSet::new();
+    let mut queue: VecDeque<SymbolId> = VecDeque::new();
+
+    let ranks: Vec<Rank<'_>> = members
         .iter()
         .map(|member| {
-            graph
-                .get_callers(member)
-                .iter()
-                .filter(|caller| !inside.contains(&caller.id))
-                .count()
+            let callers = graph.caller_ids(member);
+            Rank {
+                // Multiplicity matters: five calls into a function from
+                // outside make it more of an entrance than one does.
+                external: callers
+                    .iter()
+                    .filter(|caller| !inside.contains(*caller))
+                    .count(),
+                dominance: if by_reach {
+                    internal_reach(graph, member, &inside, &mut seen, &mut queue)
+                } else {
+                    graph
+                        .callee_ids(member)
+                        .iter()
+                        .filter(|callee| inside.contains(*callee))
+                        .count()
+                },
+                // A function nothing calls anywhere is a front door by
+                // definition — `main`, a thread body, a callback the runtime
+                // invokes. It has no incoming calls to rank it by, so it would
+                // otherwise be filtered out of its own cluster's naming, which
+                // is how the cluster holding `main` came to be labelled
+                // `parse_integer`.
+                unreached: callers.is_empty(),
+                tie_break: tie_break_key(graph, member),
+            }
         })
         .collect();
 
-    // Above the limit a BFS per member gets expensive, and how many members a
-    // function calls directly stands in well enough for how much it fronts.
-    let dominance: Vec<usize> = if members.len() > REACHABILITY_MEMBER_LIMIT {
-        members
-            .iter()
-            .map(|member| {
-                graph
-                    .get_callees(member)
-                    .iter()
-                    .filter(|callee| inside.contains(&callee.id))
-                    .count()
-            })
-            .collect()
-    } else {
-        members
-            .iter()
-            .map(|member| internal_reach(graph, member, &inside))
-            .collect()
-    };
+    let entered_from_outside = ranks.iter().any(|rank| rank.external > 0);
 
-    // A function nothing calls anywhere is a front door by definition — `main`,
-    // a thread body, a callback the runtime invokes. It has no incoming calls to
-    // rank it by, so it would otherwise be filtered out of its own cluster's
-    // naming, which is how the cluster holding `main` came to be labelled
-    // `parse_integer`.
-    let unreached: Vec<bool> = members
-        .iter()
-        .map(|member| graph.get_callers(member).is_empty())
-        .collect();
-
-    let entered_from_outside = external.iter().any(|&count| count > 0);
-
-    members
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !entered_from_outside || external[*i] > 0 || unreached[*i])
-        .max_by(|(i, left), (j, right)| {
-            dominance[*i]
-                .cmp(&dominance[*j])
-                .then(external[*i].cmp(&external[*j]))
+    (0..members.len())
+        .filter(|&i| !entered_from_outside || ranks[i].external > 0 || ranks[i].unreached)
+        .max_by(|&i, &j| {
+            ranks[i]
+                .dominance
+                .cmp(&ranks[j].dominance)
+                .then(ranks[i].external.cmp(&ranks[j].external))
                 // Definition order is the tie-break a reader would use
                 // themselves, so the lower one has to rank higher — hence the
                 // reversed comparison against a `max_by`. The uuid behind it
                 // only exists so the answer is never ambiguous.
-                .then_with(|| tie_break_key(graph, right).cmp(&tie_break_key(graph, left)))
+                .then_with(|| ranks[j].tie_break.cmp(&ranks[i].tie_break))
         })
-        .map(|(_, member)| *member)
+        .map(|i| members[i])
+}
+
+/// What the ranking knows about one member, read off the graph once.
+///
+/// The three counts used to be three passes over `members`, two of which
+/// walked the same caller list; the key used to be rebuilt inside the
+/// comparator, which clones a path and so paid two allocations per comparison
+/// over an O(n log n) fold. Gathering all four in one pass is the same
+/// ordering, read once.
+struct Rank<'g> {
+    /// Calls arriving from outside the cluster, one per call site.
+    external: usize,
+    /// How much of the cluster this member fronts — reachability, or the
+    /// direct-callee stand-in above [`REACHABILITY_MEMBER_LIMIT`].
+    dominance: usize,
+    /// Nothing calls this member from anywhere, inside or out.
+    unreached: bool,
+    /// Definition site then uuid, borrowed from the graph: the path is only
+    /// ever compared, so there is nothing for the key to own.
+    tie_break: (&'g str, u32, uuid_bytes::Bytes),
 }
 
 /// How many other members this one reaches, following calls that stay inside
 /// the cluster.
-fn internal_reach(graph: &CallGraph, start: &SymbolId, inside: &HashSet<SymbolId>) -> usize {
-    let mut seen: HashSet<SymbolId> = HashSet::from([*start]);
-    let mut queue = VecDeque::from([*start]);
+///
+/// `seen` and `queue` are the caller's scratch, cleared here rather than
+/// allocated: this runs once per member and the sets it builds are the size of
+/// the cluster.
+fn internal_reach(
+    graph: &CallGraph,
+    start: &SymbolId,
+    inside: &HashSet<SymbolId>,
+    seen: &mut HashSet<SymbolId>,
+    queue: &mut VecDeque<SymbolId>,
+) -> usize {
+    seen.clear();
+    queue.clear();
+    seen.insert(*start);
+    queue.push_back(*start);
 
     while let Some(current) = queue.pop_front() {
-        for callee in graph.get_callees(&current) {
-            if inside.contains(&callee.id) && seen.insert(callee.id) {
-                queue.push_back(callee.id);
+        for callee in graph.callee_ids(&current) {
+            if inside.contains(callee) && seen.insert(*callee) {
+                queue.push_back(*callee);
             }
         }
     }
@@ -1302,10 +1335,10 @@ fn internal_reach(graph: &CallGraph, start: &SymbolId, inside: &HashSet<SymbolId
     seen.len() - 1
 }
 
-fn tie_break_key(graph: &CallGraph, symbol: &SymbolId) -> (String, u32, uuid_bytes::Bytes) {
+fn tie_break_key<'g>(graph: &'g CallGraph, symbol: &SymbolId) -> (&'g str, u32, uuid_bytes::Bytes) {
     let location = graph.get_function(symbol).map(|f| &f.definition_location);
     (
-        location.map(|l| l.file_path.clone()).unwrap_or_default(),
+        location.map(|l| l.file_path.as_str()).unwrap_or_default(),
         location.map(|l| l.line).unwrap_or(u32::MAX),
         uuid_bytes::Bytes(*symbol.0.as_bytes()),
     )
@@ -1325,10 +1358,15 @@ mod tests {
 
     /// Distinct lines keep the generated `SymbolId`s distinct.
     fn add(graph: &mut CallGraph, name: &str, line: u32) -> SymbolId {
+        add_in(graph, name, "src/x.c", line)
+    }
+
+    /// The same, for the tie-break tests, which need two files to compare.
+    fn add_in(graph: &mut CallGraph, name: &str, file: &str, line: u32) -> SymbolId {
         graph.add_function(FunctionNode::new(
             name.to_string(),
             name.to_string(),
-            Location::new("src/x.c".to_string(), line, 0),
+            Location::new(file.to_string(), line, 0),
         ))
     }
 
@@ -2146,6 +2184,153 @@ mod tests {
         assert_eq!(
             choose_entry_point(&graph, &[main, helper]).map(|s| named(&graph, &s)),
             Some("main".to_string())
+        );
+    }
+
+    /// Two members an outside caller enters equally often, each fronting the
+    /// same amount of cluster: nothing about the calls separates them, so the
+    /// one defined first takes the name — and takes it whichever order the
+    /// members happen to be listed in, since that order is the partition's
+    /// business and not a reader's.
+    #[test]
+    fn a_tie_is_broken_by_definition_order() {
+        let mut graph = CallGraph::new();
+        let outside = add(&mut graph, "outside", 1);
+        let early = add(&mut graph, "early", 2);
+        let late = add(&mut graph, "late", 3);
+        let early_leaf = add(&mut graph, "early_leaf", 4);
+        let late_leaf = add(&mut graph, "late_leaf", 5);
+
+        call(&mut graph, outside, early, 10);
+        call(&mut graph, outside, late, 11);
+        call(&mut graph, early, early_leaf, 12);
+        call(&mut graph, late, late_leaf, 13);
+
+        for members in [
+            vec![early, late, early_leaf, late_leaf],
+            vec![late_leaf, late, early_leaf, early],
+        ] {
+            let names: Vec<String> = members.iter().map(|m| named(&graph, m)).collect();
+            assert_eq!(
+                choose_entry_point(&graph, &members).map(|s| named(&graph, &s)),
+                Some("early".to_string()),
+                "listed as {names:?}"
+            );
+        }
+    }
+
+    /// The tie-break is a definition site read the way a person reads one:
+    /// file first, then line. `in_a` is defined far further down its file and
+    /// still wins, because the file sorts earlier.
+    #[test]
+    fn a_tie_across_files_is_broken_by_the_file_before_the_line() {
+        let mut graph = CallGraph::new();
+        let outside = add_in(&mut graph, "outside", "src/main.c", 1);
+        let in_a = add_in(&mut graph, "in_a", "src/a.c", 90);
+        let in_b = add_in(&mut graph, "in_b", "src/b.c", 10);
+        let a_leaf = add_in(&mut graph, "a_leaf", "src/a.c", 91);
+        let b_leaf = add_in(&mut graph, "b_leaf", "src/b.c", 11);
+
+        call(&mut graph, outside, in_a, 10);
+        call(&mut graph, outside, in_b, 11);
+        call(&mut graph, in_a, a_leaf, 12);
+        call(&mut graph, in_b, b_leaf, 13);
+
+        assert_eq!(
+            choose_entry_point(&graph, &[in_a, in_b, a_leaf, b_leaf]).map(|s| named(&graph, &s)),
+            Some("in_a".to_string())
+        );
+    }
+
+    /// Past [`REACHABILITY_MEMBER_LIMIT`] members the ranking swaps the BFS
+    /// for a count of direct callees, and the two answers genuinely differ:
+    /// `head` fronts a long chain through one callee, `hub` calls three and
+    /// leads nowhere after. Which one names the cluster therefore pins where
+    /// the limit falls — 200 members still get the reachability, 201 get the
+    /// stand-in.
+    #[test]
+    fn a_cluster_past_the_reachability_limit_ranks_by_direct_callees() {
+        fn fixture(chain: u32) -> (CallGraph, Vec<SymbolId>) {
+            let mut graph = CallGraph::new();
+            let outside = add(&mut graph, "outside", 1);
+            let hub = add(&mut graph, "hub", 2);
+            let head = add(&mut graph, "head", 3);
+            let mut members = vec![hub, head];
+
+            for i in 0..3u32 {
+                let callee = add(&mut graph, &format!("hub_callee{i}"), 10 + i);
+                call(&mut graph, hub, callee, 100 + i);
+                members.push(callee);
+            }
+
+            let mut previous = head;
+            for i in 0..chain {
+                let link = add(&mut graph, &format!("link{i}"), 1000 + i);
+                call(&mut graph, previous, link, 2000 + i);
+                members.push(link);
+                previous = link;
+            }
+
+            call(&mut graph, outside, hub, 20);
+            call(&mut graph, outside, head, 21);
+            (graph, members)
+        }
+
+        let (graph, members) = fixture(REACHABILITY_MEMBER_LIMIT as u32 - 5);
+        assert_eq!(members.len(), REACHABILITY_MEMBER_LIMIT);
+        assert_eq!(
+            choose_entry_point(&graph, &members).map(|s| named(&graph, &s)),
+            Some("head".to_string())
+        );
+
+        let (graph, members) = fixture(REACHABILITY_MEMBER_LIMIT as u32 - 4);
+        assert_eq!(members.len(), REACHABILITY_MEMBER_LIMIT + 1);
+        assert_eq!(
+            choose_entry_point(&graph, &members).map(|s| named(&graph, &s)),
+            Some("hub".to_string())
+        );
+    }
+
+    /// The labels a known graph comes out with, rung by rung, written down.
+    /// Determinism does not pin this: a run matching itself says nothing
+    /// about matching the run before the ranking was rewritten, and the entry
+    /// point is what `DrillIntoCluster` roots a tree at, so every one of these
+    /// is a user-visible answer. A pseudo-random layered DAG is used because
+    /// its clusters are full of members nothing separates but their location.
+    #[test]
+    fn the_labels_of_a_known_graph_do_not_move() {
+        let (graph, _) = layered_dag(60);
+        let clustering = Clustering::compute(&graph, ClusterMethod::Modularity);
+
+        let labels: Vec<Vec<&str>> = (0..clustering.level_count())
+            .map(|level| {
+                clustering
+                    .level(level)
+                    .iter()
+                    .filter_map(|id| clustering.cluster(*id))
+                    .map(|cluster| cluster.label.as_str())
+                    .collect()
+            })
+            .collect();
+
+        assert_eq!(
+            labels,
+            vec![
+                vec![
+                    "f3", "f30", "f45", "f35", "f17", "f5", "f19", "f47", "f20", "f44", "f53",
+                    "f54", "f0", "f24", "f51", "f4", "f16", "f32", "f39", "f23", "f29", "f15",
+                    "f40", "f8", "f26", "f22", "f43", "f34",
+                ],
+                vec![
+                    "f3", "f30", "f43", "f35", "f15", "f5", "f19", "f47", "f20", "f53", "f54",
+                    "f0", "f22", "f4", "f32", "f23", "f29", "f40", "f8", "f34",
+                ],
+                vec![
+                    "f3", "f30", "f43", "f5", "f47", "f20", "f54", "f0", "f32", "f23", "f40",
+                    "f34",
+                ],
+                vec!["f0", "f30", "f43", "f5", "f20", "f40"],
+            ]
         );
     }
 

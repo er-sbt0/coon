@@ -18,12 +18,6 @@ pub struct DocumentSymbolResponse {
     pub symbols: Vec<model::WorkspaceSymbolInfo>,
 }
 
-/// Response from LSP textDocument/hover request
-#[derive(Debug, Clone)]
-pub struct HoverResponse {
-    pub hover_info: Option<String>,
-}
-
 /// Response from LSP textDocument/prepareCallHierarchy request
 #[derive(Debug, Clone)]
 pub struct PrepareCallHierarchyResponse {

@@ -95,11 +95,6 @@ impl FunctionNode {
             .collect()
     }
 
-    /// Get reference locations only (for backward compatibility)
-    pub fn get_reference_locations(&self) -> Vec<&Location> {
-        self.references.iter().map(|r| &r.location).collect()
-    }
-
     pub fn add_diagnostic(&mut self, diagnostic: Diagnostic) {
         self.diagnostics.push(diagnostic);
     }
@@ -247,6 +242,42 @@ impl CallGraph {
             .unwrap_or_default()
     }
 
+    /// Who calls `callee_id`, straight off the index.
+    ///
+    /// One entry per call *site*, not per distinct caller: a function that
+    /// calls this one five times is named five times. That multiplicity is
+    /// where every edge weight in the workspace comes from — see
+    /// [`callee_ids`](Self::callee_ids) — so a caller that wants distinct
+    /// symbols deduplicates for itself.
+    ///
+    /// Prefer this to [`get_callers`](Self::get_callers) wherever the ids are
+    /// all that is wanted: the two are what every traversal here is built out
+    /// of, and resolving each id into a `&FunctionNode` means a fresh `Vec` per
+    /// node visited — millions of them over a project's worth of functions, for
+    /// a walk that then reads nothing but `.id` back off them. An id here names
+    /// a symbol the graph may hold no node for, which `get_callers` would have
+    /// dropped; nothing builds such a graph, and `protocol::wire_graph` already
+    /// ships every edge on that assumption.
+    pub fn caller_ids(&self, callee_id: &SymbolId) -> &[SymbolId] {
+        self.callers_map
+            .get(callee_id)
+            .map_or(&[][..], Vec::as_slice)
+    }
+
+    /// What `caller_id` calls, straight off the index — the outgoing half of
+    /// [`caller_ids`](Self::caller_ids), with the same one-entry-per-call-site
+    /// multiplicity and the same reason to be preferred to
+    /// [`get_callees`](Self::get_callees).
+    ///
+    /// Counting the duplicates is how `logic::cluster::build_base_graph` and
+    /// `layout::aggregate_calls` weigh an edge, so dropping them here would
+    /// silently flatten every weight in the app to one.
+    pub fn callee_ids(&self, caller_id: &SymbolId) -> &[SymbolId] {
+        self.callees_map
+            .get(caller_id)
+            .map_or(&[][..], Vec::as_slice)
+    }
+
     fn rebuild_indexes(&mut self) {
         self.edge_set.clear();
         self.callers_map.clear();
@@ -329,7 +360,6 @@ mod tests {
         assert_eq!(function.references.len(), 2);
         assert_eq!(function.get_referencing_function_names().len(), 1);
         assert_eq!(function.get_referencing_function_names()[0], "caller_func");
-        assert_eq!(function.get_reference_locations().len(), 2);
     }
 
     #[test]
@@ -396,5 +426,34 @@ mod tests {
         let callers = graph.get_callers(&id2);
         assert_eq!(callers.len(), 1);
         assert_eq!(callers[0].name, "func1");
+    }
+
+    /// The id accessors count call *sites*, and the edge weights everything
+    /// downstream computes are those duplicates — so a graph walk that saw one
+    /// entry per distinct pair would be a different program.
+    #[test]
+    fn id_accessors_keep_one_entry_per_call_site() {
+        let mut graph = CallGraph::new();
+        let caller = graph.add_function(FunctionNode::new(
+            "caller".to_string(),
+            "caller".to_string(),
+            Location::new("test.c".to_string(), 1, 0),
+        ));
+        let callee = graph.add_function(FunctionNode::new(
+            "callee".to_string(),
+            "callee".to_string(),
+            Location::new("test.c".to_string(), 9, 0),
+        ));
+
+        graph.add_call(caller, callee, Location::new("test.c".to_string(), 2, 4));
+        graph.add_call(caller, callee, Location::new("test.c".to_string(), 3, 4));
+        // Same site twice: the graph deduplicates on location, so this one is
+        // not a third call.
+        graph.add_call(caller, callee, Location::new("test.c".to_string(), 3, 4));
+
+        assert_eq!(graph.callee_ids(&caller), &[callee, callee]);
+        assert_eq!(graph.caller_ids(&callee), &[caller, caller]);
+        assert!(graph.callee_ids(&callee).is_empty());
+        assert!(graph.caller_ids(&caller).is_empty());
     }
 }

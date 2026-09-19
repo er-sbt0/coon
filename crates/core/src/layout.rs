@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 
@@ -262,18 +263,18 @@ pub fn compute_layout(
         let parent_idx = symbol_to_node[&symbol];
 
         let children = match direction {
-            CallDirection::Outgoing => graph.get_callees(&symbol),
-            CallDirection::Incoming => graph.get_callers(&symbol),
+            CallDirection::Outgoing => graph.callee_ids(&symbol),
+            CallDirection::Incoming => graph.caller_ids(&symbol),
         };
 
-        for child_func in children {
-            let child_idx = if let Some(&idx) = symbol_to_node.get(&child_func.id) {
+        for &child in children {
+            let child_idx = if let Some(&idx) = symbol_to_node.get(&child) {
                 idx
             } else {
-                let idx = dag.add_node(child_func.id);
-                symbol_to_node.insert(child_func.id, idx);
-                node_to_symbol.insert(idx, child_func.id);
-                queue.push_back((child_func.id, depth + 1));
+                let idx = dag.add_node(child);
+                symbol_to_node.insert(child, idx);
+                node_to_symbol.insert(idx, child);
+                queue.push_back((child, depth + 1));
                 idx
             };
             let _ = dag.add_edge(parent_idx, child_idx);
@@ -305,26 +306,87 @@ pub fn compute_layout(
 // The cluster map
 // ---------------------------------------------------------------------------
 
-/// One element of the cluster map: a function, or a whole cluster standing in
-/// for the functions inside it.
+/// One element of the cluster map: a whole cluster, standing in for the
+/// functions inside it.
 ///
 /// It serialises as a string rather than as serde's usual tagged enum, because
 /// it is a map key on the wire and JSON has no keys but strings. That costs
 /// nothing and buys something: cytoscape needs a stable string element id for
 /// every node it draws, and this is one.
+///
+/// One variant, because a map draws boxes and nothing else — see
+/// [`GraphLayout`] for why that is the whole design. It stays an enum so that
+/// a map which one day drew, say, the isolated functions no cluster claims
+/// would add a variant and a prefix beside `cluster:`, rather than change the
+/// type every position on the wire is keyed by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LayoutNodeId {
-    Symbol(SymbolId),
     Cluster(ClusterKey),
 }
 
 impl fmt::Display for LayoutNodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LayoutNodeId::Symbol(symbol) => write!(f, "fn:{}", symbol.0),
             LayoutNodeId::Cluster(key) => write!(f, "cluster:{}:{}", key.level, key.anchor.0),
         }
     }
+}
+
+/// The order a `LayoutNodeId` sorts in is its `Display` order, and that is not
+/// an accident worth losing: the string is what the client keys its elements
+/// by, so a sort done here and a sort done on the wire agree. It is spelled out
+/// rather than derived because a derive gets the level wrong: it is rendered in
+/// decimal, so it is compared as digits and not as a number — `cluster:10:`
+/// lands before `cluster:1:`.
+///
+/// This exists because the callers used to sort on `to_string()`, which formats
+/// a uuid into a fresh `String` twice per comparison, four times for a full
+/// compare, O(n log n) times over.
+impl Ord for LayoutNodeId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (LayoutNodeId::Cluster(mine), LayoutNodeId::Cluster(theirs)) => {
+                level_cmp(mine.level, theirs.level)
+                    .then_with(|| mine.anchor.0.cmp(&theirs.anchor.0))
+            }
+        }
+    }
+}
+
+impl PartialOrd for LayoutNodeId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Two cluster levels compared the way their `Display` strings compare: the
+/// decimal digits, then the `:` that closes the field. `':'` (0x3a) is above
+/// every digit, so a level whose digits are a prefix of another's sorts
+/// *after* it — `cluster:1:` after `cluster:10:`. On the stack, because the
+/// point of having an `Ord` at all is to stop allocating per comparison.
+fn level_cmp(mine: usize, theirs: usize) -> Ordering {
+    let (mut mine_buf, mut theirs_buf) = ([0u8; LEVEL_FIELD], [0u8; LEVEL_FIELD]);
+    level_field(mine, &mut mine_buf).cmp(level_field(theirs, &mut theirs_buf))
+}
+
+/// Twenty digits is a 64-bit `usize` at its widest, and one more for the `:`.
+const LEVEL_FIELD: usize = 21;
+
+/// `level` in decimal followed by its `:`, written into `buf`.
+fn level_field(level: usize, buf: &mut [u8; LEVEL_FIELD]) -> &[u8] {
+    let mut rest = level;
+    let mut len = 0;
+    loop {
+        buf[len] = b'0' + (rest % 10) as u8;
+        len += 1;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    buf[..len].reverse();
+    buf[len] = b':';
+    &buf[..len + 1]
 }
 
 impl std::str::FromStr for LayoutNodeId {
@@ -334,9 +396,6 @@ impl std::str::FromStr for LayoutNodeId {
         let uuid = |raw: &str| {
             uuid::Uuid::parse_str(raw).map_err(|e| format!("`{text}` holds no uuid: {e}"))
         };
-        if let Some(rest) = text.strip_prefix("fn:") {
-            return Ok(LayoutNodeId::Symbol(SymbolId(uuid(rest)?)));
-        }
         if let Some(rest) = text.strip_prefix("cluster:") {
             let (level, anchor) = rest
                 .split_once(':')
@@ -349,7 +408,7 @@ impl std::str::FromStr for LayoutNodeId {
                 anchor: SymbolId(uuid(anchor)?),
             }));
         }
-        Err(format!("`{text}` is neither a function nor a cluster"))
+        Err(format!("`{text}` names no cluster"))
     }
 }
 
@@ -383,8 +442,13 @@ pub struct MetaNode {
 pub struct LayoutEdge {
     pub source: LayoutNodeId,
     pub target: LayoutNodeId,
-    /// How many individual calls this one line stands for, so the client can
-    /// draw a heavily used relation more heavily than a stray one.
+    /// How many individual calls this one line stands for.
+    ///
+    /// The client scaled the line width by it until 8408323, when the map went
+    /// back to drawing every edge the way the rooted view draws a call, so
+    /// nothing on the canvas reads it now. It stays on the wire as the only
+    /// record of what a line aggregates, which is what `aggregate_calls`'s
+    /// tests assert on.
     pub weight: usize,
 }
 
@@ -499,7 +563,7 @@ pub fn compute_map_frame(graph: &CallGraph) -> MapFrame {
     let mut functions: Vec<SymbolId> = graph
         .function_ids()
         .copied()
-        .filter(|id| !graph.get_callees(id).is_empty() || !graph.get_callers(id).is_empty())
+        .filter(|id| !graph.callee_ids(id).is_empty() || !graph.caller_ids(id).is_empty())
         .collect();
     functions.sort_unstable_by_key(|id| id.0);
     if functions.is_empty() {
@@ -509,14 +573,14 @@ pub fn compute_map_frame(graph: &CallGraph) -> MapFrame {
     let mut dag: Dag<SymbolId> = Dag::new();
     let index: HashMap<SymbolId, usize> =
         functions.iter().map(|&id| (id, dag.add_node(id))).collect();
-    // `get_callees` reports one entry per call *site*, which is what
+    // `callee_ids` reports one entry per call *site*, which is what
     // `aggregate_calls` wants and what a layout does not: the same pair added
     // twelve times is twelve parallel edges for the crossing pass to chew on.
     let mut seen: HashSet<(usize, usize)> = HashSet::new();
     for caller in &functions {
         let from = index[caller];
-        for callee in graph.get_callees(caller) {
-            let Some(&to) = index.get(&callee.id) else {
+        for callee in graph.callee_ids(caller) {
+            let Some(&to) = index.get(callee) else {
                 continue;
             };
             if seen.insert((from, to)) {
@@ -714,11 +778,13 @@ fn place_boxes(
             })
             .collect();
         // Ties are broken on the node id so that two boxes whose members
-        // average to the same spot do not swap places between runs.
+        // average to the same spot do not swap places between runs. On the id
+        // itself, whose `Ord` is its `Display` order: rendering the string here
+        // instead would format two uuids for every comparison of every box.
         wanted.sort_by(|a, b| {
             a.1.partial_cmp(&b.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| display[a.0].to_string().cmp(&display[b.0].to_string()))
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| display[a.0].cmp(&display[b.0]))
         });
 
         let before: f32 = wanted.iter().map(|(_, cross)| *cross).sum::<f32>();
@@ -771,9 +837,14 @@ fn place_boxes(
 
 /// Roll every call up to the pair of clusters it runs between.
 ///
-/// `CallGraph` exposes no `edges()`, so the calls have to be walked the way
-/// `logic::cluster` walks them: `get_callees` per function, which returns one
-/// entry per distinct call *site* and so counts multiplicity for free.
+/// [`CallGraph::edges`] would report the same calls one entry per call *site*,
+/// but the walk goes the way `logic::cluster` walks them — `callee_ids` per
+/// function — for what it costs: `owner` holds only the functions the rung has
+/// boxed, which for a map scoped to one neighbourhood is a few dozen of a
+/// project's thousands, and a caller with no box is skipped before its calls
+/// are looked at. `edges()` would read every call site in the project to find
+/// the ones crossing between two boxes. Either way the duplicates in the slice
+/// are the multiplicity, counted for free.
 ///
 /// Calls whose two ends land in the same cluster are dropped. Those are the
 /// ones internal to a box whose whole purpose is to not show its insides.
@@ -791,8 +862,8 @@ fn aggregate_calls(
         let Some(&from) = owner.get(caller) else {
             continue;
         };
-        for callee in graph.get_callees(caller) {
-            let Some(&to) = owner.get(&callee.id) else {
+        for callee in graph.callee_ids(caller) {
+            let Some(&to) = owner.get(callee) else {
                 continue;
             };
             if from == to {
@@ -800,7 +871,7 @@ fn aggregate_calls(
             }
             // `direction` says which way the user is reading the graph, so an
             // incoming map is the same aggregation with every arrow turned
-            // round — exactly what `compute_layout` does with get_callers.
+            // round — exactly what `compute_layout` does with caller_ids.
             let pair = match direction {
                 CallDirection::Outgoing => (from, to),
                 CallDirection::Incoming => (to, from),
@@ -818,14 +889,16 @@ fn aggregate_calls(
         })
         .collect();
 
-    // `graph.function_ids()` is a HashMap iteration, so the aggregate has to be
-    // sorted before it decides node order in the DAG — otherwise the same graph
-    // lays out differently from one run to the next.
+    // `graph.function_ids()` is a HashMap iteration, so the aggregate comes out
+    // in a different order every run. These edges go straight to the wire and
+    // the client draws them as given, so sorting them is what makes one graph
+    // ship one way — and an export of the map diff against the last one. The
+    // order is the ids' `Display` order, which their `Ord` is, without a uuid
+    // formatted into a fresh `String` twice per comparison.
     edges.sort_by(|a, b| {
         a.source
-            .to_string()
-            .cmp(&b.source.to_string())
-            .then_with(|| a.target.to_string().cmp(&b.target.to_string()))
+            .cmp(&b.source)
+            .then_with(|| a.target.cmp(&b.target))
     });
     edges
 }
@@ -854,6 +927,18 @@ mod tests {
             graph.add_call(pair[0], pair[1], Location::new("src/x.c".to_string(), 1, 0));
         }
         (graph, ids)
+    }
+
+    /// A spread of node ids chosen so that their `Display` order disagrees
+    /// with the cheaper one: a level is rendered in decimal, so `cluster:10:`
+    /// lands before both `cluster:1:` (`'0'` is under the `':'` that ends the
+    /// field) and `cluster:9:`.
+    fn awkward_ids(anchors: &[SymbolId]) -> Vec<LayoutNodeId> {
+        anchors
+            .iter()
+            .zip([0, 1, 9, 10, 2, 11])
+            .map(|(&anchor, level)| LayoutNodeId::Cluster(ClusterKey { level, anchor }))
+            .collect()
     }
 
     #[test]
@@ -1256,10 +1341,7 @@ mod tests {
         layout
             .nodes
             .keys()
-            .filter_map(|node| match node {
-                LayoutNodeId::Cluster(key) => Some(*key),
-                LayoutNodeId::Symbol(_) => None,
-            })
+            .map(|LayoutNodeId::Cluster(key)| *key)
             .collect()
     }
 
@@ -1445,10 +1527,7 @@ mod tests {
         let mut drawn = 0usize;
         for edge in &layout.edges {
             let (LayoutNodeId::Cluster(source), LayoutNodeId::Cluster(target)) =
-                (edge.source, edge.target)
-            else {
-                panic!("a cluster map draws clusters");
-            };
+                (edge.source, edge.target);
             assert_eq!(
                 Some(edge.weight),
                 expected.get(&(source, target)).copied(),
@@ -1457,6 +1536,42 @@ mod tests {
             drawn += 1;
         }
         assert_eq!(drawn, expected.len(), "one line per ordered pair");
+    }
+
+    /// The aggregate is walked out of a `HashMap`, so its order is imposed —
+    /// and it is the node ids' `Display` order, the string the client keys its
+    /// elements by. Nothing downstream re-sorts it, so this is the wire order.
+    #[test]
+    fn the_aggregate_ships_in_the_node_ids_display_order() {
+        let (mut graph, ids) = graph_with_chain(&["a", "b", "c", "d", "e", "f"]);
+        // Every function calls every later one, so a source repeats and the
+        // target is what breaks the tie.
+        for (nth, &from) in ids.iter().enumerate() {
+            for &to in &ids[nth + 1..] {
+                graph.add_call(from, to, Location::new("src/x.c".to_string(), 2, 0));
+            }
+        }
+        let display = awkward_ids(&ids);
+        let owner: HashMap<SymbolId, LayoutNodeId> =
+            ids.iter().copied().zip(display.iter().copied()).collect();
+
+        let shipped: Vec<(String, String)> =
+            aggregate_calls(&graph, &owner, CallDirection::Outgoing)
+                .iter()
+                .map(|edge| (edge.source.to_string(), edge.target.to_string()))
+                .collect();
+
+        assert_eq!(shipped.len(), 15, "every ordered pair crosses a boundary");
+        let mut expected = shipped.clone();
+        expected.sort();
+        assert_eq!(
+            shipped, expected,
+            "sorted on the ids as the client sees them"
+        );
+        assert!(
+            shipped.windows(2).any(|pair| pair[0].0 == pair[1].0),
+            "and a repeated source, or the target tie-break went untested"
+        );
     }
 
     /// The map never draws a boundary crossed both ways: `logic::cluster`
@@ -1735,6 +1850,41 @@ mod tests {
         );
     }
 
+    /// Boxes whose members average to one spot have nothing to order them but
+    /// their ids, and two runs that disagree would swap them on the canvas. The
+    /// order is the ids' `Display` order, the same one the aggregate ships in.
+    #[test]
+    fn boxes_wanting_one_spot_are_ordered_by_node_id() {
+        let anchors: Vec<SymbolId> = (0..6)
+            .map(|i| SymbolId::from_content(&format!("b{i}"), "b.c", i))
+            .collect();
+        let display = awkward_ids(&anchors);
+        let seats = vec![
+            Some(Seat {
+                layer: 0,
+                cross: 4.0
+            });
+            6
+        ];
+
+        let out = place_boxes(
+            &display,
+            &seats,
+            CallDirection::Outgoing,
+            LayoutOrientation::LeftRight,
+        );
+        let mut down_the_column: Vec<(String, f32)> = display
+            .iter()
+            .map(|node| (node.to_string(), out[node].y))
+            .collect();
+        down_the_column.sort_by(|a, b| a.1.partial_cmp(&b.1).expect("no box is at NaN"));
+
+        let placed: Vec<String> = down_the_column.into_iter().map(|(id, _)| id).collect();
+        let mut expected = placed.clone();
+        expected.sort();
+        assert_eq!(placed, expected);
+    }
+
     /// Order is the part of the frame worth defending to the last: it is what a
     /// reader recognises from the call tree, and absolute position is what
     /// gives way when the boxes will not fit.
@@ -1829,34 +1979,62 @@ mod tests {
         }
     }
 
+    /// The whole of `Ord`'s claim: sorting by it is sorting by the string, on
+    /// the case a derive would have got wrong — a two-digit level read as
+    /// digits rather than as a number.
+    #[test]
+    fn a_node_id_sorts_exactly_as_its_display_string_does() {
+        let anchors: Vec<SymbolId> = (0..4)
+            .map(|i| SymbolId::from_content(&format!("a{i}"), "a.c", i))
+            .collect();
+        let mut ids: Vec<LayoutNodeId> = Vec::new();
+        for level in [0, 1, 2, 9, 10, 11, 19, 100, 101] {
+            ids.extend(
+                anchors
+                    .iter()
+                    .map(|&anchor| LayoutNodeId::Cluster(ClusterKey { level, anchor })),
+            );
+        }
+
+        let mut by_ord = ids.clone();
+        by_ord.sort();
+        let mut by_string: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        by_string.sort();
+
+        assert_eq!(
+            by_ord.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+            by_string
+        );
+        let ten = by_string.iter().position(|s| s.starts_with("cluster:10:"));
+        let one = by_string.iter().position(|s| s.starts_with("cluster:1:"));
+        assert!(
+            ten < one,
+            "the level is digits, not a number: {ten:?} {one:?}"
+        );
+    }
+
     /// A `LayoutNodeId` is a JSON *map key*, and JSON has no keys but strings —
     /// so its string form is the wire contract, not an implementation detail.
     #[test]
     fn a_layout_node_id_is_a_string_on_the_wire() {
-        let symbol = SymbolId::from_content("a", "a.c", 1);
-        for node in [
-            LayoutNodeId::Symbol(symbol),
-            LayoutNodeId::Cluster(ClusterKey {
-                level: 2,
-                anchor: symbol,
-            }),
-        ] {
-            let json = serde_json::to_value(node).expect("serialises");
-            assert!(json.is_string(), "{json} has to be usable as a map key");
-            assert_eq!(
-                serde_json::from_value::<LayoutNodeId>(json).expect("round-trips"),
-                node
-            );
-        }
+        let anchor = SymbolId::from_content("a", "a.c", 1);
+        let node = LayoutNodeId::Cluster(ClusterKey { level: 2, anchor });
+
+        let json = serde_json::to_value(node).expect("serialises");
+        assert!(json.is_string(), "{json} has to be usable as a map key");
+        assert_eq!(
+            serde_json::from_value::<LayoutNodeId>(json).expect("round-trips"),
+            node
+        );
 
         let mut nodes = HashMap::new();
-        nodes.insert(LayoutNodeId::Symbol(symbol), NodePos { x: 1.0, y: 2.0 });
+        nodes.insert(node, NodePos { x: 1.0, y: 2.0 });
         let layout = GraphLayout {
             nodes,
             metas: Vec::new(),
             edges: Vec::new(),
         };
         let json = serde_json::to_value(&layout).expect("a whole layout serialises");
-        assert!(json["nodes"][format!("fn:{}", symbol.0)].is_object());
+        assert!(json["nodes"][format!("cluster:2:{}", anchor.0)].is_object());
     }
 }

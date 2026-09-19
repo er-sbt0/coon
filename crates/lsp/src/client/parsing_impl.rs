@@ -44,11 +44,6 @@ impl LspClient {
         crate::parsing::parse_document_symbol_response_impl(&mut self.pending_requests, response)
     }
 
-    /// Parse hover response
-    pub fn parse_hover_response(&mut self, response: &Value) -> Result<Option<HoverResponse>> {
-        crate::parsing::parse_hover_response_impl(&mut self.pending_requests, response)
-    }
-
     /// Parse prepare call hierarchy response
     pub fn parse_prepare_call_hierarchy_response(
         &mut self,

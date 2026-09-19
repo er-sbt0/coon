@@ -38,7 +38,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     // `Completed` is not the end of the wait: clangd has handed over the
     // symbols, but their edges are still being fetched, so the bar stays up
     // until the warmup drains too.
-    let show_lsp_status = !matches!(app.core.lsp.status, LspLoadPhase::Completed)
+    let show_lsp_status = !matches!(app.core.lsp.status(), LspLoadPhase::Completed)
         || app.core.warmup_progress().is_some();
 
     let chunks = if show_lsp_status {
@@ -91,7 +91,7 @@ fn render_lsp_status_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &App) 
         return;
     }
 
-    let status_text = match &app.core.lsp.status {
+    let status_text = match app.core.lsp.status() {
         LspLoadPhase::NotStarted => "LSP: not started".to_string(),
         LspLoadPhase::SpawningServer => "LSP: starting clangd…".to_string(),
         LspLoadPhase::Initializing => "LSP: initializing…".to_string(),
@@ -337,7 +337,7 @@ fn render_workspace_manager_modal(f: &mut Frame, area: ratatui::layout::Rect, ap
         };
 
         let root_info = workspace
-            .root_symbol
+            .root_symbol()
             .as_ref()
             .and_then(|id| app.core.call_graph.get_function(id))
             .map(|f| f.name.as_str())
@@ -394,7 +394,7 @@ mod tests {
         // part the user actually waits through — so the bar must not vanish the
         // moment the phase flips.
         let mut app = App::new(CallGraph::new());
-        app.core.lsp.status = LspLoadPhase::Completed;
+        app.core.lsp.set_status(LspLoadPhase::Completed);
 
         assert!(
             !screen(&mut app).contains("LSP:"),
@@ -402,8 +402,11 @@ mod tests {
         );
 
         // Mid-warmup: seeded, and part of the queue still owed.
+        // Both halves at once: the bridge takes them together, and nothing
+        // here reads a reply.
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        app.core.lsp.request_tx = Some(tx);
+        let (_replies_tx, replies_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.core.lsp.set_channels(replies_rx, tx);
         for i in 0..5 {
             app.core.call_graph.add_function(model::FunctionNode::new(
                 format!("f{i}"),
