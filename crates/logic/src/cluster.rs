@@ -475,9 +475,9 @@ struct Base {
 /// Build the weighted graph the coarsening runs on, plus the symbol list that
 /// gives every index its meaning.
 ///
-/// `CallGraph::get_callees` returns one entry per distinct *call site*, not per
+/// `CallGraph::callee_ids` returns one entry per distinct *call site*, not per
 /// distinct callee — the graph deduplicates on (caller, callee, location). So
-/// the duplicates in that `Vec` are exactly the number of times the caller calls
+/// the duplicates in that slice are exactly the number of times the caller calls
 /// the callee, and counting them is how we get an edge weight out of an API that
 /// exposes no weights and no `edges()` accessor. Those counts are the whole
 /// input to "heaviest": two functions that call each other twenty times merge
@@ -510,8 +510,8 @@ fn build_base_graph(graph: &CallGraph, scope: Option<&HashSet<SymbolId>>) -> Bas
     let mut weights: Vec<HashMap<usize, f64>> = vec![HashMap::new(); all.len()];
     let mut out: Vec<Vec<usize>> = vec![Vec::new(); all.len()];
     for (i, symbol) in all.iter().enumerate() {
-        for callee in graph.get_callees(symbol) {
-            let Some(&j) = position.get(&callee.id) else {
+        for callee in graph.callee_ids(symbol) {
+            let Some(&j) = position.get(callee) else {
                 continue;
             };
             // A function cannot be merged with itself, so recursion is weight
@@ -1229,9 +1229,9 @@ fn choose_entry_point(graph: &CallGraph, members: &[SymbolId]) -> Option<SymbolI
         .iter()
         .map(|member| {
             graph
-                .get_callers(member)
+                .caller_ids(member)
                 .iter()
-                .filter(|caller| !inside.contains(&caller.id))
+                .filter(|caller| !inside.contains(*caller))
                 .count()
         })
         .collect();
@@ -1243,9 +1243,9 @@ fn choose_entry_point(graph: &CallGraph, members: &[SymbolId]) -> Option<SymbolI
             .iter()
             .map(|member| {
                 graph
-                    .get_callees(member)
+                    .callee_ids(member)
                     .iter()
-                    .filter(|callee| inside.contains(&callee.id))
+                    .filter(|callee| inside.contains(*callee))
                     .count()
             })
             .collect()
@@ -1263,7 +1263,7 @@ fn choose_entry_point(graph: &CallGraph, members: &[SymbolId]) -> Option<SymbolI
     // `parse_integer`.
     let unreached: Vec<bool> = members
         .iter()
-        .map(|member| graph.get_callers(member).is_empty())
+        .map(|member| graph.caller_ids(member).is_empty())
         .collect();
 
     let entered_from_outside = external.iter().any(|&count| count > 0);
@@ -1292,9 +1292,9 @@ fn internal_reach(graph: &CallGraph, start: &SymbolId, inside: &HashSet<SymbolId
     let mut queue = VecDeque::from([*start]);
 
     while let Some(current) = queue.pop_front() {
-        for callee in graph.get_callees(&current) {
-            if inside.contains(&callee.id) && seen.insert(callee.id) {
-                queue.push_back(callee.id);
+        for callee in graph.callee_ids(&current) {
+            if inside.contains(callee) && seen.insert(*callee) {
+                queue.push_back(*callee);
             }
         }
     }

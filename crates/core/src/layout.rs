@@ -262,18 +262,18 @@ pub fn compute_layout(
         let parent_idx = symbol_to_node[&symbol];
 
         let children = match direction {
-            CallDirection::Outgoing => graph.get_callees(&symbol),
-            CallDirection::Incoming => graph.get_callers(&symbol),
+            CallDirection::Outgoing => graph.callee_ids(&symbol),
+            CallDirection::Incoming => graph.caller_ids(&symbol),
         };
 
-        for child_func in children {
-            let child_idx = if let Some(&idx) = symbol_to_node.get(&child_func.id) {
+        for &child in children {
+            let child_idx = if let Some(&idx) = symbol_to_node.get(&child) {
                 idx
             } else {
-                let idx = dag.add_node(child_func.id);
-                symbol_to_node.insert(child_func.id, idx);
-                node_to_symbol.insert(idx, child_func.id);
-                queue.push_back((child_func.id, depth + 1));
+                let idx = dag.add_node(child);
+                symbol_to_node.insert(child, idx);
+                node_to_symbol.insert(idx, child);
+                queue.push_back((child, depth + 1));
                 idx
             };
             let _ = dag.add_edge(parent_idx, child_idx);
@@ -499,7 +499,7 @@ pub fn compute_map_frame(graph: &CallGraph) -> MapFrame {
     let mut functions: Vec<SymbolId> = graph
         .function_ids()
         .copied()
-        .filter(|id| !graph.get_callees(id).is_empty() || !graph.get_callers(id).is_empty())
+        .filter(|id| !graph.callee_ids(id).is_empty() || !graph.caller_ids(id).is_empty())
         .collect();
     functions.sort_unstable_by_key(|id| id.0);
     if functions.is_empty() {
@@ -509,14 +509,14 @@ pub fn compute_map_frame(graph: &CallGraph) -> MapFrame {
     let mut dag: Dag<SymbolId> = Dag::new();
     let index: HashMap<SymbolId, usize> =
         functions.iter().map(|&id| (id, dag.add_node(id))).collect();
-    // `get_callees` reports one entry per call *site*, which is what
+    // `callee_ids` reports one entry per call *site*, which is what
     // `aggregate_calls` wants and what a layout does not: the same pair added
     // twelve times is twelve parallel edges for the crossing pass to chew on.
     let mut seen: HashSet<(usize, usize)> = HashSet::new();
     for caller in &functions {
         let from = index[caller];
-        for callee in graph.get_callees(caller) {
-            let Some(&to) = index.get(&callee.id) else {
+        for callee in graph.callee_ids(caller) {
+            let Some(&to) = index.get(callee) else {
                 continue;
             };
             if seen.insert((from, to)) {
@@ -772,7 +772,7 @@ fn place_boxes(
 /// Roll every call up to the pair of clusters it runs between.
 ///
 /// `CallGraph` exposes no `edges()`, so the calls have to be walked the way
-/// `logic::cluster` walks them: `get_callees` per function, which returns one
+/// `logic::cluster` walks them: `callee_ids` per function, which returns one
 /// entry per distinct call *site* and so counts multiplicity for free.
 ///
 /// Calls whose two ends land in the same cluster are dropped. Those are the
@@ -791,8 +791,8 @@ fn aggregate_calls(
         let Some(&from) = owner.get(caller) else {
             continue;
         };
-        for callee in graph.get_callees(caller) {
-            let Some(&to) = owner.get(&callee.id) else {
+        for callee in graph.callee_ids(caller) {
+            let Some(&to) = owner.get(callee) else {
                 continue;
             };
             if from == to {
@@ -800,7 +800,7 @@ fn aggregate_calls(
             }
             // `direction` says which way the user is reading the graph, so an
             // incoming map is the same aggregation with every arrow turned
-            // round — exactly what `compute_layout` does with get_callers.
+            // round — exactly what `compute_layout` does with caller_ids.
             let pair = match direction {
                 CallDirection::Outgoing => (from, to),
                 CallDirection::Incoming => (to, from),

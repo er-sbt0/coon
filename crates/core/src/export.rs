@@ -226,8 +226,8 @@ fn hidden_children(
     ws: &CoreWorkspace,
 ) -> usize {
     let children = match ws.direction {
-        CallDirection::Outgoing => graph.get_callees(id),
-        CallDirection::Incoming => graph.get_callers(id),
+        CallDirection::Outgoing => graph.callee_ids(id),
+        CallDirection::Incoming => graph.caller_ids(id),
     };
     if children.is_empty() {
         return 0;
@@ -237,7 +237,7 @@ fn hidden_children(
     }
     children
         .iter()
-        .filter(|child| !visible.contains_key(&child.id))
+        .filter(|child| !visible.contains_key(*child))
         .count()
 }
 
@@ -350,7 +350,7 @@ fn cluster_dot(core: &CoreApp) -> Option<String> {
 ///
 /// `CallGraph` exposes no `edges()` accessor that counts multiplicity, so the
 /// calls are walked the way `logic::cluster` and `layout` walk them:
-/// `get_callees` per function, which returns one entry per distinct call site.
+/// `callee_ids` per function, which returns one entry per distinct call site.
 /// Calls inside a box are kept — that is what the box is for here — and the
 /// ones leaving the exported set are dropped, exactly as an isolated function
 /// is absent from the map it was never clustered into.
@@ -364,13 +364,13 @@ fn call_edges(
         if !exported.contains_key(caller) {
             continue;
         }
-        for callee in graph.get_callees(caller) {
-            if !exported.contains_key(&callee.id) || callee.id == *caller {
+        for callee in graph.callee_ids(caller) {
+            if !exported.contains_key(callee) || callee == caller {
                 continue;
             }
             let pair = match direction {
-                CallDirection::Outgoing => (*caller, callee.id),
-                CallDirection::Incoming => (callee.id, *caller),
+                CallDirection::Outgoing => (*caller, *callee),
+                CallDirection::Incoming => (*callee, *caller),
             };
             *weights.entry(pair).or_insert(0) += 1;
         }
