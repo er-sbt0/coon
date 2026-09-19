@@ -18,7 +18,38 @@ use crate::workspace::{CoreWorkspace, CoreWorkspaceManager, ViewMode};
 /// hundred requests on a 30 s timeout behind a server that answers them at its
 /// own pace — not about parallelism. Eight keeps the pipe busy and leaves room
 /// for a request the user makes while the warmup is still running.
+///
+/// It is also bounded from above by [`lsp::OPEN_DOCUMENT_LIMIT`], and the
+/// `const` assertion below is what enforces that rather than describing it.
 const WARMUP_IN_FLIGHT: usize = 8;
+
+/// The warmup may not outrun the set of documents clangd is holding open.
+///
+/// A call hierarchy is two round trips: the prepare opens the symbol's file
+/// and puts it at the recent end of the LRU, and the follow-up
+/// (`GetOutgoingCalls`) neither reopens it nor touches it again — so the file
+/// has to survive both legs on the position the prepare gave it. Every other
+/// request dispatched in that window can open a file of its own, and a slot
+/// freed by a reply is refilled at once, so under in-order service up to twice
+/// this concurrency of fresh documents lands on top of it: the hard floor is
+/// `2 * WARMUP_IN_FLIGHT + 1`. Replies are not in fact ordered — a slow file
+/// leaves its document sitting while the other slots cycle — and the user's
+/// own expands and find-references draw on the same budget and open files of
+/// their own, neither of which has a bound worth quoting. So the enforced
+/// margin is four times over, which is what the shipping pair already is.
+///
+/// Violating it is silent at runtime: clangd answers the follow-up with
+/// "trying to get AST for non-added document", the symbol keeps no edges, and
+/// the graph merely comes out smaller than it should. Hence a build failure.
+/// Raising the concurrency is allowed — it just has to be paid for in
+/// [`lsp::OPEN_DOCUMENT_LIMIT`], which is clangd's memory, and saying so here
+/// is the point.
+const _: () = assert!(
+    WARMUP_IN_FLIGHT * 4 <= lsp::OPEN_DOCUMENT_LIMIT,
+    "WARMUP_IN_FLIGHT must stay at or below a quarter of lsp::OPEN_DOCUMENT_LIMIT: \
+     a call hierarchy needs its document open across two round trips, and evicting \
+     it mid-flight loses the symbol's edges silently. Raise OPEN_DOCUMENT_LIMIT too."
+);
 
 /// How often the edge warmup writes its state to the log while it runs.
 ///

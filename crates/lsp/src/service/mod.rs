@@ -10,6 +10,8 @@ mod request;
 mod response;
 mod worker;
 
+pub use document::OPEN_DOCUMENT_LIMIT;
+
 /// Async LSP service that handles background requests
 pub struct LspService {
     request_tx: mpsc::Sender<LspRequest>,

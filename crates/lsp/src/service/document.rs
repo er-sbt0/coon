@@ -11,10 +11,19 @@ use std::collections::VecDeque;
 /// leaving it open runs to gigabytes on a 217-file tree like jemalloc.
 ///
 /// The floor is `core`'s warmup concurrency: evicting a document with a request
-/// still in flight would answer it against a file clangd no longer has. Anything
-/// in flight was touched within the last few requests, so it sits at the recent
-/// end of the queue, and a limit several times that concurrency is enough.
-const OPEN_DOCUMENT_LIMIT: usize = 32;
+/// still in flight would answer it against a file clangd no longer has
+/// ("trying to get AST for non-added document"). A call hierarchy is two round
+/// trips and only the first one opens anything — `GetOutgoingCalls` neither
+/// reopens the item's file nor touches it here — so a document has to outlive
+/// *both* legs, and everything dispatched while they are outstanding can open
+/// a fresh one. That puts the floor at twice the concurrency, not once, and
+/// the margin above it pays for replies arriving out of order and for the
+/// user's own requests, which draw on the same in-flight budget.
+///
+/// `lsp` cannot name `core`, so the relationship is checked from the other
+/// side: see the `const` assertion next to `WARMUP_IN_FLIGHT` in `core::app`,
+/// which is why this is public.
+pub const OPEN_DOCUMENT_LIMIT: usize = 32;
 
 /// The documents clangd currently has open, least-recently-used first.
 ///
