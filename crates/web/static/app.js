@@ -28,16 +28,6 @@ const truncate = (name) => truncateTo(name, LABEL_MAX);
 // band: the band is exactly where every edge reaching a node inside the box
 // crosses, and edges are painted over a compound parent whatever z-index it is
 // given, so a name written in there gets struck through.
-// A cluster-map edge stands for however many calls actually cross between two
-// clusters, so its width has to say "a hundred" differently from "one".
-// Log-scaled and capped, for two reasons: linear width would turn a hot
-// relation into a hundred pixels of ink, and past a few pixels a thicker line
-// stops reading as "more calls" and starts swallowing the arrowhead and the
-// nodes at either end. Six pixels against a 32px node is as far as that goes.
-const EDGE_W_MIN = 1;
-const EDGE_W_MAX = 6;
-const edgeWidth = (weight) =>
-  Math.min(EDGE_W_MAX, EDGE_W_MIN + Math.log2(Math.max(1, weight)));
 
 /// Built from the CSS custom properties, so the canvas and the chrome stay on
 /// one palette — and re-running it is all a theme switch needs.
@@ -112,7 +102,6 @@ function graphStyle() {
         'text-max-width': NODE_W - 16,
       }
     },
-    { selector: 'edge.aggregate', style: { 'width': 'data(width)' } },
   ];
 }
 
@@ -582,11 +571,11 @@ function rebuildClusterMap(map) {
 
   for (const edge of map.edges || []) {
     const id = `${edge.source}=>${edge.target}`;
-    cy.add({
-      group: 'edges',
-      data: { id, source: edge.source, target: edge.target, width: edgeWidth(edge.weight) },
-    });
-    cy.$id(id).addClass('aggregate');
+    // Drawn exactly like a call edge in the rooted view. The weight (how many
+    // calls cross between the two boxes) used to scale the line width, which
+    // made the map read as a different kind of picture from the graph it
+    // summarises; one line, one arrow, the same as everywhere else.
+    cy.add({ group: 'edges', data: { id, source: edge.source, target: edge.target } });
   }
 
   // The rung is deliberately *not* part of the key. Every box is placed where
