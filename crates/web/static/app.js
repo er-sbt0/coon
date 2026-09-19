@@ -218,7 +218,10 @@ function handleSnapshot(msg) {
     // answer — before any symbols load there is nothing to cluster.
     rebuildClusterMap(clusterMap ?? {});
   } else {
-    rebuildGraph(currentGraph, msg.layout);
+    // And the rooted layout rides along with this one, on the same terms: it
+    // is absent under the map, and an empty one is a real answer — a tab with
+    // no root yet has an empty canvas.
+    rebuildGraph(currentGraph, msg.layout ?? {});
   }
   renderSidebar(searchEl.value);
   renderBreadcrumb();
@@ -226,9 +229,8 @@ function handleSnapshot(msg) {
   const n = Object.keys(allFunctions).length;
   fnCountEl.textContent = n ? `(${n})` : '';
   statSymbolsEl.textContent = n.toLocaleString();
-  // What is actually on the canvas. The rooted layout ships on every snapshot
-  // whether or not it is the view being drawn, so counting it on the map would
-  // report a number for a graph the user cannot see.
+  // What is actually on the canvas. Only the view being drawn is laid out, so
+  // this reads the one that came with the view — the other is not there at all.
   const placed = currentView === 'ClusterMap'
     ? Object.keys(clusterMap?.nodes || {}).length
     : Object.keys(msg.layout || {}).length;

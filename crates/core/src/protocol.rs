@@ -113,7 +113,12 @@ pub enum ServerMsg<'a> {
     /// Full state: graph structure, node positions, workspaces, selection.
     Snapshot {
         graph: WireGraph<'a>,
-        layout: HashMap<SymbolId, NodePos>,
+        /// Where the rooted call tree's nodes sit, present only while the
+        /// active workspace is showing that tree. Absent on the cluster map
+        /// for the same reason `cluster_layout` is absent off it: a view that
+        /// is not on screen is not laid out.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        layout: Option<HashMap<SymbolId, NodePos>>,
         /// The cluster map, present only while the active workspace is showing
         /// one. It is a second, parallel layout rather than a replacement for
         /// `layout`: the two views draw different things out of the same graph,
@@ -199,16 +204,13 @@ pub fn snapshot_of(core: &CoreApp) -> ServerMsg<'_> {
     let ws = core.workspaces.current();
     let root = ws.and_then(|w| w.root_symbol);
     let direction = ws.map(|w| w.direction).unwrap_or(CallDirection::Outgoing);
-    // The BFS origin is the workspace root and only ever that. Expanding a node
-    // does not move it — it widens the walk at that node (see
-    // `LayoutOptions::expanded`), so the graph grows rather than changing.
-    let layout = compute_layout(&core.call_graph, root, direction, &layout_options(core));
+    let layout = layout_of(core);
 
     log::info!(
         "[protocol] snapshot: nodes={} edges={} layout_nodes={} root={:?} expanded={} direction={:?} selected={:?}",
         core.call_graph.node_count(),
         core.call_graph.edge_count(),
-        layout.len(),
+        layout.as_ref().map_or(0, |l| l.len()),
         root,
         ws.map_or(0, |w| w.expanded.len()),
         direction,
@@ -231,6 +233,37 @@ pub fn snapshot_of(core: &CoreApp) -> ServerMsg<'_> {
         active_workspace: core.workspaces.current_index,
         selected: core.selected_function,
     }
+}
+
+/// The rooted call tree's node positions for the active workspace, or `None`
+/// when it is showing the cluster map instead.
+///
+/// Computing it is not free — a BFS out of the root and then a full Sugiyama
+/// pass over what it reached — and on the map the client throws the answer
+/// away: `handleSnapshot` hands `layout` to `rebuildGraph` on the rooted
+/// branch and nowhere else. A workspace opens on the map ([`ViewMode`]'s
+/// default) and goes back to it whenever the user zooms out, so paying for
+/// both views on every snapshot was paying for the one nobody asked to see.
+///
+/// `None` rather than an empty map, exactly as [`cluster_layout_of`] answers:
+/// the two say the same thing in the same way, that this view is not the one
+/// being drawn. An empty map is a different statement — a rooted workspace
+/// with no root yet, which is a real state and still ships as `Some`.
+///
+/// The BFS origin is the workspace root and only ever that. Expanding a node
+/// does not move it — it widens the walk at that node (see
+/// `LayoutOptions::expanded`), so the graph grows rather than changing.
+fn layout_of(core: &CoreApp) -> Option<HashMap<SymbolId, NodePos>> {
+    let ws = core.workspaces.current()?;
+    if ws.view != ViewMode::Rooted {
+        return None;
+    }
+    Some(compute_layout(
+        &core.call_graph,
+        ws.root_symbol,
+        ws.direction,
+        &layout_options(core),
+    ))
 }
 
 /// The cluster map for the active workspace, or `None` when it is showing the
@@ -752,7 +785,6 @@ mod tests {
         assert_eq!(json["active_workspace"], 0);
         assert!(json["workspaces"].is_array());
         assert!(json.get("graph").is_some());
-        assert!(json.get("layout").is_some());
         let methods = json["cluster_methods"]
             .as_array()
             .expect("the picker's entries");
@@ -802,8 +834,8 @@ mod tests {
             "and the map has the communities on it"
         );
         assert!(
-            json.get("layout").is_some(),
-            "the rooted layout still ships"
+            json.get("layout").is_none(),
+            "and nothing is spent laying out the tree nobody is looking at"
         );
 
         core.workspaces
@@ -815,6 +847,64 @@ mod tests {
         assert!(
             json.get("cluster_layout").is_none(),
             "a rooted workspace must send exactly what it sent before"
+        );
+        assert!(
+            json.get("layout").is_some(),
+            "and the view it is showing is the one that gets laid out"
+        );
+    }
+
+    /// Each view pays for itself and for nothing else: the rooted layout is
+    /// computed for the workspace showing the tree, the map for the workspace
+    /// showing the map, and a workspace never ships both.
+    ///
+    /// A rooted layout is not cheap — a BFS out of the root and a Sugiyama
+    /// pass over what it reaches — and the client reads `layout` only on the
+    /// branch that draws the tree, so shipping it under the map was work done
+    /// to be thrown away.
+    #[test]
+    fn only_the_view_on_screen_is_laid_out() {
+        use crate::command::Command;
+
+        let mut core = CoreApp::new(crate::demo::create_demo_call_graph());
+        let main = core
+            .call_graph
+            .find_function_by_name("main")
+            .expect("the demo has a main")
+            .id;
+
+        // Rooting the tree is asking for it, so this is the rooted view.
+        core.dispatch(Command::SelectFunction(main));
+        let json = serde_json::to_value(snapshot_of(&core)).expect("snapshot serialises");
+        let layout = json
+            .get("layout")
+            .and_then(|l| l.as_object())
+            .expect("the rooted view ships its layout");
+        assert!(
+            !layout.is_empty(),
+            "and the tree under `main` has nodes on it"
+        );
+        assert!(
+            json.get("cluster_layout").is_none(),
+            "the map it is not showing costs nothing"
+        );
+
+        // Zooming back out to the communities keeps the root but stops drawing
+        // the tree — which is the case this is about.
+        core.dispatch(Command::SetViewMode(ViewMode::ClusterMap));
+        assert_eq!(
+            core.workspaces.current().and_then(|ws| ws.root_symbol),
+            Some(main),
+            "the workspace still has a root; it is simply not what is drawn"
+        );
+        let json = serde_json::to_value(snapshot_of(&core)).expect("snapshot serialises");
+        assert!(
+            json.get("layout").is_none(),
+            "and the tree that root would grow is not laid out for nobody"
+        );
+        assert!(
+            json.get("cluster_layout").is_some(),
+            "the view on screen is"
         );
     }
 

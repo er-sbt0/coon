@@ -17,11 +17,11 @@ use crate::events::AppEvent;
 /// It lives beside the workspace rather than beside `LayoutOrientation` in
 /// `layout` because it is not a layout parameter. Orientation says how to draw
 /// a view; the view mode says which view there is to draw at all, and the
-/// workspace is the thing that remembers it. `protocol::cluster_layout_of`
-/// reads it to pick between `compute_cluster_layout` and `compute_layout` —
-/// the way `protocol::layout_options` reads `depth` and `collapsed` — so
-/// `layout` stays two functions with no mode flag between them, and neither
-/// owns the answer.
+/// workspace is the thing that remembers it. `protocol::layout_of` and
+/// `protocol::cluster_layout_of` each read it to decide whether the view they
+/// build is the one on screen — the way `protocol::layout_options` reads
+/// `depth` and `collapsed` — so `layout` stays two functions with no mode
+/// flag between them, and neither owns the answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ViewMode {
     /// The default. A workspace has no root until the user picks one, so a tab

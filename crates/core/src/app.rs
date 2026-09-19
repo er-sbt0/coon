@@ -1679,9 +1679,17 @@ mod tests {
     }
 
     /// The laid-out nodes of the current snapshot — what the canvas would draw.
+    ///
+    /// Only the rooted view has a layout at all: on the cluster map the
+    /// snapshot ships none, so a caller that has not rooted the workspace is
+    /// asking about a canvas that is drawing something else.
     fn placed(app: &CoreApp) -> Vec<SymbolId> {
         match crate::protocol::snapshot_of(app) {
-            crate::protocol::ServerMsg::Snapshot { layout, .. } => layout.keys().copied().collect(),
+            crate::protocol::ServerMsg::Snapshot { layout, .. } => layout
+                .expect("the workspace is showing the rooted view")
+                .keys()
+                .copied()
+                .collect(),
             other => panic!("snapshot_of returned {other:?}"),
         }
     }
