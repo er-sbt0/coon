@@ -1,5 +1,5 @@
 use logic::{ClusterKey, ClusterMethod, ClusterSettings};
-use model::SymbolId;
+use model::{CallDirection, SymbolId};
 
 use crate::export::ExportFormat;
 use crate::layout::LayoutOrientation;
@@ -24,6 +24,15 @@ pub enum Command {
     Refresh,
     /// Toggle between outgoing and incoming call direction.
     ToggleCallDirection,
+    /// Read the graph in this direction — callees or callers.
+    ///
+    /// The absolute form, kept beside the toggle for the reason
+    /// [`Command::SetClusterSettings`] is kept beside `SetClusterMethod`: the
+    /// toolbar button flips what is there, and a remembered setting being
+    /// restored names what it wants. A restore cannot use the toggle, because
+    /// "the other one" is only a direction if you already know which one you
+    /// have.
+    SetCallDirection(CallDirection),
     /// Set how many levels of callees/callers the view shows.
     SetGraphDepth(usize),
     /// Collapse or re-expand one node's children. The node stays visible.

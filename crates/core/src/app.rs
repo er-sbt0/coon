@@ -412,6 +412,7 @@ impl CoreApp {
             Command::FindReferences => self.cmd_find_references(),
             Command::Refresh => self.cmd_refresh(),
             Command::ToggleCallDirection => self.cmd_toggle_call_direction(),
+            Command::SetCallDirection(direction) => self.cmd_set_call_direction(direction),
             Command::SetGraphDepth(depth) => self.cmd_set_graph_depth(depth),
             Command::ToggleCollapsed(id) => self.cmd_toggle_collapsed(id),
             Command::SetGraphOrientation(o) => self.cmd_set_graph_orientation(o),
@@ -779,6 +780,25 @@ impl CoreApp {
             log::info!("CoreApp: direction toggled to {direction:?}, expansions cleared");
         }
         vec![AppEvent::LayoutDirty]
+    }
+
+    /// Read the graph in the named direction.
+    ///
+    /// Only redraws on a real change, the way the orientation command does: a
+    /// control — or a setting being restored — may name the direction already
+    /// in force, and the answer to that is nothing, not a rebuild of the same
+    /// tree with the expansions thrown away.
+    fn cmd_set_call_direction(&mut self, direction: CallDirection) -> Vec<AppEvent> {
+        let changed = self
+            .workspaces
+            .current_mut()
+            .is_some_and(|ws| ws.set_direction(direction));
+        if changed {
+            log::info!("CoreApp: direction set to {direction:?}, expansions cleared");
+            vec![AppEvent::LayoutDirty]
+        } else {
+            vec![]
+        }
     }
 
     fn cmd_set_graph_orientation(&mut self, orientation: LayoutOrientation) -> Vec<AppEvent> {

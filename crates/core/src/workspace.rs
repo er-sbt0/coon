@@ -271,13 +271,31 @@ impl CoreWorkspace {
     /// rather than in the command handler that used to do both halves inline,
     /// so that there is no way to flip one without the other.
     pub fn toggle_direction(&mut self) -> CallDirection {
-        self.direction = match self.direction {
+        let flipped = match self.direction {
             CallDirection::Outgoing => CallDirection::Incoming,
             CallDirection::Incoming => CallDirection::Outgoing,
         };
+        self.set_direction(flipped);
+        self.direction
+    }
+
+    /// Read the graph in this direction. Returns true when that is news.
+    ///
+    /// The absolute form of [`Self::toggle_direction`], and where the rule
+    /// about `expanded` now lives — the toggle is this with the other one
+    /// worked out first. It exists because something has to be able to *name*
+    /// a direction: a remembered setting restored onto a fresh workspace knows
+    /// which way it wants to read, not that it wants the other way from
+    /// whatever it finds, and "the other one" against a value nobody has
+    /// checked is how a restore lands on the opposite of what was saved.
+    pub fn set_direction(&mut self, direction: CallDirection) -> bool {
+        if direction == self.direction {
+            return false;
+        }
+        self.direction = direction;
         self.expanded.clear();
         self.touch();
-        self.direction
+        true
     }
 
     // ---- Readers ----
@@ -589,6 +607,33 @@ mod tests {
         );
 
         assert_eq!(ws.toggle_direction(), CallDirection::Outgoing);
+    }
+
+    #[test]
+    fn direction_is_also_set_absolutely_and_reports_real_changes() {
+        // What a restored setting needs: name a direction, and be told whether
+        // that was news. Naming the one already in force must not count as a
+        // change, or a restore would throw away the expansions of a tree it
+        // did not move.
+        let mut ws = CoreWorkspace::new(1, "w".to_string());
+        let sym = SymbolId::from_content("a", "a.c", 1);
+        ws.expand(sym);
+
+        assert!(
+            !ws.set_direction(CallDirection::Outgoing),
+            "the direction it already reads is not a change"
+        );
+        assert!(
+            ws.expanded.contains(&sym),
+            "and so the tree it is already showing is left alone"
+        );
+
+        assert!(ws.set_direction(CallDirection::Incoming));
+        assert_eq!(ws.direction(), CallDirection::Incoming);
+        assert!(
+            ws.expanded.is_empty(),
+            "a real change is the same different tree the toggle produces"
+        );
     }
 
     #[test]

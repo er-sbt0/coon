@@ -788,6 +788,9 @@ mod tests {
             "\"PreviousWorkspace\"".to_string(),
             "\"ToggleCallDirection\"".to_string(),
             "\"Refresh\"".to_string(),
+            // The absolute direction, which is what a restored setting sends.
+            "{\"SetCallDirection\":\"Incoming\"}".to_string(),
+            "{\"SetCallDirection\":\"Outgoing\"}".to_string(),
             "{\"SetGraphDepth\":4}".to_string(),
             format!("{{\"ToggleCollapsed\":{id}}}"),
             "{\"SetGraphOrientation\":\"TopDown\"}".to_string(),

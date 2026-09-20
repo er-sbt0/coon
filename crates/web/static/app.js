@@ -2,10 +2,37 @@
 // Styles read from the CSS custom properties in theme.css so the graph and the
 // chrome stay on one palette, and a theme switch moves both together.
 
+// ── Remembered settings ──────────────────────────────────────────────────────
+// Everything this client remembers between runs is one `localStorage` object.
+// The backend persists nothing — not the depth, not the direction, not which
+// algorithm built the map — so a setting that has to survive a restart
+// survives it here, and is handed to each workspace the first time this client
+// sees one. That makes one mechanism do two jobs: the restore after a restart,
+// and the default a new tab opens with.
+//
+// One object rather than a key per setting, because they are read together —
+// every one of them on every snapshot — and because a store you can print is a
+// store you can reason about when a setting comes back wrong.
+
+const PREFS_KEY = 'coon.prefs';
+
+function prefs() {
+  try {
+    return JSON.parse(localStorage.getItem(PREFS_KEY) || '{}') || {};
+  } catch { return {}; /* private mode, or something else wrote here */ }
+}
+
+function savePrefs(patch) {
+  try {
+    localStorage.setItem(PREFS_KEY, JSON.stringify({ ...prefs(), ...patch }));
+  } catch { /* storage blocked: this run simply does not remember */ }
+}
+
 // Restore a pinned theme before anything reads the palette. Without a pin we
-// leave the attribute off entirely so the OS preference wins.
+// leave the attribute off entirely so the OS preference wins. `coon.theme` is
+// the key this moved out of, read once so nobody loses a pinned theme.
 try {
-  const saved = localStorage.getItem('coon.theme');
+  const saved = prefs().theme || localStorage.getItem('coon.theme');
   if (saved) document.documentElement.dataset.theme = saved;
 } catch { /* private mode / blocked storage: fall back to the OS preference */ }
 
@@ -213,7 +240,7 @@ function handleSnapshot(msg) {
   renderClusterPanel();
   // Last, because it answers with commands: whatever this workspace is missing
   // of the remembered settings arrives on the next snapshot, not this one.
-  restorePreference(active);
+  restoreWorkspace(active);
   if (active?.direction) {
     currentDirection = active.direction;
     updateDirToggle();
@@ -654,8 +681,9 @@ function clusterDrill(node) {
 // the panel does not say which is which. What it does instead is wait: a
 // slider sends nothing until it is let go, so a drag across a range is one
 // coarsening run and not thirty.
-
-const CLUSTER_STORE = 'coon.cluster';
+//
+// Everything here is remembered, with the rest of the view settings, in the
+// one store at the top of this file.
 
 const clusterMenuEl   = $('cluster-menu');
 const clusterToggleEl = $('cluster-control');
@@ -665,7 +693,10 @@ const clusterPanelEl  = $('cluster-panel');
 ///
 /// First sight only, and never again. A preference that kept re-asserting
 /// itself would undo every change the user made after it, which is the one way
-/// a remembered setting is worse than no memory at all.
+/// a remembered setting is worse than no memory at all. The rung is tracked
+/// separately because it cannot be restored at the same moment: it needs a
+/// ladder to land on, and the settings that build that ladder have only just
+/// been sent.
 const settingsRestored = new Set();
 const levelRestored    = new Set();
 
@@ -679,37 +710,36 @@ function sameSettings(a, b) {
     && a.target_top === b.target_top;
 }
 
-function loadPreference() {
-  try {
-    const raw = localStorage.getItem(CLUSTER_STORE);
-    return raw ? JSON.parse(raw) : null;
-  } catch { return null; /* storage blocked, or something else wrote here */ }
-}
-
-function storePreference(patch) {
-  try {
-    localStorage.setItem(CLUSTER_STORE, JSON.stringify({ ...(loadPreference() || {}), ...patch }));
-  } catch { /* storage blocked */ }
-}
-
-/// Hand the remembered settings to a workspace the first time it is seen.
+/// Hand every remembered view setting to a workspace the first time it is
+/// seen: how deep the tree goes, which way it is read, which way it flows, and
+/// what builds the map.
 ///
-/// The backend remembers nothing across a restart — nothing in this app does
-/// but the theme — so the preference lives here and is applied per workspace,
-/// which also makes it the default a new tab opens with.
+/// Absolute commands throughout, including for the direction — which is why
+/// `SetCallDirection` exists beside the toggle. A restore knows which way it
+/// wants to read; "the other one from whatever is there" is a coin flip
+/// dressed up as a setting.
 ///
-/// What is stored for the grain is the *box count*, not the rung number, for
-/// the same reason every control reads that out: a ladder built to different
-/// settings is a different height, so rung 3 of one is not rung 3 of the next,
-/// where "about twenty boxes" means the same thing on both.
-function restorePreference(ws) {
-  const saved = loadPreference();
-  if (!saved || !ws) return;
+/// The map's rung is stored as a *box count*, not a rung number, for the same
+/// reason every control reads that out: a ladder built to other settings is a
+/// different height, so rung 3 of one is not rung 3 of the next, where "about
+/// twenty boxes" means the same on both.
+function restoreWorkspace(ws) {
+  if (!ws) return;
+  const saved = prefs();
 
-  if (saved.settings && !settingsRestored.has(ws.id)) {
+  if (!settingsRestored.has(ws.id)) {
     settingsRestored.add(ws.id);
-    if (!sameSettings(saved.settings, ws.cluster)) {
-      sendCommand({ SetClusterSettings: saved.settings });
+    if (typeof saved.depth === 'number' && saved.depth !== ws.depth) {
+      sendCommand({ SetGraphDepth: saved.depth });
+    }
+    if (saved.direction && saved.direction !== ws.direction) {
+      sendCommand({ SetCallDirection: saved.direction });
+    }
+    if (saved.orientation && saved.orientation !== ws.orientation) {
+      sendCommand({ SetGraphOrientation: saved.orientation });
+    }
+    if (saved.cluster && !sameSettings(saved.cluster, ws.cluster)) {
+      sendCommand({ SetClusterSettings: saved.cluster });
       // The rung waits for the ladder these settings build. Landing one from
       // the old ladder on the new one is how a restore puts a user somewhere
       // neither of them asked for.
@@ -719,7 +749,7 @@ function restorePreference(ws) {
 
   const sizes = ws.map_level_sizes || [];
   if (levelRestored.has(ws.id) || !saved.clusters || sizes.length === 0) return;
-  if (saved.settings && !sameSettings(saved.settings, ws.cluster)) return;
+  if (saved.cluster && !sameSettings(saved.cluster, ws.cluster)) return;
   levelRestored.add(ws.id);
   const want = nearestRung(sizes, saved.clusters);
   if (want !== ws.map_level) sendCommand({ SetMapLevel: want });
@@ -957,7 +987,7 @@ function renderRungs() {
 /// the defaults, which would overwrite the preference with them.
 function sendClusterSettings(next) {
   if (!clusterSettings || sameSettings(next, clusterSettings)) return;
-  storePreference({ settings: next });
+  savePrefs({ cluster: next });
   sendCommand({ SetClusterSettings: next });
 }
 
@@ -977,7 +1007,7 @@ function resetClusterSettings() {
   }
   // And forget the remembered grain with them, so the map goes back to opening
   // where the method says rather than where this user last dragged it.
-  storePreference({ clusters: null });
+  savePrefs({ clusters: null });
   sendClusterSettings({ ...clusterSettings, ...defaults });
   renderClusterPanel();
 }
@@ -991,7 +1021,7 @@ function setMapLevel(next) {
   if (currentView !== 'ClusterMap' || mapLevels === 0) return;
   const clamped = Math.min(Math.max(next, 0), mapLevels - 1);
   if (clamped === mapLevel) return;
-  storePreference({ clusters: mapLevelSizes[clamped] ?? mapClusters });
+  savePrefs({ clusters: mapLevelSizes[clamped] ?? mapClusters });
   sendCommand({ SetMapLevel: clamped });
 }
 
@@ -1141,6 +1171,7 @@ function setDepth(next) {
   // Reflect it immediately; the snapshot that follows confirms it.
   graphDepth = clamped;
   updateDepthControl();
+  savePrefs({ depth: clamped });
   sendCommand({ SetGraphDepth: clamped });
 }
 
@@ -1635,10 +1666,27 @@ function setOrientation(next) {
   // Reflect it immediately; the snapshot that follows confirms it.
   currentOrientation = next;
   updateOrientToggle();
+  savePrefs({ orientation: next });
   sendCommand({ SetGraphOrientation: next });
 }
 
-dirToggleEl.addEventListener('click', () => sendCommand('ToggleCallDirection'));
+/// Read the graph as callees or as callers.
+///
+/// The one funnel — button, palette and Ctrl+D all come through here — and it
+/// names the direction rather than asking for the other one, so what is
+/// remembered is a direction and not a number of flips. The button on the
+/// toolbar is still a flip; it works out which way that lands and says so.
+function setDirection(next) {
+  if (next === currentDirection) return;
+  savePrefs({ direction: next });
+  sendCommand({ SetCallDirection: next });
+}
+
+function flipDirection() {
+  setDirection(currentDirection === 'Outgoing' ? 'Incoming' : 'Outgoing');
+}
+
+dirToggleEl.addEventListener('click', flipDirection);
 orientLrEl.addEventListener('click', () => setOrientation('LeftRight'));
 orientTdEl.addEventListener('click', () => setOrientation('TopDown'));
 $('refresh-btn').addEventListener('click', () => sendCommand('Refresh'));
@@ -1649,9 +1697,20 @@ const sidebarEl = $('sidebar');
 
 $('sidebar-toggle').addEventListener('click', toggleSidebar);
 function toggleSidebar() {
-  document.body.classList.toggle('sidebar-collapsed');
+  const collapsed = document.body.classList.toggle('sidebar-collapsed');
+  savePrefs({ sidebar: { ...(prefs().sidebar || {}), collapsed } });
   requestAnimationFrame(() => cy.resize());
 }
+
+// The dock is chrome rather than a view setting, so it is restored here and
+// now rather than handed to a workspace: there is no workspace in it, and
+// waiting for a snapshot to size the sidebar would show it at one width and
+// then another.
+(function restoreDock() {
+  const saved = prefs().sidebar || {};
+  if (saved.collapsed) document.body.classList.add('sidebar-collapsed');
+  if (typeof saved.width === 'number') sidebarEl.style.width = `${saved.width}px`;
+})();
 
 const dockHandle = $('dock-handle');
 dockHandle.addEventListener('mousedown', (e) => {
@@ -1668,6 +1727,10 @@ dockHandle.addEventListener('mousedown', (e) => {
     document.body.classList.remove('resizing');
     document.removeEventListener('mousemove', onMove);
     document.removeEventListener('mouseup', onUp);
+    // On release, not on every pixel of the drag: this is a write to disk in
+    // the desktop app, and the width the user let go of is the only one they
+    // asked for.
+    savePrefs({ sidebar: { ...(prefs().sidebar || {}), width: sidebarEl.getBoundingClientRect().width } });
     cy.resize();
   };
   document.addEventListener('mousemove', onMove);
@@ -1691,7 +1754,7 @@ function currentTheme() {
 function toggleTheme() {
   const next = currentTheme() === 'dark' ? 'light' : 'dark';
   document.documentElement.dataset.theme = next;
-  try { localStorage.setItem('coon.theme', next); } catch { /* storage blocked */ }
+  savePrefs({ theme: next });
   // The graph reads its colours from the same tokens, so re-apply them.
   cy.style(graphStyle());
 }
@@ -1778,7 +1841,7 @@ function buildCommands() {
     },
 
     { id: 'view.sidebar', label: 'View: Toggle Sidebar', hint: 'Ctrl+B', run: toggleSidebar },
-    { id: 'view.direction', label: 'View: Toggle Call Direction', hint: 'Ctrl+D', run: () => sendCommand('ToggleCallDirection') },
+    { id: 'view.direction', label: 'View: Toggle Call Direction', hint: 'Ctrl+D', run: flipDirection },
     { id: 'view.orientation', label: 'View: Toggle Graph Orientation', hint: 'Ctrl+Shift+D', run: () => setOrientation(currentOrientation === 'LeftRight' ? 'TopDown' : 'LeftRight') },
     { id: 'view.fit', label: 'View: Fit Graph to Screen', disabled: cy.nodes().length === 0, run: fitGraph },
     { id: 'view.deeper', label: 'View: Show More Levels', hint: 'Ctrl+]', disabled: onMap || graphDepth >= DEPTH_MAX, run: () => setDepth(graphDepth + 1) },
@@ -1903,7 +1966,7 @@ document.addEventListener('keydown', (e) => {
   else if (key === 'm' && e.shiftKey) { e.preventDefault(); clusterThisFunction(); }
   else if (key === 'm') { e.preventDefault(); toggleView(); }
   else if (key === 'd' && e.shiftKey) { e.preventDefault(); setOrientation(currentOrientation === 'LeftRight' ? 'TopDown' : 'LeftRight'); }
-  else if (key === 'd') { e.preventDefault(); sendCommand('ToggleCallDirection'); }
+  else if (key === 'd') { e.preventDefault(); flipDirection(); }
   // One pair of keys, one meaning — more or less detail — pointed at whichever
   // view is showing: the tree's depth limit, or the map's grouping.
   else if (key === ']') {
