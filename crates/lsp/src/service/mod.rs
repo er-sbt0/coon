@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 mod document;
+mod project;
 mod request;
 mod response;
 mod worker;
@@ -63,8 +64,10 @@ pub enum LspRequest {
     /// Fire-and-forget: `didClose` is a notification, and this travels the same
     /// channel as everything queued after it, so a reopen cannot overtake it.
     CloseDocuments,
-    SetProjectFiles {
-        project_files: Vec<String>,
+    /// Where the project is on disk: every symbol and every call-hierarchy
+    /// item naming a file outside it is dropped. See [`project::ProjectScope`].
+    SetProjectRoot {
+        root: std::path::PathBuf,
     },
     Shutdown,
 }
@@ -76,8 +79,8 @@ impl LspRequest {
     /// Exists for the failure path in `loader::run_tui_lsp_bridge`, which has
     /// to tell whoever is waiting that their request never went out — and by
     /// then the request itself has been moved into [`LspService::send`]. The
-    /// id-less three are the ones nobody is waiting on: a close, a
-    /// project-file list and the shutdown.
+    /// id-less three are the ones nobody is waiting on: a close, the project
+    /// root and the shutdown.
     pub fn request_id(&self) -> Option<&str> {
         match self {
             Self::PrepareCallHierarchy { request_id, .. }
@@ -88,7 +91,7 @@ impl LspRequest {
             | Self::GetDocumentSymbols { request_id, .. }
             | Self::GetWorkspaceSymbols { request_id, .. }
             | Self::PreloadDocuments { request_id, .. } => Some(request_id),
-            Self::CloseDocuments | Self::SetProjectFiles { .. } | Self::Shutdown => None,
+            Self::CloseDocuments | Self::SetProjectRoot { .. } | Self::Shutdown => None,
         }
     }
 }

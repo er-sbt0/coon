@@ -132,15 +132,11 @@ pub(super) async fn handle_workspace_symbols_response(
                         | lsp_types::SymbolKind::METHOD
                         | lsp_types::SymbolKind::CONSTRUCTOR
                 );
-                let is_project_file = if state.project_files.is_empty() {
-                    true
-                } else {
-                    state.project_files.iter().any(|project_file| {
-                        sym.location.file_path.contains(project_file)
-                            || project_file.contains(&sym.location.file_path)
-                    })
-                };
-                is_function && is_project_file
+                // Under the project root, not in the compilation database:
+                // a C project's headers are in no database entry, and
+                // jemalloc defines ~736 functions in them. See
+                // `service::project`.
+                is_function && state.project_scope.contains_path(&sym.location.file_path)
             })
             .map(|sym| model::FunctionNode::new(sym.name, sym.qualified_name, sym.location))
             .collect();

@@ -292,19 +292,16 @@ pub async fn lsp_loader_task(
 
     let mut lsp_service = LspService::new(lsp_client, rx_for_init).await?;
 
-    let project_file_paths: Vec<String> = source_files
-        .iter()
-        .map(|path| path.to_string_lossy().to_string())
-        .collect();
+    // The root, not the list of files just discovered: a compilation database
+    // holds translation units, and the functions a C project defines in its
+    // headers belong to it just as much — jemalloc has ~736 of them. What the
+    // filter is for is the other direction, libc and the system headers, and
+    // those are under nobody's root. See `service::project`.
     lsp_service
-        .send(LspRequest::SetProjectFiles {
-            project_files: project_file_paths.clone(),
+        .send(LspRequest::SetProjectRoot {
+            root: root_path.clone(),
         })
         .await?;
-    info!(
-        "Set {} project files for symbol filtering",
-        project_file_paths.len()
-    );
 
     // Exactly one document is opened, and it is the same one every run.
     //

@@ -1,4 +1,5 @@
 use super::document::OpenDocuments;
+use super::project::ProjectScope;
 use super::{LspRequest, LspResponse};
 use crate::LspClient;
 use lsp_types::Url;
@@ -55,7 +56,9 @@ pub(super) struct LspWorkerState {
     /// answers them from its index and never touches the document.
     pub(super) request_documents: HashMap<i64, Url>,
     pub(super) opened_documents: OpenDocuments,
-    pub(super) project_files: HashSet<String>,
+    /// Where the project is, and so which of the files clangd names are part
+    /// of it. See [`super::project::ProjectScope`].
+    pub(super) project_scope: ProjectScope,
     pub(super) pending_enhanced_requests: HashMap<String, EnhancedRequestInfo>,
     pub(super) enhanced_lsp_requests: HashSet<i64>,
 }
@@ -167,8 +170,8 @@ fn describe_request(request: &LspRequest) -> String {
             request_id
         ),
         LspRequest::CloseDocuments => "CloseDocuments".to_string(),
-        LspRequest::SetProjectFiles { project_files } => {
-            format!("SetProjectFiles {} file(s)", project_files.len())
+        LspRequest::SetProjectRoot { root } => {
+            format!("SetProjectRoot {}", root.display())
         }
         LspRequest::Shutdown => "Shutdown".to_string(),
     }
@@ -192,7 +195,7 @@ pub(super) async fn run_loop(
         request_sent_at: HashMap::new(),
         request_documents: HashMap::new(),
         opened_documents: OpenDocuments::default(),
-        project_files: HashSet::new(),
+        project_scope: ProjectScope::default(),
         pending_enhanced_requests: HashMap::new(),
         enhanced_lsp_requests: HashSet::new(),
     };
@@ -240,9 +243,9 @@ pub(super) async fn run_loop(
                     LspRequest::CloseDocuments => {
                         super::document::close_all_documents(&mut state).await;
                     }
-                    LspRequest::SetProjectFiles { project_files } => {
-                        state.project_files = project_files.into_iter().collect();
-                        log::info!("Updated project files: {} files", state.project_files.len());
+                    LspRequest::SetProjectRoot { root } => {
+                        log::info!("Project root for symbol filtering: {}", root.display());
+                        state.project_scope = ProjectScope::new(root);
                     }
                     LspRequest::Shutdown => {
                         log::info!("LSP worker: shutdown requested, stopping");
