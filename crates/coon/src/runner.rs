@@ -36,8 +36,13 @@ pub async fn run_with_lsp(
 
     let project_path_string = project_path.to_string();
     let loader_handle = tokio::spawn(async move {
-        if let Err(e) =
-            lsp::loader::lsp_loader_task(&project_path_string, ui_msg_tx, lsp_channels_tx).await
+        if let Err(e) = lsp::loader::lsp_loader_task(
+            &project_path_string,
+            lsp::LoaderOptions::default(),
+            ui_msg_tx,
+            lsp_channels_tx,
+        )
+        .await
         {
             error!("LSP loader task failed: {}", e);
         }
@@ -94,7 +99,9 @@ pub async fn run_web_with_lsp(
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting LSP loader for web server on {}...", project_path);
-    let lsp = spawn_lsp_bridge(project_path);
+    // The deprecated frontends take the default: every build in the database,
+    // which is what they always did. `--flavour` is the desktop app's.
+    let lsp = spawn_lsp_bridge(project_path, ::core::LoaderOptions::default());
     serve_web(CoreApp::new_with_lsp(CallGraph::new(), lsp), port).await
 }
 

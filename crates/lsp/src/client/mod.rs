@@ -141,8 +141,29 @@ impl LspClient {
     /// otherwise; a `COON_CLANGD` pointing at nothing runnable is an error
     /// rather than a fallback.
     pub async fn new(tx: mpsc::Sender<Value>) -> Result<Self> {
+        Self::new_with_args(tx, &[]).await
+    }
+
+    /// The same, plus arguments this particular run needs.
+    ///
+    /// [`CLANGD_ARGS`] is what every clangd gets; `extra_args` is what one load
+    /// asks for on top — today, the `--compile-commands-dir` naming the build
+    /// flavour the user chose. A per-run argument cannot join the `const`,
+    /// because it is not a property of this crate but of this launch.
+    pub async fn new_with_args(tx: mpsc::Sender<Value>, extra_args: &[String]) -> Result<Self> {
         let clangd_path = resolve_clangd_path()?;
-        Self::with_path(tx, &clangd_path).await
+        if !extra_args.is_empty() {
+            log::info!("passing clangd {}", extra_args.join(" "));
+        }
+        let process = Command::new(&clangd_path)
+            .args(CLANGD_ARGS)
+            .args(extra_args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        Self::from_process(tx, process).await
     }
 
     async fn from_process(tx: mpsc::Sender<Value>, mut process: Child) -> Result<Self> {

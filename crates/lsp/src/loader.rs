@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::compile_commands;
 use crate::{IndexProgress, LspClient, LspRequest, LspResponse, LspService};
 use model::lsp_status::{LspLoadPhase, LspUiMessage};
+use std::path::{Path, PathBuf};
 
 /// How long clangd has to answer `initialize`.
 ///
@@ -68,10 +69,115 @@ const INDEX_WAIT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_se
 /// wait is bounded like every other one here.
 const PRELOAD_SYNC_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 
+/// What a frontend gets to choose about a load.
+///
+/// One value rather than a parameter per setting, because a frontend that
+/// grows a second launch flag should not make every caller of
+/// [`lsp_loader_task`] — including the two deprecated ones — change shape
+/// again.
+#[derive(Debug, Clone, Default)]
+pub struct LoaderOptions {
+    /// A source file naming the build to analyse: the project becomes every
+    /// entry of the compilation database compiled with the same defines.
+    ///
+    /// `None` hands clangd the database as it stands, which is every build at
+    /// once. See [`compile_commands::Flavour`] for why that is a choice and
+    /// not a default.
+    pub flavour: Option<PathBuf>,
+}
+
+/// What [`choose_build`] settled on: the project's files, and what clangd has
+/// to be told to see the same project.
+struct Build {
+    source_files: Vec<PathBuf>,
+    clangd_args: Vec<String>,
+}
+
+/// Decide which build of the project this load is of.
+///
+/// A call graph is of one build. The same header compiled under two define
+/// sets declares different functions — jemalloc's tests see `jet_*` where its
+/// library sees `je_*` — and clangd answers `outgoingCalls` out of whichever
+/// view of a header was published last, so with every build in one database a
+/// call into the library appears or vanishes depending on which translation
+/// unit happened to be opened most recently. Handing clangd one flavour's
+/// database leaves exactly one view per header, and the answers stop moving.
+///
+/// Without a flavour nothing changes from what this always did — the whole
+/// database, whatever is in it — but the choices are logged, because the flag
+/// is useless to a user who cannot see what there is to pass it. Nothing is
+/// guessed: on jemalloc the tests outnumber the library two to one, so
+/// "the biggest" would pick the build almost nobody means.
+async fn choose_build(root_path: &Path, options: &LoaderOptions) -> Result<Build, String> {
+    let entries = compile_commands::read_entries(root_path)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let Some(entries) = entries else {
+        if let Some(wanted) = &options.flavour {
+            return Err(format!(
+                "--flavour {} was given, but {} has no compile_commands.json, \
+                 so there are no builds to choose between",
+                wanted.display(),
+                root_path.display()
+            ));
+        }
+        let mut source_files = compile_commands::parse_compile_commands(root_path)
+            .await
+            .map_err(|e| e.to_string())?;
+        source_files.sort();
+        return Ok(Build {
+            source_files,
+            clangd_args: Vec::new(),
+        });
+    };
+
+    let total = entries.len();
+    let flavours = compile_commands::group_by_flavour(entries);
+
+    let Some(wanted) = &options.flavour else {
+        if flavours.len() > 1 {
+            info!(
+                "This project is {} builds in one compilation database; analysing all of them. \
+                 Pass --flavour <file> to analyse one:\n  {}",
+                flavours.len(),
+                compile_commands::describe_flavours(&flavours, root_path).join("\n  ")
+            );
+        }
+        let entries: Vec<compile_commands::CompileCommand> =
+            flavours.into_iter().flat_map(|f| f.entries).collect();
+        return Ok(Build {
+            source_files: compile_commands::canonical_files(&entries).await,
+            clangd_args: Vec::new(),
+        });
+    };
+
+    let flavour = compile_commands::select_flavour(&flavours, root_path, wanted).await?;
+    // The database this flavour gets is written inside the project, so clangd
+    // keeps a set of index shards per flavour and finds them again next time.
+    // The first run of a flavour therefore indexes from cold, which is what
+    // `INDEX_WAIT_TIMEOUT` and the re-query on a later `end` are there for.
+    let dir = compile_commands::write_flavour_database(root_path, flavour)
+        .await
+        .map_err(|e| format!("could not write this flavour's compilation database: {e}"))?;
+    info!(
+        "Analysing the build of {}: {} of the database's {total} entries, defined by {}",
+        wanted.display(),
+        flavour.entries.len(),
+        flavour.key.defines().join(" ")
+    );
+
+    Ok(Build {
+        source_files: compile_commands::canonical_files(&flavour.entries).await,
+        clangd_args: vec![format!("--compile-commands-dir={}", dir.display())],
+    })
+}
+
 /// Runs the full LSP initialization sequence in the background:
 ///
 /// 1. Spawns and initializes clangd
-/// 2. Discovers source files via compile_commands.json
+/// 2. Picks the build to analyse and discovers its files via
+///    compile_commands.json
 /// 3. Opens exactly one of them, which is what makes clangd read the
 ///    compilation database and start indexing
 /// 4. Fetches initial workspace symbols
@@ -82,6 +188,7 @@ const PRELOAD_SYNC_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_
 /// `lsp_channels_tx`.
 pub async fn lsp_loader_task(
     project_path: &str,
+    options: LoaderOptions,
     ui_tx: mpsc::UnboundedSender<LspUiMessage>,
     lsp_channels_tx: oneshot::Sender<(
         mpsc::UnboundedReceiver<LspResponse>,
@@ -89,16 +196,33 @@ pub async fn lsp_loader_task(
     )>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("LSP loader: starting background initialization");
-    ui_tx.send(LspUiMessage::Progress(LspLoadPhase::SpawningServer))?;
-
-    let (tx, rx) = mpsc::channel::<Value>(100);
-    let mut lsp_client = LspClient::new(tx).await?;
-
-    ui_tx.send(LspUiMessage::Progress(LspLoadPhase::Initializing))?;
 
     let root_path = std::path::Path::new(project_path).canonicalize()?;
     let root_uri = lsp_types::Url::from_file_path(&root_path)
         .map_err(|_| "Failed to create URI from project path")?;
+
+    // Before the server, not after it: which build this is decides what clangd
+    // is spawned with, and a `--compile-commands-dir` cannot be handed to a
+    // process that is already running.
+    ui_tx.send(LspUiMessage::Progress(LspLoadPhase::DiscoveringFiles))?;
+    let Build {
+        source_files,
+        clangd_args,
+    } = match choose_build(&root_path, &options).await {
+        Ok(build) => build,
+        Err(msg) => {
+            ui_tx.send(LspUiMessage::Progress(LspLoadPhase::Failed(msg.clone())))?;
+            return Err(msg.into());
+        }
+    };
+    info!("Found {} source files", source_files.len());
+
+    ui_tx.send(LspUiMessage::Progress(LspLoadPhase::SpawningServer))?;
+
+    let (tx, rx) = mpsc::channel::<Value>(100);
+    let mut lsp_client = LspClient::new_with_args(tx, &clangd_args).await?;
+
+    ui_tx.send(LspUiMessage::Progress(LspLoadPhase::Initializing))?;
 
     let init_id = lsp_client.initialize(root_uri.clone()).await?;
 
@@ -165,13 +289,6 @@ pub async fn lsp_loader_task(
     // the file's real ones. This pause is only about that ordering — what the
     // *symbol query* waits for is the index, below.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    ui_tx.send(LspUiMessage::Progress(LspLoadPhase::DiscoveringFiles))?;
-    let mut source_files = compile_commands::parse_compile_commands(&root_path).await?;
-    // Sorted so that the one file opened below is the same one on every run,
-    // whatever order the compilation database happens to list its entries in.
-    source_files.sort();
-    info!("Found {} source files", source_files.len());
 
     let mut lsp_service = LspService::new(lsp_client, rx_for_init).await?;
 

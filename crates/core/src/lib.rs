@@ -12,12 +12,13 @@ mod warmup;
 pub mod workspace;
 
 pub use app::CoreApp;
-pub use boot::spawn_lsp_bridge;
+pub use boot::{check_flavour, spawn_lsp_bridge};
 pub use command::Command;
 pub use demo::create_demo_call_graph;
 pub use events::AppEvent;
 pub use export::{Export, ExportFormat};
 pub use layout::{compute_layout, NodePos};
+pub use lsp::LoaderOptions;
 pub use lsp_bridge::{LoadingState, LspBridge, PendingRequest, RequestOrigin, SendOutcome};
 pub use protocol::{snapshot_of, ClientMsg, EventRouter, Routed, ServerMsg, WorkspaceInfo};
 pub use workspace::{CoreWorkspace, CoreWorkspaceManager, ViewMode};

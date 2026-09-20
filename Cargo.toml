@@ -44,6 +44,8 @@ ratatui = "0.29"
 crossterm = "0.28"
 pretty_env_logger = "0.5"
 tempfile = "3.0"
+# Splitting a `command` line out of compile_commands.json the way a shell would.
+shlex = "1"
 
 # Internal crates
 model = { path = "crates/model" }

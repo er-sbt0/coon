@@ -16,3 +16,8 @@ serde_json.workspace = true
 grid.workspace = true
 fern.workspace = true
 chrono.workspace = true
+
+[dev-dependencies]
+# The `load` example drives the loader, so it needs a runtime to drive it with;
+# the library itself only ever borrows the caller's.
+tokio = { workspace = true }

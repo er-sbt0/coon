@@ -6,12 +6,16 @@
 
 use tokio::sync::{mpsc, oneshot};
 
-use lsp::{LspRequest, LspResponse};
+use lsp::{LoaderOptions, LspRequest, LspResponse};
 use model::lsp_status::LspUiMessage;
 
 use crate::lsp_bridge::LspBridge;
 
 /// Spawn the clangd loader for `project_path` and return a bridge wired to it.
+///
+/// `options` is what the frontend's launch flags decided — today, which build
+/// of the project to analyse. It travels as one value so that a flag added to
+/// one frontend costs the others nothing but a `Default`.
 ///
 /// The loader runs detached; the returned `LspBridge` starts out with no
 /// channels and picks them up via its one-shot receiver once clangd is ready,
@@ -24,7 +28,7 @@ use crate::lsp_bridge::LspBridge;
 /// relay is here rather than in `lsp` because the signal is the bridge's,
 /// and `lsp` does not know a bridge exists; it costs one extra channel hop
 /// per reply, which is nothing against the poll interval it saves.
-pub fn spawn_lsp_bridge(project_path: &str) -> LspBridge {
+pub fn spawn_lsp_bridge(project_path: &str, options: LoaderOptions) -> LspBridge {
     let (ui_msg_tx, ui_msg_rx) = mpsc::unbounded_channel::<LspUiMessage>();
     let (lsp_channels_tx, lsp_channels_rx) = oneshot::channel::<(
         mpsc::UnboundedReceiver<LspResponse>,
@@ -35,7 +39,7 @@ pub fn spawn_lsp_bridge(project_path: &str) -> LspBridge {
     let project_path = project_path.to_string();
     tokio::spawn(async move {
         if let Err(e) =
-            lsp::loader::lsp_loader_task(&project_path, ui_msg_tx, lsp_channels_tx).await
+            lsp::loader::lsp_loader_task(&project_path, options, ui_msg_tx, lsp_channels_tx).await
         {
             log::error!("LSP loader task failed: {}", e);
         }
@@ -62,4 +66,18 @@ pub fn spawn_lsp_bridge(project_path: &str) -> LspBridge {
     });
 
     bridge
+}
+
+/// Check a `--flavour` before anything is spawned, so a frontend can refuse to
+/// start rather than open onto a load that is going to fail.
+///
+/// Here beside the bootstrap for the same reason the bootstrap is here: a
+/// frontend talks to `core`, and which builds a project holds is a question
+/// about a load, not about clangd. The error is a finished message, listing the
+/// files the user could have named instead.
+pub async fn check_flavour(
+    project_path: &std::path::Path,
+    flavour: &std::path::Path,
+) -> Result<(), String> {
+    lsp::compile_commands::check_flavour(project_path, flavour).await
 }

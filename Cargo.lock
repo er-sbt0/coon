@@ -2363,6 +2363,7 @@ dependencies = [
  "pretty_env_logger",
  "serde",
  "serde_json",
+ "shlex",
  "tempfile",
  "tokio",
  "uuid",

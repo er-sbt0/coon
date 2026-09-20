@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 
 use coon_core::{
     create_demo_call_graph, snapshot_of, spawn_lsp_bridge, AppEvent, Command, CoreApp, EventRouter,
-    ServerMsg,
+    LoaderOptions, ServerMsg,
 };
 use model::CallGraph;
 
@@ -44,6 +44,19 @@ const TICK_MS: u64 = 100;
 struct Args {
     /// Path to the C/C++ project directory (omit to run with demo data)
     project_path: Option<String>,
+
+    /// A source file whose compile command names the build to analyse.
+    ///
+    /// A project's compilation database is usually several builds at once —
+    /// the library, the unit tests, the integration tests — and the same
+    /// header compiled under different defines declares different functions,
+    /// so a call graph of all of them at once is a graph of no build in
+    /// particular. Naming one file picks the build that file is compiled as;
+    /// the project becomes every entry sharing its defines. Absolute, or
+    /// relative to the project directory. Omitted, every entry is analysed and
+    /// the builds on offer are listed in the log.
+    #[arg(long, value_name = "FILE")]
+    flavour: Option<std::path::PathBuf>,
 }
 
 /// Shared backend state. One window, one `CoreApp` — unlike the web frontend
@@ -205,10 +218,29 @@ fn main() {
                 eprintln!("Error: Project path '{}' does not exist", path);
                 std::process::exit(1);
             }
+            // Checked here rather than left to the loader: a mistyped flavour
+            // would otherwise open a window onto a load that failed, with the
+            // list of what could have been typed buried in the log file.
+            if let Some(flavour) = args.flavour.as_deref() {
+                if let Err(message) = runtime.block_on(coon_core::check_flavour(
+                    std::path::Path::new(path),
+                    flavour,
+                )) {
+                    eprintln!("Error: {message}");
+                    std::process::exit(1);
+                }
+            }
             log::info!("[desktop] starting LSP loader for {}", path);
-            CoreApp::new_with_lsp(CallGraph::new(), spawn_lsp_bridge(path))
+            let options = LoaderOptions {
+                flavour: args.flavour.clone(),
+            };
+            CoreApp::new_with_lsp(CallGraph::new(), spawn_lsp_bridge(path, options))
         }
         None => {
+            if args.flavour.is_some() {
+                eprintln!("Error: --flavour needs a project path; demo data has no builds");
+                std::process::exit(1);
+            }
             log::info!("[desktop] no project path given — using demo data");
             CoreApp::new(create_demo_call_graph())
         }
