@@ -185,6 +185,7 @@ const orientLrEl = $('orient-lr');
 const orientTdEl = $('orient-td');
 const tabsEl     = $('tabs');
 const crumbEl    = $('breadcrumb');
+const statusBarEl   = $('status-bar');
 const statSymbolsEl = $('stat-symbols');
 const statNodesEl   = $('stat-nodes');
 
@@ -1309,6 +1310,9 @@ function countField(value, widest) {
 /// many are coming. Only the fraction is held to a width — the bare count has
 /// no total to be held to, and is the end of the line anyway.
 function renderLoad() {
+  // The tallies come and go with the load, so this rides along with the one
+  // function both stages already call on every change.
+  statusBarEl.classList.toggle('loading', loading());
   if (!loading()) return;
   // The numbers belong to whichever stage last set them, and a finished stage's
   // numbers are a lie: painting them is what leaves "Resolving calls 15 / 19" on

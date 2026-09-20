@@ -341,6 +341,13 @@ body.resizing { cursor: col-resize; user-select: none; }
 }
 .status-item.right { margin-left: auto; }
 
+/* While the project is loading the bar says one thing, and it is the load.
+   The tallies are hidden rather than shown stale: during the symbol stage
+   `symbols` is the count the status line is already reporting, arriving on the
+   snapshot's slower clock, and `in view` is 0 throughout — nothing is
+   clustered until loading stops, so there is nothing on the canvas to count. */
+#status-bar.loading .status-item.stat { display: none; }
+
 /* `<done> / <total>`: the near number sits in a field held to the width of the
    far one by an invisible copy of it, so a count gaining a digit — or a
    thousands separator — does not shove the rest of the bar along. The margin is
