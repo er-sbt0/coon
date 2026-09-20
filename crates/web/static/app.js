@@ -1266,6 +1266,11 @@ function loading() { return load.symbols || load.edges; }
 /// of ordinary spaces; it does not collapse these.
 const FIGURE_SPACE = '\u2007';
 
+/// The gap between a stage's name and its numbers, wider than a word space so
+/// the label reads as a label and not as part of the fraction. Figure spaces
+/// again, for the same reason: a run of ordinary ones collapses to one.
+const LABEL_GAP = FIGURE_SPACE.repeat(2);
+
 /// `value`, right-aligned in a field `width` characters wide.
 ///
 /// Tabular figures make every digit the same width, which is not the same as
@@ -1296,7 +1301,7 @@ function renderLoad() {
     ? `${padCount(load.done, total.length)} / ${total}`
     : (load.count != null ? load.count.toLocaleString() : '');
 
-  setStatus(counts ? `${load.label} ${counts}` : load.label, 'busy');
+  setStatus(counts ? `${load.label}${LABEL_GAP}${counts}` : load.label, 'busy');
 }
 
 function updateStatusFromEvent(key, payload) {
