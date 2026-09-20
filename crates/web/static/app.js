@@ -1280,18 +1280,25 @@ function loading() { return load.symbols || load.edges; }
 /// So the width comes from the text itself: an invisible copy of the widest
 /// value the field will hold, stacked under the live one in the same grid cell.
 /// Exact in any font, with or without tabular figures, separators and all.
+///
+/// `widest` is optional. A field without one is free to grow — which is the
+/// running count, where nothing has said how wide it will end up — and is still
+/// a field, because the gap to the stage's name comes with it.
 function countField(value, widest) {
   const field = document.createElement('span');
   field.className = 'count';
 
-  const ghost = document.createElement('span');
-  ghost.className = 'count-ghost';
-  ghost.textContent = widest;
+  if (widest != null) {
+    const ghost = document.createElement('span');
+    ghost.className = 'count-ghost';
+    ghost.textContent = widest;
+    field.append(ghost);
+  }
 
   const shown = document.createElement('span');
   shown.textContent = value;
 
-  field.append(ghost, shown);
+  field.append(shown);
   return field;
 }
 
@@ -1299,8 +1306,8 @@ function countField(value, widest) {
 ///
 /// A stage with a total reads as a fraction; one without reads as a running
 /// count, because clangd streams workspace symbols without ever saying how
-/// many are coming. Only the fraction is padded — the bare count is the end of
-/// the line, so there is nothing after it to shift.
+/// many are coming. Only the fraction is held to a width — the bare count has
+/// no total to be held to, and is the end of the line anyway.
 function renderLoad() {
   if (!loading()) return;
   // The numbers belong to whichever stage last set them, and a finished stage's
@@ -1317,7 +1324,7 @@ function renderLoad() {
       ` / ${total}`,
     ], 'busy');
   } else if (load.count != null) {
-    setStatus(`${load.label} ${load.count.toLocaleString()}`, 'busy');
+    setStatus([load.label, countField(load.count.toLocaleString())], 'busy');
   } else {
     setStatus(load.label, 'busy');
   }
