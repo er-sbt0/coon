@@ -1190,8 +1190,12 @@ function handleEvent(event) {
   updateStatusFromEvent(key, event[key]);
 }
 
-function setStatus(text, state) {
-  statusEl.textContent = text;
+/// Write the status line. `content` is a string, or a list of strings and
+/// elements for the one writer — the load line — that needs a fixed-width field
+/// in the middle of its text.
+function setStatus(content, state) {
+  if (Array.isArray(content)) statusEl.replaceChildren(...content);
+  else statusEl.textContent = content;
   lspDotEl.className = state || '';
 }
 
@@ -1262,24 +1266,33 @@ const PHASE_LABEL = {
 
 function loading() { return load.symbols || load.edges; }
 
-/// A digit's width, in a font asked for tabular figures. HTML collapses a run
-/// of ordinary spaces; it does not collapse these.
-const FIGURE_SPACE = '\u2007';
-
-/// The gap between a stage's name and its numbers, wider than a word space so
-/// the label reads as a label and not as part of the fraction. Figure spaces
-/// again, for the same reason: a run of ordinary ones collapses to one.
-const LABEL_GAP = FIGURE_SPACE.repeat(2);
-
-/// `value`, right-aligned in a field `width` characters wide.
+/// `value`, right-aligned in a field held open to the width of `widest`.
 ///
 /// Tabular figures make every digit the same width, which is not the same as
 /// making every *number* the same width: 9 → 10 still grows the string and
-/// shoves everything after it along the bar. Padding the near side to the width
-/// of the far one holds the pair still until the total itself gains a digit.
-function padCount(value, width) {
-  const text = value.toLocaleString();
-  return text.length >= width ? text : FIGURE_SPACE.repeat(width - text.length) + text;
+/// shoves everything after it along the bar. Nor can the near side be padded
+/// with spacing characters to the width of the far one — the far one is
+/// `toLocaleString`d, so it carries thousands separators, and a comma is about
+/// half a digit wide. Padding `999` to the *character* count of `2,916` gives
+/// five digit-widths against four digits and a comma, and the line jumped 3px
+/// narrower the moment the count reached `1,000` and grew a comma of its own.
+///
+/// So the width comes from the text itself: an invisible copy of the widest
+/// value the field will hold, stacked under the live one in the same grid cell.
+/// Exact in any font, with or without tabular figures, separators and all.
+function countField(value, widest) {
+  const field = document.createElement('span');
+  field.className = 'count';
+
+  const ghost = document.createElement('span');
+  ghost.className = 'count-ghost';
+  ghost.textContent = widest;
+
+  const shown = document.createElement('span');
+  shown.textContent = value;
+
+  field.append(ghost, shown);
+  return field;
 }
 
 /// Push `load` to the status bar.
@@ -1296,12 +1309,18 @@ function renderLoad() {
   if (load.stage === 'edges' && !load.edges) return;
   if (load.stage === 'symbols' && !load.symbols) return;
 
-  const total = load.total.toLocaleString();
-  const counts = load.total > 0
-    ? `${padCount(load.done, total.length)} / ${total}`
-    : (load.count != null ? load.count.toLocaleString() : '');
-
-  setStatus(counts ? `${load.label}${LABEL_GAP}${counts}` : load.label, 'busy');
+  if (load.total > 0) {
+    const total = load.total.toLocaleString();
+    setStatus([
+      load.label,
+      countField(load.done.toLocaleString(), total),
+      ` / ${total}`,
+    ], 'busy');
+  } else if (load.count != null) {
+    setStatus(`${load.label} ${load.count.toLocaleString()}`, 'busy');
+  } else {
+    setStatus(load.label, 'busy');
+  }
 }
 
 function updateStatusFromEvent(key, payload) {

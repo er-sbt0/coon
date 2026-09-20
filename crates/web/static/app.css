@@ -340,6 +340,15 @@ body.resizing { cursor: col-resize; user-select: none; }
   font-variant-numeric: tabular-nums;
 }
 .status-item.right { margin-left: auto; }
+
+/* `<done> / <total>`: the near number sits in a field held to the width of the
+   far one by an invisible copy of it, so a count gaining a digit — or a
+   thousands separator — does not shove the rest of the bar along. The margin is
+   the gap to the stage's name, which would otherwise read as part of the
+   fraction. */
+.count { display: inline-grid; justify-items: end; margin-left: var(--sp-3); }
+.count > * { grid-area: 1 / 1; }
+.count-ghost { visibility: hidden; }
 .status-item b { font-weight: 600; color: var(--text-muted); }
 
 #lsp-dot {
