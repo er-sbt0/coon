@@ -10,19 +10,17 @@ use std::collections::VecDeque;
 /// dominates the server's memory. Opening a whole compilation database and
 /// leaving it open runs to gigabytes on a 217-file tree like jemalloc.
 ///
-/// The floor is `core`'s warmup concurrency: evicting a document with a request
-/// still in flight would answer it against a file clangd no longer has
-/// ("trying to get AST for non-added document"). A call hierarchy is two round
-/// trips and only the first one opens anything — `GetOutgoingCalls` neither
-/// reopens the item's file nor touches it here — so a document has to outlive
-/// *both* legs, and everything dispatched while they are outstanding can open
-/// a fresh one. That puts the floor at twice the concurrency, not once, and
-/// the margin above it pays for replies arriving out of order and for the
-/// user's own requests, which draw on the same in-flight budget.
-///
-/// `lsp` cannot name `core`, so the relationship is checked from the other
-/// side: see the `const` assertion next to `WARMUP_IN_FLIGHT` in `core::app`,
-/// which is why this is public.
+/// It is a ceiling on memory, not a correctness bound. A document with a
+/// request still outstanding against it — a prepare or a find-references
+/// clangd has not answered — is *pinned* and never the one evicted: closing it
+/// would answer that request against a file clangd no longer has ("trying to
+/// get AST for non-added document"), and silently, since the symbol merely
+/// comes out with no edges. The pin is what makes that impossible; this number
+/// is only how many documents sit idle before the oldest goes. Because pinned
+/// documents are skipped, the set can run over the limit by the number of
+/// requests in flight until they are answered, which is why `core` keeps its
+/// warmup concurrency well under it: see the `const` assertion next to
+/// `WARMUP_IN_FLIGHT` in `core::app`, which is why this is public.
 pub const OPEN_DOCUMENT_LIMIT: usize = 32;
 
 /// The documents clangd currently has open, least-recently-used first.
@@ -58,11 +56,21 @@ impl OpenDocuments {
         self.lru.push_back(uri);
     }
 
-    /// The next document to close, or `None` once the set is within its limit.
-    fn evict_overflow(&mut self) -> Option<Url> {
-        (self.lru.len() > OPEN_DOCUMENT_LIMIT)
-            .then(|| self.lru.pop_front())
-            .flatten()
+    /// The next document to close, or `None` once the set is within its limit
+    /// — or when everything over it is pinned.
+    ///
+    /// Least recently used first, skipping any document `pinned` says has a
+    /// request outstanding: those are the ones clangd is about to read, and
+    /// a `didClose` overtaking that read answers it with an error. An overflow
+    /// made entirely of pinned documents is left alone rather than forced, and
+    /// the next open tries again; the pins are as many as the requests in
+    /// flight, so the overshoot is bounded by whoever is sending them.
+    fn evict_overflow(&mut self, pinned: impl Fn(&Url) -> bool) -> Option<Url> {
+        if self.lru.len() <= OPEN_DOCUMENT_LIMIT {
+            return None;
+        }
+        let idx = self.lru.iter().position(|uri| !pinned(uri))?;
+        self.lru.remove(idx)
     }
 
     /// Forget every open document and hand them back to be closed.
@@ -157,11 +165,26 @@ pub(super) async fn ensure_document_opened(
         state.opened_documents.len()
     );
 
-    while let Some(evicted) = state.opened_documents.evict_overflow() {
+    // Only the pinned documents survive their turn: see `evict_overflow`, and
+    // `LspWorkerState::request_documents` for what pins one. Copied out
+    // first because the LRU is borrowed mutably for the eviction, and the set
+    // is a handful of entries.
+    let pinned: Vec<Url> = state.request_documents.values().cloned().collect();
+    while let Some(evicted) = state
+        .opened_documents
+        .evict_overflow(|uri| pinned.contains(uri))
+    {
         log::debug!("Closing least-recently-used document: {}", evicted);
         if let Err(e) = state.client.did_close(evicted.clone()).await {
             log::warn!("Failed to close document {}: {}", evicted, e);
         }
+    }
+    if state.opened_documents.len() > OPEN_DOCUMENT_LIMIT {
+        log::debug!(
+            "{} document(s) open, over the limit of {}: the rest have requests outstanding",
+            state.opened_documents.len(),
+            OPEN_DOCUMENT_LIMIT
+        );
     }
 
     Ok(())
@@ -397,7 +420,7 @@ mod tests {
     fn stays_within_its_limit_by_dropping_the_oldest() {
         let mut open = fill(OPEN_DOCUMENT_LIMIT + 3);
 
-        let evicted: Vec<Url> = std::iter::from_fn(|| open.evict_overflow()).collect();
+        let evicted: Vec<Url> = std::iter::from_fn(|| open.evict_overflow(|_| false)).collect();
 
         assert_eq!(evicted, vec![uri(0), uri(1), uri(2)]);
         assert_eq!(open.len(), OPEN_DOCUMENT_LIMIT);
@@ -410,7 +433,7 @@ mod tests {
         open.touch(&uri(0));
         open.insert(uri(OPEN_DOCUMENT_LIMIT));
 
-        assert_eq!(open.evict_overflow(), Some(uri(1)));
+        assert_eq!(open.evict_overflow(|_| false), Some(uri(1)));
         assert!(
             open.contains(&uri(0)),
             "the touched document should survive"
@@ -420,7 +443,36 @@ mod tests {
     #[test]
     fn nothing_is_evicted_below_the_limit() {
         let mut open = fill(OPEN_DOCUMENT_LIMIT);
-        assert_eq!(open.evict_overflow(), None);
+        assert_eq!(open.evict_overflow(|_| false), None);
+    }
+
+    /// A document clangd is about to read for a request still in flight is
+    /// not the one to close, however old it is: the `didClose` would overtake
+    /// the read and answer it with "non-added document".
+    #[test]
+    fn a_document_with_a_request_outstanding_is_skipped_over() {
+        let mut open = fill(OPEN_DOCUMENT_LIMIT + 1);
+        let oldest = uri(0);
+
+        assert_eq!(
+            open.evict_overflow(|uri| *uri == oldest),
+            Some(uri(1)),
+            "the oldest *idle* document goes instead"
+        );
+        assert!(open.contains(&oldest));
+        assert_eq!(open.len(), OPEN_DOCUMENT_LIMIT);
+    }
+
+    /// An overflow made entirely of pinned documents is left standing rather
+    /// than forced: the overshoot lasts exactly as long as the requests do.
+    #[test]
+    fn an_overflow_of_pinned_documents_is_left_alone() {
+        let mut open = fill(OPEN_DOCUMENT_LIMIT + 2);
+
+        assert_eq!(open.evict_overflow(|_| true), None);
+        assert_eq!(open.len(), OPEN_DOCUMENT_LIMIT + 2, "nothing was closed");
+        // And goes the moment the pins do.
+        assert_eq!(open.evict_overflow(|_| false), Some(uri(0)));
     }
 
     #[test]

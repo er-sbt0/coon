@@ -8,6 +8,7 @@ pub mod layout;
 pub mod logging;
 pub mod lsp_bridge;
 pub mod protocol;
+mod warmup;
 pub mod workspace;
 
 pub use app::CoreApp;

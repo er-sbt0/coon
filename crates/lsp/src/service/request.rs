@@ -11,10 +11,11 @@ async fn track_or_error(
     result: anyhow::Result<i64>,
     request_id: String,
     request_type: RequestType,
+    document: Option<Url>,
     context: &str,
 ) {
     match result {
-        Ok(lsp_id) => state.track_request(lsp_id, request_id, request_type),
+        Ok(lsp_id) => state.track_request(lsp_id, request_id, request_type, document),
         Err(e) => {
             log::error!("Failed to send {} request: {}", context, e);
             let _ = response_tx
@@ -77,6 +78,8 @@ pub(super) async fn handle_outgoing_calls_request(
         result,
         request_id,
         RequestType::OutgoingCalls,
+        // Answered from the index: the item's file need not be open.
+        None,
         "outgoing calls",
     )
     .await;
@@ -101,6 +104,7 @@ pub(super) async fn handle_incoming_calls_request(
         result,
         request_id,
         RequestType::IncomingCalls,
+        None,
         "incoming calls",
     )
     .await;
@@ -137,7 +141,7 @@ pub(super) async fn handle_prepare_call_hierarchy_request(
 
     let result = state
         .client
-        .prepare_call_hierarchy(document_uri, position)
+        .prepare_call_hierarchy(document_uri.clone(), position)
         .await;
     track_or_error(
         state,
@@ -145,6 +149,7 @@ pub(super) async fn handle_prepare_call_hierarchy_request(
         result,
         request_id,
         RequestType::PrepareCallHierarchy,
+        Some(document_uri),
         "prepare call hierarchy",
     )
     .await;
@@ -176,7 +181,9 @@ pub(super) async fn handle_references_request(
         return;
     }
 
-    let text_document = lsp_types::TextDocumentIdentifier { uri: document_uri };
+    let text_document = lsp_types::TextDocumentIdentifier {
+        uri: document_uri.clone(),
+    };
     let result = state.client.find_references(text_document, position).await;
     track_or_error(
         state,
@@ -184,6 +191,7 @@ pub(super) async fn handle_references_request(
         result,
         request_id,
         RequestType::References,
+        Some(document_uri),
         "references",
     )
     .await;
@@ -215,14 +223,21 @@ pub(super) async fn handle_references_with_symbols_request(
         return;
     }
 
-    let text_document = lsp_types::TextDocumentIdentifier { uri: document_uri };
+    let text_document = lsp_types::TextDocumentIdentifier {
+        uri: document_uri.clone(),
+    };
     let result = state
         .client
         .find_references_with_symbols(text_document, position)
         .await;
     match result {
         Ok(lsp_id) => {
-            state.track_request(lsp_id, request_id, RequestType::ReferencesWithSymbols);
+            state.track_request(
+                lsp_id,
+                request_id,
+                RequestType::ReferencesWithSymbols,
+                Some(document_uri),
+            );
             state.enhanced_lsp_requests.insert(lsp_id);
         }
         Err(e) => {
@@ -260,7 +275,9 @@ pub(super) async fn handle_document_symbols_request(
         return;
     }
 
-    let text_document = lsp_types::TextDocumentIdentifier { uri: document_uri };
+    let text_document = lsp_types::TextDocumentIdentifier {
+        uri: document_uri.clone(),
+    };
     let result = state.client.document_symbol(text_document).await;
     track_or_error(
         state,
@@ -268,6 +285,7 @@ pub(super) async fn handle_document_symbols_request(
         result,
         request_id,
         RequestType::DocumentSymbols,
+        Some(document_uri),
         "document symbols",
     )
     .await;
@@ -292,6 +310,7 @@ pub(super) async fn handle_workspace_symbols_request(
         result,
         request_id,
         RequestType::WorkspaceSymbols,
+        None,
         "workspace symbols",
     )
     .await;

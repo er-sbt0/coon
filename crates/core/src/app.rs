@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -10,45 +10,90 @@ use crate::command::Command;
 use crate::events::AppEvent;
 use crate::layout::{compute_map_frame, LayoutOrientation, MapFrame};
 use crate::lsp_bridge::{LoadingState, LspBridge, PendingRequest, RequestOrigin, SendOutcome};
+use crate::warmup::WarmupQueue;
 use crate::workspace::{CoreWorkspace, CoreWorkspaceManager, ViewMode};
 
-/// How many call-hierarchy requests to keep in flight while warming up edges.
+/// How many prepares — requests that open a document — the warmup keeps in
+/// flight.
 ///
-/// clangd serves these one at a time, so the ceiling is about not parking two
-/// hundred requests on a 30 s timeout behind a server that answers them at its
-/// own pace — not about parallelism. Eight keeps the pipe busy and leaves room
-/// for a request the user makes while the warmup is still running.
+/// A `prepareCallHierarchy` runs against its file's AST: clangd opens the
+/// file, builds its preamble and parses it, and holds all of that in memory
+/// for as long as the document stays open. So this is a budget on clangd's
+/// memory and on how many of its AST workers the warmup occupies, not on the
+/// pipe. The follow-ups that fetch a symbol's calls are budgeted separately,
+/// in [`WARMUP_INDEX_IN_FLIGHT`], because they cost none of that.
 ///
-/// It is also bounded from above by [`lsp::OPEN_DOCUMENT_LIMIT`], and the
-/// `const` assertion below is what enforces that rather than describing it.
+/// It is bounded from above by [`lsp::OPEN_DOCUMENT_LIMIT`], and the `const`
+/// assertion below is what enforces that rather than describing it.
 const WARMUP_IN_FLIGHT: usize = 8;
 
-/// The warmup may not outrun the set of documents clangd is holding open.
+/// How many index-only requests the warmup keeps in flight on top.
 ///
-/// A call hierarchy is two round trips: the prepare opens the symbol's file
-/// and puts it at the recent end of the LRU, and the follow-up
-/// (`GetOutgoingCalls`) neither reopens it nor touches it again — so the file
-/// has to survive both legs on the position the prepare gave it. Every other
-/// request dispatched in that window can open a file of its own, and a slot
-/// freed by a reply is refilled at once, so under in-order service up to twice
-/// this concurrency of fresh documents lands on top of it: the hard floor is
-/// `2 * WARMUP_IN_FLIGHT + 1`. Replies are not in fact ordered — a slow file
-/// leaves its document sitting while the other slots cycle — and the user's
-/// own expands and find-references draw on the same budget and open files of
-/// their own, neither of which has a bound worth quoting. So the enforced
-/// margin is four times over, which is what the shipping pair already is.
+/// The follow-up for a symbol whose item is in hand —
+/// `callHierarchy/outgoingCalls` — is answered from clangd's index in a few
+/// milliseconds and opens nothing, so the only cost of keeping more of them
+/// outstanding is the 30 s timeout each one is parked on. Sixteen is a pipe
+/// depth: enough that clangd's worker pool has the next one waiting when it
+/// finishes this one, while the reply crosses two channels and a tick. It is
+/// not parallelism — clangd runs at most `-j` of them — and past the pool's
+/// size a deeper pipe only queues.
+const WARMUP_INDEX_IN_FLIGHT: usize = 16;
+
+/// How many files the warmup prepares from at once.
 ///
-/// Violating it is silent at runtime: clangd answers the follow-up with
-/// "trying to get AST for non-added document", the symbol keeps no edges, and
-/// the graph merely comes out smaller than it should. Hence a build failure.
+/// Prepares are grouped by file so that a document is opened once for all
+/// of its symbols, and this is how many such groups are worked in parallel.
+/// The number is set by clangd's AST cache, not by its thread count: clangd
+/// keeps the ASTs of three idle files (`ASTRetentionPolicy::MaxRetainedASTs`,
+/// with no flag to change it) and rebuilds any other from its preamble on
+/// every request, at ~80 ms on jemalloc. Reading from three files at a time
+/// means the second prepare into a file finds the AST the first one built;
+/// reading from eight means every prepare rebuilds it. Measured on jemalloc:
+/// a prepare into an already open file had a median of 82 ms under the old
+/// queue, which read from eight files at once; it is 3–6 ms at three lanes
+/// and 29 ms at eight, and the warmup at eight lanes is a quarter slower
+/// despite sending fewer prepares. Two lanes measure the same as three.
+const WARMUP_LANES: usize = 3;
+
+/// How many files the warmup opens ahead of its lanes.
+///
+/// The first prepare into a file waits for clangd to build the file's
+/// preamble: a quarter of a second on jemalloc, three times what the rest of
+/// the file's prepares cost together. Opening the next files while the
+/// current ones are being read puts that build on another of clangd's
+/// threads, in parallel with the reading, instead of at the head of every
+/// file's queue. Deeper than the lanes, so there is always a built file to
+/// move to; not much deeper, because each one is a live preamble in clangd's
+/// memory until the LRU lets it go, and because the file a lane takes next
+/// is chosen by a ranking that moves as replies land, so what was opened
+/// ahead is not always what is read next. Measured on jemalloc: the first
+/// prepare into a file costs 240 ms when the prepare opens the file itself,
+/// 55 ms when the open led it by 100–300 ms, and 15 ms past 300 ms; eight
+/// ahead instead of four measures the same wall time as four.
+const WARMUP_PREFETCH: usize = 4;
+
+/// The warmup may not fill the set of documents clangd is holding open.
+///
+/// A document with a request outstanding against it is never evicted — the
+/// worker pins it (`lsp::service::document`) until clangd answers — so the
+/// warmup cannot lose a symbol's edges to the LRU whatever its rate. What it
+/// can do is *overfill* the set: a pinned document that would have been
+/// evicted stays, and the set runs over its limit by the number of pins. Its
+/// pins are at most one per prepare in flight, and it opens
+/// [`WARMUP_PREFETCH`] more ahead of them; keeping both together under half
+/// the limit leaves the other half for the user's own expands and lookups
+/// and for the files the lanes have just finished with, which is what makes
+/// the limit a ceiling on clangd's memory rather than a floor.
+///
 /// Raising the concurrency is allowed — it just has to be paid for in
-/// [`lsp::OPEN_DOCUMENT_LIMIT`], which is clangd's memory, and saying so here
-/// is the point.
+/// [`lsp::OPEN_DOCUMENT_LIMIT`], which is clangd's memory, and saying so
+/// here is the point.
 const _: () = assert!(
-    WARMUP_IN_FLIGHT * 4 <= lsp::OPEN_DOCUMENT_LIMIT,
-    "WARMUP_IN_FLIGHT must stay at or below a quarter of lsp::OPEN_DOCUMENT_LIMIT: \
-     a call hierarchy needs its document open across two round trips, and evicting \
-     it mid-flight loses the symbol's edges silently. Raise OPEN_DOCUMENT_LIMIT too."
+    (WARMUP_IN_FLIGHT + WARMUP_PREFETCH) * 2 <= lsp::OPEN_DOCUMENT_LIMIT,
+    "WARMUP_IN_FLIGHT + WARMUP_PREFETCH must stay at or below half of \
+     lsp::OPEN_DOCUMENT_LIMIT: each prepare in flight pins its document open and \
+     each file opened ahead holds a live preamble, and together they must leave \
+     room for the user's own requests. Raise OPEN_DOCUMENT_LIMIT too."
 );
 
 /// How often the edge warmup writes its state to the log while it runs.
@@ -230,7 +275,12 @@ pub struct CoreApp {
     /// stream, a discovery reply that lands after it, a refresh — and
     /// deliberately not by the callees a call-hierarchy reply discovers:
     /// following those would walk the whole program.
-    edge_warmup: VecDeque<SymbolId>,
+    ///
+    /// The queue decides the *form* each question takes as well as its
+    /// order — see [`WarmupQueue`]: a symbol some reply has already named
+    /// goes out as its follow-up alone, and the rest are prepared file by
+    /// file.
+    edge_warmup: WarmupQueue,
     /// Whether the queue has opened. Until it has, arriving symbols are left to
     /// the seeding sweep; after it, each one queues itself as it lands.
     warmup_seeded: bool,
@@ -305,7 +355,7 @@ impl CoreApp {
             map_frame,
             frame_stale: false,
             clustering_failed: HashSet::new(),
-            edge_warmup: VecDeque::new(),
+            edge_warmup: WarmupQueue::default(),
             warmup_seeded: false,
             warmup_total: 0,
             warmup_finish_reported: false,
@@ -640,9 +690,13 @@ impl CoreApp {
                 }
                 events.push(AppEvent::LspError(error));
             }
-            LspResponse::PreloadComplete { .. } => {
-                // No-op in core; the TUI handled this via a dedicated status message.
-                // Future: emit a dedicated AppEvent if needed.
+            LspResponse::PreloadComplete { request_id, .. } => {
+                // The warmup's open-ahead, acknowledged. The loader's own
+                // preload never reaches here — it waits for that reply itself
+                // before handing the channels over — so this is only ever
+                // ours, and there is nothing to do with it but retire the
+                // entry `send_preload` recorded.
+                self.lsp.take_pending(&request_id);
             }
             LspResponse::IndexProgress(progress) => {
                 // The loader waits on this one before it ever hands the bridge
@@ -658,6 +712,10 @@ impl CoreApp {
                     if let Some(symbol_id) = pending.symbol_id {
                         if !items.is_empty() {
                             let first_item = items[0].clone();
+                            // Kept: an expand the other way round, or a
+                            // requeue after a refresh, spends it instead of
+                            // preparing again. See `LspBridge::hierarchy_items`.
+                            self.lsp.learn_hierarchy_item(symbol_id, first_item.clone());
                             // The direction comes off the request, not off
                             // whichever tab is in front now. This arm runs
                             // whenever clangd gets round to answering, which
@@ -1283,8 +1341,36 @@ impl CoreApp {
     }
 
     /// Whether the initial edge warmup is still running.
+    ///
+    /// Counts the warmup's own requests in flight, not everyone's. It used to
+    /// read `pending_count`, so a single click after the warmup had drained —
+    /// one `RequestOrigin::User` prepare — put the app back into this state,
+    /// re-announced the finish when it landed, and had the whole program
+    /// clustered a second time over a graph that had gained one edge.
     fn warming_up(&self) -> bool {
-        self.warmup_seeded && (!self.edge_warmup.is_empty() || self.lsp.pending_count() > 0)
+        self.warmup_seeded && (!self.edge_warmup.is_empty() || self.lsp.warmup_in_flight() > 0)
+    }
+
+    /// Put `id` on the warmup queue, in the pool its state calls for.
+    ///
+    /// Returns whether it was new to the queue. The file is what the queue
+    /// groups prepares by; an item already learned for the symbol — from a
+    /// reply that named it before it was ever queued — means it needs no
+    /// prepare at all.
+    fn queue_for_warmup(&mut self, id: SymbolId) -> bool {
+        let Some((file, line)) = self.call_graph.get_function(&id).map(|f| {
+            (
+                f.definition_location.file_path.clone(),
+                f.definition_location.line,
+            )
+        }) else {
+            return false;
+        };
+        let queued = self.edge_warmup.push(id, file, line);
+        if queued && self.lsp.has_hierarchy_item(&id) {
+            self.edge_warmup.promote(id);
+        }
+        queued
     }
 
     /// Add a function that came from a symbol query, and queue its edges.
@@ -1307,8 +1393,7 @@ impl CoreApp {
         let id = self.call_graph.add_function(function);
         // Before the queue opens the seeding sweep takes everything in the
         // graph, so queueing here as well would ask about it twice.
-        if self.warmup_seeded && !known {
-            self.edge_warmup.push_back(id);
+        if self.warmup_seeded && !known && self.queue_for_warmup(id) {
             self.warmup_total += 1;
         }
         id
@@ -1359,11 +1444,9 @@ impl CoreApp {
             // waiting its turn is on the queue already. Either way the queue
             // holds places, and a second place is a second request and a
             // fraction that never reaches its total.
-            if self.edge_warmup.contains(&id) {
-                continue;
+            if self.queue_for_warmup(id) {
+                requeued += 1;
             }
-            self.edge_warmup.push_back(id);
-            requeued += 1;
         }
         if requeued == 0 {
             return;
@@ -1390,8 +1473,22 @@ impl CoreApp {
     /// graph has edges before anything tries to cluster or draw it.
     ///
     /// Reuses the same request path as expanding a node by hand — prepare, then
-    /// follow up for calls — so every response lands in the handlers that
-    /// already know how to turn it into edges.
+    /// follow up for calls, or the follow-up alone when the item is already in
+    /// hand — so every response lands in the handlers that already know how to
+    /// turn it into edges.
+    ///
+    /// Two budgets, filled in order. Symbols whose item some reply has
+    /// already carried go out first, as index-only follow-ups, up to
+    /// [`WARMUP_INDEX_IN_FLIGHT`]: each is a few milliseconds of clangd's
+    /// time, and each reply names more callees — so the cascade from one
+    /// prepare runs down through everything it calls before another prepare
+    /// is spent on any of them. Then prepares, up to [`WARMUP_IN_FLIGHT`],
+    /// from at most [`WARMUP_LANES`] files at a time, with the next
+    /// [`WARMUP_PREFETCH`] files opened ahead. The two budgets are separate
+    /// rather than one because they are spent on different things: a prepare
+    /// occupies an AST worker and a document slot, a follow-up neither, and
+    /// one ceiling on both either starved the index of requests it could
+    /// answer at once or let the prepares fill clangd's memory.
     fn pump_edge_warmup(&mut self) -> Vec<AppEvent> {
         // Open the queue once the symbol stream is done and the bridge is
         // live: before that there is nothing to send on. Everything already in
@@ -1402,7 +1499,11 @@ impl CoreApp {
             && self.lsp.has_worker()
         {
             self.warmup_seeded = true;
-            self.edge_warmup = self.call_graph.function_ids().copied().collect();
+            self.edge_warmup.clear();
+            let ids: Vec<SymbolId> = self.call_graph.function_ids().copied().collect();
+            for id in ids {
+                self.queue_for_warmup(id);
+            }
             self.warmup_total = self.edge_warmup.len();
             self.warmup_last_moved = Some(Instant::now());
             self.warmup_started_at = Some(Instant::now());
@@ -1415,10 +1516,30 @@ impl CoreApp {
         }
 
         let mut events = Vec::new();
-        let mut sent = 0usize;
+        let mut followed_up = 0usize;
+        let mut prepared = 0usize;
         let mut skipped = 0usize;
-        while self.lsp.pending_count() < WARMUP_IN_FLIGHT {
-            let Some(id) = self.edge_warmup.pop_front() else {
+        loop {
+            let documents = self.lsp.documents_in_flight();
+            let index_only = self.lsp.pending_count().saturating_sub(documents);
+            let next = if index_only < WARMUP_INDEX_IN_FLIGHT {
+                self.edge_warmup.next_ready()
+            } else if self.edge_warmup.has_ready() {
+                // Follow-ups waiting behind a full pipe: the cascade is
+                // still running, and each of those replies names more of
+                // what the lanes would otherwise prepare. A prepare now is
+                // the one most likely to be wasted, so the lanes wait for
+                // the pipe rather than spend one.
+                break;
+            } else {
+                None
+            };
+            let next = match next {
+                Some(id) => Some(id),
+                None if documents < WARMUP_IN_FLIGHT => self.edge_warmup.next_prepare(WARMUP_LANES),
+                None => None,
+            };
+            let Some(id) = next else {
                 break;
             };
             // The user may have expanded this one while the queue drained.
@@ -1427,7 +1548,16 @@ impl CoreApp {
                 continue;
             }
             self.lsp.set_loading_state(id, LoadingState::Loading);
-            sent += 1;
+            // Whether this goes out as a prepare or as the follow-up alone is
+            // the bridge's call, from the items it holds — which is also why
+            // a lane's symbol can turn out to need no prepare: its item
+            // arrived after the queue's pools were sorted, and the send is
+            // what reads the final state.
+            if self.lsp.has_hierarchy_item(&id) {
+                followed_up += 1;
+            } else {
+                prepared += 1;
+            }
             // Warmup, not user: nobody is watching for this one symbol's edges,
             // so its reply must not redraw the client. See `RequestOrigin`.
             let outcome = self.lsp.send_call_hierarchy(
@@ -1450,10 +1580,30 @@ impl CoreApp {
             // `RequestOrigin` — so this only ever carries a failure.
             events.extend(outcome.event());
         }
-        if sent > 0 || skipped > 0 {
+
+        // The files the lanes reach next, opened now so their preambles are
+        // built by the time they are read. See `LspBridge::send_preload`.
+        if self.warmup_seeded {
+            let ahead: Vec<lsp_types::Url> = self
+                .edge_warmup
+                .files_to_prefetch(WARMUP_PREFETCH)
+                .iter()
+                .filter_map(|file| lsp_types::Url::from_file_path(file).ok())
+                .collect();
+            if !ahead.is_empty() {
+                log::debug!(
+                    "CoreApp: warmup opening {} file(s) ahead of its lanes",
+                    ahead.len()
+                );
+                events.extend(self.lsp.send_preload(ahead).event());
+            }
+        }
+
+        if followed_up > 0 || prepared > 0 || skipped > 0 {
             log::debug!(
-                "CoreApp: warmup pump sent {} request(s), skipped {} already-loaded, {} queued",
-                sent,
+                "CoreApp: warmup pump sent {} prepare(s) and {} follow-up(s) from items in hand, skipped {} already-loaded, {} queued",
+                prepared,
+                followed_up,
                 skipped,
                 self.edge_warmup.len()
             );
@@ -1498,13 +1648,16 @@ impl CoreApp {
             .warmup_last_moved
             .map(|at| at.elapsed())
             .unwrap_or_default();
+        let documents = self.lsp.documents_in_flight();
         let summary = format!(
-            "CoreApp: edge warmup {}/{} — {} queued, {}/{} in flight, unchanged for {:.1}s; waiting on: {}",
+            "CoreApp: edge warmup {}/{} — {} queued, {}/{} prepare(s) and {}/{} index request(s) in flight, unchanged for {:.1}s; waiting on: {}",
             done,
             self.warmup_total,
             self.edge_warmup.len(),
-            self.lsp.pending_count(),
+            documents,
             WARMUP_IN_FLIGHT,
+            self.lsp.pending_count().saturating_sub(documents),
+            WARMUP_INDEX_IN_FLIGHT,
             still.as_secs_f32(),
             self.lsp.pending_summary()
         );
@@ -1691,6 +1844,11 @@ impl CoreApp {
         let other_id =
             self.call_graph
                 .add_function(FunctionNode::new(other_name, qualified_name, location));
+        // The item names the other end, and is its ticket for a calls request
+        // of its own: if that symbol is still waiting on the warmup queue, it
+        // no longer needs a prepare. See `LspBridge::hierarchy_items`.
+        self.lsp.learn_hierarchy_item(other_id, item.clone());
+        self.edge_warmup.promote(other_id);
         for from_range in from_ranges {
             let call_location = Location::new(
                 file_path.clone(),
@@ -2246,6 +2404,311 @@ mod tests {
         );
     }
 
+    /// A `CoreApp` whose finished load found `per_file` symbols in each of
+    /// the named files, all absolute. Symbol `n` of a file sits on line
+    /// `n + 1`, so [`prepared_lines`] still names them.
+    fn loaded_app_in_files(
+        files: &[(&str, usize)],
+    ) -> (CoreApp, mpsc::UnboundedReceiver<lsp::LspRequest>) {
+        let mut graph = CallGraph::new();
+        for (file, symbols) in files {
+            for i in 0..*symbols {
+                let name = format!("{}_{i}", file.trim_start_matches('/').replace('/', "_"));
+                graph.add_function(FunctionNode::new(
+                    name.clone(),
+                    name,
+                    Location::new(file.to_string(), i as u32 + 1, 1),
+                ));
+            }
+        }
+        let mut app = CoreApp::new(graph);
+        let rx = wire_worker(&mut app);
+        app.lsp.set_status(LspLoadPhase::Completed);
+        (app, rx)
+    }
+
+    /// The requests waiting on `rx`, sorted into prepares (by the file they
+    /// open), follow-ups (by the item's name) and files opened ahead.
+    struct Sent {
+        prepares: Vec<(String, u32)>,
+        follow_ups: Vec<String>,
+        opened_ahead: Vec<String>,
+    }
+
+    fn drain_sent(rx: &mut mpsc::UnboundedReceiver<lsp::LspRequest>) -> Sent {
+        let mut out = Sent {
+            prepares: vec![],
+            follow_ups: vec![],
+            opened_ahead: vec![],
+        };
+        while let Ok(req) = rx.try_recv() {
+            match req {
+                lsp::LspRequest::PrepareCallHierarchy {
+                    document_uri,
+                    position,
+                    ..
+                } => out
+                    .prepares
+                    .push((document_uri.path().to_string(), position.line + 1)),
+                lsp::LspRequest::GetOutgoingCalls {
+                    call_hierarchy_item,
+                    ..
+                } => out.follow_ups.push(call_hierarchy_item.name),
+                lsp::LspRequest::PreloadDocuments { document_uris, .. } => out
+                    .opened_ahead
+                    .extend(document_uris.iter().map(|u| u.path().to_string())),
+                other => panic!("the warmup sent {other:?}"),
+            }
+        }
+        out
+    }
+
+    /// A `loaded_app` whose first `with_items` symbols a reply has already
+    /// named, so they go out as follow-ups.
+    fn loaded_app_with_items(
+        with_items: usize,
+        without: usize,
+    ) -> (CoreApp, mpsc::UnboundedReceiver<lsp::LspRequest>) {
+        let (mut app, rx) = loaded_app(with_items + without);
+        let named: Vec<SymbolId> = app
+            .call_graph
+            .functions()
+            .filter(|f| line_of(&app, &f.id) <= with_items as u32)
+            .map(|f| f.id)
+            .collect();
+        for id in &named {
+            let line = line_of(&app, id);
+            app.lsp
+                .learn_hierarchy_item(*id, call_item("named", Some("named"), "/src/test.c", line));
+        }
+        (app, rx)
+    }
+
+    /// Prepares open documents and follow-ups do not, so the warmup budgets
+    /// them apart: every symbol with an item in hand goes out as a follow-up
+    /// up to its own ceiling, and the prepares fill theirs beside them. One
+    /// ceiling on both either starved the index or filled clangd's memory.
+    #[test]
+    fn follow_ups_and_prepares_are_budgeted_apart() {
+        let with_items = WARMUP_INDEX_IN_FLIGHT;
+        let (mut app, mut rx) = loaded_app_with_items(with_items, WARMUP_IN_FLIGHT * 2);
+
+        app.tick();
+
+        let sent = drain_sent(&mut rx);
+        assert_eq!(
+            sent.follow_ups.len(),
+            WARMUP_INDEX_IN_FLIGHT,
+            "the index is kept fed, and not flooded"
+        );
+        assert_eq!(
+            sent.prepares.len(),
+            WARMUP_IN_FLIGHT,
+            "and the prepares go out beside them, not behind them"
+        );
+        for (_, line) in &sent.prepares {
+            assert!(
+                *line > with_items as u32,
+                "line {line} had an item in hand and must not be prepared"
+            );
+        }
+        assert_eq!(
+            app.lsp.documents_in_flight(),
+            WARMUP_IN_FLIGHT,
+            "only the prepares hold a document"
+        );
+    }
+
+    /// Follow-ups waiting behind a full pipe mean the cascade is still
+    /// running, and each reply names more of what the lanes would prepare —
+    /// so while they wait, the lanes do too. Preparing beside them spent a
+    /// parse of a file on symbols the next reply was about to hand over.
+    #[test]
+    fn the_lanes_wait_while_follow_ups_are_backed_up_behind_the_pipe() {
+        let backlog = WARMUP_INDEX_IN_FLIGHT * 2;
+        let (mut app, mut rx) = loaded_app_with_items(backlog, WARMUP_IN_FLIGHT);
+
+        app.tick();
+
+        let sent = drain_sent(&mut rx);
+        assert_eq!(sent.follow_ups.len(), WARMUP_INDEX_IN_FLIGHT);
+        assert!(
+            sent.prepares.is_empty(),
+            "no prepare while follow-ups are waiting on the pipe"
+        );
+
+        // The pipe drains: the rest of the backlog goes, and the lanes start.
+        app.lsp.clear_pending();
+        app.tick();
+        let next = drain_sent(&mut rx);
+        assert_eq!(next.follow_ups.len(), WARMUP_INDEX_IN_FLIGHT);
+        assert_eq!(next.prepares.len(), WARMUP_IN_FLIGHT);
+    }
+
+    /// A follow-up reply names every callee, with the item clangd would mint
+    /// by preparing it. A callee still waiting its turn on the queue is
+    /// therefore asked about with that item — one index request — and never
+    /// prepared at all.
+    #[test]
+    fn a_symbol_a_reply_has_named_is_followed_up_without_a_prepare() {
+        let (mut app, mut rx) = loaded_app(WARMUP_IN_FLIGHT * 2);
+        app.tick();
+        let first = drain_sent(&mut rx);
+        assert_eq!(first.prepares.len(), WARMUP_IN_FLIGHT);
+        let waiting = *app.edge_warmup.iter().next().expect("symbols still queued");
+        let waiting_line = line_of(&app, &waiting);
+        let in_flight = *app
+            .lsp
+            .pending()
+            .find_map(|p| p.symbol_id.as_ref())
+            .expect("a prepare in flight");
+
+        // One of the in-flight symbols turns out to call the waiting one.
+        app.lsp.insert_pending(
+            "follow-up",
+            PendingRequest::new(Some(in_flight), "outgoing calls", RequestOrigin::Warmup),
+        );
+        app.handle_lsp_response(LspResponse::OutgoingCalls {
+            request_id: "follow-up".to_string(),
+            calls: vec![lsp_types::CallHierarchyOutgoingCall {
+                to: call_item(
+                    &format!("f{}", waiting_line - 1),
+                    Some(&format!("f{}", waiting_line - 1)),
+                    "/src/test.c",
+                    waiting_line,
+                ),
+                from_ranges: vec![],
+            }],
+        });
+        assert!(
+            app.lsp.has_hierarchy_item(&waiting),
+            "the item the reply carried is kept"
+        );
+
+        app.tick();
+
+        let next = drain_sent(&mut rx);
+        assert_eq!(
+            next.follow_ups,
+            vec![format!("f{}", waiting_line - 1)],
+            "the named symbol goes out as its follow-up alone"
+        );
+        assert!(
+            next.prepares.iter().all(|(_, line)| *line != waiting_line),
+            "and is not prepared as well"
+        );
+        assert!(!app.edge_warmup.contains(&waiting));
+    }
+
+    /// Prepares are grouped by file, a few files at a time, and the files
+    /// after those are opened ahead: a document opened once serves every
+    /// symbol in it, where hash order reopened each of jemalloc's files nine
+    /// times over and paid for a preamble each time.
+    #[test]
+    fn prepares_are_grouped_by_file_with_the_next_files_opened_ahead() {
+        let files: Vec<String> = (0..WARMUP_LANES + WARMUP_PREFETCH + 2)
+            .map(|i| format!("/src/file_{i}.c"))
+            .collect();
+        let per_file: Vec<(&str, usize)> = files.iter().map(|f| (f.as_str(), 3)).collect();
+        let (mut app, mut rx) = loaded_app_in_files(&per_file);
+
+        app.tick();
+
+        let sent = drain_sent(&mut rx);
+        assert_eq!(sent.prepares.len(), WARMUP_IN_FLIGHT);
+        let touched: HashSet<&String> = sent.prepares.iter().map(|(file, _)| file).collect();
+        assert_eq!(
+            touched.len(),
+            WARMUP_LANES,
+            "eight prepares into three files, not eight files: {:?}",
+            sent.prepares
+        );
+        assert_eq!(
+            sent.opened_ahead.len(),
+            WARMUP_PREFETCH,
+            "and the next files are opened while those are read"
+        );
+        for file in &sent.opened_ahead {
+            assert!(
+                !touched.contains(file),
+                "{file} is being prepared from, not merely opened ahead"
+            );
+        }
+        // The open-ahead is acknowledged by the worker at once; here nobody
+        // answers, so retire it by hand as the reply arm would.
+        let ahead_ids: Vec<String> = app
+            .lsp
+            .pending()
+            .filter(|p| p.symbol_id.is_none())
+            .map(|p| p.label.clone())
+            .collect();
+        assert_eq!(
+            ahead_ids.len(),
+            1,
+            "one open-ahead request, for all of them"
+        );
+
+        // The next pump opens nothing it already opened.
+        app.lsp.clear_pending();
+        app.tick();
+        let next = drain_sent(&mut rx);
+        for file in &next.opened_ahead {
+            assert!(
+                !sent.opened_ahead.contains(file),
+                "{file} was opened ahead twice"
+            );
+        }
+    }
+
+    /// The end of the warmup is the end: a click afterwards is one request
+    /// the user made, not the warmup starting over. Counting every pending
+    /// request re-announced the finish on each click and had the whole
+    /// program clustered again over a graph one edge bigger.
+    #[test]
+    fn a_click_after_the_warmup_has_drained_does_not_restart_it() {
+        let (mut app, _rx) = loaded_app(1);
+        app.tick();
+        app.lsp.clear_pending();
+        app.tick();
+        assert!(!app.warming_up());
+        assert!(app.warmup_finish_reported);
+        let id = *app.call_graph.function_ids().next().expect("the symbol");
+
+        app.lsp.insert_pending(
+            "click",
+            PendingRequest::new(Some(id), "prepare f0", RequestOrigin::User),
+        );
+
+        assert!(!app.warming_up(), "a user's request is not the warmup's");
+        assert!(!app.loading());
+        assert!(
+            !app.tick()
+                .iter()
+                .any(|e| matches!(e, AppEvent::ResolvingCalls { .. })),
+            "and nothing is re-announced when it lands"
+        );
+    }
+
+    /// The item shortcut is the bridge's, not the warmup's: a node the user
+    /// expands is asked about the same way, so a symbol any reply has named
+    /// opens on one index request rather than a parse of its file.
+    #[test]
+    fn expanding_a_symbol_a_reply_has_named_needs_no_prepare() {
+        let (graph, left, _) = two_triangles();
+        let mut app = CoreApp::new(graph);
+        let mut rx = wire_worker(&mut app);
+        let target = left[1];
+        app.lsp
+            .learn_hierarchy_item(target, hierarchy_item("named", 0));
+
+        app.dispatch(Command::ExpandFunction(target));
+
+        let sent = drain_sent(&mut rx);
+        assert_eq!(sent.follow_ups, vec!["named".to_string()]);
+        assert!(sent.prepares.is_empty());
+        assert!(app.lsp.is_function_loading(&target));
+    }
+
     /// The symbol stream does not stop when clangd says `Completed`.
     ///
     /// The loader gives up waiting for its discovery query after 30s and the
@@ -2687,7 +3150,7 @@ mod tests {
         app.dispatch(Command::Refresh);
 
         let mut seen = HashSet::new();
-        for id in &app.edge_warmup {
+        for id in app.edge_warmup.iter() {
             assert!(seen.insert(*id), "{id:?} is queued twice");
         }
         assert_eq!(

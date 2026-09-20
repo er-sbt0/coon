@@ -1,6 +1,7 @@
 use super::document::OpenDocuments;
 use super::{LspRequest, LspResponse};
 use crate::LspClient;
+use lsp_types::Url;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -36,6 +37,23 @@ pub(super) struct LspWorkerState {
     /// When each outstanding clangd request was sent, so the heartbeat below can
     /// say how long it has been waiting.
     pub(super) request_sent_at: HashMap<i64, Instant>,
+    /// The document each outstanding request reads, for the ones that read one.
+    ///
+    /// A prepare, a find-references or a document-symbol query runs against
+    /// the AST of its file, and clangd builds that AST from the *open*
+    /// document — so the file has to stay open until the reply lands. This is
+    /// what `OpenDocuments::evict_overflow` consults before closing anything:
+    /// a document in here is pinned, and the LRU closes the oldest idle one
+    /// instead. It used to be an arithmetic promise made from the other side —
+    /// `core` kept its warmup concurrency under a quarter of the document
+    /// limit so that the file could not be pushed out mid-flight — and that
+    /// held only for the request rate the warmup was designed at. Recording
+    /// the fact makes it hold for any rate.
+    ///
+    /// Index-only requests — the outgoing and incoming calls that follow a
+    /// prepare, and `workspace/symbol` — are not in here, because clangd
+    /// answers them from its index and never touches the document.
+    pub(super) request_documents: HashMap<i64, Url>,
     pub(super) opened_documents: OpenDocuments,
     pub(super) project_files: HashSet<String>,
     pub(super) pending_enhanced_requests: HashMap<String, EnhancedRequestInfo>,
@@ -43,15 +61,21 @@ pub(super) struct LspWorkerState {
 }
 
 impl LspWorkerState {
+    /// `document` is the file the request reads, for the kinds that read one,
+    /// and pins it open until the reply: see `request_documents`.
     pub(super) fn track_request(
         &mut self,
         lsp_id: i64,
         service_id: String,
         request_type: RequestType,
+        document: Option<Url>,
     ) {
         self.service_requests.insert(lsp_id, service_id.clone());
         self.request_types.insert(lsp_id, request_type.clone());
         self.request_sent_at.insert(lsp_id, Instant::now());
+        if let Some(document) = document {
+            self.request_documents.insert(lsp_id, document);
+        }
         // At info, because this line is the only thing tying clangd's own log
         // ("--> reply:callHierarchy/outgoingCalls(37)") to the service request
         // id the rest of the app talks in.
@@ -67,6 +91,7 @@ impl LspWorkerState {
     /// Forget the bookkeeping for a request clangd has answered, returning how
     /// long the answer took.
     pub(super) fn finish_request(&mut self, lsp_id: i64) -> Option<std::time::Duration> {
+        self.request_documents.remove(&lsp_id);
         self.request_sent_at
             .remove(&lsp_id)
             .map(|sent| sent.elapsed())
@@ -165,6 +190,7 @@ pub(super) async fn run_loop(
         service_requests: HashMap::new(),
         request_types: HashMap::new(),
         request_sent_at: HashMap::new(),
+        request_documents: HashMap::new(),
         opened_documents: OpenDocuments::default(),
         project_files: HashSet::new(),
         pending_enhanced_requests: HashMap::new(),

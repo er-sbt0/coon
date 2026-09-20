@@ -120,6 +120,12 @@ pub struct PendingRequest {
     /// prepare, got its callers fetched, and was marked `Loaded` all the same,
     /// so `+` on that node did nothing ever again.
     pub direction: Option<CallDirection>,
+    /// Whether clangd has to open — and, until it answers, keep open — the
+    /// symbol's file to answer this. A prepare and a find-references do; the
+    /// follow-up that fetches a symbol's calls does not, because clangd
+    /// answers it from its index. The warmup budgets the two kinds apart, and
+    /// this is how it tells them apart: see `CoreApp::pump_edge_warmup`.
+    pub opens_document: bool,
 }
 
 impl PendingRequest {
@@ -134,7 +140,14 @@ impl PendingRequest {
             origin,
             label: label.into(),
             direction: None,
+            opens_document: false,
         }
+    }
+
+    /// Mark this as a request clangd needs the symbol's file open for.
+    pub fn opening_a_document(mut self) -> Self {
+        self.opens_document = true;
+        self
     }
 
     /// Stamp the call direction this request was asked in.
@@ -199,6 +212,25 @@ pub struct LspBridge {
     /// `is_function_loading`, `get_loading_state` and `set_loading_state`,
     /// which is the whole of what anyone outside has ever wanted from it.
     loading_states: HashMap<SymbolId, LoadingState>,
+    /// Every call-hierarchy item clangd has produced, by the symbol it names.
+    ///
+    /// An item is the ticket for `callHierarchy/outgoingCalls` and
+    /// `incomingCalls`: the protocol preserves its `data` between the prepare
+    /// that minted it and the calls requests that spend it, and clangd's
+    /// `data` is the symbol's index id, which is all those requests read.
+    /// A prepare is the expensive way to get one — it opens the file and
+    /// parses it — but every calls reply carries an item for each caller or
+    /// callee it names, minted by the same code from the same index, and the
+    /// spec means those to be spent the same way: that is how an editor's
+    /// call-hierarchy tree expands a level without preparing every node.
+    /// So a symbol met as somebody's callee never needs its own prepare, for
+    /// the warmup or for a click. On jemalloc 2125 of the 2897 symbols the
+    /// warmup prepared had been named by an earlier reply.
+    ///
+    /// Kept across [`LspBridge::clear`]: a refresh re-queries the symbols,
+    /// not the server, and an item stays valid for the life of the clangd
+    /// session.
+    hierarchy_items: HashMap<SymbolId, lsp_types::CallHierarchyItem>,
     /// Current phase of the background LSP loading process
     status: LspLoadPhase,
     /// Channel for progress/add-function messages from the background loader
@@ -227,6 +259,7 @@ impl LspBridge {
             response_ready: Arc::new(Notify::new()),
             pending_requests: HashMap::new(),
             loading_states: HashMap::new(),
+            hierarchy_items: HashMap::new(),
             status: LspLoadPhase::NotStarted,
             loader_rx: None,
             channels_rx: None,
@@ -247,6 +280,7 @@ impl LspBridge {
             response_ready: Arc::new(Notify::new()),
             pending_requests: HashMap::new(),
             loading_states: HashMap::new(),
+            hierarchy_items: HashMap::new(),
             status: LspLoadPhase::NotStarted,
             loader_rx: Some(loader_rx),
             channels_rx: Some(channels_rx),
@@ -456,6 +490,16 @@ impl LspBridge {
             return SendOutcome::Declined;
         };
 
+        // An item already in hand is the prepare's answer: skip to the
+        // question it was for. See `hierarchy_items`.
+        if let Some(item) = self.hierarchy_items.get(function_id).cloned() {
+            log::debug!(
+                "core::LspBridge {} has a call-hierarchy item in hand, no prepare needed",
+                name
+            );
+            return self.send_follow_up_call(function_id, item, direction, origin);
+        }
+
         let document_uri = match lsp_types::Url::from_file_path(&file_path) {
             Ok(uri) => uri,
             Err(_) => {
@@ -477,7 +521,8 @@ impl LspBridge {
             format!("prepare {} ({}:{}:{})", name, file_path, line, column),
             origin,
         )
-        .in_direction(direction);
+        .in_direction(direction)
+        .opening_a_document();
 
         if !self.dispatch(&request_tx, pending, |request_id| {
             LspRequest::PrepareCallHierarchy {
@@ -533,7 +578,10 @@ impl LspBridge {
             Some(*function_id),
             format!("references {}", name),
             RequestOrigin::User,
-        );
+        )
+        // clangd finds references from the file's AST, so this holds its
+        // document open until the reply like a prepare does.
+        .opening_a_document();
 
         if !self.dispatch(&request_tx, pending, |request_id| {
             LspRequest::FindReferencesWithSymbols {
@@ -625,9 +673,15 @@ impl LspBridge {
                 call_hierarchy_item: item,
             },
         }) {
-            SendOutcome::Sent(Some(AppEvent::LoadingCalls {
-                direction: which.to_string(),
-            }))
+            match origin {
+                RequestOrigin::User => SendOutcome::Sent(Some(AppEvent::LoadingCalls {
+                    direction: which.to_string(),
+                })),
+                // Nobody is watching for this one, and the warmup sends
+                // thousands: a status line for each is the noise
+                // `RequestOrigin` exists to stop.
+                RequestOrigin::Warmup => SendOutcome::Sent(None),
+            }
         } else {
             self.loading_states.insert(
                 *symbol_id,
@@ -640,6 +694,74 @@ impl LspBridge {
             // `None` indistinguishable from the success of its neighbour.
             SendOutcome::Failed(None)
         }
+    }
+
+    /// Ask the worker to open `documents` now, ahead of any request for them.
+    ///
+    /// clangd builds a file's preamble when the file is opened, and a prepare
+    /// sent into a file it has not seen waits for that build: a quarter of a
+    /// second on jemalloc, against tens of milliseconds once it is built. The
+    /// warmup knows which files its lanes will reach next, so it has them
+    /// opened while the current ones are still being read, and the build
+    /// overlaps the reading instead of preceding it. The documents go through
+    /// the worker's LRU like any other open, so they cost nothing the limit
+    /// does not already allow, and are evicted like any other once idle.
+    ///
+    /// The worker acknowledges the open at once — it is a notification to
+    /// clangd, not a question — so the pending entry this records is gone by
+    /// the next tick; it is registered at all only because every request that
+    /// gets an answer is, see [`LspBridge::dispatch`].
+    pub fn send_preload(&mut self, documents: Vec<lsp_types::Url>) -> SendOutcome {
+        let Some(request_tx) = self.request_tx.clone() else {
+            return SendOutcome::Declined;
+        };
+        let pending = PendingRequest::new(
+            None,
+            format!("open {} file(s) ahead", documents.len()),
+            RequestOrigin::Warmup,
+        );
+        if self.dispatch(&request_tx, pending, |request_id| {
+            LspRequest::PreloadDocuments {
+                request_id,
+                document_uris: documents,
+            }
+        }) {
+            SendOutcome::Sent(None)
+        } else {
+            SendOutcome::Failed(Some(AppEvent::FailedToSendRequest))
+        }
+    }
+
+    /// Record an item clangd produced for `symbol_id`, from whichever reply
+    /// carried it. The first one wins: they are the same ticket.
+    pub fn learn_hierarchy_item(
+        &mut self,
+        symbol_id: SymbolId,
+        item: lsp_types::CallHierarchyItem,
+    ) {
+        self.hierarchy_items.entry(symbol_id).or_insert(item);
+    }
+
+    /// Whether `symbol_id` can be asked about without a prepare.
+    pub fn has_hierarchy_item(&self, symbol_id: &SymbolId) -> bool {
+        self.hierarchy_items.contains_key(symbol_id)
+    }
+
+    /// How many requests in flight hold a document open. See
+    /// [`PendingRequest::opens_document`].
+    pub fn documents_in_flight(&self) -> usize {
+        self.pending_requests
+            .values()
+            .filter(|p| p.opens_document)
+            .count()
+    }
+
+    /// How many requests in flight the warmup sent, as opposed to the user.
+    pub fn warmup_in_flight(&self) -> usize {
+        self.pending_requests
+            .values()
+            .filter(|p| p.origin == RequestOrigin::Warmup)
+            .count()
     }
 
     /// Remove and return a pending request by ID.
@@ -992,6 +1114,60 @@ mod tests {
             Ok(LspRequest::GetOutgoingCalls { .. })
         ));
         assert_eq!(bridge.pending_requests.len(), 1, "follow-up");
+    }
+
+    /// An item already in hand is the prepare's answer, so the send skips
+    /// to the follow-up: one index request, no document opened.
+    #[test]
+    fn a_symbol_with_an_item_in_hand_is_followed_up_not_prepared() {
+        let (graph, id) = one_function();
+        let (mut bridge, mut rx) = live_worker();
+        bridge.learn_hierarchy_item(id, hierarchy_item());
+
+        let outcome =
+            bridge.send_call_hierarchy(&graph, &id, RequestOrigin::Warmup, CallDirection::Outgoing);
+
+        assert!(matches!(outcome, SendOutcome::Sent(None)));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(LspRequest::GetOutgoingCalls { .. })
+        ));
+        assert_eq!(bridge.pending_requests.len(), 1);
+        assert_eq!(
+            bridge.documents_in_flight(),
+            0,
+            "a follow-up is answered from the index and holds no document"
+        );
+        // The direction still comes off the asker.
+        let (mut bridge, mut rx) = live_worker();
+        bridge.learn_hierarchy_item(id, hierarchy_item());
+        let _ =
+            bridge.send_call_hierarchy(&graph, &id, RequestOrigin::User, CallDirection::Incoming);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(LspRequest::GetIncomingCalls { .. })
+        ));
+    }
+
+    /// A prepare holds its document open until the reply; the warmup's
+    /// document budget is a count of exactly these.
+    #[test]
+    fn a_prepare_holds_a_document_and_the_items_outlive_a_refresh() {
+        let (graph, id) = one_function();
+        let (mut bridge, _rx) = live_worker();
+        let _ =
+            bridge.send_call_hierarchy(&graph, &id, RequestOrigin::Warmup, CallDirection::Outgoing);
+        assert_eq!(bridge.documents_in_flight(), 1);
+        assert_eq!(bridge.warmup_in_flight(), 1);
+
+        bridge.learn_hierarchy_item(id, hierarchy_item());
+        let _ = bridge.clear();
+
+        assert_eq!(bridge.documents_in_flight(), 0);
+        assert!(
+            bridge.has_hierarchy_item(&id),
+            "a refresh re-queries the symbols, not the server: the items stay valid"
+        );
     }
 
     /// The id a request is filed under has to be the id it was sent with, or

@@ -259,7 +259,9 @@ async fn parse_enhanced_references_response(
 
     for file_path in files_to_analyze {
         if let Ok(document_uri) = lsp_types::Url::from_file_path(&file_path) {
-            let text_document = lsp_types::TextDocumentIdentifier { uri: document_uri };
+            let text_document = lsp_types::TextDocumentIdentifier {
+                uri: document_uri.clone(),
+            };
             match state.client.document_symbol(text_document).await {
                 Ok(lsp_request_id) => {
                     state.track_request(
@@ -268,6 +270,7 @@ async fn parse_enhanced_references_response(
                         RequestType::DocumentSymbolsForEnhancedRefs {
                             base_request_id: service_request_id.to_string(),
                         },
+                        Some(document_uri),
                     );
                     state.enhanced_lsp_requests.insert(lsp_request_id);
                     log::debug!(
