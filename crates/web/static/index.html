@@ -54,6 +54,10 @@
       <span class="stepper-label">depth</span>
       <b id="depth-value">3</b>
       <button id="depth-inc" aria-label="Show more levels">+</button>
+      <!-- Whether a number applies at all, which is a different question from
+           which number — so it is a different control, not a ninth step. -->
+      <span class="stepper-divider" aria-hidden="true"></span>
+      <button id="depth-all" aria-pressed="false" aria-label="Show every level of calls">∞</button>
     </div>
     <button class="pill" id="dir-toggle" title="Toggle call direction">→ Outgoing</button>
     <div class="pill segmented" id="orient-control" role="group" aria-label="Graph orientation">

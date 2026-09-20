@@ -237,7 +237,10 @@ function handleSnapshot(msg) {
   if (msg.cluster_top) clusterTopSpec = msg.cluster_top;
   // `null` is the depth with no bound, so a missing workspace is the only
   // reason to keep what is on screen — not a workspace that reports one.
-  if (active && 'depth' in active) graphDepth = active.depth ?? null;
+  if (active && 'depth' in active) {
+    graphDepth = active.depth ?? null;
+    if (graphDepth !== DEPTH_ALL) lastBoundedDepth = graphDepth;
+  }
   updateDepthControl();
   updateClusterControl();
   renderClusterPanel();
@@ -1154,22 +1157,32 @@ function toggleView() {
 
 const DEPTH_MIN = 1;
 const DEPTH_MAX = 8;
-/// What "limit it again" goes back to — the backend's `DEFAULT_DEPTH`, so the
-/// two controls that can leave the unbounded view land where a fresh tab does.
+/// Where the toggle lands a workspace that has never held a number — the
+/// backend's `DEFAULT_DEPTH`, so putting a limit back puts back the one a
+/// fresh tab opens with.
 const DEPTH_DEFAULT = 3;
 /// No bound at all: walk until the calls run out. `null` rather than a large
 /// number, because there is no number that means "as far as it goes" and a
 /// sentinel is something every reader has to be told about. It is what the
-/// backend's `GraphDepth::Unlimited` travels as, and what the stepper shows
-/// one step past `DEPTH_MAX`.
+/// backend's `GraphDepth::Unlimited` travels as.
 const DEPTH_ALL = null;
 
-/// The stepper's positions, shallowest first. The unbounded one sits past the
-/// top of the range rather than beside it, so + and − walk the whole control
-/// and there is no second gesture to discover.
-const DEPTH_STEPS = [];
-for (let d = DEPTH_MIN; d <= DEPTH_MAX; d++) DEPTH_STEPS.push(d);
-DEPTH_STEPS.push(DEPTH_ALL);
+/// The number the ∞ toggle comes back to.
+///
+/// Turning the limit off does not throw away which limit it was: a user who
+/// wants a look at the whole tree wants their own depth back afterwards, and
+/// landing them on the default instead would be a setting the control quietly
+/// changed while they were looking at something else. Remembered across a
+/// restart too, beside the depth itself, because the toggle survives one.
+let lastBoundedDepth = DEPTH_DEFAULT;
+{
+  // Read once, here rather than in `restoreWorkspace`: this is not a setting a
+  // workspace is handed, it is what the toggle beside it will offer next.
+  const saved = prefs().depthLevels;
+  if (typeof saved === 'number' && saved >= DEPTH_MIN && saved <= DEPTH_MAX) {
+    lastBoundedDepth = saved;
+  }
+}
 
 const depthLabel = (d) => (d === DEPTH_ALL ? 'all' : String(d));
 
@@ -1179,16 +1192,27 @@ function updateDepthControl() {
   // and a live control that does nothing when pressed is worse than a quiet
   // one. The zoom control next to it is the map's equivalent.
   const onMap = currentView === 'ClusterMap';
+  const unbounded = graphDepth === DEPTH_ALL;
+
   $('depth-value').textContent = depthLabel(graphDepth);
-  $('depth-dec').disabled = onMap || graphDepth === DEPTH_MIN;
-  $('depth-inc').disabled = onMap || graphDepth === DEPTH_ALL;
+  // The stepper names a number, so while no number applies it is dimmed rather
+  // than hidden: the range is still what the toggle will come back to, and a
+  // control that vanishes makes the toolbar jump.
+  $('depth-dec').disabled = onMap || unbounded || graphDepth === DEPTH_MIN;
+  $('depth-inc').disabled = onMap || unbounded || graphDepth === DEPTH_MAX;
+
+  const all = $('depth-all');
+  all.disabled = onMap;
+  all.setAttribute('aria-pressed', String(unbounded));
+  all.title = unbounded
+    ? `Put the limit back at ${lastBoundedDepth}`
+    : 'Show every level of calls, however deep they go';
+
   const control = $('depth-control');
   control.classList.toggle('inactive', onMap);
   control.title = onMap
     ? 'Depth applies to the call tree — double-click a cluster to get there'
-    : graphDepth === DEPTH_ALL
-      ? 'Showing every level of calls — step down to put a limit back'
-      : 'How many levels of calls to show — one step past 8 is all of them';
+    : 'How many levels of calls to show';
 }
 
 /// Ask for a depth: a number inside the range, or `DEPTH_ALL` for no bound.
@@ -1198,26 +1222,30 @@ function setDepth(next) {
     ? DEPTH_ALL
     : Math.min(Math.max(next, DEPTH_MIN), DEPTH_MAX);
   if (want === graphDepth) return;
+  if (want !== DEPTH_ALL) lastBoundedDepth = want;
   // Reflect it immediately; the snapshot that follows confirms it.
   graphDepth = want;
   updateDepthControl();
-  savePrefs({ depth: want });
+  savePrefs({ depth: want, depthLevels: lastBoundedDepth });
   sendCommand({ SetGraphDepth: want });
 }
 
-/// One position along the stepper. Walking the ladder rather than doing
-/// arithmetic is what lets the unbounded position sit on the end of it: it is
-/// not `DEPTH_MAX + 1`, and adding one to it would not be anything at all.
+/// One step along the range. Plain arithmetic, because the range is plain
+/// numbers again: whether a number applies at all is the ∞ toggle's question,
+/// not a ninth position that + walks onto.
 function stepDepth(delta) {
-  const at = DEPTH_STEPS.indexOf(graphDepth);
-  if (at < 0) return;
-  const next = at + delta;
-  if (next < 0 || next >= DEPTH_STEPS.length) return;
-  setDepth(DEPTH_STEPS[next]);
+  if (graphDepth === DEPTH_ALL) return;
+  setDepth(graphDepth + delta);
+}
+
+/// Turn the limit off, or put back the one it was on.
+function toggleDepthLimit() {
+  setDepth(graphDepth === DEPTH_ALL ? lastBoundedDepth : DEPTH_ALL);
 }
 
 $('depth-dec').addEventListener('click', () => stepDepth(-1));
 $('depth-inc').addEventListener('click', () => stepDepth(1));
+$('depth-all').addEventListener('click', toggleDepthLimit);
 
 // ── Event handling ────────────────────────────────────────────────────────────
 
@@ -1936,13 +1964,13 @@ function buildCommands() {
     { id: 'view.direction', label: 'View: Toggle Call Direction', hint: 'Ctrl+D', run: flipDirection },
     { id: 'view.orientation', label: 'View: Toggle Graph Orientation', hint: 'Ctrl+Shift+D', run: () => setOrientation(currentOrientation === 'LeftRight' ? 'TopDown' : 'LeftRight') },
     { id: 'view.fit', label: 'View: Fit Graph to Screen', disabled: cy.nodes().length === 0, run: fitGraph },
-    { id: 'view.deeper', label: 'View: Show More Levels', hint: 'Ctrl+]', disabled: onMap || graphDepth === DEPTH_ALL, run: () => stepDepth(1) },
-    { id: 'view.shallower', label: 'View: Show Fewer Levels', hint: 'Ctrl+[', disabled: onMap || graphDepth === DEPTH_MIN, run: () => stepDepth(-1) },
-    // The end of the stepper reaches it in one press from 8 and in eight from
-    // 1, and on a real project the answer to "show me everything" should not
-    // be eight presses that each redraw the canvas.
+    { id: 'view.deeper', label: 'View: Show More Levels', hint: 'Ctrl+]', disabled: onMap || graphDepth === DEPTH_ALL || graphDepth === DEPTH_MAX, run: () => stepDepth(1) },
+    { id: 'view.shallower', label: 'View: Show Fewer Levels', hint: 'Ctrl+[', disabled: onMap || graphDepth === DEPTH_ALL || graphDepth === DEPTH_MIN, run: () => stepDepth(-1) },
+    // Both directions of the ∞ toggle, named absolutely rather than as one
+    // entry that does the opposite of whatever is there: a palette is searched
+    // for what you want, not read for what you have.
     { id: 'view.alldepth', label: 'View: Show All Levels', disabled: onMap || graphDepth === DEPTH_ALL, run: () => setDepth(DEPTH_ALL) },
-    { id: 'view.limitdepth', label: 'View: Limit Depth Again', disabled: onMap || graphDepth !== DEPTH_ALL, run: () => setDepth(DEPTH_DEFAULT) },
+    { id: 'view.limitdepth', label: 'View: Limit Depth Again', disabled: onMap || graphDepth !== DEPTH_ALL, run: () => setDepth(lastBoundedDepth) },
     {
       id: 'view.collapse',
       label: 'View: Collapse or Expand Selected Node',

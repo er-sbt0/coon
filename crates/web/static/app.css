@@ -404,11 +404,28 @@ body.resizing { cursor: col-resize; user-select: none; }
   padding: 0 var(--sp-1) 0 3px;
   color: var(--text);
   font-variant-numeric: tabular-nums;
-  /* Wide enough for the widest readout ("all"), so stepping off the end of
-     the range does not shove the rest of the toolbar sideways. */
+  /* Wide enough for the widest readout ("all"), so turning the limit off does
+     not shove the rest of the toolbar sideways. */
   display: inline-block;
   min-width: 3ch;
   text-align: center;
+}
+
+/* The stepper picks a number; the toggle past this line decides whether a
+   number applies at all. The rule is there so the two do not read as one run
+   of buttons — the ∞ is not a third step in the same direction. */
+.pill.stepper .stepper-divider {
+  width: 1px;
+  align-self: stretch;
+  margin: var(--sp-1) 0;
+  background: var(--border);
+}
+/* One accent at full strength marks the live state, as the orientation
+   control does — the limit is off, and the numbers beside it are greyed
+   because the range they name is not what the canvas is drawing. */
+.pill.stepper button[aria-pressed="true"] {
+  background: var(--surface-hover);
+  color: var(--accent);
 }
 
 /* ── Cluster settings menu ──────────────────────────────────────────────────
