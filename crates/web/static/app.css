@@ -330,9 +330,17 @@ body.resizing { cursor: col-resize; user-select: none; }
   color: var(--text-dim);
   user-select: none;
 }
-.status-item { display: flex; align-items: center; gap: var(--sp-1); white-space: nowrap; }
+/* Tabular figures across the whole bar: the counts here change while the user
+   is reading them, and proportional digits reflow the line on every tick. */
+.status-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
 .status-item.right { margin-left: auto; }
-.status-item b { font-weight: 600; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.status-item b { font-weight: 600; color: var(--text-muted); }
 
 #lsp-dot {
   width: 6px;

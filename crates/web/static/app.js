@@ -1262,11 +1262,27 @@ const PHASE_LABEL = {
 
 function loading() { return load.symbols || load.edges; }
 
+/// A digit's width, in a font asked for tabular figures. HTML collapses a run
+/// of ordinary spaces; it does not collapse these.
+const FIGURE_SPACE = '\u2007';
+
+/// `value`, right-aligned in a field `width` characters wide.
+///
+/// Tabular figures make every digit the same width, which is not the same as
+/// making every *number* the same width: 9 → 10 still grows the string and
+/// shoves everything after it along the bar. Padding the near side to the width
+/// of the far one holds the pair still until the total itself gains a digit.
+function padCount(value, width) {
+  const text = value.toLocaleString();
+  return text.length >= width ? text : FIGURE_SPACE.repeat(width - text.length) + text;
+}
+
 /// Push `load` to the status bar.
 ///
 /// A stage with a total reads as a fraction; one without reads as a running
 /// count, because clangd streams workspace symbols without ever saying how
-/// many are coming.
+/// many are coming. Only the fraction is padded — the bare count is the end of
+/// the line, so there is nothing after it to shift.
 function renderLoad() {
   if (!loading()) return;
   // The numbers belong to whichever stage last set them, and a finished stage's
@@ -1275,8 +1291,9 @@ function renderLoad() {
   if (load.stage === 'edges' && !load.edges) return;
   if (load.stage === 'symbols' && !load.symbols) return;
 
+  const total = load.total.toLocaleString();
   const counts = load.total > 0
-    ? `${load.done.toLocaleString()} / ${load.total.toLocaleString()}`
+    ? `${padCount(load.done, total.length)} / ${total}`
     : (load.count != null ? load.count.toLocaleString() : '');
 
   setStatus(counts ? `${load.label} ${counts}` : load.label, 'busy');
