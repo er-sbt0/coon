@@ -34,7 +34,7 @@
 //! letting the copy drift. So the export carries shape and dash — the parts
 //! that mean something — and leaves the colours to whoever renders it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 
 use model::{CallDirection, CallGraph, SymbolId};
@@ -134,6 +134,7 @@ fn rooted_dot(core: &CoreApp) -> Option<String> {
             ws.depth(),
             visible.len()
         ),
+        false,
     );
 
     for id in &visible {
@@ -305,6 +306,7 @@ fn cluster_dot(core: &CoreApp) -> Option<String> {
             core.map_level_for(ws) + 1,
             clustering.level_count(),
         ),
+        true,
     );
 
     for (id, (meta, members)) in boxes.iter().zip(&members_of).enumerate() {
@@ -335,14 +337,63 @@ fn cluster_dot(core: &CoreApp) -> Option<String> {
     // the count is not lost for want of a hover — DOT is text, so it is legible
     // in the source, becomes a tooltip in a rendered SVG, and comes back as an
     // attribute through `networkx` or `gvpr`, which a line width never did.
+    //
+    // Calls that stay inside a box are written one per function pair, since
+    // opening the box is what the file is for. Calls that cross between two
+    // boxes are folded into one line per pair of boxes, drawn border to
+    // border, because that is the one line the canvas draws: `aggregate_calls`
+    // in `layout` sums the calls between two boxes into one edge, and an
+    // export of that map with thirty lines fanning between the same two boxes
+    // was a drawing of something the screen never showed. The line is anchored
+    // on the pair of functions that call each other the most across it, so
+    // `dot` routes it where the traffic is, and the count it carries is the
+    // sum. What this gives up is the function-level record of who calls whom
+    // across a border — a tool reading the file back gets the pair of boxes
+    // and the total, not the thirty calls.
+    let box_of: HashMap<SymbolId, usize> = members_of
+        .iter()
+        .enumerate()
+        .flat_map(|(index, members)| members.iter().map(move |m| (*m, index)))
+        .collect();
+    // Per ordered pair of boxes: the calls crossing it, and the heaviest
+    // function pair among them. `call_edges` is sorted by name, so among
+    // equally heavy pairs the first by name is the anchor.
+    struct Crossing {
+        total: usize,
+        anchor: (SymbolId, SymbolId, usize),
+    }
+    let mut between: BTreeMap<(usize, usize), Crossing> = BTreeMap::new();
     for edge in call_edges(&core.call_graph, &name_of, ws.direction()) {
-        let (Some(source), Some(target)) = (name_of.get(&edge.0), name_of.get(&edge.1)) else {
+        let (Some(&from), Some(&to)) = (box_of.get(&edge.0), box_of.get(&edge.1)) else {
             continue;
         };
+        if from != to {
+            let crossing = between.entry((from, to)).or_insert(Crossing {
+                total: 0,
+                anchor: edge,
+            });
+            crossing.total += edge.2;
+            if edge.2 > crossing.anchor.2 {
+                crossing.anchor = edge;
+            }
+            continue;
+        }
         writeln!(
             &mut out,
-            "  {source} -> {target} [tooltip={}];",
+            "  {} -> {} [tooltip={}];",
+            name_of[&edge.0],
+            name_of[&edge.1],
             quote(&count_of("call", edge.2))
+        )
+        .ok();
+    }
+    for ((from, to), crossing) in &between {
+        writeln!(
+            &mut out,
+            "  {} -> {} [ltail=cluster_{from}, lhead=cluster_{to}, tooltip={}];",
+            name_of[&crossing.anchor.0],
+            name_of[&crossing.anchor.1],
+            quote(&count_of("call", crossing.total))
         )
         .ok();
     }
@@ -428,7 +479,10 @@ fn emit_function(
 // Shared bits
 // ---------------------------------------------------------------------------
 
-fn header(out: &mut String, orientation: LayoutOrientation, label: &str) {
+/// `compound` lets an edge end on a cluster's border (`ltail`/`lhead`)
+/// rather than on a node inside it, which is how the map draws one line
+/// between two boxes; a rooted export has no clusters and leaves it off.
+fn header(out: &mut String, orientation: LayoutOrientation, label: &str, compound: bool) {
     let rankdir = match orientation {
         LayoutOrientation::LeftRight => "LR",
         LayoutOrientation::TopDown => "TB",
@@ -437,8 +491,9 @@ fn header(out: &mut String, orientation: LayoutOrientation, label: &str) {
     out.push_str("digraph coon {\n");
     writeln!(
         out,
-        "  graph [rankdir={rankdir}, labelloc=\"t\", label={}, fontname=\"Helvetica\", fontsize=12];",
-        quote(label)
+        "  graph [rankdir={rankdir}, labelloc=\"t\", label={}, fontname=\"Helvetica\", fontsize=12{}];",
+        quote(label),
+        if compound { ", compound=true" } else { "" }
     )
     .ok();
     out.push_str("  node [shape=box, style=rounded, fontname=\"Helvetica\", fontsize=11];\n");
@@ -823,7 +878,7 @@ mod tests {
             count(&fine),
             count(&coarse)
         );
-        let functions = |out: &str| out.matches("tooltip=").count();
+        let functions = |out: &str| out.matches("[label=").count();
         assert_eq!(
             functions(&fine),
             functions(&coarse),
@@ -888,7 +943,7 @@ mod tests {
 
         let twice = dot(&CoreApp::new(graph));
         assert!(
-            twice.contains("[tooltip=\"2 calls\"]"),
+            twice.contains("tooltip=\"2 calls\"]"),
             "two call sites, one line, and the file says which; got:\n{twice}"
         );
         assert!(!twice.contains("penwidth"), "still no ink for it:\n{twice}");
@@ -920,6 +975,67 @@ mod tests {
         assert!(
             out.contents.contains("main — neighbourhood"),
             "the two look identical otherwise, so the file has to say which it is"
+        );
+    }
+
+    /// The map draws one line between two boxes however many calls cross
+    /// between them, and so does its export: every plain line stays inside
+    /// one box, and every line between boxes is border to border and unique
+    /// to its pair.
+    #[test]
+    fn two_boxes_share_one_line_however_many_calls_cross() {
+        let core = CoreApp::new(create_demo_call_graph());
+        let out = dot(&core);
+        assert!(
+            out.contains("compound=true"),
+            "border-to-border edges need it"
+        );
+
+        // Which cluster subgraph each node is declared in.
+        let mut box_of: HashMap<&str, usize> = HashMap::new();
+        let mut current = None;
+        for line in out.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("subgraph cluster_") {
+                current = rest.split_whitespace().next().and_then(|n| n.parse().ok());
+            } else if line == "}" {
+                current = None;
+            } else if let (Some(id), Some(index)) = (
+                line.split_whitespace()
+                    .next()
+                    .filter(|_| line.contains("[label=")),
+                current,
+            ) {
+                box_of.insert(id, index);
+            }
+        }
+
+        let mut pairs: HashSet<(usize, usize)> = HashSet::new();
+        let mut crossing = 0;
+        for line in out.lines() {
+            let Some((left, right)) = line.trim().split_once(" -> ") else {
+                continue;
+            };
+            let target = right.split_whitespace().next().unwrap();
+            let (from, to) = (box_of[left], box_of[target]);
+            if right.contains("ltail=") {
+                crossing += 1;
+                assert!(
+                    right.contains(&format!("ltail=cluster_{from}, lhead=cluster_{to}"))
+                        && from != to,
+                    "a border line is anchored in the boxes it names: {line}"
+                );
+                assert!(
+                    pairs.insert((from, to)),
+                    "two lines between the same pair of boxes: {line}"
+                );
+            } else {
+                assert_eq!(from, to, "a plain line crosses between boxes: {line}");
+            }
+        }
+        assert!(
+            crossing > 0,
+            "the demo's boxes call each other; got:\n{out}"
         );
     }
 

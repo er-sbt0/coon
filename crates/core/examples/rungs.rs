@@ -60,17 +60,25 @@ fn from_dot(text: &str) -> CallGraph {
             continue;
         };
         let to = rest.trim_end_matches(';');
-        let (to, pen) = match to.split_once(" [penwidth=") {
-            Some((to, tail)) => (
-                to,
-                tail.split(',')
-                    .next()
-                    .and_then(|p| p.parse().ok())
-                    .unwrap_or(1.0),
-            ),
-            None => (to, 1.0f32),
+        let (to, attrs) = to.split_once(" [").unwrap_or((to, ""));
+        // Older exports scaled the pen with the count; current ones say it
+        // in the tooltip, and a tree's edges carry neither and weigh one.
+        let calls = if let Some(pen) = attrs.strip_prefix("penwidth=") {
+            let pen: f32 = pen
+                .split(',')
+                .next()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(1.0);
+            2f32.powf(pen - 1.0).round().max(1.0) as u32
+        } else if let Some((_, count)) = attrs.split_once("tooltip=\"") {
+            count
+                .split_whitespace()
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(1)
+        } else {
+            1
         };
-        let calls = 2f32.powf(pen - 1.0).round().max(1.0) as u32;
         let (Some(&a), Some(&b)) = (ids.get(from), ids.get(to)) else {
             continue;
         };
