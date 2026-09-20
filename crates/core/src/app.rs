@@ -111,27 +111,48 @@ const WARMUP_LOG_INTERVAL: Duration = Duration::from_secs(2);
 /// going to answer is named here before the timeout quietly retires it.
 const WARMUP_STALL_AFTER: Duration = Duration::from_secs(10);
 
+/// One function's neighbourhood: where a scoped map is drawn from, which way
+/// it reaches, and how far.
+///
+/// The depth is the workspace's own — the number the toolbar's stepper shows —
+/// so a map scoped to a function groups the same functions the call tree of
+/// that function was showing. It belongs *inside* the scope rather than beside
+/// it in [`ClusterTarget`]: the whole-program map has no origin to walk from,
+/// so a depth on it would be a key that splits the one cache entry every tab
+/// falls back to, and recompute it on every press of a stepper that does not
+/// govern it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct MapScope {
+    symbol: SymbolId,
+    direction: CallDirection,
+    depth: GraphDepth,
+}
+
 /// Which clustering a workspace is asking for — and so what a cache entry and
 /// a background job are each about.
 ///
 /// Every part of it comes off the workspace, because every part of it changes
 /// what comes back: the settings are the algorithm and the knobs it reads, the
-/// scope is the subgraph, and the direction decides which way a scope reaches.
-/// Two tabs agreeing on all of it are asking the same question and share the
-/// answer — and two that agree on the method but not on its grain are not, which
-/// is why the whole of [`ClusterSettings`] is in the key rather than the method
-/// alone.
+/// scope is the subgraph, the direction decides which way a scope reaches, and
+/// the depth decides how far. Two tabs agreeing on all of it are asking the
+/// same question and share the answer — and two that agree on the method but
+/// not on its grain are not, which is why the whole of [`ClusterSettings`] is
+/// in the key rather than the method alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ClusterTarget {
     /// One function's neighbourhood, or `None` for the whole program.
-    scope: Option<(SymbolId, CallDirection)>,
+    scope: Option<MapScope>,
     settings: ClusterSettings,
 }
 
 impl ClusterTarget {
     fn of(ws: &CoreWorkspace) -> Self {
         Self {
-            scope: ws.map_scope().map(|scope| (scope, ws.direction())),
+            scope: ws.map_scope().map(|symbol| MapScope {
+                symbol,
+                direction: ws.direction(),
+                depth: ws.depth(),
+            }),
             settings: ws.cluster_settings(),
         }
     }
@@ -149,18 +170,20 @@ impl ClusterTarget {
     /// depend on hash iteration. Settings sort by method and then by the knobs
     /// as they go out on the wire, which is arbitrary but total, and that is
     /// all this promises.
-    fn order(&self) -> (bool, u128, bool, usize, u64, u64, usize) {
-        let (scope, incoming) = match self.scope {
-            Some((symbol, direction)) => (
-                symbol.0.as_u128(),
-                matches!(direction, CallDirection::Incoming),
+    fn order(&self) -> (bool, u128, bool, Option<usize>, usize, u64, u64, usize) {
+        let (scope, incoming, depth) = match self.scope {
+            Some(scope) => (
+                scope.symbol.0.as_u128(),
+                matches!(scope.direction, CallDirection::Incoming),
+                scope.depth.levels(),
             ),
-            None => (0, false),
+            None => (0, false, None),
         };
         (
             self.scope.is_some(),
             scope,
             incoming,
+            depth,
             self.settings.method() as usize,
             self.settings.resolution().to_bits(),
             self.settings.inflation().to_bits(),
@@ -216,10 +239,13 @@ pub struct CoreApp {
     /// then means one staleness rule, one job queue and one eviction pass
     /// instead of two of each.
     ///
-    /// Derived from the whole graph (or the whole scope), never from the BFS
-    /// window on screen: the window changes every time the user expands a node,
-    /// and boxes that regrouped and renamed themselves on every click would be
-    /// describing the view rather than the program.
+    /// Derived from the whole graph, or — when a tab has scoped its map to one
+    /// function — from what that function reaches within the tab's depth, which
+    /// is the same walk the call tree it was scoped from was drawing. What is
+    /// deliberately *not* in it is the rest of the window: collapse and expand
+    /// change every time the user clicks a node, and boxes that regrouped and
+    /// renamed themselves on every click would be describing the clicking
+    /// rather than the program.
     clusterings: HashMap<ClusterTarget, Clustering>,
     /// Targets whose cached map is out of date with the graph. The entries are
     /// still worth keeping — a stale map is drawable, and stands in while the
@@ -949,12 +975,16 @@ impl CoreApp {
         // by a user already waiting on the map they just asked for — where the
         // recompute this replaced fired on a timer for as long as the graph
         // kept growing.
-        let direction = ws.direction();
+        let scope = MapScope {
+            symbol,
+            direction: ws.direction(),
+            depth: ws.depth(),
+        };
         let target = ClusterTarget {
-            scope: Some((symbol, direction)),
+            scope: Some(scope),
             settings: ws.cluster_settings(),
         };
-        let clustering = cluster_within(&self.call_graph, symbol, direction, target.settings);
+        let clustering = cluster_within(&self.call_graph, scope, target.settings);
         // And the frame it will be placed in, if no worker has been round yet —
         // which is the case while the project is still arriving, since nothing
         // is clustered until it settles. Inline for the same reason the
@@ -978,7 +1008,11 @@ impl CoreApp {
             .current_mut()
             .is_some_and(|ws| ws.set_map_scope(Some(symbol)));
         if changed {
-            log::info!("CoreApp: cluster map scoped to {symbol:?} ({direction:?})");
+            log::info!(
+                "CoreApp: cluster map scoped to {symbol:?} ({:?}, depth {})",
+                scope.direction,
+                scope.depth
+            );
             vec![AppEvent::LayoutDirty]
         } else {
             vec![]
@@ -1784,9 +1818,7 @@ impl CoreApp {
         std::thread::spawn(move || {
             let clustering = match target.scope {
                 None => Clustering::compute(&graph, target.settings),
-                Some((scope, direction)) => {
-                    cluster_within(&graph, scope, direction, target.settings)
-                }
+                Some(scope) => cluster_within(&graph, scope, target.settings),
             };
             let frame = frame_wanted.then(|| compute_map_frame(&graph));
             // A gone receiver means the app was dropped while this ran, which
@@ -1868,22 +1900,26 @@ impl CoreApp {
 /// Cluster everything `scope` reaches, reading the graph the way the workspace
 /// that asked for it does.
 ///
+/// Bounded by the workspace's depth, which is the same walk the call tree the
+/// user came from was drawing: a map of "what `f` reaches" that reaches further
+/// than the view it was asked for from is a map of a different question, and
+/// the boxes it draws hold functions the user cannot see. The number is the
+/// only part of the view the map takes — collapse and expand are not, because
+/// they describe one tree's shape rather than how much program is in view, and
+/// a map that regrouped and renamed its boxes on every collapse click would be
+/// describing the clicking rather than the program.
+///
+/// [`GraphDepth::Unlimited`] is the whole neighbourhood, as it was before the
+/// depth reached here at all.
+///
 /// A free function rather than a method because a worker thread is what mostly
 /// runs it, and a thread cannot borrow the app.
-fn cluster_within(
-    graph: &CallGraph,
-    scope: SymbolId,
-    direction: CallDirection,
-    settings: ClusterSettings,
-) -> Clustering {
+fn cluster_within(graph: &CallGraph, scope: MapScope, settings: ClusterSettings) -> Clustering {
     let traversal = GraphTraversal::new(graph);
-    // Unbounded, unlike the rooted tree's BFS: depth is how much of a tree
-    // fits on a canvas, and the map exists precisely to stand in for more
-    // than fits. Cutting the neighbourhood at three levels would group the
-    // near half of a subsystem and call it the subsystem.
-    let reachable: HashSet<SymbolId> = match direction {
-        CallDirection::Outgoing => traversal.find_reachable_from(&scope),
-        CallDirection::Incoming => traversal.find_can_reach(&scope),
+    let levels = scope.depth.clamped().levels();
+    let reachable: HashSet<SymbolId> = match scope.direction {
+        CallDirection::Outgoing => traversal.find_reachable_within(&scope.symbol, levels),
+        CallDirection::Incoming => traversal.find_can_reach_within(&scope.symbol, levels),
     }
     .into_iter()
     .collect();
@@ -3663,6 +3699,77 @@ mod tests {
         assert!(
             active(&app).cluster_of(&right[2]).is_none(),
             "and not what it reaches"
+        );
+    }
+
+    #[test]
+    fn the_scoped_map_stops_where_the_depth_limit_does() {
+        // left_a → left_b, left_c → right_a → right_b, right_c: one level of
+        // calls short of the far triangle, two levels into it.
+        let (graph, left, right) = two_triangles();
+        let mut app = CoreApp::new(graph);
+        app.dispatch(Command::SetGraphDepth(GraphDepth::Levels(1)));
+
+        app.dispatch(Command::SetMapScope(Some(left[0])));
+
+        for symbol in left {
+            assert!(
+                active(&app).cluster_of(&symbol).is_some(),
+                "one level out is the triangle this function is in"
+            );
+        }
+        for symbol in right {
+            assert!(
+                active(&app).cluster_of(&symbol).is_none(),
+                "and the next triangle is past where the view stops"
+            );
+        }
+    }
+
+    #[test]
+    fn deepening_the_view_widens_the_scoped_map_with_it() {
+        let (graph, left, right) = two_triangles();
+        let mut app = CoreApp::new(graph);
+        app.dispatch(Command::SetGraphDepth(GraphDepth::Levels(1)));
+        app.dispatch(Command::SetMapScope(Some(left[0])));
+
+        app.dispatch(Command::SetGraphDepth(GraphDepth::Levels(3)));
+        tick_until_settled(&mut app);
+
+        assert!(
+            right.iter().all(|s| active(&app).cluster_of(s).is_some()),
+            "three levels out reaches the far triangle, so the map holds it"
+        );
+        assert!(
+            app.clusterings.keys().any(|target| matches!(
+                target.scope,
+                Some(scope) if scope.depth == GraphDepth::Levels(3)
+            )),
+            "and the map that is showing is the one built to the depth on screen"
+        );
+    }
+
+    #[test]
+    fn the_whole_program_map_is_not_bounded_by_the_depth() {
+        // Depth is where a walk *from somewhere* stops, and the whole-program
+        // map starts nowhere in particular — so the stepper must neither
+        // narrow it nor split its cache entry per number.
+        let (graph, left, _) = two_triangles();
+        let mut app = CoreApp::new(graph);
+        app.dispatch(Command::SetGraphDepth(GraphDepth::Levels(1)));
+        tick_until_settled(&mut app);
+
+        let whole = ClusterTarget {
+            scope: None,
+            settings: ClusterSettings::default(),
+        };
+        assert!(
+            app.clusterings
+                .get(&whole)
+                .expect("the whole-program map is keyed without a depth")
+                .cluster_of(&left[0])
+                .is_some(),
+            "the whole program is on it whatever the stepper says"
         );
     }
 

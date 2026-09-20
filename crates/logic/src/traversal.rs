@@ -21,7 +21,18 @@ impl<'a> GraphTraversal<'a> {
     }
 
     /// Generic BFS traversal that can work with different neighbor functions
-    fn bfs_traverse<F>(&self, start_id: &SymbolId, get_neighbors: F) -> Vec<SymbolId>
+    ///
+    /// `max_depth` is how many hops out from `start_id` the walk goes, or
+    /// `None` for as far as the calls lead. It counts hops, not nodes: a limit
+    /// of 0 is the start on its own, and a limit of 3 is the start plus three
+    /// levels — the same reading [`crate::cluster`]'s callers and the layout's
+    /// depth limit give the number.
+    fn bfs_traverse<F>(
+        &self,
+        start_id: &SymbolId,
+        max_depth: Option<usize>,
+        get_neighbors: F,
+    ) -> Vec<SymbolId>
     where
         F: Fn(&SymbolId) -> Vec<SymbolId>,
     {
@@ -29,16 +40,24 @@ impl<'a> GraphTraversal<'a> {
         let mut queue = VecDeque::new();
         let mut result = Vec::new();
 
-        queue.push_back(*start_id);
+        queue.push_back((*start_id, 0usize));
         visited.insert(*start_id);
 
-        while let Some(current_id) = queue.pop_front() {
+        while let Some((current_id, depth)) = queue.pop_front() {
             result.push(current_id);
+
+            // Enqueued the first time it is seen and never again, so a cycle is
+            // walked once whether or not there is a limit — and a node reached
+            // at two depths is kept at the shorter of them, which is what the
+            // BFS order already guarantees.
+            if max_depth.is_some_and(|max| depth >= max) {
+                continue;
+            }
 
             for neighbor_id in get_neighbors(&current_id) {
                 if !visited.contains(&neighbor_id) {
                     visited.insert(neighbor_id);
-                    queue.push_back(neighbor_id);
+                    queue.push_back((neighbor_id, depth + 1));
                 }
             }
         }
@@ -48,7 +67,22 @@ impl<'a> GraphTraversal<'a> {
 
     /// Find all functions reachable from a starting function (BFS)
     pub fn find_reachable_from(&self, start_id: &SymbolId) -> Vec<SymbolId> {
-        self.bfs_traverse(start_id, |id| {
+        self.find_reachable_within(start_id, None)
+    }
+
+    /// Find all functions that can reach a target function (reverse BFS)
+    pub fn find_can_reach(&self, target_id: &SymbolId) -> Vec<SymbolId> {
+        self.find_can_reach_within(target_id, None)
+    }
+
+    /// Find the functions reachable from a starting function within
+    /// `max_depth` levels of calls, or all of them with `None`.
+    pub fn find_reachable_within(
+        &self,
+        start_id: &SymbolId,
+        max_depth: Option<usize>,
+    ) -> Vec<SymbolId> {
+        self.bfs_traverse(start_id, max_depth, |id| {
             self.graph
                 .get_callees(id)
                 .iter()
@@ -57,9 +91,14 @@ impl<'a> GraphTraversal<'a> {
         })
     }
 
-    /// Find all functions that can reach a target function (reverse BFS)
-    pub fn find_can_reach(&self, target_id: &SymbolId) -> Vec<SymbolId> {
-        self.bfs_traverse(target_id, |id| {
+    /// Find the functions that reach a target function within `max_depth`
+    /// levels of calls, or all of them with `None`.
+    pub fn find_can_reach_within(
+        &self,
+        target_id: &SymbolId,
+        max_depth: Option<usize>,
+    ) -> Vec<SymbolId> {
+        self.bfs_traverse(target_id, max_depth, |id| {
             self.graph
                 .get_callers(id)
                 .iter()
@@ -202,6 +241,38 @@ mod tests {
         let can_reach = traversal.find_can_reach(&func_c.id);
 
         assert_eq!(can_reach.len(), 3); // C, B, A (reverse order)
+    }
+
+    #[test]
+    fn a_bounded_walk_stops_at_the_level_it_was_given() {
+        let graph = create_test_graph();
+        let traversal = GraphTraversal::new(&graph);
+
+        let func_a = graph.find_function_by_name("func_a").unwrap();
+        let func_c = graph.find_function_by_name("func_c").unwrap();
+
+        // The number counts hops, so it is the start plus that many levels.
+        assert_eq!(traversal.find_reachable_within(&func_a.id, Some(0)).len(), 1);
+        assert_eq!(traversal.find_reachable_within(&func_a.id, Some(1)).len(), 2);
+        assert_eq!(traversal.find_reachable_within(&func_a.id, Some(2)).len(), 3);
+        // Past the end of the chain is the whole chain, not an error.
+        assert_eq!(traversal.find_reachable_within(&func_a.id, Some(9)).len(), 3);
+        assert_eq!(traversal.find_reachable_within(&func_a.id, None).len(), 3);
+
+        // And the same in reverse.
+        assert_eq!(traversal.find_can_reach_within(&func_c.id, Some(1)).len(), 2);
+        assert_eq!(traversal.find_can_reach_within(&func_c.id, None).len(), 3);
+    }
+
+    #[test]
+    fn a_bounded_walk_terminates_on_a_cycle() {
+        let mut graph = create_test_graph();
+        let func_a = graph.find_function_by_name("func_a").unwrap().id;
+        let func_c = graph.find_function_by_name("func_c").unwrap().id;
+        graph.add_call(func_c, func_a, Location::new("test.rs".to_string(), 11, 4));
+
+        let traversal = GraphTraversal::new(&graph);
+        assert_eq!(traversal.find_reachable_within(&func_a, Some(100)).len(), 3);
     }
 
     #[test]

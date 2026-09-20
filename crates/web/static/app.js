@@ -1186,38 +1186,49 @@ let lastBoundedDepth = DEPTH_DEFAULT;
 
 const depthLabel = (d) => (d === DEPTH_ALL ? 'all' : String(d));
 
+/// Whether the depth stepper governs what is on screen.
+///
+/// It does on the call tree, where it is where the BFS stops — and on a map
+/// scoped to one function, which groups that function's neighbourhood walked
+/// to the same depth. It does not on the whole-program map: that one starts
+/// nowhere in particular, so there is no walk for a number of levels to bound,
+/// and the zoom control beside it is what moves there instead.
+function depthApplies() {
+  return currentView !== 'ClusterMap' || mapScope !== null;
+}
+
 function updateDepthControl() {
-  // Depth is where the rooted view's BFS stops. The map is bounded by the rung
-  // of the ladder it is drawn at instead, so the stepper governs nothing here —
-  // and a live control that does nothing when pressed is worse than a quiet
-  // one. The zoom control next to it is the map's equivalent.
-  const onMap = currentView === 'ClusterMap';
+  // A live control that does nothing when pressed is worse than a quiet one,
+  // so where the number governs nothing the whole pill goes inactive.
+  const live = depthApplies();
   const unbounded = graphDepth === DEPTH_ALL;
 
   $('depth-value').textContent = depthLabel(graphDepth);
   // The stepper names a number, so while no number applies it is dimmed rather
   // than hidden: the range is still what the toggle will come back to, and a
   // control that vanishes makes the toolbar jump.
-  $('depth-dec').disabled = onMap || unbounded || graphDepth === DEPTH_MIN;
-  $('depth-inc').disabled = onMap || unbounded || graphDepth === DEPTH_MAX;
+  $('depth-dec').disabled = !live || unbounded || graphDepth === DEPTH_MIN;
+  $('depth-inc').disabled = !live || unbounded || graphDepth === DEPTH_MAX;
 
   const all = $('depth-all');
-  all.disabled = onMap;
+  all.disabled = !live;
   all.setAttribute('aria-pressed', String(unbounded));
   all.title = unbounded
     ? `Put the limit back at ${lastBoundedDepth}`
     : 'Show every level of calls, however deep they go';
 
   const control = $('depth-control');
-  control.classList.toggle('inactive', onMap);
-  control.title = onMap
+  control.classList.toggle('inactive', !live);
+  control.title = !live
     ? 'Depth applies to the call tree — double-click a cluster to get there'
-    : 'How many levels of calls to show';
+    : currentView === 'ClusterMap'
+      ? 'How many levels of calls this map groups'
+      : 'How many levels of calls to show';
 }
 
 /// Ask for a depth: a number inside the range, or `DEPTH_ALL` for no bound.
 function setDepth(next) {
-  if (currentView === 'ClusterMap') return;   // nothing on the map to deepen
+  if (!depthApplies()) return;   // nothing on the whole-program map to deepen
   const want = next === DEPTH_ALL
     ? DEPTH_ALL
     : Math.min(Math.max(next, DEPTH_MIN), DEPTH_MAX);
@@ -1890,6 +1901,9 @@ function buildCommands() {
   // silently changing a view the user is not looking at.
   const onMap = currentView === 'ClusterMap';
   const canZoom = onMap && mapLevels > 0;
+  // The depth is the one of these the map does not simply ignore: a map scoped
+  // to a function groups what that function reaches within it.
+  const depth = depthApplies();
 
   const cmds = [
     { id: 'goto', label: 'Go to Symbol\u2026', hint: 'Ctrl+P', run: openSymbolFinder },
@@ -1964,13 +1978,17 @@ function buildCommands() {
     { id: 'view.direction', label: 'View: Toggle Call Direction', hint: 'Ctrl+D', run: flipDirection },
     { id: 'view.orientation', label: 'View: Toggle Graph Orientation', hint: 'Ctrl+Shift+D', run: () => setOrientation(currentOrientation === 'LeftRight' ? 'TopDown' : 'LeftRight') },
     { id: 'view.fit', label: 'View: Fit Graph to Screen', disabled: cy.nodes().length === 0, run: fitGraph },
-    { id: 'view.deeper', label: 'View: Show More Levels', hint: 'Ctrl+]', disabled: onMap || graphDepth === DEPTH_ALL || graphDepth === DEPTH_MAX, run: () => stepDepth(1) },
-    { id: 'view.shallower', label: 'View: Show Fewer Levels', hint: 'Ctrl+[', disabled: onMap || graphDepth === DEPTH_ALL || graphDepth === DEPTH_MIN, run: () => stepDepth(-1) },
+    // Live on a scoped map too, where the depth is how far the neighbourhood
+    // it groups was walked — but without the bracket hints there, because on
+    // any map those keys are the zoom, and a hint that names a key doing
+    // something else is worse than none.
+    { id: 'view.deeper', label: 'View: Show More Levels', hint: onMap ? '' : 'Ctrl+]', disabled: !depth || graphDepth === DEPTH_ALL || graphDepth === DEPTH_MAX, run: () => stepDepth(1) },
+    { id: 'view.shallower', label: 'View: Show Fewer Levels', hint: onMap ? '' : 'Ctrl+[', disabled: !depth || graphDepth === DEPTH_ALL || graphDepth === DEPTH_MIN, run: () => stepDepth(-1) },
     // Both directions of the ∞ toggle, named absolutely rather than as one
     // entry that does the opposite of whatever is there: a palette is searched
     // for what you want, not read for what you have.
-    { id: 'view.alldepth', label: 'View: Show All Levels', disabled: onMap || graphDepth === DEPTH_ALL, run: () => setDepth(DEPTH_ALL) },
-    { id: 'view.limitdepth', label: 'View: Limit Depth Again', disabled: onMap || graphDepth !== DEPTH_ALL, run: () => setDepth(lastBoundedDepth) },
+    { id: 'view.alldepth', label: 'View: Show All Levels', disabled: !depth || graphDepth === DEPTH_ALL, run: () => setDepth(DEPTH_ALL) },
+    { id: 'view.limitdepth', label: 'View: Limit Depth Again', disabled: !depth || graphDepth !== DEPTH_ALL, run: () => setDepth(lastBoundedDepth) },
     {
       id: 'view.collapse',
       label: 'View: Collapse or Expand Selected Node',

@@ -81,7 +81,7 @@ pub const MAX_DEPTH: usize = 8;
 /// What it is not is cheap — on a project the size of jemalloc a root near the
 /// top reaches thousands of nodes, which is what the limit exists to prevent —
 /// so it is a thing the user asks for, never a default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(from = "Option<usize>", into = "Option<usize>")]
 pub enum GraphDepth {
     /// Walk this many levels out from the root.
