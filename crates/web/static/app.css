@@ -404,6 +404,11 @@ body.resizing { cursor: col-resize; user-select: none; }
   padding: 0 var(--sp-1) 0 3px;
   color: var(--text);
   font-variant-numeric: tabular-nums;
+  /* Wide enough for the widest readout ("all"), so stepping off the end of
+     the range does not shove the rest of the toolbar sideways. */
+  display: inline-block;
+  min-width: 3ch;
+  text-align: center;
 }
 
 /* ── Cluster settings menu ──────────────────────────────────────────────────

@@ -120,11 +120,13 @@ A whole call graph is unreadable by default: rooting at `main` in the demo reach
 
 | Mechanism | Where |
 |---|---|
-| **Depth limit** (`Command::SetGraphDepth`, per workspace, default 3) | `core::layout` stops the BFS |
+| **Depth limit** (`Command::SetGraphDepth`, per workspace, default 3, or none at all) | `core::layout` stops the BFS |
 | **Collapse** (`Command::ToggleCollapsed`, per workspace) | `core::layout` stops descending; client drops the node's outgoing edges |
 | **Expand** (`Command::ExpandFunction`, per workspace) | `core::layout` walks one level *past* the limit at those nodes |
 | **Hover focus** — fade everything non-adjacent | `app.js`, transient |
 | **Map zoom** (`Command::SetMapLevel`, per workspace) — the map's own control, since it has no depth to limit | `logic::cluster` builds the rungs; `core::layout` draws one |
+
+**The depth limit can be taken off.** `layout::GraphDepth` is `Levels(n)` or `Unlimited`, and the second is the *absent* bound rather than a large number: there is no number that means "as far as the calls go", and a `usize::MAX` sentinel is something every reader between the stepper and the BFS has to be told about. `Unlimited` travels as `null` — so `{"SetGraphDepth":4}` still means what it always did — and is not clamped to `MIN_DEPTH..=MAX_DEPTH`, because the range is what keeps a *number* meaningful. It terminates on a cyclic graph for the same reason the bounded walk does: the BFS enqueues a symbol the first time it sees it and never again. `expanded` decides nothing when there is no limit to walk past, and `collapsed` decides as much as it ever did. It is the one mechanism in this table the user can switch off, so it is a thing asked for and never a default: rooting near the top of a real project reaches thousands of nodes, which is what the limit exists to prevent. In the client the unbounded position sits one step past `DEPTH_MAX` on the same stepper — `DEPTH_STEPS` is walked rather than added to, since `all` is not `8 + 1` — reads out as `all`, and is reachable in one press from the command palette, because eight presses that each redraw the canvas is not an answer to "show me everything".
 
 Nodes hiding children are dashed and labelled `+N`. Auto-fit is clamped at both ends (`MAX_FIT_ZOOM` / `MIN_FIT_ZOOM`): a small graph must not render at cartoon size, and a large one must not shrink past readable — below the floor it holds the zoom and anchors on the focused node so the user pans.
 

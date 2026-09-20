@@ -2,7 +2,7 @@ use logic::{ClusterKey, ClusterMethod, ClusterSettings};
 use model::{CallDirection, SymbolId};
 
 use crate::export::ExportFormat;
-use crate::layout::LayoutOrientation;
+use crate::layout::{GraphDepth, LayoutOrientation};
 use crate::workspace::ViewMode;
 use serde::{Deserialize, Serialize};
 
@@ -33,8 +33,13 @@ pub enum Command {
     /// "the other one" is only a direction if you already know which one you
     /// have.
     SetCallDirection(CallDirection),
-    /// Set how many levels of callees/callers the view shows.
-    SetGraphDepth(usize),
+    /// Set how many levels of callees/callers the view shows, or ask for all
+    /// of them.
+    ///
+    /// `GraphDepth::Unlimited` is the absent bound rather than a large one,
+    /// and travels as `null` — so `{"SetGraphDepth":4}` still means what it
+    /// always did and `{"SetGraphDepth":null}` is "as far as the calls go".
+    SetGraphDepth(GraphDepth),
     /// Collapse or re-expand one node's children. The node stays visible.
     ToggleCollapsed(SymbolId),
     /// Lay the graph out left-to-right or top-down. Absolute rather than a

@@ -645,7 +645,9 @@ mod tests {
         let whole = core.call_graph.node_count();
 
         let shallow = dot(&core).matches("[label=").count();
-        core.dispatch(crate::Command::SetGraphDepth(crate::layout::MAX_DEPTH));
+        core.dispatch(crate::Command::SetGraphDepth(
+            crate::layout::GraphDepth::Levels(crate::layout::MAX_DEPTH),
+        ));
         let deep = dot(&core).matches("[label=").count();
 
         assert!(
@@ -655,6 +657,32 @@ mod tests {
         assert!(
             deep <= whole,
             "and nothing outside the root's reach gets in"
+        );
+    }
+
+    #[test]
+    fn an_unbounded_export_says_so_in_words() {
+        let mut core = rooted_at("main");
+        core.dispatch(crate::Command::SetGraphDepth(
+            crate::layout::GraphDepth::Unlimited,
+        ));
+        let out = dot(&core);
+
+        assert!(
+            out.contains("label=\"main — callees, all levels"),
+            "the header reads as the toolbar does, not as a number; got:\n{out}"
+        );
+
+        // And the file is bigger than the deepest *number* could make it:
+        // unbounded is not MAX_DEPTH spelled differently.
+        let unbounded = out.matches("[label=").count();
+        core.dispatch(crate::Command::SetGraphDepth(
+            crate::layout::GraphDepth::Levels(crate::layout::MIN_DEPTH),
+        ));
+        let bounded = dot(&core).matches("[label=").count();
+        assert!(
+            bounded < unbounded,
+            "no bound has to reach further than one level: {bounded} vs {unbounded}"
         );
     }
 
@@ -686,7 +714,9 @@ mod tests {
         // Depth 1 puts every one of main's callees on screen with their own
         // callees left off, so the `+N` has to appear somewhere.
         let mut core = rooted_at("main");
-        core.dispatch(crate::Command::SetGraphDepth(1));
+        core.dispatch(crate::Command::SetGraphDepth(
+            crate::layout::GraphDepth::Levels(1),
+        ));
 
         let out = dot(&core);
         assert!(
@@ -702,7 +732,9 @@ mod tests {
     #[test]
     fn the_export_lists_functions_in_name_order() {
         let mut core = rooted_at("main");
-        core.dispatch(crate::Command::SetGraphDepth(crate::layout::MAX_DEPTH));
+        core.dispatch(crate::Command::SetGraphDepth(
+            crate::layout::GraphDepth::Levels(crate::layout::MAX_DEPTH),
+        ));
 
         assert_eq!(
             labels(&dot(&core)),

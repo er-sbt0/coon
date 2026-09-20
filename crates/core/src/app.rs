@@ -8,7 +8,7 @@ use model::{CallDirection, CallGraph, FunctionNode, Location, LspLoadPhase, Symb
 
 use crate::command::Command;
 use crate::events::AppEvent;
-use crate::layout::{compute_map_frame, LayoutOrientation, MapFrame};
+use crate::layout::{compute_map_frame, GraphDepth, LayoutOrientation, MapFrame};
 use crate::lsp_bridge::{LoadingState, LspBridge, PendingRequest, RequestOrigin, SendOutcome};
 use crate::warmup::WarmupQueue;
 use crate::workspace::{CoreWorkspace, CoreWorkspaceManager, ViewMode};
@@ -874,7 +874,7 @@ impl CoreApp {
         }
     }
 
-    fn cmd_set_graph_depth(&mut self, depth: usize) -> Vec<AppEvent> {
+    fn cmd_set_graph_depth(&mut self, depth: GraphDepth) -> Vec<AppEvent> {
         // Only redraw when the value actually moved; the client sends this from
         // a stepper that can be held at either end of the range.
         let changed = self
@@ -1984,7 +1984,7 @@ mod tests {
 
         let mut app = CoreApp::new(graph);
         app.dispatch(Command::SelectFunction(root));
-        app.dispatch(Command::SetGraphDepth(1));
+        app.dispatch(Command::SetGraphDepth(GraphDepth::Levels(1)));
 
         let before = placed(&app);
         assert!(before.contains(&root) && before.contains(&mid) && before.contains(&sibling));
@@ -2015,7 +2015,7 @@ mod tests {
 
         let mut app = CoreApp::new(graph);
         app.dispatch(Command::SelectFunction(root));
-        app.dispatch(Command::SetGraphDepth(1));
+        app.dispatch(Command::SetGraphDepth(GraphDepth::Levels(1)));
         let before = placed(&app);
 
         let events = app.dispatch(Command::FocusFunction(mid));

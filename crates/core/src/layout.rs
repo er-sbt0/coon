@@ -64,6 +64,85 @@ pub const DEFAULT_DEPTH: usize = 3;
 pub const MIN_DEPTH: usize = 1;
 pub const MAX_DEPTH: usize = 8;
 
+/// The depth a view is walked to, or [`GraphDepth::Unlimited`] for no bound at
+/// all.
+///
+/// `Option<usize>` in everything but name, and named because the two ends of
+/// this travel a long way apart: a workspace stores it, a command sets it, the
+/// snapshot ships it and the client draws it, and "the depth is `None`" reads
+/// at every one of those as a value that is missing rather than a bound that
+/// is absent. The range a `Levels` is held to is `MIN_DEPTH..=MAX_DEPTH`;
+/// `Unlimited` is outside it on purpose and is not a bigger number — there is
+/// no number that means "as far as the calls go", and `usize::MAX` standing in
+/// for one is a sentinel every reader has to be told about.
+///
+/// Unbounded is safe on a cyclic graph for the same reason the bounded walk is:
+/// [`compute_layout`]'s BFS enqueues a symbol only the first time it sees it.
+/// What it is not is cheap — on a project the size of jemalloc a root near the
+/// top reaches thousands of nodes, which is what the limit exists to prevent —
+/// so it is a thing the user asks for, never a default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "Option<usize>", into = "Option<usize>")]
+pub enum GraphDepth {
+    /// Walk this many levels out from the root.
+    Levels(usize),
+    /// Walk until the calls run out.
+    Unlimited,
+}
+
+impl GraphDepth {
+    /// The levels to walk, or `None` for no bound — the form the BFS and the
+    /// wire both want.
+    pub fn levels(self) -> Option<usize> {
+        match self {
+            GraphDepth::Levels(n) => Some(n),
+            GraphDepth::Unlimited => None,
+        }
+    }
+
+    /// A bound snapped into `MIN_DEPTH..=MAX_DEPTH`. `Unlimited` is not a
+    /// bound and comes back untouched.
+    pub fn clamped(self) -> Self {
+        match self {
+            GraphDepth::Levels(n) => GraphDepth::Levels(n.clamp(MIN_DEPTH, MAX_DEPTH)),
+            GraphDepth::Unlimited => GraphDepth::Unlimited,
+        }
+    }
+}
+
+impl Default for GraphDepth {
+    fn default() -> Self {
+        GraphDepth::Levels(DEFAULT_DEPTH)
+    }
+}
+
+/// `null` is the absent bound, a number is the bound — so the wire form is the
+/// one a frontend would have picked anyway, and an old client sending a plain
+/// number still means what it used to.
+impl From<Option<usize>> for GraphDepth {
+    fn from(levels: Option<usize>) -> Self {
+        match levels {
+            Some(n) => GraphDepth::Levels(n),
+            None => GraphDepth::Unlimited,
+        }
+    }
+}
+
+impl From<GraphDepth> for Option<usize> {
+    fn from(depth: GraphDepth) -> Self {
+        depth.levels()
+    }
+}
+
+impl std::fmt::Display for GraphDepth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GraphDepth::Levels(n) => write!(f, "{n}"),
+            GraphDepth::Unlimited => write!(f, "all"),
+        }
+    }
+}
+
 /// Which way the graph flows: root on the left with callees to the right, or
 /// root on top with callees below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -83,8 +162,8 @@ pub struct NodePos {
 #[derive(Debug, Clone)]
 pub struct LayoutOptions<'a> {
     /// Levels of children to traverse from the root. 1 = root plus its
-    /// immediate children.
-    pub depth: usize,
+    /// immediate children; `Unlimited` walks until the calls run out.
+    pub depth: GraphDepth,
     /// Nodes whose children the user has collapsed. The node itself stays
     /// visible; traversal stops there.
     pub collapsed: &'a HashSet<SymbolId>,
@@ -100,7 +179,7 @@ impl Default for LayoutOptions<'_> {
     fn default() -> Self {
         static EMPTY: std::sync::OnceLock<HashSet<SymbolId>> = std::sync::OnceLock::new();
         Self {
-            depth: DEFAULT_DEPTH,
+            depth: GraphDepth::default(),
             collapsed: EMPTY.get_or_init(HashSet::new),
             expanded: EMPTY.get_or_init(HashSet::new),
             orientation: LayoutOrientation::default(),
@@ -234,7 +313,7 @@ pub fn compute_layout(
         return HashMap::new();
     }
 
-    let max_depth = opts.depth.clamp(MIN_DEPTH, MAX_DEPTH);
+    let max_depth = opts.depth.clamped().levels();
 
     let mut symbol_to_node: HashMap<SymbolId, usize> = HashMap::new();
     let mut node_to_symbol: HashMap<usize, SymbolId> = HashMap::new();
@@ -253,7 +332,12 @@ pub fn compute_layout(
         // asked for too — so that gesture *adds* to what is on screen. Moving
         // the window onto the expanded node instead, which is what this used to
         // do, redrew the whole graph around a node the user only wanted more of.
-        if depth >= max_depth && !opts.expanded.contains(&symbol) {
+        //
+        // With no limit there is nothing to stop short of and nothing to walk
+        // past, so `expanded` decides nothing here. The walk still terminates:
+        // a symbol is enqueued only the first time it is seen, so a cycle is
+        // visited once like any other shared callee.
+        if max_depth.is_some_and(|max| depth >= max) && !opts.expanded.contains(&symbol) {
             continue;
         }
         // A collapsed node stays on screen; its children simply aren't walked.
@@ -948,7 +1032,7 @@ mod tests {
         for depth in [1usize, 2, 3] {
             let collapsed = HashSet::new();
             let opts = LayoutOptions {
-                depth,
+                depth: GraphDepth::Levels(depth),
                 collapsed: &collapsed,
                 ..Default::default()
             };
@@ -962,13 +1046,70 @@ mod tests {
     }
 
     #[test]
+    fn unlimited_depth_walks_past_the_range_a_number_is_held_to() {
+        // Longer than MAX_DEPTH, so the chain's far end is only reachable with
+        // no bound at all — a bigger number could not have got there.
+        let names: Vec<String> = (0..MAX_DEPTH + 4).map(|i| format!("f{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (graph, ids) = graph_with_chain(&refs);
+
+        let opts = LayoutOptions {
+            depth: GraphDepth::Unlimited,
+            ..Default::default()
+        };
+        let layout = compute_layout(&graph, Some(ids[0]), CallDirection::Outgoing, &opts);
+        assert_eq!(layout.len(), ids.len(), "every function in the chain");
+
+        let bounded = LayoutOptions {
+            depth: GraphDepth::Levels(MAX_DEPTH),
+            ..Default::default()
+        };
+        let layout = compute_layout(&graph, Some(ids[0]), CallDirection::Outgoing, &bounded);
+        assert_eq!(layout.len(), MAX_DEPTH + 1, "the deepest bound stops short");
+    }
+
+    #[test]
+    fn unlimited_depth_terminates_on_a_cycle() {
+        let (graph, ids) = graph_with_chain(&["a", "b", "c"]);
+        let mut graph = graph;
+        // c calls a: the walk has to visit each symbol once, not forever.
+        graph.add_call(ids[2], ids[0], Location::new("src/x.c".to_string(), 1, 0));
+
+        let opts = LayoutOptions {
+            depth: GraphDepth::Unlimited,
+            ..Default::default()
+        };
+        let layout = compute_layout(&graph, Some(ids[0]), CallDirection::Outgoing, &opts);
+        assert_eq!(layout.len(), 3);
+    }
+
+    #[test]
+    fn collapsing_still_stops_a_walk_with_no_depth_bound() {
+        let (graph, ids) = graph_with_chain(&["a", "b", "c", "d"]);
+        let mut collapsed = HashSet::new();
+        collapsed.insert(ids[1]);
+
+        let opts = LayoutOptions {
+            depth: GraphDepth::Unlimited,
+            collapsed: &collapsed,
+            ..Default::default()
+        };
+        let layout = compute_layout(&graph, Some(ids[0]), CallDirection::Outgoing, &opts);
+        assert!(layout.contains_key(&ids[1]), "the collapsed node stays");
+        assert!(
+            !layout.contains_key(&ids[2]),
+            "no bound is not the same as no collapse"
+        );
+    }
+
+    #[test]
     fn collapsing_a_node_keeps_it_but_drops_its_children() {
         let (graph, ids) = graph_with_chain(&["a", "b", "c", "d"]);
         let mut collapsed = HashSet::new();
         collapsed.insert(ids[1]);
 
         let opts = LayoutOptions {
-            depth: MAX_DEPTH,
+            depth: GraphDepth::Levels(MAX_DEPTH),
             collapsed: &collapsed,
             ..Default::default()
         };
@@ -991,7 +1132,7 @@ mod tests {
         expanded.insert(ids[2]);
 
         let opts = LayoutOptions {
-            depth: 2,
+            depth: GraphDepth::Levels(2),
             collapsed: &collapsed,
             expanded: &expanded,
             ..Default::default()
@@ -1048,7 +1189,7 @@ mod tests {
         expanded.insert(ids[1]);
 
         let opts = LayoutOptions {
-            depth: 1,
+            depth: GraphDepth::Levels(1),
             collapsed: &collapsed,
             expanded: &expanded,
             ..Default::default()
@@ -1069,7 +1210,7 @@ mod tests {
         expanded.insert(ids[1]);
 
         let opts = LayoutOptions {
-            depth: MAX_DEPTH,
+            depth: GraphDepth::Levels(MAX_DEPTH),
             collapsed: &collapsed,
             expanded: &expanded,
             ..Default::default()
@@ -1087,7 +1228,7 @@ mod tests {
         let (graph, ids) = graph_with_chain(&["a", "b"]);
         let collapsed = HashSet::new();
         let opts = LayoutOptions {
-            depth: 2,
+            depth: GraphDepth::Levels(2),
             collapsed: &collapsed,
             ..Default::default()
         };
@@ -1132,7 +1273,7 @@ mod tests {
 
         let collapsed = HashSet::new();
         let opts = LayoutOptions {
-            depth: 2,
+            depth: GraphDepth::Levels(2),
             collapsed: &collapsed,
             ..Default::default()
         };
@@ -1175,7 +1316,7 @@ mod tests {
 
         let collapsed = HashSet::new();
         let opts = LayoutOptions {
-            depth: 2,
+            depth: GraphDepth::Levels(2),
             collapsed: &collapsed,
             orientation: LayoutOrientation::TopDown,
             ..Default::default()
@@ -1244,7 +1385,7 @@ mod tests {
         let (graph, root) = fan(3);
         let collapsed = HashSet::new();
         let opts = LayoutOptions {
-            depth: 2,
+            depth: GraphDepth::Levels(2),
             collapsed: &collapsed,
             orientation: LayoutOrientation::TopDown,
             ..Default::default()
@@ -1270,7 +1411,7 @@ mod tests {
         let (graph, root) = fan(20);
         let collapsed = HashSet::new();
         let opts = LayoutOptions {
-            depth: 2,
+            depth: GraphDepth::Levels(2),
             collapsed: &collapsed,
             orientation: LayoutOrientation::TopDown,
             ..Default::default()
@@ -1291,7 +1432,7 @@ mod tests {
         let (graph, ids) = graph_with_chain(&["a", "b", "c", "d"]);
         let collapsed = HashSet::new();
         let opts = LayoutOptions {
-            depth: MAX_DEPTH,
+            depth: GraphDepth::Levels(MAX_DEPTH),
             collapsed: &collapsed,
             ..Default::default()
         };

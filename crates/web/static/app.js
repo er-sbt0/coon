@@ -149,7 +149,7 @@ let currentDirection = 'Outgoing';
 let currentOrientation = 'LeftRight';   // or 'TopDown'; the server lays both out
 let workspaces       = [];
 let activeWorkspace  = 0;
-let graphDepth       = 3;
+let graphDepth       = 3;     // levels from the root, or null for no bound at all
 let collapsed        = new Set();
 let currentView      = 'ClusterMap';  // or 'Rooted'; a workspace opens on the map
 let clusterMap       = null;          // the laid-out map, while one is showing
@@ -235,7 +235,9 @@ function handleSnapshot(msg) {
   if (active?.cluster) clusterSettings = active.cluster;
   if (Array.isArray(msg.cluster_methods)) clusterMethods = msg.cluster_methods;
   if (msg.cluster_top) clusterTopSpec = msg.cluster_top;
-  if (typeof active?.depth === 'number') graphDepth = active.depth;
+  // `null` is the depth with no bound, so a missing workspace is the only
+  // reason to keep what is on screen — not a workspace that reports one.
+  if (active && 'depth' in active) graphDepth = active.depth ?? null;
   updateDepthControl();
   updateClusterControl();
   renderClusterPanel();
@@ -730,8 +732,12 @@ function restoreWorkspace(ws) {
 
   if (!settingsRestored.has(ws.id)) {
     settingsRestored.add(ws.id);
-    if (typeof saved.depth === 'number' && saved.depth !== ws.depth) {
-      sendCommand({ SetGraphDepth: saved.depth });
+    // `null` is a remembered setting — no bound — where `undefined` is nothing
+    // remembered at all. The two are not interchangeable here, so this asks
+    // for the key by name rather than for a truthy value.
+    const wantDepth = 'depth' in saved ? saved.depth ?? DEPTH_ALL : undefined;
+    if (wantDepth !== undefined && wantDepth !== (ws.depth ?? DEPTH_ALL)) {
+      sendCommand({ SetGraphDepth: wantDepth });
     }
     if (saved.direction && saved.direction !== ws.direction) {
       sendCommand({ SetCallDirection: saved.direction });
@@ -1148,6 +1154,24 @@ function toggleView() {
 
 const DEPTH_MIN = 1;
 const DEPTH_MAX = 8;
+/// What "limit it again" goes back to — the backend's `DEFAULT_DEPTH`, so the
+/// two controls that can leave the unbounded view land where a fresh tab does.
+const DEPTH_DEFAULT = 3;
+/// No bound at all: walk until the calls run out. `null` rather than a large
+/// number, because there is no number that means "as far as it goes" and a
+/// sentinel is something every reader has to be told about. It is what the
+/// backend's `GraphDepth::Unlimited` travels as, and what the stepper shows
+/// one step past `DEPTH_MAX`.
+const DEPTH_ALL = null;
+
+/// The stepper's positions, shallowest first. The unbounded one sits past the
+/// top of the range rather than beside it, so + and − walk the whole control
+/// and there is no second gesture to discover.
+const DEPTH_STEPS = [];
+for (let d = DEPTH_MIN; d <= DEPTH_MAX; d++) DEPTH_STEPS.push(d);
+DEPTH_STEPS.push(DEPTH_ALL);
+
+const depthLabel = (d) => (d === DEPTH_ALL ? 'all' : String(d));
 
 function updateDepthControl() {
   // Depth is where the rooted view's BFS stops. The map is bounded by the rung
@@ -1155,29 +1179,45 @@ function updateDepthControl() {
   // and a live control that does nothing when pressed is worse than a quiet
   // one. The zoom control next to it is the map's equivalent.
   const onMap = currentView === 'ClusterMap';
-  $('depth-value').textContent = graphDepth;
-  $('depth-dec').disabled = onMap || graphDepth <= DEPTH_MIN;
-  $('depth-inc').disabled = onMap || graphDepth >= DEPTH_MAX;
+  $('depth-value').textContent = depthLabel(graphDepth);
+  $('depth-dec').disabled = onMap || graphDepth === DEPTH_MIN;
+  $('depth-inc').disabled = onMap || graphDepth === DEPTH_ALL;
   const control = $('depth-control');
   control.classList.toggle('inactive', onMap);
   control.title = onMap
     ? 'Depth applies to the call tree — double-click a cluster to get there'
-    : 'How many levels of calls to show';
+    : graphDepth === DEPTH_ALL
+      ? 'Showing every level of calls — step down to put a limit back'
+      : 'How many levels of calls to show — one step past 8 is all of them';
 }
 
+/// Ask for a depth: a number inside the range, or `DEPTH_ALL` for no bound.
 function setDepth(next) {
   if (currentView === 'ClusterMap') return;   // nothing on the map to deepen
-  const clamped = Math.min(Math.max(next, DEPTH_MIN), DEPTH_MAX);
-  if (clamped === graphDepth) return;
+  const want = next === DEPTH_ALL
+    ? DEPTH_ALL
+    : Math.min(Math.max(next, DEPTH_MIN), DEPTH_MAX);
+  if (want === graphDepth) return;
   // Reflect it immediately; the snapshot that follows confirms it.
-  graphDepth = clamped;
+  graphDepth = want;
   updateDepthControl();
-  savePrefs({ depth: clamped });
-  sendCommand({ SetGraphDepth: clamped });
+  savePrefs({ depth: want });
+  sendCommand({ SetGraphDepth: want });
 }
 
-$('depth-dec').addEventListener('click', () => setDepth(graphDepth - 1));
-$('depth-inc').addEventListener('click', () => setDepth(graphDepth + 1));
+/// One position along the stepper. Walking the ladder rather than doing
+/// arithmetic is what lets the unbounded position sit on the end of it: it is
+/// not `DEPTH_MAX + 1`, and adding one to it would not be anything at all.
+function stepDepth(delta) {
+  const at = DEPTH_STEPS.indexOf(graphDepth);
+  if (at < 0) return;
+  const next = at + delta;
+  if (next < 0 || next >= DEPTH_STEPS.length) return;
+  setDepth(DEPTH_STEPS[next]);
+}
+
+$('depth-dec').addEventListener('click', () => stepDepth(-1));
+$('depth-inc').addEventListener('click', () => stepDepth(1));
 
 // ── Event handling ────────────────────────────────────────────────────────────
 
@@ -1896,8 +1936,13 @@ function buildCommands() {
     { id: 'view.direction', label: 'View: Toggle Call Direction', hint: 'Ctrl+D', run: flipDirection },
     { id: 'view.orientation', label: 'View: Toggle Graph Orientation', hint: 'Ctrl+Shift+D', run: () => setOrientation(currentOrientation === 'LeftRight' ? 'TopDown' : 'LeftRight') },
     { id: 'view.fit', label: 'View: Fit Graph to Screen', disabled: cy.nodes().length === 0, run: fitGraph },
-    { id: 'view.deeper', label: 'View: Show More Levels', hint: 'Ctrl+]', disabled: onMap || graphDepth >= DEPTH_MAX, run: () => setDepth(graphDepth + 1) },
-    { id: 'view.shallower', label: 'View: Show Fewer Levels', hint: 'Ctrl+[', disabled: onMap || graphDepth <= DEPTH_MIN, run: () => setDepth(graphDepth - 1) },
+    { id: 'view.deeper', label: 'View: Show More Levels', hint: 'Ctrl+]', disabled: onMap || graphDepth === DEPTH_ALL, run: () => stepDepth(1) },
+    { id: 'view.shallower', label: 'View: Show Fewer Levels', hint: 'Ctrl+[', disabled: onMap || graphDepth === DEPTH_MIN, run: () => stepDepth(-1) },
+    // The end of the stepper reaches it in one press from 8 and in eight from
+    // 1, and on a real project the answer to "show me everything" should not
+    // be eight presses that each redraw the canvas.
+    { id: 'view.alldepth', label: 'View: Show All Levels', disabled: onMap || graphDepth === DEPTH_ALL, run: () => setDepth(DEPTH_ALL) },
+    { id: 'view.limitdepth', label: 'View: Limit Depth Again', disabled: onMap || graphDepth !== DEPTH_ALL, run: () => setDepth(DEPTH_DEFAULT) },
     {
       id: 'view.collapse',
       label: 'View: Collapse or Expand Selected Node',
@@ -2023,11 +2068,11 @@ document.addEventListener('keydown', (e) => {
   // view is showing: the tree's depth limit, or the map's grouping.
   else if (key === ']') {
     e.preventDefault();
-    if (currentView === 'ClusterMap') setMapLevel(mapLevel - 1); else setDepth(graphDepth + 1);
+    if (currentView === 'ClusterMap') setMapLevel(mapLevel - 1); else stepDepth(1);
   }
   else if (key === '[') {
     e.preventDefault();
-    if (currentView === 'ClusterMap') setMapLevel(mapLevel + 1); else setDepth(graphDepth - 1);
+    if (currentView === 'ClusterMap') setMapLevel(mapLevel + 1); else stepDepth(-1);
   }
   else if (key === 'Tab') {
     e.preventDefault();

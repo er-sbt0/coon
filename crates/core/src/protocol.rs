@@ -18,7 +18,8 @@ use crate::app::CoreApp;
 use crate::command::Command;
 use crate::events::AppEvent;
 use crate::layout::{
-    compute_cluster_layout, compute_layout, GraphLayout, LayoutOptions, LayoutOrientation, NodePos,
+    compute_cluster_layout, compute_layout, GraphDepth, GraphLayout, LayoutOptions,
+    LayoutOrientation, NodePos,
 };
 use crate::workspace::ViewMode;
 
@@ -177,8 +178,10 @@ pub struct WorkspaceInfo {
     pub name: String,
     pub direction: CallDirection,
     pub selected: Option<SymbolId>,
-    /// Levels of callees/callers currently shown.
-    pub depth: usize,
+    /// Levels of callees/callers currently shown, or `null` when the view is
+    /// walked with no bound. A client draws the number it is given and the
+    /// absent bound as whatever its stepper calls "all".
+    pub depth: GraphDepth,
     /// Nodes the user has collapsed, so the client can mark them.
     pub collapsed: Vec<SymbolId>,
     /// Which way the graph flows on the canvas.
@@ -792,6 +795,10 @@ mod tests {
             "{\"SetCallDirection\":\"Incoming\"}".to_string(),
             "{\"SetCallDirection\":\"Outgoing\"}".to_string(),
             "{\"SetGraphDepth\":4}".to_string(),
+            // The absent bound. `null` rather than a large number, so the
+            // stepper's "all" position is not a magic value either end has to
+            // agree on.
+            "{\"SetGraphDepth\":null}".to_string(),
             format!("{{\"ToggleCollapsed\":{id}}}"),
             "{\"SetGraphOrientation\":\"TopDown\"}".to_string(),
             "{\"SetGraphOrientation\":\"LeftRight\"}".to_string(),
@@ -815,6 +822,20 @@ mod tests {
             serde_json::from_str::<Command>(&case)
                 .unwrap_or_else(|e| panic!("client sends {case}, which no longer parses: {e}"));
         }
+    }
+
+    /// An unbounded depth reaches the client as `null`, not as a number it
+    /// would have to recognise as meaning "all".
+    #[test]
+    fn snapshot_carries_an_absent_depth_as_null() {
+        let mut core = CoreApp::new(CallGraph::new());
+
+        let json = serde_json::to_value(snapshot_of(&core)).expect("snapshot serialises");
+        assert_eq!(json["workspaces"][0]["depth"], 3, "the default is a number");
+
+        core.dispatch(Command::SetGraphDepth(GraphDepth::Unlimited));
+        let json = serde_json::to_value(snapshot_of(&core)).expect("snapshot serialises");
+        assert!(json["workspaces"][0]["depth"].is_null());
     }
 
     /// The client reads `msg.type`, `msg.active_workspace` and `msg.workspaces`

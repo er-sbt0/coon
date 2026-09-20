@@ -5,7 +5,7 @@ use logic::{ClusterMethod, ClusterSettings};
 use model::{CallDirection, SymbolId};
 use serde::{Deserialize, Serialize};
 
-use crate::layout::{LayoutOrientation, DEFAULT_DEPTH, MAX_DEPTH, MIN_DEPTH};
+use crate::layout::{GraphDepth, LayoutOrientation};
 
 use crate::events::AppEvent;
 
@@ -43,8 +43,8 @@ pub struct CoreWorkspace {
     pub name: String,
     root_symbol: Option<SymbolId>,
     direction: CallDirection,
-    /// Levels of callees/callers to show from the root.
-    depth: usize,
+    /// Levels of callees/callers to show from the root, or no bound at all.
+    depth: GraphDepth,
     /// Nodes whose children the user has collapsed. The node stays visible.
     collapsed: HashSet<SymbolId>,
     /// Nodes the user asked to load the calls of, so the layout walks one level
@@ -100,7 +100,7 @@ impl CoreWorkspace {
             name,
             root_symbol: None,
             direction: CallDirection::Outgoing,
-            depth: DEFAULT_DEPTH,
+            depth: GraphDepth::default(),
             collapsed: HashSet::new(),
             expanded: HashSet::new(),
             orientation: LayoutOrientation::default(),
@@ -142,9 +142,14 @@ impl CoreWorkspace {
     }
 
     /// Set the traversal depth, clamped to the supported range.
+    ///
+    /// [`GraphDepth::Unlimited`] is not clamped, because it is not a bound:
+    /// it is the request to walk until the calls run out, and the range is
+    /// what keeps a *number* meaningful.
+    ///
     /// Returns true when the value actually changed.
-    pub fn set_depth(&mut self, depth: usize) -> bool {
-        let next = depth.clamp(MIN_DEPTH, MAX_DEPTH);
+    pub fn set_depth(&mut self, depth: GraphDepth) -> bool {
+        let next = depth.clamped();
         let changed = next != self.depth;
         self.depth = next;
         if changed {
@@ -321,9 +326,10 @@ impl CoreWorkspace {
         self.direction
     }
 
-    /// Levels of callees/callers shown from the root, always inside
-    /// `MIN_DEPTH..=MAX_DEPTH`: [`Self::set_depth`] is what keeps it there.
-    pub fn depth(&self) -> usize {
+    /// Levels of callees/callers shown from the root — a number always inside
+    /// `MIN_DEPTH..=MAX_DEPTH` ([`Self::set_depth`] is what keeps it there),
+    /// or `Unlimited` for a walk with no bound.
+    pub fn depth(&self) -> GraphDepth {
         self.depth
     }
 
@@ -518,6 +524,7 @@ impl CoreWorkspaceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::{DEFAULT_DEPTH, MAX_DEPTH, MIN_DEPTH};
 
     #[test]
     fn test_new_has_one_workspace() {
@@ -539,18 +546,45 @@ mod tests {
     #[test]
     fn depth_is_clamped_to_the_supported_range() {
         let mut ws = CoreWorkspace::new(1, "w".to_string());
-        assert_eq!(ws.depth, DEFAULT_DEPTH);
+        assert_eq!(ws.depth, GraphDepth::Levels(DEFAULT_DEPTH));
 
-        assert!(ws.set_depth(0) || ws.depth == MIN_DEPTH);
-        assert_eq!(ws.depth, MIN_DEPTH, "0 clamps up to the minimum");
+        assert!(ws.set_depth(GraphDepth::Levels(0)) || ws.depth == GraphDepth::Levels(MIN_DEPTH));
+        assert_eq!(
+            ws.depth,
+            GraphDepth::Levels(MIN_DEPTH),
+            "0 clamps up to the minimum"
+        );
 
-        ws.set_depth(999);
-        assert_eq!(ws.depth, MAX_DEPTH, "large values clamp down");
+        ws.set_depth(GraphDepth::Levels(999));
+        assert_eq!(
+            ws.depth,
+            GraphDepth::Levels(MAX_DEPTH),
+            "large values clamp down"
+        );
 
         assert!(
-            !ws.set_depth(MAX_DEPTH),
+            !ws.set_depth(GraphDepth::Levels(MAX_DEPTH)),
             "setting the same depth is not a change"
         );
+    }
+
+    #[test]
+    fn unlimited_is_a_depth_the_range_does_not_touch() {
+        let mut ws = CoreWorkspace::new(1, "w".to_string());
+
+        assert!(ws.set_depth(GraphDepth::Unlimited), "a change from 3");
+        assert_eq!(
+            ws.depth,
+            GraphDepth::Unlimited,
+            "no bound survives the clamp — it is not a number to snap"
+        );
+        assert!(
+            !ws.set_depth(GraphDepth::Unlimited),
+            "setting it again is not a change"
+        );
+
+        assert!(ws.set_depth(GraphDepth::Levels(2)), "and it is left again");
+        assert_eq!(ws.depth, GraphDepth::Levels(2));
     }
 
     #[test]
