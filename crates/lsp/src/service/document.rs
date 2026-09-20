@@ -81,9 +81,12 @@ impl OpenDocuments {
 
 /// Close every document clangd has open.
 ///
-/// Used once the initial symbol sweep is in: the preload exists to make clangd
-/// index the project, and from then on `workspace/symbol` is served from that
-/// index while anything position-based reopens its own file below.
+/// Frees the AST workers and resident preambles; it does not take anything out
+/// of clangd's merged index. A preamble publishes its document's view of every
+/// header it includes, and `didClose` does not retract it — the view was
+/// measured still standing eight seconds after the close — so closing is a
+/// memory measure and never a way to change what `workspace/symbol` answers.
+/// The loader no longer calls it: it opens one file and leaves it open.
 pub(super) async fn close_all_documents(state: &mut LspWorkerState) {
     let uris = state.opened_documents.take_all();
     log::info!("Closing {} open document(s)", uris.len());

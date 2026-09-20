@@ -39,11 +39,12 @@ const INDEX_START_GRACE: tokio::time::Duration = tokio::time::Duration::from_sec
 /// How long the indexer has to stay quiet after reporting itself done before
 /// that is believed.
 ///
-/// clangd reports `end` whenever its queue drains, and the preload feeds that
-/// queue 217 `didOpen`s in a row — so an `end` can arrive between batches with
-/// most of the project still to go. Waiting out a quiet window turns "the queue
-/// is empty right now" into "there is no more work", and costs a second only on
-/// the path that was about to declare victory anyway.
+/// clangd reports `end` whenever its indexing queue drains, and it works
+/// through the compilation database in batches — so an `end` can arrive
+/// between two of them with most of the project still to go. Waiting out a
+/// quiet window turns "the queue is empty right now" into "there is no more
+/// work", and costs a second only on the path that was about to declare
+/// victory anyway.
 const INDEX_SETTLE: tokio::time::Duration = tokio::time::Duration::from_secs(1);
 
 /// The ceiling on waiting for a running index to finish.
@@ -59,11 +60,20 @@ const INDEX_SETTLE: tokio::time::Duration = tokio::time::Duration::from_secs(1);
 /// `run_tui_lsp_bridge` repeats it the moment indexing does finish.
 const INDEX_WAIT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 
+/// How long to wait for the preloaded file's `documentSymbol` reply before
+/// querying anyway.
+///
+/// That reply is a synchronisation point, not a result anyone reads — see the
+/// call site — so losing it costs determinism rather than correctness, and the
+/// wait is bounded like every other one here.
+const PRELOAD_SYNC_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+
 /// Runs the full LSP initialization sequence in the background:
 ///
 /// 1. Spawns and initializes clangd
 /// 2. Discovers source files via compile_commands.json
-/// 3. Pre-loads documents into the language server
+/// 3. Opens exactly one of them, which is what makes clangd read the
+///    compilation database and start indexing
 /// 4. Fetches initial workspace symbols
 /// 5. Spins up a forwarder loop that bridges TUI requests to `LspService`
 ///
@@ -157,7 +167,10 @@ pub async fn lsp_loader_task(
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     ui_tx.send(LspUiMessage::Progress(LspLoadPhase::DiscoveringFiles))?;
-    let source_files = compile_commands::parse_compile_commands(&root_path).await?;
+    let mut source_files = compile_commands::parse_compile_commands(&root_path).await?;
+    // Sorted so that the one file opened below is the same one on every run,
+    // whatever order the compilation database happens to list its entries in.
+    source_files.sort();
     info!("Found {} source files", source_files.len());
 
     let mut lsp_service = LspService::new(lsp_client, rx_for_init).await?;
@@ -176,10 +189,31 @@ pub async fn lsp_loader_task(
         project_file_paths.len()
     );
 
-    let document_uris: Vec<lsp_types::Url> = source_files
+    // Exactly one document is opened, and it is the same one every run.
+    //
+    // clangd answers `workspace/symbol` from its static index *merged with a
+    // dynamic index of whatever has been open*: building a document's preamble
+    // publishes that document's view of every header it includes, last writer
+    // per header wins, and `didClose` does not retract it — a view measured
+    // still standing eight seconds after the close. So the answer is decided by
+    // which files this process has ever had open, and in what order their
+    // preambles landed.
+    //
+    // Opening the whole compilation database made that a lottery: 217
+    // `didOpen`s racing the LRU in `service::document`, which closed most of
+    // them again before their preambles had published, so a different subset
+    // won the headers each run. On jemalloc the headers have two views — its
+    // 149 test TUs compile with the `jet_*` defines, its 68 library TUs with
+    // `je_*` — and one clangd process answered 4,041 project functions with a
+    // library file open against 4,594 with a test file open. Two processes
+    // given the same open history answered identically, symbol for symbol.
+    //
+    // One `didOpen` is all the compilation database needs: clangd reads
+    // `compile_commands.json` to compile that file and hands every entry in it
+    // to the background indexer, which is the only job the preload ever had.
+    let preload_uri = source_files
         .iter()
-        .filter_map(|path| lsp_types::Url::from_file_path(path).ok())
-        .collect();
+        .find_map(|path| lsp_types::Url::from_file_path(path).ok());
 
     // Whether the last thing clangd said about its indexer was that it had gone
     // idle. Tracked from here rather than only inside `await_background_index`,
@@ -188,12 +222,12 @@ pub async fn lsp_loader_task(
     // for an announcement that has already been made waits forever.
     let mut index_idle = false;
 
-    if !document_uris.is_empty() {
-        let total = document_uris.len();
+    if let Some(preload_uri) = &preload_uri {
         ui_tx.send(LspUiMessage::Progress(LspLoadPhase::PreloadingDocuments {
             done: 0,
-            total,
+            total: 1,
         }))?;
+        info!("Opening {preload_uri} to make clangd load the compilation database");
 
         // The id is minted here, not by the service, because this is the end
         // that matches it against the `PreloadComplete` below.
@@ -201,11 +235,11 @@ pub async fn lsp_loader_task(
         lsp_service
             .send(LspRequest::PreloadDocuments {
                 request_id: preload_request_id.clone(),
-                document_uris: document_uris.clone(),
+                document_uris: vec![preload_uri.clone()],
             })
             .await?;
 
-        // Wait for the service worker to confirm all didOpen notifications were sent.
+        // Wait for the service worker to confirm the didOpen notification was sent.
         let preload_timeout = tokio::time::Duration::from_secs(30);
         let preload_deadline = tokio::time::Instant::now() + preload_timeout;
         loop {
@@ -241,9 +275,11 @@ pub async fn lsp_loader_task(
             }
         }
         ui_tx.send(LspUiMessage::Progress(LspLoadPhase::PreloadingDocuments {
-            done: total,
-            total,
+            done: 1,
+            total: 1,
         }))?;
+    } else {
+        log::warn!("No source file to open: clangd will index nothing and the query will be empty");
     }
 
     // The point of everything above was to get clangd indexing. Wait for it to
@@ -255,20 +291,24 @@ pub async fn lsp_loader_task(
     let queried_a_finished_index =
         await_background_index(&mut lsp_service, &ui_tx, index_idle).await;
 
-    // The preload existed to make clangd load the compilation database and index
-    // the project; the index is now built, so it has done its job. Closing here
-    // rather than after the query is deliberate on two counts. Holding every
-    // document open costs a live AST worker and a resident preamble each — on a
-    // 217-file tree the difference between hundreds of megabytes and several
-    // gigabytes — and buys nothing, since `workspace/symbol` is answered from
-    // the index and every position-based request reopens its own file through
-    // `ensure_document_opened`. And clangd answers `workspace/symbol` from the
-    // static index *merged with a dynamic index of whatever is open*, whose
-    // contents depend on which of the open files have finished building their
-    // ASTs — timing that `backgroundIndexProgress` says nothing about. Querying
-    // with nothing open is what makes the answer the same twice running.
-    if let Err(e) = lsp_service.send(LspRequest::CloseDocuments).await {
-        log::warn!("Failed to close documents before the symbol sweep: {}", e);
+    // Sync on the preloaded file before asking anything about the project.
+    //
+    // `PreloadComplete` above says the `didOpen` was *sent*; it says nothing
+    // about when clangd gets round to building that file's preamble and
+    // publishing its view of the headers into the dynamic index the query below
+    // is answered from. A `textDocument/documentSymbol` is answered from the
+    // file's AST, which is built on top of that preamble, so its reply is the
+    // first moment the open history is settled. Nothing reads the symbols it
+    // returns: it is a barrier, not a result.
+    //
+    // Nothing is closed first, and closing would not help if it were: a
+    // `didClose` does not retract what the preamble published, so the view is
+    // in the merged index either way. One open document is one AST worker and
+    // one resident preamble, far inside `OPEN_DOCUMENT_LIMIT`, so it stays
+    // open and the graph is seeded from a clangd whose dynamic index holds
+    // exactly one file's view.
+    if let Some(preload_uri) = &preload_uri {
+        await_document_sync(&mut lsp_service, preload_uri, &mut index_idle).await;
     }
 
     let initial_request_id = Uuid::new_v4().to_string();
@@ -371,6 +411,73 @@ pub async fn lsp_loader_task(
     .await;
 
     Ok(())
+}
+
+/// Wait for `uri`'s `documentSymbol` reply, which lands once clangd has built
+/// that file's AST — and therefore once its preamble has published its view of
+/// every header it includes into the merged index the discovery query reads.
+///
+/// Keeps `index_idle` current for the reason every wait in this file does: they
+/// all drain the one response channel, so a `$/progress` read by this one is
+/// gone from the next.
+///
+/// Every way of not getting the reply is a warning and a shrug. The query still
+/// goes out; what is lost is the guarantee that two runs ask the same clangd.
+async fn await_document_sync(
+    lsp_service: &mut LspService,
+    uri: &lsp_types::Url,
+    index_idle: &mut bool,
+) {
+    let request_id = Uuid::new_v4().to_string();
+    if let Err(e) = lsp_service
+        .send(LspRequest::GetDocumentSymbols {
+            request_id: request_id.clone(),
+            document_uri: uri.clone(),
+        })
+        .await
+    {
+        log::warn!("Failed to ask {uri} for its document symbols: {e}");
+        return;
+    }
+
+    let deadline = tokio::time::Instant::now() + PRELOAD_SYNC_TIMEOUT;
+    loop {
+        match tokio::time::timeout_at(deadline, lsp_service.recv_response()).await {
+            Ok(Some(LspResponse::DocumentSymbols {
+                request_id: id,
+                symbols,
+            })) if id == request_id => {
+                info!(
+                    "Preloaded document parsed ({} top-level symbol(s)); its view of the headers \
+                     is in the index",
+                    symbols.len()
+                );
+                return;
+            }
+            Ok(Some(LspResponse::Error {
+                request_id: id,
+                error,
+            })) if id == request_id => {
+                log::warn!("Could not parse the preloaded document: {error}");
+                return;
+            }
+            Ok(Some(LspResponse::IndexProgress(progress))) => {
+                *index_idle = progress == IndexProgress::Finished;
+            }
+            Ok(Some(_)) => continue, // a reply to something else; keep waiting
+            Ok(None) => {
+                log::warn!("LSP service channel closed while parsing the preloaded document");
+                return;
+            }
+            Err(_) => {
+                log::warn!(
+                    "The preloaded document was not parsed within {:?}; querying anyway",
+                    PRELOAD_SYNC_TIMEOUT
+                );
+                return;
+            }
+        }
+    }
 }
 
 /// Block until clangd's background indexer has drained, so the discovery query
