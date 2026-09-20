@@ -86,6 +86,30 @@
 //! flow itself is computed sparsely, because dense squaring is cubic in the
 //! function count.
 //!
+//! **Leiden is the third method.** [`ClusterMethod::Leiden`] optimises the
+//! same modularity as the first, with the Leiden algorithm (Traag, Waltman and
+//! van Eck, 2019) in place of Louvain. Louvain can hand back a box that is not
+//! connected: a node that was the bridge between two halves of its box moves
+//! out, and the halves stay together because nothing re-examines them once
+//! the box is collapsed into one node. Leiden puts a *refinement* between the
+//! moving and the collapsing: every box is broken back into singletons and
+//! rebuilt by merging only nodes that are well connected to the box, into
+//! sub-boxes that are well connected to it too, so what gets collapsed is
+//! connected by construction. The collapsed nodes then start the next round
+//! in the box they came from rather than alone, and the run is over when
+//! every box is one node. One run to convergence is one pass of the ladder
+//! ([`leiden_pass`]): its internal rounds are scaffolding, not rungs — the
+//! unrefined partitions do not nest across them, and the refined ones are not
+//! what the method stands behind. The ladder around it is modularity's, pass
+//! for pass. The paper picks each refinement merge at random, weighted by
+//! gain; this takes the best, which is the zero-temperature limit and keeps
+//! the module deterministic, forfeiting only the guarantees that need an
+//! unbounded number of iterations. The DAG rule applies at every merge,
+//! including the refinement's: a finer partition of an acyclic quotient is
+//! not itself acyclic, a chain of three in one box being a two-way cycle once
+//! its ends are split from its middle. Refusing a merge never disconnects
+//! anything, so the constraint costs modularity, not the guarantee.
+//!
 //! The implementation works in index space — every hot loop indexes `Vec`s
 //! rather than hashing `SymbolId`s — so it stays usable on the ~10k-node graphs
 //! a mid-sized C++ project produces.
@@ -199,6 +223,9 @@ pub enum ClusterMethod {
     /// this module.
     #[default]
     Modularity,
+    /// Modularity again, optimised by the Leiden algorithm, which keeps every
+    /// box connected. Described at the top of this module.
+    Leiden,
     /// Markov clustering — flow simulation with inflation — also described
     /// at the top of this module.
     Markov,
@@ -206,12 +233,17 @@ pub enum ClusterMethod {
 
 impl ClusterMethod {
     /// Every method, in the order a picker should list them.
-    pub const ALL: &'static [ClusterMethod] = &[ClusterMethod::Modularity, ClusterMethod::Markov];
+    pub const ALL: &'static [ClusterMethod] = &[
+        ClusterMethod::Modularity,
+        ClusterMethod::Leiden,
+        ClusterMethod::Markov,
+    ];
 
     /// What to write in the picker.
     pub fn label(self) -> &'static str {
         match self {
             ClusterMethod::Modularity => "Modularity",
+            ClusterMethod::Leiden => "Leiden",
             ClusterMethod::Markov => "Markov flow",
         }
     }
@@ -222,6 +254,7 @@ impl ClusterMethod {
             ClusterMethod::Modularity => {
                 "Groups functions that call each other more than chance would"
             }
+            ClusterMethod::Leiden => "Modularity again, with every box guaranteed to hang together",
             ClusterMethod::Markov => {
                 "Groups functions a random walk along the calls drains into together"
             }
@@ -727,7 +760,8 @@ fn coarsen(base: WeightedGraph, sizes: Vec<usize>, method: ClusterMethod) -> Lad
 
     if run.current.node_count() > TARGET_TOP_CLUSTERS {
         match method {
-            ClusterMethod::Modularity => run.by_modularity(),
+            ClusterMethod::Modularity => run.by_modularity(louvain_pass),
+            ClusterMethod::Leiden => run.by_modularity(leiden_pass),
             ClusterMethod::Markov => run.by_flow(),
         }
     }
@@ -780,14 +814,18 @@ impl Coarsening {
     ///    to its optimum. The last rung this leaves is the opening rung.
     /// 3. Only while the top is still wider than the target: halve γ and pass
     ///    again, down to [`MIN_RESOLUTION`].
-    fn by_modularity(&mut self) {
+    ///
+    /// `optimise` is the pass: [`louvain_pass`] or [`leiden_pass`]. Both
+    /// climb the same objective, so the regimes are the same and only the
+    /// climb differs.
+    fn by_modularity(&mut self, optimise: fn(&WeightedGraph, f64) -> (Vec<usize>, usize)) {
         for &resolution in RESOLUTION_LADDER {
-            self.pass(resolution >= 1.0, |graph| louvain_pass(graph, resolution));
+            self.pass(resolution >= 1.0, |graph| optimise(graph, resolution));
         }
-        while self.pass(true, |graph| louvain_pass(graph, 1.0)) {}
+        while self.pass(true, |graph| optimise(graph, 1.0)) {}
         let mut resolution = 0.5;
         while self.current.node_count() > TARGET_TOP_CLUSTERS && resolution >= MIN_RESOLUTION {
-            self.pass(false, |graph| louvain_pass(graph, resolution));
+            self.pass(false, |graph| optimise(graph, resolution));
             resolution /= 2.0;
         }
     }
@@ -877,105 +915,410 @@ impl Ladder {
 /// Returns the assignment of nodes to communities, renumbered so they are
 /// `0..count` in order of lowest member.
 ///
-/// The gain of moving `i` into community `C`, with `i` taken out of wherever it
-/// was, is `k_iC - γ · k_i · Σ_C / 2m` up to a constant factor: the calls
-/// between `i` and `C`, less what the null model expects given `i`'s degree
-/// and `C`'s total degree. Staying is a candidate like any other, scored with
-/// `i` removed, so a node in a community it no longer fits leaves it. A move
-/// needs a strictly better gain than staying, and candidates are tried in
-/// ascending community id, so ties are deterministic and lean towards leaving
-/// things be.
-///
-/// A candidate that would put its community on a directed cycle of the
-/// quotient is skipped, however much it gains — see [`joins_a_cycle`]. The
-/// graph handed in is a DAG, by construction at the base and by this rule at
-/// every rung above it, and every community starts as one node, so the
-/// quotient is acyclic before the first move and stays so after each.
+/// The move itself is [`Mover::place`]; this is the sweep that drives it.
 fn louvain_pass(graph: &WeightedGraph, resolution: f64) -> (Vec<usize>, usize) {
     let n = graph.node_count();
+    if total_degree(graph) <= 0.0 {
+        return renumber(&(0..n).collect::<Vec<_>>());
+    }
+    let mut mover = Mover::new(graph, resolution, (0..n).collect(), n);
+    mover.sweep();
+    renumber(&mover.community)
+}
 
-    // A self-loop counts twice towards degree, as in the modularity definition,
-    // which is what keeps the degrees of a quotient summing to the base's.
-    let degree: Vec<f64> = (0..n)
+/// Every node's degree. A self-loop counts twice, as in the modularity
+/// definition, which is what keeps the degrees of a quotient summing to the
+/// base's.
+fn degrees(graph: &WeightedGraph) -> Vec<f64> {
+    (0..graph.node_count())
         .map(|node| {
             graph.adj[node].iter().map(|(_, w)| w).sum::<f64>() + 2.0 * graph.self_loops[node]
         })
-        .collect();
-    let two_m: f64 = degree.iter().sum();
-    if two_m <= 0.0 {
+        .collect()
+}
+
+/// Twice the total weight — the `2m` of the modularity formula.
+fn total_degree(graph: &WeightedGraph) -> f64 {
+    degrees(graph).iter().sum()
+}
+
+/// The state of one local-moving phase: which community every node is in,
+/// and everything a move needs to be scored and checked. Shared by Louvain,
+/// which starts it from singletons and sweeps, and Leiden, which starts it
+/// from the previous round's partition and drains a queue.
+struct Mover<'g> {
+    graph: &'g WeightedGraph,
+    resolution: f64,
+    degree: Vec<f64>,
+    two_m: f64,
+    community: Vec<usize>,
+    community_degree: Vec<f64>,
+    /// The nodes of each community, in the order they arrived — a sweep
+    /// over `0..n` is the visit order, this is for the cycle test.
+    members: Vec<Vec<usize>>,
+    scratch: CycleScratch,
+    /// Calls from the node being placed into each neighbouring community.
+    /// A `BTreeMap` so the candidates come out in ascending id — the
+    /// tie-break.
+    links: BTreeMap<usize, f64>,
+}
+
+impl<'g> Mover<'g> {
+    /// Start from `community`, whose ids must all be below `slots`. The
+    /// caller has checked that the graph has any weight at all.
+    fn new(graph: &'g WeightedGraph, resolution: f64, community: Vec<usize>, slots: usize) -> Self {
+        let degree = degrees(graph);
+        let two_m = degree.iter().sum();
+        let mut community_degree = vec![0.0f64; slots];
+        let mut members: Vec<Vec<usize>> = vec![Vec::new(); slots];
+        for (node, &own) in community.iter().enumerate() {
+            community_degree[own] += degree[node];
+            members[own].push(node);
+        }
+        Self {
+            graph,
+            resolution,
+            degree,
+            two_m,
+            community,
+            community_degree,
+            members,
+            scratch: CycleScratch::new(slots),
+            links: BTreeMap::new(),
+        }
+    }
+
+    /// Move `node` to the neighbouring community that gains the most, if any
+    /// gains over staying. Returns whether it moved.
+    ///
+    /// The gain of moving `i` into community `C`, with `i` taken out of
+    /// wherever it was, is `k_iC - γ · k_i · Σ_C / 2m` up to a constant
+    /// factor: the calls between `i` and `C`, less what the null model expects
+    /// given `i`'s degree and `C`'s total degree. Staying is a candidate like
+    /// any other, scored with `i` removed, so a node in a community it no
+    /// longer fits leaves it. A move needs a strictly better gain than
+    /// staying, and candidates are tried in ascending community id, so ties
+    /// are deterministic and lean towards leaving things be.
+    ///
+    /// A candidate that would put its community on a directed cycle of the
+    /// quotient is skipped, however much it gains — see [`joins_a_cycle`].
+    /// The graph handed in is a DAG, by construction at the base and by this
+    /// rule at every rung above it, and the starting partition's quotient is
+    /// one too — singletons, or a partition this rule built — so the quotient
+    /// is acyclic before the first move and stays so after each.
+    fn place(&mut self, node: usize) -> bool {
+        let Self {
+            graph,
+            resolution,
+            degree,
+            two_m,
+            community,
+            community_degree,
+            members,
+            scratch,
+            links,
+        } = self;
+        let (resolution, two_m) = (*resolution, *two_m);
+
+        links.clear();
+        for &(neighbour, weight) in &graph.adj[node] {
+            *links.entry(community[neighbour]).or_insert(0.0) += weight;
+        }
+
+        let own = community[node];
+        community_degree[own] -= degree[node];
+
+        let gain = |candidate: usize, into: f64, community_degree: &[f64]| {
+            into - resolution * degree[node] * community_degree[candidate] / two_m
+        };
+        let mut best = own;
+        let mut best_gain = gain(
+            own,
+            links.get(&own).copied().unwrap_or(0.0),
+            community_degree,
+        );
+        for (&candidate, &into) in links.iter() {
+            if candidate == own {
+                continue;
+            }
+            let candidate_gain = gain(candidate, into, community_degree);
+            if candidate_gain <= best_gain + GAIN_EPSILON {
+                continue;
+            }
+            // Better — but only legal if the quotient stays a DAG.
+            let after = |other: usize| {
+                if other == node {
+                    candidate
+                } else {
+                    community[other]
+                }
+            };
+            if joins_a_cycle(graph, after, members, &[node], candidate, scratch) {
+                continue;
+            }
+            best = candidate;
+            best_gain = candidate_gain;
+        }
+
+        community_degree[best] += degree[node];
+        if best == own {
+            return false;
+        }
+        community[node] = best;
+        let at = members[own]
+            .iter()
+            .position(|&member| member == node)
+            .expect("a node is listed in its own community");
+        members[own].swap_remove(at);
+        members[best].push(node);
+        true
+    }
+
+    /// Louvain's driver: full sweeps in index order until one moves nothing.
+    fn sweep(&mut self) {
+        for _ in 0..MAX_SWEEPS {
+            let mut moved = false;
+            for node in 0..self.graph.node_count() {
+                moved |= self.place(node);
+            }
+            if !moved {
+                break;
+            }
+        }
+    }
+
+    /// Leiden's driver, the paper's "fast local move": every node once, in
+    /// index order, and after that only the neighbours of a node that moved
+    /// — the only nodes whose best community can have changed — each queued
+    /// at most once at a time. A sweep re-scores every node after any move;
+    /// this re-scores the handful that a move could have affected, and on a
+    /// graph where most nodes settle at once that is most of the work saved.
+    /// Deterministic for the same reason a sweep is: the queue starts in
+    /// index order and grows in adjacency order.
+    fn drain_queue(&mut self) {
+        let n = self.graph.node_count();
+        let mut queue: VecDeque<usize> = (0..n).collect();
+        let mut queued = vec![true; n];
+        // Strict gains make the drain finite; the budget is insurance against
+        // floating-point ties chasing each other, and is a sweep's worth.
+        let mut budget = n.saturating_mul(MAX_SWEEPS);
+        while let Some(node) = queue.pop_front() {
+            queued[node] = false;
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            if !self.place(node) {
+                continue;
+            }
+            let own = self.community[node];
+            for &(neighbour, _) in &self.graph.adj[node] {
+                if self.community[neighbour] != own && !queued[neighbour] {
+                    queued[neighbour] = true;
+                    queue.push_back(neighbour);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Leiden
+// ---------------------------------------------------------------------------
+
+/// One pass of the Leiden algorithm at `resolution`: rounds of move, refine
+/// and collapse until every box is one node of the collapsed graph.
+///
+/// Returns the assignment of nodes to boxes, renumbered so they are
+/// `0..count` in order of lowest member, like [`louvain_pass`], and is
+/// dropped into the ladder in its place.
+///
+/// A round moves nodes with [`Mover::drain_queue`], starting from the
+/// partition the previous round left — singletons in the first — then
+/// [`refine`]s what that made, and collapses the graph by the *refined*
+/// partition while handing the *unrefined* one on as the next round's start.
+/// That is the whole difference from Louvain, which collapses by the
+/// partition the moves made and starts the next round from singletons of it:
+/// here every node of the collapsed graph is something the refinement built,
+/// and it built only connected things, so what the moves regroup can only be
+/// connected pieces of connected pieces. The run is done when the moves
+/// leave every box a single node, which is when the partition is a fixed
+/// point of both phases. It is also stopped when a refinement merges nothing
+/// — the moves grouped nodes none of which are well connected to the group,
+/// which the DAG rule can arrange by refusing every merge inside a box — and
+/// then the answer is the current nodes as they stand, since a box the
+/// refinement will not rebuild is a box the method does not stand behind.
+///
+/// Each round collapses at least one merge, so the rounds are bounded by the
+/// node count; [`MAX_ROUNDS`] is insurance.
+fn leiden_pass(graph: &WeightedGraph, resolution: f64) -> (Vec<usize>, usize) {
+    let n = graph.node_count();
+    if total_degree(graph) <= 0.0 {
         return renumber(&(0..n).collect::<Vec<_>>());
     }
 
-    let mut community: Vec<usize> = (0..n).collect();
-    let mut community_degree: Vec<f64> = degree.clone();
-    let mut members: Vec<Vec<usize>> = (0..n).map(|node| vec![node]).collect();
-    let mut scratch = CycleScratch::new(n);
-    // Calls from the node being placed into each neighbouring community.
-    // A `BTreeMap` so the candidates come out in ascending id — the tie-break.
+    // The node of `current` each base node has been collapsed into.
+    let mut owner: Vec<usize> = (0..n).collect();
+    // `current` is `graph` in the first round and a collapse of it after.
+    let mut collapsed: Option<WeightedGraph> = None;
+    let mut partition: Vec<usize> = (0..n).collect();
+    let mut slots = n;
+
+    for _ in 0..MAX_ROUNDS {
+        let current: &WeightedGraph = collapsed.as_ref().unwrap_or(graph);
+        let mut mover = Mover::new(current, resolution, partition, slots);
+        mover.drain_queue();
+        let (community, count) = renumber(&mover.community);
+        if count == current.node_count() {
+            return renumber(
+                &owner
+                    .iter()
+                    .map(|&node| community[node])
+                    .collect::<Vec<_>>(),
+            );
+        }
+
+        let (refined, refined_count) = refine(&mover);
+        if refined_count == current.node_count() {
+            return renumber(&owner);
+        }
+
+        let mut next = vec![0usize; refined_count];
+        for (node, &sub) in refined.iter().enumerate() {
+            next[sub] = community[node];
+        }
+        for node in owner.iter_mut() {
+            *node = refined[*node];
+        }
+        let aggregated = aggregate(current, &refined, refined_count);
+        collapsed = Some(aggregated);
+        partition = next;
+        slots = refined_count;
+    }
+
+    renumber(
+        &owner
+            .iter()
+            .map(|&node| partition[node])
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Rebuild every box of `mover`'s partition from singletons, merging only
+/// what is well connected: the refinement that makes Leiden's boxes
+/// connected.
+///
+/// Returns the refined assignment, renumbered like every pass. Each refined
+/// box lies inside one box of the partition.
+///
+/// Within a box `S`, a node `v` is *well connected* when its calls into the
+/// rest of `S` are at least what the null model expects at this resolution,
+/// `γ · k_v · (K_S − k_v) / 2m`, and a sub-box is well connected by the same
+/// measure with its own degree. Nodes are visited in index order; one that is
+/// still alone and well connected merges into the well-connected sub-box it
+/// gains the most by joining, if any gains at all, and the sub-box's degree
+/// and outward calls are updated for the next. A node that has been joined
+/// by another is not alone and is not visited again — merging is one way,
+/// which is what makes every sub-box a union of merges into something
+/// connected, and so connected itself. The paper draws the merge at random,
+/// weighted by gain; this takes the best, so the run is a function of the
+/// graph alone.
+///
+/// The DAG rule holds here as everywhere: a merge that would put its sub-box
+/// on a directed cycle of the refined quotient is refused, and refusing one
+/// disconnects nothing. Any such cycle lies within one box — a cycle of the
+/// refined quotient projects to a closed walk of the partition's quotient,
+/// which is acyclic, so it never leaves a box — and the search is confined
+/// accordingly: every node outside the box under refinement is mapped to one
+/// spare group with no members, where the walk dead-ends.
+fn refine(mover: &Mover) -> (Vec<usize>, usize) {
+    let graph = mover.graph;
+    let n = graph.node_count();
+    let (resolution, two_m) = (mover.resolution, mover.two_m);
+    let degree = &mover.degree;
+    let community = &mover.community;
+
+    let mut refined: Vec<usize> = (0..n).collect();
+    // Index `n` is the spare group for everything outside the current box.
+    let mut sub_members: Vec<Vec<usize>> = (0..n).map(|node| vec![node]).collect();
+    sub_members.push(Vec::new());
+    let mut sub_degree: Vec<f64> = degree.clone();
+    // Calls from a sub-box to the rest of its box, and from a node to the
+    // rest of its box — the well-connectedness measure, kept current.
+    let mut sub_external = vec![0.0f64; n];
+    let mut within = vec![0.0f64; n];
+    let mut scratch = CycleScratch::new(n + 1);
     let mut links: BTreeMap<usize, f64> = BTreeMap::new();
 
-    for _ in 0..MAX_SWEEPS {
-        let mut moved = false;
-        for node in 0..n {
+    for (box_id, box_members) in mover.members.iter().enumerate() {
+        if box_members.len() < 2 {
+            continue;
+        }
+        let mut nodes = box_members.clone();
+        nodes.sort_unstable();
+        let box_degree: f64 = nodes.iter().map(|&node| degree[node]).sum();
+        for &node in &nodes {
+            within[node] = graph.adj[node]
+                .iter()
+                .filter(|(other, _)| community[*other] == box_id)
+                .map(|(_, weight)| weight)
+                .sum();
+            sub_external[node] = within[node];
+        }
+        let expected =
+            |own_degree: f64| resolution * own_degree * (box_degree - own_degree) / two_m;
+
+        for &node in &nodes {
+            if sub_members[node].len() != 1 || within[node] < expected(degree[node]) {
+                continue;
+            }
             links.clear();
-            for &(neighbour, weight) in &graph.adj[node] {
-                *links.entry(community[neighbour]).or_insert(0.0) += weight;
+            for &(other, weight) in &graph.adj[node] {
+                if community[other] == box_id {
+                    *links.entry(refined[other]).or_insert(0.0) += weight;
+                }
             }
 
-            let own = community[node];
-            community_degree[own] -= degree[node];
-
-            let gain = |candidate: usize, into: f64, community_degree: &[f64]| {
-                into - resolution * degree[node] * community_degree[candidate] / two_m
-            };
-            let mut best = own;
-            let mut best_gain = gain(
-                own,
-                links.get(&own).copied().unwrap_or(0.0),
-                &community_degree,
-            );
+            let mut best = node;
+            let mut best_gain = 0.0;
             for (&candidate, &into) in &links {
-                if candidate == own {
+                if sub_external[candidate] < expected(sub_degree[candidate]) {
                     continue;
                 }
-                let candidate_gain = gain(candidate, into, &community_degree);
-                if candidate_gain <= best_gain + GAIN_EPSILON {
+                let gain = into - resolution * degree[node] * sub_degree[candidate] / two_m;
+                if gain <= best_gain + GAIN_EPSILON {
                     continue;
                 }
-                // Better — but only legal if the quotient stays a DAG.
                 let after = |other: usize| {
                     if other == node {
                         candidate
+                    } else if community[other] != box_id {
+                        n
                     } else {
-                        community[other]
+                        refined[other]
                     }
                 };
-                if joins_a_cycle(graph, after, &members, &[node], candidate, &mut scratch) {
+                if joins_a_cycle(graph, after, &sub_members, &[node], candidate, &mut scratch) {
                     continue;
                 }
                 best = candidate;
-                best_gain = candidate_gain;
+                best_gain = gain;
             }
 
-            community_degree[best] += degree[node];
-            if best != own {
-                community[node] = best;
-                let at = members[own]
-                    .iter()
-                    .position(|&member| member == node)
-                    .expect("a node is listed in its own community");
-                members[own].swap_remove(at);
-                members[best].push(node);
-                moved = true;
+            if best != node {
+                let into = links[&best];
+                refined[node] = best;
+                sub_members[node].clear();
+                sub_members[best].push(node);
+                sub_degree[best] += degree[node];
+                sub_external[best] += within[node] - 2.0 * into;
             }
-        }
-        if !moved {
-            break;
         }
     }
 
-    renumber(&community)
+    renumber(&refined)
 }
+
 // ---------------------------------------------------------------------------
 // Markov clustering
 // ---------------------------------------------------------------------------
@@ -2950,7 +3293,11 @@ mod tests {
     fn markov_is_listed_after_modularity() {
         assert_eq!(
             ClusterMethod::ALL,
-            &[ClusterMethod::Modularity, ClusterMethod::Markov]
+            &[
+                ClusterMethod::Modularity,
+                ClusterMethod::Leiden,
+                ClusterMethod::Markov
+            ]
         );
         assert_ne!(
             ClusterMethod::Markov.label(),
@@ -2961,5 +3308,236 @@ mod tests {
             Clustering::compute(&layered_dag(60).0, ClusterMethod::Markov).method(),
             ClusterMethod::Markov
         );
+    }
+
+    // -- Leiden ----------------------------------------------------------------
+
+    /// Whether every box at one level is connected by the calls among its
+    /// own members — the property Leiden promises and Louvain does not.
+    fn rung_is_connected(graph: &CallGraph, clustering: &Clustering, level: usize) -> bool {
+        clustering.level(level).iter().all(|id| {
+            let members: HashSet<SymbolId> = clustering
+                .cluster(*id)
+                .unwrap()
+                .members
+                .iter()
+                .copied()
+                .collect();
+            let start = *members.iter().next().unwrap();
+            let mut seen: HashSet<SymbolId> = HashSet::from([start]);
+            let mut stack = vec![start];
+            while let Some(at) = stack.pop() {
+                let mut around: Vec<SymbolId> =
+                    graph.get_callees(&at).into_iter().map(|f| f.id).collect();
+                around.extend(graph.get_callers(&at).into_iter().map(|f| f.id));
+                for other in around {
+                    if members.contains(&other) && seen.insert(other) {
+                        stack.push(other);
+                    }
+                }
+            }
+            seen.len() == members.len()
+        })
+    }
+
+    /// The refinement of a partition handed in by hand, as names. Lets a test
+    /// start from a grouping the moves would never make and watch the
+    /// refinement take it apart.
+    fn refinement_of(graph: &CallGraph, grouping: &[&[&str]]) -> Vec<Vec<String>> {
+        partition_names(graph, |base| {
+            let n = base.node_count();
+            let names: Vec<String> = base_names(graph, base, n);
+            let community: Vec<usize> = names
+                .iter()
+                .map(|name| {
+                    grouping
+                        .iter()
+                        .position(|g| g.contains(&name.as_str()))
+                        .expect("every function is in a group")
+                })
+                .collect();
+            let mover = Mover::new(base, 1.0, community, grouping.len().max(n));
+            refine(&mover)
+        })
+    }
+
+    /// The name of every base node, by index. Only valid on a graph with no
+    /// cycle, where no node condenses.
+    fn base_names(graph: &CallGraph, base: &WeightedGraph, n: usize) -> Vec<String> {
+        let full = build_base_graph(graph, None);
+        assert_eq!(full.graph.node_count(), base.node_count());
+        (0..n)
+            .map(|node| {
+                let symbol = full
+                    .units
+                    .iter()
+                    .position(|&unit| unit == node)
+                    .expect("every node has a symbol");
+                named(graph, &full.symbols[symbol])
+            })
+            .collect()
+    }
+
+    fn one_leiden_pass(graph: &CallGraph, resolution: f64) -> Vec<Vec<String>> {
+        partition_names(graph, |base| leiden_pass(base, resolution))
+    }
+
+    fn groups(names: &[&[&str]]) -> Vec<Vec<String>> {
+        let mut out: Vec<Vec<String>> = names
+            .iter()
+            .map(|g| {
+                let mut g: Vec<String> = g.iter().map(|s| s.to_string()).collect();
+                g.sort();
+                g
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The mechanism of the guarantee: a box whose two halves share no call
+    /// is rebuilt as two boxes, because a merge needs a call to go through.
+    #[test]
+    fn a_box_in_two_pieces_is_refined_into_two() {
+        let mut graph = CallGraph::new();
+        let a = add(&mut graph, "a", 1);
+        let b = add(&mut graph, "b", 2);
+        let c = add(&mut graph, "c", 3);
+        let d = add(&mut graph, "d", 4);
+        call_often(&mut graph, a, b, 100, 3);
+        call_often(&mut graph, c, d, 200, 3);
+
+        assert_eq!(
+            refinement_of(&graph, &[&["a", "b", "c", "d"]]),
+            groups(&[&["a", "b"], &["c", "d"]])
+        );
+    }
+
+    /// A node whose one call into a box is less than the null model expects
+    /// of a node as busy as it is stays out of the box on refinement, however
+    /// the moves had placed it.
+    #[test]
+    fn a_poorly_connected_node_is_not_merged_on_refinement() {
+        let mut graph = CallGraph::new();
+        let clique: Vec<SymbolId> = ["a", "b", "c", "d"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| add(&mut graph, name, i as u32 + 1))
+            .collect();
+        let mut line = 100;
+        for i in 0..clique.len() {
+            for j in i + 1..clique.len() {
+                call_often(&mut graph, clique[i], clique[j], line, 5);
+                line += 5;
+            }
+        }
+        let v = add(&mut graph, "v", 50);
+        let w = add(&mut graph, "w", 51);
+        call(&mut graph, v, clique[0], 500);
+        call_often(&mut graph, v, w, 600, 20);
+
+        let refined = refinement_of(&graph, &[&["a", "b", "c", "d", "v"], &["w"]]);
+        assert!(
+            refined.contains(&vec!["v".to_string()]),
+            "v has one call into the box and twenty elsewhere: {refined:?}"
+        );
+    }
+
+    /// A refinement merge is held to the DAG rule. `a` calls `c` heavily and
+    /// `b` calls `d` heavily, and a one-way chain `a -> b -> c` crosses
+    /// between them. Both pairs pay to merge, but `{a, c}` would sit on both
+    /// ends of `b`: a cycle of the refined quotient, though the box holding
+    /// all four was on none. So that merge is refused, from either end, and
+    /// only `b` and `d` come out together.
+    #[test]
+    fn a_refinement_merge_that_would_close_a_cycle_is_refused() {
+        let mut graph = CallGraph::new();
+        let a = add(&mut graph, "a", 1);
+        let b = add(&mut graph, "b", 2);
+        let c = add(&mut graph, "c", 3);
+        let d = add(&mut graph, "d", 4);
+        call_often(&mut graph, a, c, 100, 5);
+        call_often(&mut graph, b, d, 150, 5);
+        call(&mut graph, a, b, 200);
+        call(&mut graph, b, c, 201);
+
+        assert_eq!(
+            refinement_of(&graph, &[&["a", "b", "c", "d"]]),
+            groups(&[&["a"], &["b", "d"], &["c"]])
+        );
+    }
+
+    /// The promise, over every rung of ladders that exercise every regime.
+    #[test]
+    fn every_box_of_every_leiden_rung_is_connected() {
+        let (layered, _) = layered_dag(200);
+        let (chain, _) = chain_of(60);
+        let crossing = crossing_graph();
+        let stray = two_groups_one_stray_call();
+        for (name, graph) in [
+            ("layered", &layered),
+            ("chain", &chain),
+            ("crossing", &crossing),
+            ("stray", &stray),
+        ] {
+            let clustering = Clustering::compute(graph, ClusterMethod::Leiden);
+            for level in 0..clustering.level_count() {
+                assert!(
+                    rung_is_connected(graph, &clustering, level),
+                    "{name}: a box on rung {level} is not connected: {:?}",
+                    grouping_at(graph, &clustering, level)
+                );
+                assert!(
+                    rung_is_a_dag(graph, &clustering, level),
+                    "{name}: rung {level} has a cycle"
+                );
+            }
+        }
+    }
+
+    /// One pass to convergence climbs the same objective Louvain does, so on
+    /// a graph with a clean answer the two agree.
+    #[test]
+    fn leiden_finds_the_two_groups_louvain_finds() {
+        let graph = two_groups_one_stray_call();
+        assert_eq!(one_leiden_pass(&graph, 1.0), one_pass(&graph, 1.0));
+        assert_eq!(
+            one_leiden_pass(&graph, 1.0),
+            groups(&[&["a", "b", "c", "d"], &["e", "f", "g", "h"]])
+        );
+    }
+
+    /// A pass is a run to convergence, not one round: on a graph Louvain
+    /// needs several passes for, one Leiden pass is already as coarse as
+    /// Louvain's ladder gets at that resolution.
+    #[test]
+    fn a_leiden_pass_runs_to_convergence() {
+        let (graph, _) = layered_dag(200);
+        let leiden = one_leiden_pass(&graph, 1.0).len();
+        let base = build_base_graph(&graph, None);
+        let mut current = base.graph;
+        let mut count = current.node_count();
+        loop {
+            let (groups, merged) = louvain_pass(&current, 1.0);
+            if merged == count {
+                break;
+            }
+            current = aggregate(&current, &groups, merged);
+            count = merged;
+        }
+        assert!(
+            leiden <= count + count / 4,
+            "one Leiden pass left {leiden} boxes where Louvain converged to {count}"
+        );
+    }
+
+    /// The zero-temperature choice is what makes this a function of the graph.
+    #[test]
+    fn leiden_recomputes_identically() {
+        let (graph, _) = layered_dag(120);
+        let first = Clustering::compute(&graph, ClusterMethod::Leiden);
+        let second = Clustering::compute(&graph, ClusterMethod::Leiden);
+        assert_eq!(fingerprint(&graph, &first), fingerprint(&graph, &second));
+        assert_eq!(first.method(), ClusterMethod::Leiden);
     }
 }

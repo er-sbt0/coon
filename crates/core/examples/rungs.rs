@@ -87,6 +87,61 @@ fn report(name: &str, graph: &CallGraph) {
     }
 }
 
+/// Plain modularity (γ = 1) of the partition `owner` gives, over the calls
+/// read undirected and weighted by call site, which is the objective two of
+/// the methods climb and the number the other is compared on.
+fn modularity(graph: &CallGraph, owner: &HashMap<SymbolId, usize>) -> f64 {
+    let boxes = owner.values().max().map_or(0, |b| b + 1);
+    let mut inside = vec![0.0f64; boxes];
+    let mut degree = vec![0.0f64; boxes];
+    let mut two_m = 0.0f64;
+    for caller in graph.function_ids() {
+        let Some(&a) = owner.get(caller) else {
+            continue;
+        };
+        for callee in graph.get_callees(caller) {
+            let Some(&b) = owner.get(&callee.id) else {
+                continue;
+            };
+            if callee.id == *caller {
+                continue;
+            }
+            two_m += 2.0;
+            degree[a] += 1.0;
+            degree[b] += 1.0;
+            if a == b {
+                inside[a] += 2.0;
+            }
+        }
+    }
+    if two_m == 0.0 {
+        return 0.0;
+    }
+    (0..boxes)
+        .map(|b| inside[b] / two_m - (degree[b] / two_m).powi(2))
+        .sum()
+}
+
+/// Whether `members` hang together by the calls among themselves alone.
+fn is_connected(graph: &CallGraph, members: &[SymbolId]) -> bool {
+    let inside: HashSet<SymbolId> = members.iter().copied().collect();
+    let Some(&start) = members.first() else {
+        return true;
+    };
+    let mut seen: HashSet<SymbolId> = HashSet::from([start]);
+    let mut stack = vec![start];
+    while let Some(at) = stack.pop() {
+        let mut around: Vec<SymbolId> = graph.get_callees(&at).into_iter().map(|f| f.id).collect();
+        around.extend(graph.get_callers(&at).into_iter().map(|f| f.id));
+        for other in around {
+            if inside.contains(&other) && seen.insert(other) {
+                stack.push(other);
+            }
+        }
+    }
+    seen.len() == inside.len()
+}
+
 fn report_method(name: &str, graph: &CallGraph, method: ClusterMethod) {
     let clustering = Clustering::compute(graph, method);
     println!(
@@ -137,9 +192,16 @@ fn report_method(name: &str, graph: &CallGraph, method: ClusterMethod) {
             .map(|id| clustering.cluster(*id).unwrap().members.len())
             .collect();
         let held: usize = sizes.iter().sum();
+        // Boxes that are not connected by the calls among their own members
+        // — what Leiden rules out, and what a modularity box can quietly be.
+        let split = ids
+            .iter()
+            .filter(|id| !is_connected(graph, &clustering.cluster(**id).unwrap().members))
+            .count();
+        let q = modularity(graph, &owner);
         println!(
             "  rung {:>2}: {n:>4} boxes  {:>4} lines  density {:>4.0}%  mutual {mutual:>3}  \
-             {:>4.1} fns/box  singletons {:>2}{}",
+             split {split:>2}  Q {q:>5.3}  {:>4.1} fns/box  singletons {:>2}{}",
             level + 1,
             pairs.len(),
             if possible > 0 {
