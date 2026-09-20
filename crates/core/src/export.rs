@@ -296,13 +296,19 @@ fn cluster_dot(core: &CoreApp) -> Option<String> {
         Some(func) => format!("{} — neighbourhood", func.qualified_name),
         None => "Whole project".to_string(),
     };
+    // The grain goes in the title beside the method, because the same method
+    // at a different γ or inflation is a different map and the file is the
+    // only thing left saying which one this was.
+    let settings = ws.cluster_settings();
     header(
         &mut out,
         ws.orientation(),
         &format!(
-            "Cluster map: {scope}, {} clusters ({}, rung {} of {})",
+            "Cluster map: {scope}, {} clusters ({} at {} {}, rung {} of {})",
             boxes.len(),
-            ws.method().label(),
+            settings.method().label(),
+            settings.method().grain_spec().label,
+            settings.grain(),
             core.map_level_for(ws) + 1,
             clustering.level_count(),
         ),

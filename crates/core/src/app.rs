@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use logic::{ClusterKey, ClusterMethod, Clustering, GraphTraversal};
+use logic::{ClusterKey, ClusterMethod, ClusterSettings, Clustering, GraphTraversal};
 use lsp::LspResponse;
 use model::{CallDirection, CallGraph, FunctionNode, Location, LspLoadPhase, SymbolId};
 
@@ -70,27 +70,41 @@ const WARMUP_STALL_AFTER: Duration = Duration::from_secs(10);
 /// a background job are each about.
 ///
 /// Every part of it comes off the workspace, because every part of it changes
-/// what comes back: the method is the algorithm, the scope is the subgraph, and
-/// the direction decides which way a scope reaches. Two tabs agreeing on all
-/// three are asking the same question and share the answer.
+/// what comes back: the settings are the algorithm and the knobs it reads, the
+/// scope is the subgraph, and the direction decides which way a scope reaches.
+/// Two tabs agreeing on all of it are asking the same question and share the
+/// answer — and two that agree on the method but not on its grain are not, which
+/// is why the whole of [`ClusterSettings`] is in the key rather than the method
+/// alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ClusterTarget {
     /// One function's neighbourhood, or `None` for the whole program.
     scope: Option<(SymbolId, CallDirection)>,
-    method: ClusterMethod,
+    settings: ClusterSettings,
 }
 
 impl ClusterTarget {
     fn of(ws: &CoreWorkspace) -> Self {
         Self {
             scope: ws.map_scope().map(|scope| (scope, ws.direction())),
-            method: ws.method(),
+            settings: ws.cluster_settings(),
+        }
+    }
+
+    /// The whole-program map built to the same settings — what a new tab opens
+    /// on, and what widening a scope goes back to.
+    fn unscoped(&self) -> Self {
+        Self {
+            scope: None,
+            ..*self
         }
     }
 
     /// A total order, so which of several owed maps is computed first does not
-    /// depend on hash iteration.
-    fn order(&self) -> (bool, u128, bool, usize) {
+    /// depend on hash iteration. Settings sort by method and then by the knobs
+    /// as they go out on the wire, which is arbitrary but total, and that is
+    /// all this promises.
+    fn order(&self) -> (bool, u128, bool, usize, u64, u64, usize) {
         let (scope, incoming) = match self.scope {
             Some((symbol, direction)) => (
                 symbol.0.as_u128(),
@@ -98,7 +112,15 @@ impl ClusterTarget {
             ),
             None => (0, false),
         };
-        (self.scope.is_some(), scope, incoming, self.method as usize)
+        (
+            self.scope.is_some(),
+            scope,
+            incoming,
+            self.settings.method() as usize,
+            self.settings.resolution().to_bits(),
+            self.settings.inflation().to_bits(),
+            self.settings.target_top(),
+        )
     }
 }
 
@@ -263,10 +285,10 @@ impl CoreApp {
         // symbols returns before it allocates.
         let opening = ClusterTarget {
             scope: None,
-            method: ClusterMethod::default(),
+            settings: ClusterSettings::default(),
         };
         let clusterings =
-            HashMap::from([(opening, Clustering::compute(&call_graph, opening.method))]);
+            HashMap::from([(opening, Clustering::compute(&call_graph, opening.settings))]);
         // The frame the map is placed in, for the same reason and on the same
         // terms: over an empty graph it returns before it allocates, and over a
         // demo graph it is the frame every rung is drawn in from the first
@@ -397,6 +419,7 @@ impl CoreApp {
             Command::SetMapScope(scope) => self.cmd_set_map_scope(scope),
             Command::SetMapLevel(level) => self.cmd_set_map_level(level),
             Command::SetClusterMethod(method) => self.cmd_set_cluster_method(method),
+            Command::SetClusterSettings(settings) => self.cmd_set_cluster_settings(settings),
             Command::DrillIntoCluster(key) => self.cmd_drill_into_cluster(key),
             Command::ZoomOutToClusters => self.cmd_zoom_out_to_clusters(),
             Command::NewWorkspace => self.cmd_new_workspace(),
@@ -851,9 +874,9 @@ impl CoreApp {
         let direction = ws.direction();
         let target = ClusterTarget {
             scope: Some((symbol, direction)),
-            method: ws.method(),
+            settings: ws.cluster_settings(),
         };
-        let clustering = cluster_within(&self.call_graph, symbol, direction, target.method);
+        let clustering = cluster_within(&self.call_graph, symbol, direction, target.settings);
         // And the frame it will be placed in, if no worker has been round yet —
         // which is the case while the project is still arriving, since nothing
         // is clustered until it settles. Inline for the same reason the
@@ -923,6 +946,36 @@ impl CoreApp {
             Some(ws) => {
                 if ws.set_method(method) {
                     log::info!("CoreApp: cluster map switched to {}", method.label());
+                    vec![AppEvent::LayoutDirty]
+                } else {
+                    vec![]
+                }
+            }
+            None => vec![],
+        }
+    }
+
+    /// Rebuild the map to different settings — the method, its grain, or how
+    /// far the ladder coarsens.
+    ///
+    /// The same answer as [`Self::cmd_set_cluster_method`] and for the same
+    /// reason: a knob that moves asks a question no cache holds, so this only
+    /// says the layout is dirty and the old map stays on screen until
+    /// `sync_clusterings` has a worker bring back the new one.
+    ///
+    /// What arrives is already sanitised — `ClusterSettings` clamps and snaps
+    /// on the way in from the wire — so there is nothing to validate here and
+    /// no way for a frontend to ask for a γ the ladder has no meaning for.
+    fn cmd_set_cluster_settings(&mut self, settings: ClusterSettings) -> Vec<AppEvent> {
+        match self.workspaces.current_mut() {
+            Some(ws) => {
+                if ws.set_cluster_settings(settings) {
+                    log::info!(
+                        "CoreApp: cluster map set to {} (grain {}, top {})",
+                        settings.method().label(),
+                        settings.grain(),
+                        settings.target_top()
+                    );
                     vec![AppEvent::LayoutDirty]
                 } else {
                     vec![]
@@ -1151,13 +1204,8 @@ impl CoreApp {
             .workspaces
             .iter()
             .flat_map(|ws| {
-                [
-                    ClusterTarget::of(ws),
-                    ClusterTarget {
-                        scope: None,
-                        method: ws.method(),
-                    },
-                ]
+                let target = ClusterTarget::of(ws);
+                [target, target.unscoped()]
             })
             .collect();
 
@@ -1562,8 +1610,10 @@ impl CoreApp {
         let (tx, result) = mpsc::channel();
         std::thread::spawn(move || {
             let clustering = match target.scope {
-                None => Clustering::compute(&graph, target.method),
-                Some((scope, direction)) => cluster_within(&graph, scope, direction, target.method),
+                None => Clustering::compute(&graph, target.settings),
+                Some((scope, direction)) => {
+                    cluster_within(&graph, scope, direction, target.settings)
+                }
             };
             let frame = frame_wanted.then(|| compute_map_frame(&graph));
             // A gone receiver means the app was dropped while this ran, which
@@ -1646,7 +1696,7 @@ fn cluster_within(
     graph: &CallGraph,
     scope: SymbolId,
     direction: CallDirection,
-    method: ClusterMethod,
+    settings: ClusterSettings,
 ) -> Clustering {
     let traversal = GraphTraversal::new(graph);
     // Unbounded, unlike the rooted tree's BFS: depth is how much of a tree
@@ -1660,7 +1710,7 @@ fn cluster_within(
     .into_iter()
     .collect();
 
-    Clustering::compute_within(graph, &reachable, method)
+    Clustering::compute_within(graph, &reachable, settings)
 }
 
 #[cfg(test)]
@@ -1988,6 +2038,52 @@ mod tests {
     }
 
     #[test]
+    fn a_map_built_to_other_settings_is_not_this_tab_s_map() {
+        // The cache is keyed by the whole of `ClusterSettings`, not by the
+        // method: the same method at another grain is a different ladder, and
+        // handing one over because the algorithm matched would draw a map the
+        // user's knobs do not describe.
+        let mut app = CoreApp::new(crate::demo::create_demo_call_graph());
+        tick_until_settled(&mut app);
+        let before = ClusterTarget::of(app.workspaces.current().expect("a workspace"));
+        assert!(
+            app.clusterings.contains_key(&before),
+            "demo mode clusters up front"
+        );
+
+        let settings = app
+            .workspaces
+            .current()
+            .expect("a workspace")
+            .cluster_settings()
+            .with_grain(2.0);
+        let events = app.dispatch(Command::SetClusterSettings(settings));
+        assert!(events.iter().any(|e| matches!(e, AppEvent::LayoutDirty)));
+
+        let ws = app.workspaces.current().expect("a workspace");
+        let after = ClusterTarget::of(ws);
+        assert_ne!(before, after, "a moved knob is a different question");
+        assert!(
+            !app.clusterings.contains_key(&before),
+            "and the answer to the old question is dropped, since no tab asks it any more"
+        );
+        assert!(
+            app.clustering_for(ws).is_empty(),
+            "a tab whose settings have no map yet reads as not ready"
+        );
+
+        // It arrives on its own, and it is the ladder the new γ builds.
+        tick_until_settled(&mut app);
+        let ws = app.workspaces.current().expect("a workspace");
+        assert_eq!(app.clustering_for(ws).settings(), settings);
+        assert_eq!(
+            ws.map_level(),
+            None,
+            "and the zoom went back to wherever the new ladder opens"
+        );
+    }
+
+    #[test]
     fn a_clustering_worker_that_dies_is_not_sent_straight_back_out() {
         // A panic in the clustering is a function of the graph, so retrying it
         // against the same graph panics again — and since what is owed is
@@ -2052,7 +2148,7 @@ mod tests {
             .clusterings
             .get(&ClusterTarget {
                 scope: None,
-                method: ClusterMethod::default(),
+                settings: ClusterSettings::default(),
             })
             .expect("demo mode clustered the whole graph up front");
         assert!(
@@ -3060,7 +3156,7 @@ mod tests {
             app.clusterings
                 .get(&ClusterTarget {
                     scope: None,
-                    method: ClusterMethod::default(),
+                    settings: ClusterSettings::default(),
                 })
                 .expect("the whole-program map is still cached")
                 .cluster_of(&left[0])

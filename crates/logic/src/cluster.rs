@@ -130,19 +130,33 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 /// A pass merges whatever pays at its resolution, so the top lands at or under
 /// the target rather than on it. Twelve puts the top at roughly six to twelve
 /// boxes, which is a map a person reads rather than counts.
+///
+/// The default, since [`ClusterSettings::TARGET_TOP`]: a reader who wants the
+/// summary tighter or the ladder shorter says so per workspace, and this is
+/// where everyone who has not starts.
 pub const TARGET_TOP_CLUSTERS: usize = 12;
 
-/// The resolutions the ladder runs down to plain modularity, finest first.
+/// The resolutions the ladder runs down to the chosen one, finest first, as
+/// multiples of it.
 ///
 /// γ scales the null model: a function joins a box when the calls between them
 /// beat γ times what its busyness alone would predict. At 8 only a function and
 /// the helpers it all but owns pay for the merge, and the rung is boxes of two
-/// and three; each halving lets the next larger grouping through; 1 is plain
-/// modularity, the rung the map opens on. Halving rather than a finer step
-/// because the gain compares a ratio, and a rung a reader can tell from the one
-/// below it needs that ratio to move by a factor, not a fraction. A pass that
-/// changes nothing adds no rung, so a small program simply has fewer.
+/// and three; each halving lets the next larger grouping through; 1 is the
+/// resolution the user picked — plain modularity unless they moved it — and the
+/// rung the map opens on. Halving rather than a finer step because the gain
+/// compares a ratio, and a rung a reader can tell from the one below it needs
+/// that ratio to move by a factor, not a fraction. A pass that changes nothing
+/// adds no rung, so a small program simply has fewer.
+///
+/// Multiples rather than absolute γs so that [`ClusterSettings::RESOLUTION`]
+/// moves the whole ladder rather than only its last rung: the rungs below the
+/// opening one are meant to be finer than it, whatever grain it was built at.
 pub const RESOLUTION_LADDER: &[f64] = &[8.0, 4.0, 2.0, 1.0];
+
+/// Plain modularity, and where [`ClusterSettings::RESOLUTION`] sits until a
+/// user moves it.
+pub const DEFAULT_RESOLUTION: f64 = 1.0;
 
 /// How far below plain modularity the ladder will go to reach
 /// [`TARGET_TOP_CLUSTERS`].
@@ -176,7 +190,9 @@ const REACHABILITY_MEMBER_LIMIT: usize = 200;
 ///
 /// MCL's one knob. Higher starves weak flow sooner and the walk settles into
 /// more, smaller boxes; lower lets it spread and settles into fewer. Two is
-/// van Dongen's default, and the grain the map opens on.
+/// van Dongen's default, and the grain the map opens on — and, since
+/// [`ClusterSettings::INFLATION`], the grain it opens on for a user who has not
+/// said otherwise.
 pub const MARKOV_INFLATION: f64 = 2.0;
 
 /// How close to one the inflation is eased, above the opening rung, to reach
@@ -260,6 +276,286 @@ impl ClusterMethod {
             }
         }
     }
+
+    /// The one knob this method turns, and the range it turns over.
+    ///
+    /// Every method has exactly one, because every method has exactly one
+    /// thing to say about grain: modularity and Leiden climb the same
+    /// objective and so share γ, and flow has its inflation. A picker draws
+    /// whichever this names and never needs to know which method it belongs
+    /// to — which is what keeps a method added here reachable without touching
+    /// a frontend, the same bargain [`ClusterMethod::label`] makes.
+    pub fn grain_spec(self) -> SettingSpec {
+        match self {
+            ClusterMethod::Modularity | ClusterMethod::Leiden => ClusterSettings::RESOLUTION,
+            ClusterMethod::Markov => ClusterSettings::INFLATION,
+        }
+    }
+}
+
+/// A knob's name, range and default — everything a picker needs to draw it.
+///
+/// It ships in the snapshot beside the method that reads it, for the reason
+/// [`ClusterMethod::label`] does: a range written into a frontend instead is a
+/// range that goes on meaning what it meant the day it was copied, and a knob
+/// retuned here then reads one thing in the client and does another.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct SettingSpec {
+    /// Which field of [`ClusterSettings`] a control moves.
+    pub field: SettingField,
+    pub label: &'static str,
+    /// One line on what turning it up does.
+    pub description: &'static str,
+    pub min: f64,
+    pub max: f64,
+    /// The grain of the control *and* of the value: everything arriving is
+    /// rounded to a multiple of this. Two users who dragged a slider to the
+    /// same place are asking the same question, and a request that differs
+    /// only in the last bits of a float is a cache miss and a second run of
+    /// the whole coarsening.
+    pub step: f64,
+    pub default: f64,
+}
+
+impl SettingSpec {
+    /// The nearest legal value to `value`: clamped to the range, then rounded
+    /// to a multiple of [`SettingSpec::step`].
+    ///
+    /// Total, because the only callers are a wire hop and a frontend: a
+    /// nonsense value is answered with the default rather than refused, since
+    /// there is no one on the other end of a refusal who could do better.
+    pub fn sanitise(&self, value: f64) -> f64 {
+        if !value.is_finite() {
+            return self.default;
+        }
+        let clamped = value.clamp(self.min, self.max);
+        (clamped / self.step).round() * self.step
+    }
+}
+
+/// Which setting a [`SettingSpec`] describes, and so which field of
+/// [`ClusterSettings`] a control writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingField {
+    Resolution,
+    Inflation,
+    TargetTop,
+}
+
+/// What a clustering was asked for: the method, and the knobs that method
+/// reads.
+///
+/// One value rather than a method beside a loose bag of parameters, because
+/// they are one question. A workspace holds one, a cache entry is keyed by
+/// one, a worker computes one — and every part of it changes the answer, so
+/// anything keyed on the method alone would hand back a map built at another
+/// inflation as though it were this one.
+///
+/// Every method's knob is carried, not just the selected one's. A user who
+/// tunes the flow, looks at modularity and comes back has not thrown the
+/// tuning away, and each method keeps its own grain rather than sharing one
+/// number that means γ to two of them and an inflation to the third.
+///
+/// Stored in hundredths so the whole thing is `Eq` and `Hash`: this is a cache
+/// key, and a key made of floats is one that two equal-looking requests can
+/// miss each other on. The API and the wire speak plain numbers —
+/// [`WireSettings`] is the hop between, and it sanitises on the way in, so a
+/// value off the step or out of range cannot reach the ladder from a frontend
+/// at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(from = "WireSettings", into = "WireSettings")]
+pub struct ClusterSettings {
+    method: ClusterMethod,
+    /// γ, in hundredths.
+    resolution: u16,
+    /// MCL inflation, in hundredths.
+    inflation: u16,
+    /// The widest the coarsest rung may be, in boxes.
+    target_top: u16,
+}
+
+impl ClusterSettings {
+    /// γ, the resolution the modularity methods build their ladder around.
+    ///
+    /// The ladder is [`RESOLUTION_LADDER`] *times this*, so moving it moves
+    /// every rung together rather than only the one the map opens on: at γ = 2
+    /// the opening rung is what γ = 2 pays for and the rungs below it are
+    /// finer still. One is plain modularity and the default, and the range
+    /// stops where the objective stops saying anything a reader can use — a
+    /// quarter merges nearly everything, four merges little but what one
+    /// function all but owns.
+    pub const RESOLUTION: SettingSpec = SettingSpec {
+        field: SettingField::Resolution,
+        label: "Resolution γ",
+        description: "Higher only pays for tighter groups, so the map opens on more, smaller boxes",
+        min: 0.25,
+        max: 4.0,
+        step: 0.25,
+        default: DEFAULT_RESOLUTION,
+    };
+
+    /// The power MCL raises every column to between expansions.
+    ///
+    /// Bounded below well above one because at one exactly MCL is a plain
+    /// random walk that settles into one box per connected component, which is
+    /// a map of nothing; the ladder still eases below this floor on its own to
+    /// reach the target, one rung at a time, where a user cannot.
+    pub const INFLATION: SettingSpec = SettingSpec {
+        field: SettingField::Inflation,
+        label: "Inflation",
+        description:
+            "Higher starves weak flow sooner, so the walk settles into more, smaller boxes",
+        min: 1.2,
+        max: 4.0,
+        step: 0.1,
+        default: MARKOV_INFLATION,
+    };
+
+    /// How wide the coarsest rung may be.
+    ///
+    /// It does not trim a grouping and never touches the rung the map opens
+    /// on: it decides only how far past its own grain the ladder keeps merging,
+    /// so lowering it adds zoom steps and raising it takes them away. See
+    /// [`TARGET_TOP_CLUSTERS`].
+    pub const TARGET_TOP: SettingSpec = SettingSpec {
+        field: SettingField::TargetTop,
+        label: "Coarsest rung",
+        description: "How few boxes the ladder keeps merging towards — it only ever adds rungs to zoom out to",
+        min: 4.0,
+        max: 40.0,
+        step: 1.0,
+        default: TARGET_TOP_CLUSTERS as f64,
+    };
+
+    /// `method` at every knob's default.
+    pub fn new(method: ClusterMethod) -> Self {
+        Self {
+            method,
+            resolution: hundredths(Self::RESOLUTION.default),
+            inflation: hundredths(Self::INFLATION.default),
+            target_top: Self::TARGET_TOP.default as u16,
+        }
+    }
+
+    pub fn method(self) -> ClusterMethod {
+        self.method
+    }
+
+    /// The same knobs, under a different method.
+    pub fn with_method(self, method: ClusterMethod) -> Self {
+        Self { method, ..self }
+    }
+
+    pub fn resolution(self) -> f64 {
+        f64::from(self.resolution) / 100.0
+    }
+
+    pub fn inflation(self) -> f64 {
+        f64::from(self.inflation) / 100.0
+    }
+
+    pub fn target_top(self) -> usize {
+        usize::from(self.target_top)
+    }
+
+    /// The knob the chosen method actually reads — γ or the inflation — as
+    /// [`ClusterMethod::grain_spec`] names it.
+    pub fn grain(self) -> f64 {
+        match self.method.grain_spec().field {
+            SettingField::Inflation => self.inflation(),
+            _ => self.resolution(),
+        }
+    }
+
+    /// Move the chosen method's grain, sanitised. The other method's is left
+    /// where it was.
+    pub fn with_grain(self, value: f64) -> Self {
+        let spec = self.method.grain_spec();
+        let value = hundredths(spec.sanitise(value));
+        match spec.field {
+            SettingField::Inflation => Self {
+                inflation: value,
+                ..self
+            },
+            _ => Self {
+                resolution: value,
+                ..self
+            },
+        }
+    }
+
+    /// Move the width the ladder coarsens towards, sanitised.
+    pub fn with_target_top(self, boxes: usize) -> Self {
+        Self {
+            target_top: Self::TARGET_TOP.sanitise(boxes as f64) as u16,
+            ..self
+        }
+    }
+}
+
+impl Default for ClusterSettings {
+    fn default() -> Self {
+        Self::new(ClusterMethod::default())
+    }
+}
+
+/// So that a caller with nothing to say about the knobs can pass a method
+/// where settings are wanted — which is most of them, and every one that
+/// existed before the knobs did.
+impl From<ClusterMethod> for ClusterSettings {
+    fn from(method: ClusterMethod) -> Self {
+        Self::new(method)
+    }
+}
+
+/// [`ClusterSettings`] as a frontend reads and writes them: plain numbers.
+///
+/// Public because it is the shape on the wire, and a protocol is worth being
+/// able to name. Everything arriving this way is sanitised by the conversion
+/// below, and a field left out is the default — a frontend that knows about
+/// the method and nothing else still sends a settings object that works.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WireSettings {
+    pub method: ClusterMethod,
+    pub resolution: f64,
+    pub inflation: f64,
+    pub target_top: usize,
+}
+
+impl Default for WireSettings {
+    fn default() -> Self {
+        ClusterSettings::default().into()
+    }
+}
+
+impl From<WireSettings> for ClusterSettings {
+    fn from(wire: WireSettings) -> Self {
+        Self {
+            method: wire.method,
+            resolution: hundredths(Self::RESOLUTION.sanitise(wire.resolution)),
+            inflation: hundredths(Self::INFLATION.sanitise(wire.inflation)),
+            target_top: Self::TARGET_TOP.sanitise(wire.target_top as f64) as u16,
+        }
+    }
+}
+
+impl From<ClusterSettings> for WireSettings {
+    fn from(settings: ClusterSettings) -> Self {
+        Self {
+            method: settings.method(),
+            resolution: settings.resolution(),
+            inflation: settings.inflation(),
+            target_top: settings.target_top(),
+        }
+    }
+}
+
+/// Every setting is held in hundredths of its unit; both knobs step in
+/// hundredths or coarser, so nothing is lost in the rounding.
+fn hundredths(value: f64) -> u16 {
+    (value * 100.0).round().max(0.0) as u16
 }
 /// Index handle for a cluster within one [`Clustering`], valid until the next
 /// recompute and no longer.
@@ -343,15 +639,19 @@ pub struct Clustering {
     /// The rung a map should open on — the last one built at plain
     /// modularity. Not necessarily the top, and never past it.
     opening: usize,
-    /// Which method built it, so a holder can tell whether the clustering it
-    /// has is the one that was asked for.
-    method: ClusterMethod,
+    /// What it was built from — method and knobs — so a holder can tell
+    /// whether the clustering it has is the one that was asked for.
+    settings: ClusterSettings,
 }
 
 impl Clustering {
     /// Cluster the whole graph.
-    pub fn compute(graph: &CallGraph, method: ClusterMethod) -> Self {
-        Self::compute_scoped(graph, None, method)
+    ///
+    /// Takes anything that is settings or can become them, so a caller with
+    /// nothing to say about the knobs passes a [`ClusterMethod`] and gets that
+    /// method at its defaults.
+    pub fn compute(graph: &CallGraph, settings: impl Into<ClusterSettings>) -> Self {
+        Self::compute_scoped(graph, None, settings.into())
     }
 
     /// Coarsen one corner of the graph: only the functions in `scope`, with
@@ -375,30 +675,35 @@ impl Clustering {
     pub fn compute_within(
         graph: &CallGraph,
         scope: &HashSet<SymbolId>,
-        method: ClusterMethod,
+        settings: impl Into<ClusterSettings>,
     ) -> Self {
-        Self::compute_scoped(graph, Some(scope), method)
+        Self::compute_scoped(graph, Some(scope), settings.into())
     }
 
     /// The method this ladder was built with.
     pub fn method(&self) -> ClusterMethod {
-        self.method
+        self.settings.method()
+    }
+
+    /// Everything this ladder was built from, knobs included.
+    pub fn settings(&self) -> ClusterSettings {
+        self.settings
     }
 
     fn compute_scoped(
         graph: &CallGraph,
         scope: Option<&HashSet<SymbolId>>,
-        method: ClusterMethod,
+        settings: ClusterSettings,
     ) -> Self {
         let base = build_base_graph(graph, scope);
         if base.symbols.is_empty() {
             return Self {
-                method,
+                settings,
                 ..Self::default()
             };
         }
 
-        let mut ladder = coarsen(base.graph, base.sizes, method);
+        let mut ladder = coarsen(base.graph, base.sizes, settings);
         // The ladder's first rung maps condensed nodes; `build_clustering`
         // reads a map from symbols, so the condensation is composed in.
         let first: Vec<usize> = base
@@ -410,7 +715,7 @@ impl Clustering {
         let opening = ladder.opening();
         let mut clustering = build_clustering(graph, &base.symbols, &ladder.levels);
         clustering.opening = opening;
-        clustering.method = method;
+        clustering.settings = settings;
         clustering
     }
 
@@ -750,16 +1055,17 @@ fn condense(out: &[Vec<usize>]) -> (Vec<usize>, usize) {
 /// singletons. A map has to have something to draw, and "every function is its
 /// own box" is the honest answer for a graph that small — grouping it further
 /// would merge a program small enough to read whole.
-fn coarsen(base: WeightedGraph, sizes: Vec<usize>, method: ClusterMethod) -> Ladder {
+fn coarsen(base: WeightedGraph, sizes: Vec<usize>, settings: ClusterSettings) -> Ladder {
     let mut run = Coarsening {
         levels: Vec::new(),
         sizes,
         current: base,
         opening: 0,
+        settings,
     };
 
-    if run.current.node_count() > TARGET_TOP_CLUSTERS {
-        match method {
+    if run.current.node_count() > settings.target_top() {
+        match settings.method() {
             ClusterMethod::Modularity => run.by_modularity(louvain_pass),
             ClusterMethod::Leiden => run.by_modularity(leiden_pass),
             ClusterMethod::Markov => run.by_flow(),
@@ -803,28 +1109,41 @@ struct Coarsening {
     current: WeightedGraph,
     /// The last rung built at the method's own grain.
     opening: usize,
+    /// The method and the knobs this ladder is being built to.
+    settings: ClusterSettings,
 }
 
 impl Coarsening {
     /// The Louvain ladder, in three phases, each a resolution regime:
     ///
-    /// 1. One pass per entry of [`RESOLUTION_LADDER`], finest first. A pass
-    ///    that merges nothing adds no rung.
-    /// 2. Passes at γ = 1 until one merges nothing — the standard Louvain run
-    ///    to its optimum. The last rung this leaves is the opening rung.
+    /// 1. One pass per entry of [`RESOLUTION_LADDER`], as a multiple of the
+    ///    chosen γ, finest first. A pass that merges nothing adds no rung.
+    /// 2. Passes at the chosen γ until one merges nothing — the standard
+    ///    Louvain run to its optimum. The last rung this leaves is the opening
+    ///    rung.
     /// 3. Only while the top is still wider than the target: halve γ and pass
     ///    again, down to [`MIN_RESOLUTION`].
+    ///
+    /// The chosen γ is [`ClusterSettings::RESOLUTION`], one unless the user
+    /// moved it, and it scales the whole ladder rather than the opening rung
+    /// alone — the rungs under the opening one are the ones meant to be finer
+    /// than what the user asked for, and they stay finer wherever that is.
+    /// The floor below is absolute: it exists because a graph of disconnected
+    /// components has nothing any resolution merges, which is as true at γ = 4
+    /// as at γ = 1.
     ///
     /// `optimise` is the pass: [`louvain_pass`] or [`leiden_pass`]. Both
     /// climb the same objective, so the regimes are the same and only the
     /// climb differs.
     fn by_modularity(&mut self, optimise: fn(&WeightedGraph, f64) -> (Vec<usize>, usize)) {
-        for &resolution in RESOLUTION_LADDER {
-            self.pass(resolution >= 1.0, |graph| optimise(graph, resolution));
+        let chosen = self.settings.resolution();
+        let target = self.settings.target_top();
+        for &step in RESOLUTION_LADDER {
+            self.pass(step >= 1.0, |graph| optimise(graph, chosen * step));
         }
-        while self.pass(true, |graph| optimise(graph, 1.0)) {}
-        let mut resolution = 0.5;
-        while self.current.node_count() > TARGET_TOP_CLUSTERS && resolution >= MIN_RESOLUTION {
+        while self.pass(true, |graph| optimise(graph, chosen)) {}
+        let mut resolution = chosen / 2.0;
+        while self.current.node_count() > target && resolution >= MIN_RESOLUTION {
             self.pass(false, |graph| optimise(graph, resolution));
             resolution /= 2.0;
         }
@@ -832,7 +1151,8 @@ impl Coarsening {
 
     /// The Markov ladder, in two phases:
     ///
-    /// 1. One pass of MCL at [`MARKOV_INFLATION`] over the base graph. That
+    /// 1. One pass of MCL at the chosen inflation ([`ClusterSettings::INFLATION`],
+    ///    [`MARKOV_INFLATION`] unless the user moved it) over the base graph. That
     ///    is the grouping the method stands behind and the rung the map opens
     ///    on. One pass, not passes until nothing merges: MCL is not an
     ///    optimiser climbing towards an optimum, a run *is* the answer, and a
@@ -848,9 +1168,11 @@ impl Coarsening {
     /// on the base graph is not a refinement of MCL at a lower one — the two
     /// partitions need not nest — and a ladder is a chain of refinements.
     fn by_flow(&mut self) {
-        self.pass(true, |graph| markov_pass(graph, MARKOV_INFLATION));
-        let mut inflation = MARKOV_INFLATION;
-        while self.current.node_count() > TARGET_TOP_CLUSTERS && inflation >= MIN_INFLATION {
+        let chosen = self.settings.inflation();
+        let target = self.settings.target_top();
+        self.pass(true, |graph| markov_pass(graph, chosen));
+        let mut inflation = chosen;
+        while self.current.node_count() > target && inflation >= MIN_INFLATION {
             if !self.pass(false, |graph| markov_pass(graph, inflation)) {
                 inflation = 1.0 + (inflation - 1.0) / 2.0;
             }
@@ -1956,9 +2278,9 @@ fn build_clustering(graph: &CallGraph, symbols: &[SymbolId], ladder: &[Vec<usize
         index,
         anchors,
         // Both set by the caller, which is the half still holding the ladder
-        // these were measured from and the method that asked for it.
+        // these were measured from and the settings that asked for it.
         opening: 0,
-        method: ClusterMethod::default(),
+        settings: ClusterSettings::default(),
     }
 }
 
@@ -2789,6 +3111,162 @@ mod tests {
             call(&mut graph, pair[0], pair[1], 1000 + i as u32);
         }
         (graph, ids)
+    }
+
+    #[test]
+    fn a_coarser_resolution_opens_on_fewer_boxes() {
+        // γ scales what a merge has to beat, so turning it down lets groupings
+        // through that plain modularity refuses — on the same graph, at the
+        // rung each run opens on.
+        let (graph, _) = layered_dag(120);
+        let settings = ClusterSettings::new(ClusterMethod::Modularity);
+
+        let fine = Clustering::compute(&graph, settings.with_grain(4.0));
+        let plain = Clustering::compute(&graph, settings);
+        let coarse = Clustering::compute(&graph, settings.with_grain(0.25));
+
+        let opening = |c: &Clustering| c.level(c.opening_level()).len();
+        assert!(
+            opening(&fine) > opening(&plain),
+            "γ = 4 should open finer than γ = 1: {} vs {}",
+            opening(&fine),
+            opening(&plain)
+        );
+        assert!(
+            opening(&coarse) < opening(&plain),
+            "γ = 0.25 should open coarser than γ = 1: {} vs {}",
+            opening(&coarse),
+            opening(&plain)
+        );
+    }
+
+    #[test]
+    fn the_target_width_is_the_one_the_settings_asked_for() {
+        // The target only decides how far past its own grain the ladder keeps
+        // merging, so it binds the top rung and nothing else.
+        let (graph, _) = layered_dag(150);
+        for &method in ClusterMethod::ALL {
+            let settings = ClusterSettings::new(method);
+            for target in [5usize, 30] {
+                let clustering = Clustering::compute(&graph, settings.with_target_top(target));
+                let top = clustering.top_level().len();
+                assert!(
+                    top <= target,
+                    "{method:?}: a target of {target} left a top rung of {top}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_tighter_target_only_adds_rungs_above_the_opening_one() {
+        // Lowering it must not change what the method itself decided: the
+        // grouping the map opens on is the same, with further zoom steps
+        // stacked on top of it.
+        let (graph, _) = layered_dag(150);
+        let settings = ClusterSettings::new(ClusterMethod::Modularity);
+        let wide = Clustering::compute(&graph, settings.with_target_top(30));
+        let tight = Clustering::compute(&graph, settings.with_target_top(5));
+
+        assert_eq!(
+            wide.level(wide.opening_level()).len(),
+            tight.level(tight.opening_level()).len(),
+            "the opening rung is the method's, not the target's"
+        );
+        assert!(
+            tight.level_count() > wide.level_count(),
+            "a tighter target should add zoom steps: {} vs {}",
+            tight.level_count(),
+            wide.level_count()
+        );
+    }
+
+    #[test]
+    fn a_higher_inflation_settles_into_more_boxes() {
+        let (graph, _) = layered_dag(120);
+        let settings = ClusterSettings::new(ClusterMethod::Markov);
+        let slack = Clustering::compute(&graph, settings.with_grain(1.4));
+        let sharp = Clustering::compute(&graph, settings.with_grain(3.0));
+        assert!(
+            sharp.level(sharp.opening_level()).len() > slack.level(slack.opening_level()).len(),
+            "inflation 3 should open finer than 1.4"
+        );
+    }
+
+    #[test]
+    fn each_method_keeps_its_own_grain() {
+        // Turning the flow up and going back to modularity must not have moved
+        // γ — the two knobs mean different things and are not one slider.
+        let markov = ClusterSettings::new(ClusterMethod::Markov).with_grain(3.5);
+        assert_eq!(markov.inflation(), 3.5);
+        assert_eq!(markov.resolution(), DEFAULT_RESOLUTION);
+
+        let back = markov.with_method(ClusterMethod::Modularity);
+        assert_eq!(back.grain(), DEFAULT_RESOLUTION);
+        assert_eq!(
+            back.inflation(),
+            3.5,
+            "the flow's grain survived the detour"
+        );
+    }
+
+    #[test]
+    fn settings_off_the_range_or_the_step_are_snapped_on_the_way_in() {
+        // Sanitising is what makes the settings a cache key: a slider dragged
+        // to the same place twice, or a frontend sending something absurd, has
+        // to land on one value and not on two that only look alike.
+        let from = |json: &str| serde_json::from_str::<ClusterSettings>(json).expect("valid json");
+
+        let snapped =
+            from(r#"{"method":"Modularity","resolution":0.9,"inflation":2.04,"target_top":12}"#);
+        assert_eq!(snapped.resolution(), 1.0);
+        assert_eq!(snapped.inflation(), 2.0);
+
+        let clamped =
+            from(r#"{"method":"Markov","resolution":-4.0,"inflation":99.0,"target_top":9000}"#);
+        assert_eq!(clamped.resolution(), ClusterSettings::RESOLUTION.min);
+        assert_eq!(clamped.inflation(), ClusterSettings::INFLATION.max);
+        assert_eq!(
+            clamped.target_top(),
+            ClusterSettings::TARGET_TOP.max as usize
+        );
+
+        // And a field nobody sent is the default, so a frontend that knows only
+        // about the method still sends something that works.
+        let bare = from(r#"{"method":"Leiden"}"#);
+        assert_eq!(bare, ClusterSettings::new(ClusterMethod::Leiden));
+
+        // Two requests that agree are one cache key.
+        let mut seen = HashSet::new();
+        assert!(seen.insert(snapped));
+        assert!(!seen.insert(from(
+            r#"{"method":"Modularity","resolution":1.02,"inflation":1.99,"target_top":12}"#
+        )));
+    }
+
+    #[test]
+    fn settings_survive_the_wire() {
+        let settings = ClusterSettings::new(ClusterMethod::Markov)
+            .with_grain(2.7)
+            .with_target_top(7);
+        let json = serde_json::to_string(&settings).expect("serialises");
+        assert!(
+            json.contains("2.7"),
+            "the wire speaks plain numbers: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<ClusterSettings>(&json).expect("round trip"),
+            settings
+        );
+    }
+
+    #[test]
+    fn a_clustering_remembers_what_it_was_asked_for() {
+        let (graph, _) = layered_dag(40);
+        let settings = ClusterSettings::new(ClusterMethod::Leiden).with_grain(2.0);
+        let clustering = Clustering::compute(&graph, settings);
+        assert_eq!(clustering.settings(), settings);
+        assert_eq!(clustering.method(), ClusterMethod::Leiden);
     }
 
     #[test]

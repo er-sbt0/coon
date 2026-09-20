@@ -1,0 +1,47 @@
+// Exported by COON. Render with: dot -Tsvg <this file> -o graph.svg
+digraph coon {
+  graph [rankdir=LR, labelloc="t", label="arena_choose_maybe_huge — callees, 3 levels, 18 functions", fontname="Helvetica", fontsize=12];
+  node [shape=box, style=rounded, fontname="Helvetica", fontsize=11];
+  edge [arrowsize=0.7];
+
+  n0 [label="abort", tooltip="abort\n/usr/include/stdlib.h:730"];
+  n1 [label="arena_choose", tooltip="arena_choose\n/home/eransa/code/jemalloc/include/jemalloc/internal/jemalloc_internal_inlines_b.h:90"];
+  n2 [label="arena_choose_maybe_huge", tooltip="arena_choose_maybe_huge\n/home/eransa/code/jemalloc/include/jemalloc/internal/arena_inlines_b.h:30"];
+  n3 [label="arena_create_huge_arena", tooltip="arena_create_huge_arena\n/home/eransa/code/jemalloc/src/arena.c:1890"];
+  n4 [label="arena_get", tooltip="arena_get\n/home/eransa/code/jemalloc/include/jemalloc/internal/jemalloc_internal_inlines_a.h:73"];
+  n5 [label="arena_is_auto", tooltip="arena_is_auto\n/home/eransa/code/jemalloc/include/jemalloc/internal/jemalloc_internal_inlines_b.h:100"];
+  n6 [label="atomic_load_zu", tooltip="atomic_load_zu\n/home/eransa/code/jemalloc/include/jemalloc/internal/atomic.h:94"];
+  n7 [label="background_thread_enabled", tooltip="background_thread_enabled\n/home/eransa/code/jemalloc/include/jemalloc/internal/background_thread_inlines.h:10"];
+  n8 [label="je_arena_choose_huge", tooltip="je_arena_choose_huge\n/home/eransa/code/jemalloc/src/arena.c:1926"];
+  n9 [label="je_arena_decay_ms_set  +2", tooltip="je_arena_decay_ms_set\n/home/eransa/code/jemalloc/src/arena.c:390", style="rounded,dashed"];
+  n10 [label="je_arena_dirty_decay_ms_default_get  +1", tooltip="je_arena_dirty_decay_ms_default_get\n/home/eransa/code/jemalloc/src/arena.c:1718", style="rounded,dashed"];
+  n11 [label="je_arena_muzzy_decay_ms_default_get  +1", tooltip="je_arena_muzzy_decay_ms_default_get\n/home/eransa/code/jemalloc/src/arena.c:1732", style="rounded,dashed"];
+  n12 [label="je_malloc_printf", tooltip="je_malloc_printf\n/home/eransa/code/jemalloc/src/malloc_io.c:755"];
+  n13 [label="je_malloc_vcprintf  +2", tooltip="je_malloc_vcprintf\n/home/eransa/code/jemalloc/src/malloc_io.c:720", style="rounded,dashed"];
+  n14 [label="malloc_initialized", tooltip="malloc_initialized\n/home/eransa/code/jemalloc/include/jemalloc/internal/jemalloc_internal_inlines_c.h:284"];
+  n15 [label="strncpy", tooltip="strncpy\n/usr/include/string.h:144"];
+  n16 [label="tsd_arena_get", tooltip="tsd_arena_get\n/home/eransa/code/jemalloc/include/jemalloc/internal/tsd.h:79"];
+  n17 [label="tsd_tsdn", tooltip="tsd_tsdn\n/home/eransa/code/jemalloc/include/jemalloc/internal/tsd_internals.h:266"];
+
+  n2 -> n1;
+  n2 -> n5;
+  n2 -> n6;
+  n2 -> n8;
+  n2 -> n16;
+  n3 -> n0;
+  n3 -> n4;
+  n3 -> n7;
+  n3 -> n9;
+  n3 -> n10;
+  n3 -> n11;
+  n3 -> n12;
+  n3 -> n15;
+  n3 -> n17;
+  n8 -> n0;
+  n8 -> n3;
+  n8 -> n4;
+  n8 -> n12;
+  n8 -> n14;
+  n8 -> n17;
+  n12 -> n13;
+}

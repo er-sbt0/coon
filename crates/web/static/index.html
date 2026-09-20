@@ -60,14 +60,36 @@
       <button id="orient-lr" aria-pressed="true" title="Lay the graph out left to right" aria-label="Left to right">→</button>
       <button id="orient-td" aria-pressed="false" title="Lay the graph out top to bottom" aria-label="Top to bottom">↓</button>
     </div>
-    <div class="pill stepper" id="zoom-control" title="How finely the cluster map is grouped">
-      <button id="zoom-out" aria-label="Fewer, larger clusters">−</button>
-      <span class="stepper-label">clusters</span>
-      <b id="zoom-value">—</b>
-      <button id="zoom-in" aria-label="More, smaller clusters">+</button>
-    </div>
-    <div class="pill select" id="method-control" title="How the cluster map is built">
-      <select id="method-select" aria-label="Clustering method"></select>
+    <!-- One control for the whole map: which algorithm builds it, how that
+         algorithm is tuned, and which rung of the ladder is drawn. The pill
+         reads out the two values a reader of the canvas needs — the method and
+         how many boxes are on screen — and the panel behind it holds the rest. -->
+    <div class="pill-menu" id="cluster-menu">
+      <button class="pill" id="cluster-control" aria-haspopup="true" aria-expanded="false"
+              aria-controls="cluster-panel" title="How the cluster map is built">
+        <span id="cluster-summary">Clusters</span>
+        <svg class="caret" width="8" height="8" viewBox="0 0 8 8" aria-hidden="true">
+          <path d="M1 2.5L4 5.5 7 2.5" stroke="currentColor" stroke-width="1.2" fill="none"/>
+        </svg>
+      </button>
+      <div id="cluster-panel" role="group" aria-label="Cluster map settings" hidden>
+        <div class="panel-section" id="method-section">
+          <div class="panel-title">Method</div>
+          <div id="method-list" role="radiogroup" aria-label="Clustering method"></div>
+        </div>
+        <div class="panel-section" id="knob-section">
+          <div class="panel-title">Algorithm</div>
+          <div id="knob-list"></div>
+        </div>
+        <div class="panel-section" id="grouping-section">
+          <div class="panel-title">Grouping<b id="grouping-value">—</b></div>
+          <div id="grouping-list"></div>
+        </div>
+        <div class="panel-foot">
+          <span id="cluster-memory">Remembered for next time</span>
+          <button id="cluster-reset" class="link">Reset defaults</button>
+        </div>
+      </div>
     </div>
     <button class="pill" id="refresh-btn" title="Refresh workspace symbols">Refresh</button>
   </div>

@@ -129,9 +129,13 @@ let clusterMap       = null;          // the laid-out map, while one is showing
 let mapScope         = null;          // the function the map is drawn from, or null for all of it
 let mapLevel         = 0;             // which rung of the coarsening ladder is showing
 let mapLevels        = 0;             // how many rungs there are; 0 while nothing is clustered
-let mapClusters      = 0;             // how many boxes this rung holds — what the zoom control reads out
+let mapClusters      = 0;             // how many boxes this rung holds — what the pill reads out
+let mapLevelSizes    = [];            // how many boxes every rung holds, finest first
+let mapOpening       = 0;             // the rung the method itself stands behind
 let clusterMethod    = null;          // which algorithm built the map
-let clusterMethods   = [];            // every algorithm on offer, for the picker
+let clusterMethods   = [];            // every algorithm on offer, each with its own knob
+let clusterSettings  = null;          // and what the map was built to: method plus knobs
+let clusterTopSpec   = null;          // the knob that belongs to no one method
 let selectedClusterId = null;         // the box pointed at on the map, if it is still on this rung
 let lastFitKey       = null;                      // refit only on root/direction change
 
@@ -197,12 +201,19 @@ function handleSnapshot(msg) {
   mapLevel = active?.map_level ?? 0;
   mapLevels = active?.map_levels ?? 0;
   mapClusters = active?.map_clusters ?? 0;
+  mapLevelSizes = active?.map_level_sizes ?? [];
+  mapOpening = active?.map_opening_level ?? 0;
   clusterMethod = active?.method ?? null;
+  if (active?.cluster) clusterSettings = active.cluster;
   if (Array.isArray(msg.cluster_methods)) clusterMethods = msg.cluster_methods;
+  if (msg.cluster_top) clusterTopSpec = msg.cluster_top;
   if (typeof active?.depth === 'number') graphDepth = active.depth;
   updateDepthControl();
-  updateZoomControl();
-  updateMethodControl();
+  updateClusterControl();
+  renderClusterPanel();
+  // Last, because it answers with commands: whatever this workspace is missing
+  // of the remembered settings arrives on the next snapshot, not this one.
+  restorePreference(active);
   if (active?.direction) {
     currentDirection = active.direction;
     updateDirToggle();
@@ -626,73 +637,363 @@ function clusterDrill(node) {
   sendCommand({ DrillIntoCluster: key });
 }
 
-// ── Map zoom ──────────────────────────────────────────────────────────────────
-// Rung 0 is the finest map and `mapLevels - 1` the coarsest. The control reads
-// out how many boxes the rung holds rather than which rung it is, because the
-// count is the thing the user is choosing between; the rung number is an
+// ── Cluster map settings ─────────────────────────────────────────────────────
+// One pill and one panel for everything that decides what the map shows: which
+// algorithm builds it, the knob that algorithm reads, how far the ladder
+// coarsens, and which rung of it is drawn. The pill stays a readout — method
+// and box count — because a setting whose value appears only once you open
+// something is a setting nobody checks; the knobs live behind it because the
+// toolbar is not where five sliders belong.
+//
+// Rung 0 is the finest map and `mapLevels - 1` the coarsest. Every control
+// here reads out how many boxes a rung holds rather than which rung it is: the
+// count is the thing the user is choosing between, and the rung number is an
 // implementation detail of the ladder underneath it.
+//
+// Two of these settings rebuild the map on a worker thread and two do not, and
+// the panel does not say which is which. What it does instead is wait: a
+// slider sends nothing until it is let go, so a drag across a range is one
+// coarsening run and not thirty.
 
-function updateZoomControl() {
+const CLUSTER_STORE = 'coon.cluster';
+
+const clusterMenuEl   = $('cluster-menu');
+const clusterToggleEl = $('cluster-control');
+const clusterPanelEl  = $('cluster-panel');
+
+/// Workspaces this session has already handed the remembered settings to.
+///
+/// First sight only, and never again. A preference that kept re-asserting
+/// itself would undo every change the user made after it, which is the one way
+/// a remembered setting is worse than no memory at all.
+const settingsRestored = new Set();
+const levelRestored    = new Set();
+
+const near = (a, b) => Math.abs((a ?? 0) - (b ?? 0)) < 1e-6;
+
+function sameSettings(a, b) {
+  return !!a && !!b
+    && a.method === b.method
+    && near(a.resolution, b.resolution)
+    && near(a.inflation, b.inflation)
+    && a.target_top === b.target_top;
+}
+
+function loadPreference() {
+  try {
+    const raw = localStorage.getItem(CLUSTER_STORE);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; /* storage blocked, or something else wrote here */ }
+}
+
+function storePreference(patch) {
+  try {
+    localStorage.setItem(CLUSTER_STORE, JSON.stringify({ ...(loadPreference() || {}), ...patch }));
+  } catch { /* storage blocked */ }
+}
+
+/// Hand the remembered settings to a workspace the first time it is seen.
+///
+/// The backend remembers nothing across a restart — nothing in this app does
+/// but the theme — so the preference lives here and is applied per workspace,
+/// which also makes it the default a new tab opens with.
+///
+/// What is stored for the grain is the *box count*, not the rung number, for
+/// the same reason every control reads that out: a ladder built to different
+/// settings is a different height, so rung 3 of one is not rung 3 of the next,
+/// where "about twenty boxes" means the same thing on both.
+function restorePreference(ws) {
+  const saved = loadPreference();
+  if (!saved || !ws) return;
+
+  if (saved.settings && !settingsRestored.has(ws.id)) {
+    settingsRestored.add(ws.id);
+    if (!sameSettings(saved.settings, ws.cluster)) {
+      sendCommand({ SetClusterSettings: saved.settings });
+      // The rung waits for the ladder these settings build. Landing one from
+      // the old ladder on the new one is how a restore puts a user somewhere
+      // neither of them asked for.
+      return;
+    }
+  }
+
+  const sizes = ws.map_level_sizes || [];
+  if (levelRestored.has(ws.id) || !saved.clusters || sizes.length === 0) return;
+  if (saved.settings && !sameSettings(saved.settings, ws.cluster)) return;
+  levelRestored.add(ws.id);
+  const want = nearestRung(sizes, saved.clusters);
+  if (want !== ws.map_level) sendCommand({ SetMapLevel: want });
+}
+
+/// The rung whose box count comes closest to the one remembered, ties to the
+/// finer — more boxes is the one that can still be zoomed out of.
+function nearestRung(sizes, clusters) {
+  let best = 0;
+  for (let i = 1; i < sizes.length; i++) {
+    if (Math.abs(sizes[i] - clusters) < Math.abs(sizes[best] - clusters)) best = i;
+  }
+  return best;
+}
+
+// ── The pill ──────────────────────────────────────────────────────────────────
+
+function updateClusterControl() {
   const onMap = currentView === 'ClusterMap';
   const live = onMap && mapLevels > 0;
-  $('zoom-value').textContent = live ? mapClusters : '—';
-  // `+` is more boxes, which is a *finer* rung and so a lower number.
-  $('zoom-in').disabled = !live || mapLevel <= 0;
-  $('zoom-out').disabled = !live || mapLevel >= mapLevels - 1;
-  const control = $('zoom-control');
-  control.classList.toggle('inactive', !live);
-  control.title = !onMap
-    ? 'Grouping applies to the cluster map (Ctrl+M)'
+  const label = clusterMethods.find((m) => m.id === clusterMethod)?.label ?? 'Clusters';
+  $('cluster-summary').textContent = live ? `${label} · ${mapClusters} clusters` : label;
+  clusterToggleEl.classList.toggle('inactive', !onMap);
+  clusterToggleEl.title = !onMap
+    ? 'These settings build the cluster map (Ctrl+M)'
     : live
-      ? `${mapClusters} clusters, ${mapLevel + 1} of ${mapLevels} grouping levels`
+      ? `${label} · ${mapClusters} clusters, grouping ${mapLevel + 1} of ${mapLevels}`
       : 'Nothing is clustered yet';
 }
 
+function clusterPanelOpen() {
+  return !clusterPanelEl.hidden;
+}
+
+function openClusterPanel() {
+  clusterPanelEl.hidden = false;
+  clusterToggleEl.setAttribute('aria-expanded', 'true');
+  renderClusterPanel();
+}
+
+function closeClusterPanel() {
+  clusterPanelEl.hidden = true;
+  clusterToggleEl.setAttribute('aria-expanded', 'false');
+}
+
+function toggleClusterPanel() {
+  if (clusterPanelOpen()) closeClusterPanel(); else openClusterPanel();
+}
+
+clusterToggleEl.addEventListener('click', toggleClusterPanel);
+
+// Closed by clicking away or by Escape. A menu that only closes by the button
+// that opened it is one the user has to aim at twice.
+document.addEventListener('pointerdown', (e) => {
+  if (clusterPanelOpen() && !clusterMenuEl.contains(e.target)) closeClusterPanel();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape' || !clusterPanelOpen() || CoonPalette.isOpen()) return;
+  closeClusterPanel();
+  clusterToggleEl.focus();
+});
+
+// ── The panel ─────────────────────────────────────────────────────────────────
+
+function renderClusterPanel() {
+  if (!clusterPanelOpen()) return;
+  // A snapshot lands every second or so while a project is loading, and
+  // rebuilding this under a thumb on a slider would drop the drag. The panel
+  // is a generation stale for as long as a control is being used, which is the
+  // one moment its readouts are coming from the user anyway.
+  const busy = clusterPanelEl.contains(document.activeElement)
+    && document.activeElement.tagName === 'INPUT';
+  if (busy) return;
+
+  renderMethodRows();
+  renderKnobs();
+  renderRungs();
+  $('cluster-memory').textContent = currentView === 'ClusterMap'
+    ? 'Remembered for next time'
+    : 'Applies to the cluster map (Ctrl+M)';
+}
+
+/// One row per method: the name, and the claim it makes about the program.
+///
+/// Drawn from what the snapshot sent, so a method added in `logic` arrives
+/// here with its description and its own knob and needs nothing written for it.
+function renderMethodRows() {
+  const list = $('method-list');
+  list.innerHTML = '';
+  for (const method of clusterMethods) {
+    const row = document.createElement('button');
+    row.className = 'method-row';
+    row.type = 'button';
+    row.setAttribute('role', 'radio');
+    row.setAttribute('aria-checked', String(method.id === clusterMethod));
+
+    const name = document.createElement('span');
+    name.className = 'method-name';
+    name.textContent = method.label;
+    const why = document.createElement('span');
+    why.className = 'method-why';
+    why.textContent = method.description;
+
+    row.append(name, why);
+    row.addEventListener('click', () => setClusterMethod(method.id));
+    list.appendChild(row);
+  }
+}
+
+/// The knobs: the one the chosen method reads, then the shared one.
+function renderKnobs() {
+  const list = $('knob-list');
+  list.innerHTML = '';
+  if (!clusterSettings) return;
+  const grain = clusterMethods.find((m) => m.id === clusterMethod)?.grain;
+  for (const spec of [grain, clusterTopSpec]) {
+    if (spec) list.appendChild(knobRow(spec));
+  }
+}
+
+/// One slider, drawn entirely from the spec the backend sent — range, step,
+/// wording and default. Nothing about a knob is written on this side, so a
+/// knob retuned in `logic` is retuned here too, and a method that arrives with
+/// a knob of its own arrives with its control already drawn.
+function knobRow(spec) {
+  const row = document.createElement('div');
+  row.className = 'knob';
+
+  const input = document.createElement('input');
+  input.type = 'range';
+  input.id = `knob-${spec.field}`;
+  input.min = spec.min;
+  input.max = spec.max;
+  input.step = spec.step;
+  input.value = clusterSettings[spec.field];
+  input.disabled = !clusterSettings;
+
+  const head = document.createElement('div');
+  head.className = 'knob-head';
+  const label = document.createElement('label');
+  label.htmlFor = input.id;
+  label.textContent = spec.label;
+  const value = document.createElement('span');
+  value.className = 'knob-value';
+  value.textContent = formatSetting(spec, Number(input.value));
+  head.append(label, value);
+
+  const why = document.createElement('div');
+  why.className = 'knob-why';
+  why.textContent = spec.description;
+
+  // The readout follows the thumb; the command waits for it to be let go. A
+  // knob that moves asks for a coarsening no cache holds, and sending one per
+  // pixel of a drag queues a dozen ladders to throw away.
+  input.addEventListener('input', () => {
+    value.textContent = formatSetting(spec, Number(input.value));
+  });
+  input.addEventListener('change', () => {
+    sendClusterSettings({ ...clusterSettings, [spec.field]: Number(input.value) });
+  });
+
+  row.append(head, input, why);
+  return row;
+}
+
+/// As many decimals as the step has, so a quarter-step knob reads 1.25 and a
+/// whole-step one reads 12 rather than 12.00.
+function formatSetting(spec, value) {
+  const places = spec.step >= 1 ? 0 : spec.step >= 0.1 ? 1 : 2;
+  return value.toFixed(places);
+}
+
+/// The zoom, as the ladder actually is: a row of grains, each one a box count.
+function renderRungs() {
+  const list = $('grouping-list');
+  list.innerHTML = '';
+  // The knobs above still mean something off the map — they decide what it
+  // will be when the user goes back to it — but a rung does not: there is no
+  // ladder on screen to land on, and `setMapLevel` refuses. A control that
+  // refuses is worse than one that says it is not for here.
+  const live = currentView === 'ClusterMap' && mapLevels > 0;
+  const count = live ? mapLevelSizes[mapLevel] ?? mapClusters : null;
+  const valueEl = $('grouping-value');
+  valueEl.textContent = live ? `${count} ${count === 1 ? 'cluster' : 'clusters'}` : '—';
+
+  const input = document.createElement('input');
+  input.type = 'range';
+  input.id = 'grouping-range';
+  input.min = 0;
+  input.max = Math.max(mapLevels - 1, 0);
+  input.step = 1;
+  input.value = mapLevel;
+  input.disabled = !live;
+  input.setAttribute('aria-label', 'Grouping level');
+  input.addEventListener('input', () => {
+    const at = mapLevelSizes[Number(input.value)];
+    if (at != null) valueEl.textContent = `${at} ${at === 1 ? 'cluster' : 'clusters'}`;
+  });
+  input.addEventListener('change', () => setMapLevel(Number(input.value)));
+
+  const scale = document.createElement('div');
+  scale.className = 'rung-scale';
+  const finest = document.createElement('span');
+  finest.textContent = 'finest';
+  const coarsest = document.createElement('span');
+  coarsest.textContent = 'coarsest';
+
+  // The rung the method itself stands behind, marked and reachable. The rungs
+  // past it exist only to force a wide optimum down to a box count — they are
+  // where a user zooms out *to*, not the method's answer — and nothing else on
+  // screen says which one is which.
+  const natural = document.createElement('button');
+  natural.className = 'natural';
+  natural.type = 'button';
+  if (live && mapOpening < mapLevelSizes.length) {
+    const at = mapLevelSizes[mapOpening];
+    natural.textContent = mapLevel === mapOpening
+      ? '● the method’s own grouping'
+      : `○ natural: ${at}`;
+    natural.title = 'The grouping the method itself stands behind; the rungs above it merge to fit a box count';
+    natural.disabled = mapLevel === mapOpening;
+    natural.addEventListener('click', () => setMapLevel(mapOpening));
+  }
+
+  scale.append(finest, natural, coarsest);
+  list.append(input, scale);
+}
+
+// ── What the panel sends ──────────────────────────────────────────────────────
+
+/// Build the map to these settings, and remember them.
+///
+/// Remembered here rather than off the snapshot, because a snapshot describes
+/// whatever workspace happens to be active — including a fresh tab sitting on
+/// the defaults, which would overwrite the preference with them.
+function sendClusterSettings(next) {
+  if (!clusterSettings || sameSettings(next, clusterSettings)) return;
+  storePreference({ settings: next });
+  sendCommand({ SetClusterSettings: next });
+}
+
+function setClusterMethod(id) {
+  if (!clusterSettings || id === clusterMethod) return;
+  sendClusterSettings({ ...clusterSettings, method: id });
+}
+
+/// Put every knob back where `logic` says it belongs, method untouched: this
+/// resets how the map is built, not what builds it, and a user who picked
+/// Leiden did not ask to leave it.
+function resetClusterSettings() {
+  if (!clusterSettings) return;
+  const defaults = {};
+  for (const spec of [...clusterMethods.map((m) => m.grain), clusterTopSpec]) {
+    if (spec) defaults[spec.field] = spec.default;
+  }
+  // And forget the remembered grain with them, so the map goes back to opening
+  // where the method says rather than where this user last dragged it.
+  storePreference({ clusters: null });
+  sendClusterSettings({ ...clusterSettings, ...defaults });
+  renderClusterPanel();
+}
+
+$('cluster-reset').addEventListener('click', resetClusterSettings);
+
+/// Draw the map at one rung. The only funnel — the panel, the palette and
+/// Ctrl+[ / Ctrl+] all come through here, so the grain is remembered however
+/// it was asked for.
 function setMapLevel(next) {
   if (currentView !== 'ClusterMap' || mapLevels === 0) return;
   const clamped = Math.min(Math.max(next, 0), mapLevels - 1);
   if (clamped === mapLevel) return;
+  storePreference({ clusters: mapLevelSizes[clamped] ?? mapClusters });
   sendCommand({ SetMapLevel: clamped });
 }
-
-$('zoom-in').addEventListener('click', () => setMapLevel(mapLevel - 1));
-$('zoom-out').addEventListener('click', () => setMapLevel(mapLevel + 1));
-
-// ── Clustering method ─────────────────────────────────────────────────────────
-
-const methodSelectEl = $('method-select');
-
-function updateMethodControl() {
-  const onMap = currentView === 'ClusterMap';
-  // Rebuilt only when the list itself changes: replacing the options on every
-  // snapshot would close the dropdown under a user who had it open.
-  const wanted = clusterMethods.map((m) => m.id).join(',');
-  if (methodSelectEl.dataset.methods !== wanted) {
-    methodSelectEl.dataset.methods = wanted;
-    methodSelectEl.innerHTML = '';
-    for (const method of clusterMethods) {
-      const option = document.createElement('option');
-      option.value = method.id;
-      option.textContent = method.label;
-      option.title = method.description;
-      methodSelectEl.appendChild(option);
-    }
-  }
-  if (clusterMethod != null) methodSelectEl.value = clusterMethod;
-  methodSelectEl.disabled = !onMap || clusterMethods.length === 0;
-  const chosen = clusterMethods.find((m) => m.id === clusterMethod);
-  const control = $('method-control');
-  control.classList.toggle('inactive', methodSelectEl.disabled);
-  control.title = onMap
-    ? chosen?.description ?? 'How the cluster map is built'
-    : 'Grouping applies to the cluster map (Ctrl+M)';
-}
-
-methodSelectEl.addEventListener('change', () => {
-  if (methodSelectEl.value !== clusterMethod) {
-    sendCommand({ SetClusterMethod: methodSelectEl.value });
-  }
-});
 
 // ── Graph relationships ───────────────────────────────────────────────────────
 // The client holds the whole call graph, not just the laid-out subset, so it
@@ -1444,6 +1745,12 @@ function buildCommands() {
     // are" is a place on the ladder a user asks for directly, and stepping to
     // it from the other end takes eleven presses on a real project.
     {
+      id: 'view.settings',
+      label: 'Map: Cluster Settings\u2026',
+      hint: 'method, grain, grouping',
+      run: openClusterPanel,
+    },
+    {
       id: 'view.finer',
       label: 'Map: Smaller Clusters',
       hint: 'Ctrl+]',
@@ -1507,7 +1814,7 @@ function buildCommands() {
       label: `Map: Group by ${method.label}`,
       hint: method.description,
       disabled: !onMap || method.id === clusterMethod,
-      run: () => sendCommand({ SetClusterMethod: method.id }),
+      run: () => setClusterMethod(method.id),
     });
   });
 

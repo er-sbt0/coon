@@ -382,37 +382,169 @@ body.resizing { cursor: col-resize; user-select: none; }
   font-variant-numeric: tabular-nums;
 }
 
-/* A two-position view setting, shown as both options at once rather than a
-   button whose label has to double as a verb: you click the one you want. */
-/* A picker, wearing the pill rather than the browser's own control: the select
-   keeps every bit of its keyboard and screen-reader behaviour, and loses only
-   its chrome. */
-.pill.select { padding: 0; overflow: hidden; }
-.pill.select::after {
-  content: "";
-  width: 0;
-  height: 0;
-  margin-right: var(--sp-2);
-  border-left: 3px solid transparent;
-  border-right: 3px solid transparent;
-  border-top: 4px solid currentColor;
-  opacity: 0.6;
-  pointer-events: none;
+/* ── Cluster settings menu ──────────────────────────────────────────────────
+ * A pill that opens a panel. The pill itself is still a readout — method and
+ * box count, the two values you need to read the canvas — because a setting
+ * whose value only appears once you open something is a setting nobody checks.
+ * Everything that tunes the map lives behind it: one panel rather than a
+ * toolbar control per knob.
+ */
+.pill-menu { position: relative; flex-shrink: 0; }
+.pill-menu > .pill { cursor: pointer; }
+.pill-menu > .pill .caret { opacity: 0.6; transition: transform var(--t-fast); }
+.pill-menu > .pill[aria-expanded="true"] {
+  border-color: var(--accent-border);
+  color: var(--text);
 }
-.pill.select select {
-  appearance: none;
-  border: 0;
-  background: none;
-  color: inherit;
-  font: inherit;
+.pill-menu > .pill[aria-expanded="true"] .caret { transform: rotate(180deg); }
+
+#cluster-panel {
+  position: absolute;
+  top: calc(100% + var(--sp-1));
+  right: 0;
+  z-index: 40;
+  width: 300px;
+  max-height: calc(100vh - var(--h-titlebar) - var(--h-breadcrumb) - var(--h-status) - var(--sp-4));
+  overflow-y: auto;
+  padding: var(--sp-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  background: var(--surface-raised);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
   font-family: var(--font-ui);
-  padding: var(--sp-1) var(--sp-1) var(--sp-1) var(--sp-2);
+  font-size: var(--fs-sm);
+  color: var(--text);
+  cursor: default;
+}
+
+.panel-section { padding-bottom: var(--sp-3); }
+.panel-section + .panel-section {
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border);
+}
+.panel-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-2);
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.panel-title b {
+  color: var(--text);
+  font-size: var(--fs-sm);
+  letter-spacing: 0;
+  text-transform: none;
+  font-variant-numeric: tabular-nums;
+}
+
+/* One row per method: the name, and the claim it makes about the program.
+   A radio rather than a select, because the description is the point — the
+   choice is between three answers, not three words. */
+.method-row {
+  display: block;
+  width: 100%;
+  padding: var(--sp-2);
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  text-align: left;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
+}
+.method-row:hover { background: var(--surface-hover); color: var(--text); }
+.method-row[aria-checked="true"] {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+.method-row .method-name { display: block; font-size: var(--fs-sm); }
+.method-row[aria-checked="true"] .method-name { color: var(--accent); }
+.method-row .method-why {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-normal);
+}
+
+/* A knob: what it is, where it sits, and which way to turn it. */
+.knob + .knob, .knob + .rungs, .rungs + .knob { margin-top: var(--sp-3); }
+.knob-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-1);
+}
+.knob-head label { color: var(--text); }
+.knob-head .knob-value {
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+.knob-why, .rung-scale {
+  margin-top: var(--sp-1);
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-normal);
+}
+.rung-scale { display: flex; justify-content: space-between; gap: var(--sp-2); }
+.rung-scale .natural { color: var(--text-muted); }
+
+/* The range input, wearing the same border and accent as everything else. */
+#cluster-panel input[type="range"] {
+  appearance: none;
+  width: 100%;
+  height: 4px;
+  margin: var(--sp-1) 0;
+  border-radius: var(--r-full);
+  background: var(--border-strong);
   cursor: pointer;
 }
-.pill.select select:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
-.pill.select.inactive select { cursor: default; }
-.pill.select option { background: var(--surface); color: var(--text); }
+#cluster-panel input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border: 0;
+  border-radius: var(--r-full);
+  background: var(--accent);
+}
+#cluster-panel input[type="range"]::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border: 0;
+  border-radius: var(--r-full);
+  background: var(--accent);
+}
+#cluster-panel input[type="range"]:focus-visible { outline: 1px solid var(--accent); outline-offset: 3px; }
+#cluster-panel input[type="range"]:disabled { opacity: 0.4; cursor: default; }
+#cluster-panel input[type="range"]:disabled::-webkit-slider-thumb { background: var(--text-dim); }
+#cluster-panel input[type="range"]:disabled::-moz-range-thumb { background: var(--text-dim); }
 
+.panel-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+}
+.panel-foot .link {
+  color: var(--text-muted);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.panel-foot .link:hover { color: var(--accent); }
+
+/* A two-position view setting, shown as both options at once rather than a
+   button whose label has to double as a verb: you click the one you want. */
 .pill.segmented { gap: 0; padding: 0; overflow: hidden; }
 .pill.segmented button {
   width: 24px;

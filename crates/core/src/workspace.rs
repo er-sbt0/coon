@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
-use logic::ClusterMethod;
+use logic::{ClusterMethod, ClusterSettings};
 use model::{CallDirection, SymbolId};
 use serde::{Deserialize, Serialize};
 
@@ -74,8 +74,11 @@ pub struct CoreWorkspace {
     /// still about as coarse as rung 4 of this one — and `CoreApp` clamps it to
     /// what the current ladder has.
     map_level: Option<usize>,
-    /// Which algorithm builds the ladder this workspace is looking at.
-    method: ClusterMethod,
+    /// What the ladder this workspace is looking at was asked for: the
+    /// algorithm, and the knobs that algorithm reads. One value rather than a
+    /// method beside its parameters, because a map is the answer to all of it
+    /// at once — see [`ClusterSettings`].
+    cluster: ClusterSettings,
     /// The function whose neighbourhood the cluster map is drawn from, or
     /// `None` for the whole program.
     ///
@@ -103,7 +106,7 @@ impl CoreWorkspace {
             orientation: LayoutOrientation::default(),
             view: ViewMode::default(),
             map_level: None,
-            method: ClusterMethod::default(),
+            cluster: ClusterSettings::default(),
             map_scope: None,
             created_at: now,
             last_accessed: now,
@@ -208,13 +211,25 @@ impl CoreWorkspace {
         changed
     }
 
-    /// Build the map with a different method. Returns true when that is news.
-    ///
-    /// The zoom resets, because the rungs are the method's own: another method
-    /// coarsens at its own rate and its ladder is a different height.
+    /// Build the map with a different method, leaving every knob where it
+    /// was. Returns true when that is news.
     pub fn set_method(&mut self, method: ClusterMethod) -> bool {
-        let changed = method != self.method;
-        self.method = method;
+        self.set_cluster_settings(self.cluster.with_method(method))
+    }
+
+    /// Build the map to different settings — method, grain, target width.
+    /// Returns true when that is news.
+    ///
+    /// The zoom resets, because the rungs belong to the ladder these settings
+    /// build: another method coarsens at its own rate, a different γ moves
+    /// every rung, and a different target adds or removes rungs at the top.
+    /// Rung 4 of the ladder this replaces is not rung 4 of the next one, and
+    /// carrying the number across lands the user somewhere they did not ask
+    /// for — where `None` lands them on the rung the new settings open on,
+    /// which is the honest answer to "show me this instead".
+    pub fn set_cluster_settings(&mut self, settings: ClusterSettings) -> bool {
+        let changed = settings != self.cluster;
+        self.cluster = settings;
         if changed {
             self.map_level = None;
             self.touch();
@@ -330,7 +345,13 @@ impl CoreWorkspace {
     /// Which algorithm builds the ladder. Changed by [`Self::set_method`],
     /// which resets the zoom because the rungs are the method's own.
     pub fn method(&self) -> ClusterMethod {
-        self.method
+        self.cluster.method()
+    }
+
+    /// Everything the ladder is built to: the method and its knobs. Changed by
+    /// [`Self::set_cluster_settings`].
+    pub fn cluster_settings(&self) -> ClusterSettings {
+        self.cluster
     }
 
     /// The function whose neighbourhood the map is drawn from, or `None` for

@@ -1,4 +1,4 @@
-use logic::{ClusterKey, ClusterMethod};
+use logic::{ClusterKey, ClusterMethod, ClusterSettings};
 use model::SymbolId;
 
 use crate::export::ExportFormat;
@@ -57,8 +57,23 @@ pub enum Command {
     /// frontend holding a level from a taller ladder is never wrong, only
     /// coarse.
     SetMapLevel(usize),
-    /// Build the cluster map with a different algorithm.
+    /// Build the cluster map with a different algorithm, leaving its knobs
+    /// where they are.
+    ///
+    /// Kept beside [`Command::SetClusterSettings`] rather than folded into it
+    /// because picking a method is a gesture on its own — the palette offers
+    /// one entry per method, and a caller making that gesture has nothing to
+    /// say about γ and should not have to send a value for it.
     SetClusterMethod(ClusterMethod),
+    /// Build the cluster map to these settings: the method, the grain that
+    /// method reads, and how far the ladder coarsens.
+    ///
+    /// Absolute rather than a nudge per knob, for the reason the view and
+    /// orientation commands are absolute, and because a panel holding all of
+    /// them sends what it shows. Out-of-range and off-step values are snapped
+    /// by `ClusterSettings` as it deserialises, so what reaches `CoreApp` is
+    /// always a clustering it can build.
+    SetClusterSettings(ClusterSettings),
     /// Leave the map for the call tree rooted at this cluster's entry point —
     /// the member the clustering picked as its front door. Keyed for the same
     /// reason as `ToggleClusterExpanded`.

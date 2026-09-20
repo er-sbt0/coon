@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use logic::ClusterMethod;
+use logic::{ClusterMethod, ClusterSettings, SettingSpec};
 use model::{CallDirection, CallGraph, LspLoadPhase, SymbolId};
 use serde::{Deserialize, Serialize};
 
@@ -134,6 +134,10 @@ pub enum ServerMsg<'a> {
         /// comes to be one the user cannot reach. A handful of bytes per
         /// snapshot against a dropdown that is never out of date.
         cluster_methods: Vec<MethodInfo>,
+        /// How wide the coarsest rung may be — the one setting that belongs to
+        /// no single method, so it travels beside the list rather than inside
+        /// it, on the same terms.
+        cluster_top: SettingSpec,
         workspaces: Vec<WorkspaceInfo>,
         /// Index into `workspaces` of the active tab. The workspace commands
         /// (`SwitchWorkspace`, `CloseWorkspace`, `RenameWorkspace`) address
@@ -159,6 +163,12 @@ pub struct MethodInfo {
     pub id: ClusterMethod,
     pub label: &'static str,
     pub description: &'static str,
+    /// The one knob this method reads — which field it writes, what to call
+    /// it, and the range to draw. Shipped rather than written into the client
+    /// for the reason the method list itself is: a knob retuned in `logic` is
+    /// then retuned everywhere, and a method added there arrives with its own
+    /// control already drawn.
+    pub grain: SettingSpec,
 }
 
 #[derive(Debug, Serialize)]
@@ -186,8 +196,23 @@ pub struct WorkspaceInfo {
     /// How many clusters the rung being shown holds — the number the zoom
     /// control reads out, and the reason a user picks one rung over another.
     pub map_clusters: usize,
+    /// How many clusters every rung holds, finest first, so a control can
+    /// offer the ladder as the thing it is: a choice between grains, each one
+    /// a box count. `map_clusters` is this indexed by `map_level`, kept
+    /// because it is what a control with no room for the rest shows.
+    pub map_level_sizes: Vec<usize>,
+    /// The rung the method itself stands behind — plain modularity at the
+    /// chosen γ, or MCL at the chosen inflation. Sent so a control can mark
+    /// it: the rungs above it merge modules that did not want to merge, to fit
+    /// a box count, and a reader of the map deserves to know which grain is
+    /// the method's answer and which is the target's.
+    pub map_opening_level: usize,
     /// Which algorithm built the map.
     pub method: ClusterMethod,
+    /// And what it was built to — the method again, with the knobs that method
+    /// reads. `method` is the same value, kept because most of the client
+    /// wants only that much.
+    pub cluster: ClusterSettings,
     /// The function this workspace's cluster map is drawn from, or `null` for
     /// the whole program. The client shows it — a map of one function's
     /// neighbourhood and a map of the project look identical otherwise — and
@@ -227,8 +252,10 @@ pub fn snapshot_of(core: &CoreApp) -> ServerMsg<'_> {
                 id,
                 label: id.label(),
                 description: id.description(),
+                grain: id.grain_spec(),
             })
             .collect(),
+        cluster_top: ClusterSettings::TARGET_TOP,
         workspaces: workspace_infos(core),
         active_workspace: core.workspaces.current_index,
         selected: core.selected_function,
@@ -319,7 +346,15 @@ pub fn workspace_infos(core: &CoreApp) -> Vec<WorkspaceInfo> {
             map_level: core.map_level_for(ws),
             map_levels: core.clustering_for(ws).level_count(),
             map_clusters: core.clustering_for(ws).level(core.map_level_for(ws)).len(),
+            map_level_sizes: {
+                let clustering = core.clustering_for(ws);
+                (0..clustering.level_count())
+                    .map(|level| clustering.level(level).len())
+                    .collect()
+            },
+            map_opening_level: core.clustering_for(ws).opening_level(),
             method: ws.method(),
+            cluster: ws.cluster_settings(),
             map_scope: ws.map_scope(),
         })
         .collect()
@@ -764,6 +799,11 @@ mod tests {
             "{\"SetMapLevel\":0}".to_string(),
             "{\"SetMapLevel\":7}".to_string(),
             "{\"SetClusterMethod\":\"Modularity\"}".to_string(),
+            // The settings panel sends all of it at once, and a caller that
+            // knows only about the method still sends something that parses.
+            "{\"SetClusterSettings\":{\"method\":\"Markov\",\"resolution\":1.0,\"inflation\":2.5,\"target_top\":12}}"
+                .to_string(),
+            "{\"SetClusterSettings\":{\"method\":\"Leiden\"}}".to_string(),
             format!("{{\"DrillIntoCluster\":{{\"level\":2,\"anchor\":{id}}}}}"),
             "\"ZoomOutToClusters\"".to_string(),
         ];
@@ -795,6 +835,25 @@ mod tests {
                 "method field `{field}` is read by the client"
             );
         }
+        // Each method carries the knob it reads, and the shared one travels
+        // beside the list: the client draws its sliders from these and holds
+        // no copy of a range.
+        for spec in [&methods[0]["grain"], &json["cluster_top"]] {
+            for field in [
+                "field",
+                "label",
+                "description",
+                "min",
+                "max",
+                "step",
+                "default",
+            ] {
+                assert!(
+                    spec.get(field).is_some(),
+                    "setting field `{field}` is read by the client"
+                );
+            }
+        }
 
         let ws = &json["workspaces"][0];
         for field in [
@@ -809,7 +868,10 @@ mod tests {
             "map_level",
             "map_levels",
             "map_clusters",
+            "map_level_sizes",
+            "map_opening_level",
             "method",
+            "cluster",
             "map_scope",
         ] {
             assert!(
@@ -817,6 +879,29 @@ mod tests {
                 "workspace field `{field}` is read by the client"
             );
         }
+    }
+
+    /// A knob moved in the panel has to survive the round trip and land on
+    /// the workspace, or the slider springs back on the next snapshot.
+    #[test]
+    fn cluster_settings_make_the_round_trip() {
+        let mut core = CoreApp::new(crate::demo::create_demo_call_graph());
+
+        let command: Command = serde_json::from_str(
+            "{\"SetClusterSettings\":{\"method\":\"Markov\",\"resolution\":1.0,\"inflation\":2.5,\"target_top\":8}}",
+        )
+        .expect("the panel's command parses");
+        core.dispatch(command);
+
+        let json = serde_json::to_value(snapshot_of(&core)).expect("snapshot serialises");
+        let settings = &json["workspaces"][0]["cluster"];
+        assert_eq!(settings["method"], "Markov");
+        assert_eq!(settings["inflation"], 2.5);
+        assert_eq!(settings["target_top"], 8);
+        assert_eq!(
+            json["workspaces"][0]["method"], "Markov",
+            "the short form agrees with the long one"
+        );
     }
 
     /// The cluster map rides along on the snapshot rather than replacing the
