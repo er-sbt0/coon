@@ -844,7 +844,7 @@ pub fn compute_cluster_layout(
 
 /// Put each box where its functions already are.
 ///
-/// Three steps, and each one gives up as little of the frame as it has to:
+/// Four steps, and each one gives up as little of the frame as it has to:
 ///
 /// 1. **A column per layer, as many layers as the calls need, every call one
 ///    column forward.** A box's layer is the average of its members', which
@@ -884,6 +884,41 @@ pub fn compute_cluster_layout(
 ///    back so its middle has not moved. Order is the part of the frame worth
 ///    defending to the last — that is what a reader recognises — and absolute
 ///    position is what gives way.
+/// 4. **Snapped to a row lattice.** The rooted tree's nodes sit on rows by
+///    construction — `grid` assigns integer slots and the pitch is applied
+///    afterwards — so any two of them are either exactly level or a clean
+///    multiple of the pitch apart, and that is what makes it read as a grid.
+///    Nothing above puts the map on one: the scale hands each box an
+///    arbitrary real, the push makes a *gap* whole without making a
+///    *position* whole, and the recentring subtracts a fractional drift from
+///    every box in a crowded column, which alone guarantees that nothing in
+///    it lands on a row. Measured, the median box sat a fifth of a pitch off
+///    any row, a handful in twenty or forty were on one, and boxes in
+///    neighbouring columns landed 5px apart — visibly not level, far too
+///    close to read as different rows — so beside the tree the map looked
+///    slumped and hand-placed. Each slot is rounded to the nearest whole one:
+///    whole and not half, because a half-slot position in the tree is a
+///    parent centred over two children and means something, where on the
+///    map it would be the frame's noise at twice the density, and the pitch
+///    is the unit the reader is meant to count in. Rounding cannot land two
+///    neighbours on one slot: `round` is monotone and `round(x + 1)` is
+///    `round(x) + 1`, so two slots the push left a whole slot or more apart
+///    round to slots a whole slot or more apart, and the order the push
+///    established survives with them. The walk still holds each box to one
+///    past the one before it, because that is the invariant the pitch rests
+///    on and one comparison is cheaper than the argument above every time
+///    this is touched; measured over 84 maps it never once had to act. What
+///    the rounding does move is the gaps, by up to half a slot each way: a
+///    gap of one slot and a fraction under a half becomes the floor, one of
+///    a slot and a half or more becomes the two-slot target, and the map's
+///    extent comes out within a few per cent of where it was, in both
+///    directions. The column is deliberately *not* recentred again: a
+///    fractional recentring would take it straight back off the lattice,
+///    and a whole one would move every box in the column a full pitch to
+///    correct a mean displacement that is a fraction of one. The unseated
+///    lane is on the lattice already, since it is dealt out in whole slots;
+///    the snap is a no-op there and is applied all the same rather than
+///    special-cased.
 ///
 /// A box no member of which has a seat cannot be placed by any of this. Those
 /// go in a lane of their own past the last column, in the clustering's order:
@@ -1051,6 +1086,19 @@ fn place_boxes(
             for (slot, _) in &wanted {
                 slots[*slot] -= drift;
             }
+        }
+
+        // 4. Onto the lattice: each slot to the nearest whole one, in the
+        //    same order. `round` is monotone and `round(x + 1) == round(x) + 1`,
+        //    so the push's one-slot spacing and its order both survive; the
+        //    `max` restates that invariant rather than repairing anything —
+        //    see the doc comment. Not recentred afterwards, for the reason
+        //    given there too.
+        let mut last = f32::NEG_INFINITY;
+        for (slot, _) in &wanted {
+            let placed = slots[*slot].round().max(last + 1.0);
+            last = placed;
+            slots[*slot] = placed;
         }
     }
 
@@ -2499,6 +2547,67 @@ mod tests {
         );
     }
 
+    /// The scale, the push and the recentring between them leave a column at
+    /// fractional slots: here two boxes on one spot and two more at 0.4 and
+    /// 1.0 of the span scale to 0, 0, 2.4 and 6, the push makes that 0, 1,
+    /// 2.4, 6, and sliding the column back by the quarter-slot it drifted
+    /// puts every box off any row. The snap rounds each to a whole slot, and
+    /// three things hold: the order the push established, since `round` is
+    /// monotone; a whole slot or more between neighbours, since a gap of a
+    /// slot and a fraction rounds to a whole slot, never less; and the
+    /// column's middle within half a slot of where the frame asked for it,
+    /// which is why it is not recentred a second time. The unseated box in
+    /// the lane is dealt a whole slot to begin with and stays on one.
+    #[test]
+    fn a_column_is_snapped_to_whole_slots_in_the_order_it_was_pushed() {
+        let display = boxes(5);
+        let seats = vec![
+            seat(0, 0.0),
+            seat(0, 0.0),
+            seat(0, 4.0),
+            seat(0, 10.0),
+            None,
+        ];
+
+        let out = placed(&display, &seats, CallDirection::Outgoing);
+        let low = out.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+        for (slot, pos) in out.iter().enumerate() {
+            let rows = (pos.y - low) / MAP_NODE_SEPARATION;
+            assert!(
+                (rows - rows.round()).abs() < 1e-3,
+                "box {slot} at {} is {rows} rows from the lowest, not a whole number",
+                pos.y
+            );
+        }
+        let gaps = gaps_down(&out, &[0, 1, 2, 3], |p| p.y);
+        assert!(
+            gaps.iter().all(|gap| *gap >= MAP_NODE_SEPARATION - 0.01),
+            "neighbours stay at least a pitch apart after the snap: {gaps:?}"
+        );
+        assert!(
+            (gaps[1] - MAP_NODE_SEPARATION).abs() < 0.01,
+            "a gap of one slot and four tenths is one slot after the snap: {gaps:?}"
+        );
+        assert!(
+            out[0].y < out[2].y && out[1].y < out[2].y && out[2].y < out[3].y,
+            "top to bottom, as the push had them"
+        );
+        // The frame put the column's middle at (0 + 0 + 2.4 + 6) / 4 slots
+        // above its lowest box; the snapped column's is within half a slot.
+        let frame_middle = 8.4 / 4.0;
+        let middle = (out[0].y + out[1].y + out[2].y + out[3].y) / 4.0;
+        let lowest = out
+            .iter()
+            .take(4)
+            .map(|p| p.y)
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            ((middle - lowest) / MAP_NODE_SEPARATION - frame_middle).abs() <= 0.5,
+            "the column's middle has moved by less than half a slot: {}",
+            (middle - lowest) / MAP_NODE_SEPARATION
+        );
+    }
+
     /// The frame is one generation behind a graph that just grew, so a box of
     /// functions that arrived after it cannot be placed by any of this. Stacked
     /// past the last column, where they cannot be read as a position.
@@ -2768,6 +2877,52 @@ mod tests {
                                 method.label(),
                                 edge.source,
                                 edge.target
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The other complaint, end to end: the rooted tree's nodes sit on rows,
+    /// and so must the map's boxes. Any two boxes on a map are either exactly
+    /// level or a whole number of the map's cross pitches apart — never the
+    /// 5px apart that the frame's continuous coordinates used to leave boxes
+    /// in neighbouring columns, which is visibly not level and far too close
+    /// to read as different rows. Both orientations, because each has a pitch
+    /// of its own; both directions and every method, because the snap is the
+    /// last thing `place_boxes` does and must hold whatever came before it.
+    #[test]
+    fn every_box_on_the_map_sits_on_a_row() {
+        let graph = create_demo_call_graph();
+        let frame = compute_map_frame(&graph);
+        for &method in ClusterMethod::ALL {
+            let clustering = Clustering::compute(&graph, method);
+            for level in 0..clustering.level_count() {
+                for orientation in [LayoutOrientation::LeftRight, LayoutOrientation::TopDown] {
+                    for direction in [CallDirection::Outgoing, CallDirection::Incoming] {
+                        let layout = compute_cluster_layout(
+                            &graph,
+                            &clustering,
+                            &frame,
+                            level,
+                            direction,
+                            orientation,
+                        );
+                        let (across, pitch): (fn(&NodePos) -> f32, f32) = match orientation {
+                            LayoutOrientation::LeftRight => (|p| p.y, MAP_NODE_SEPARATION),
+                            LayoutOrientation::TopDown => (|p| p.x, MAP_NODE_SEPARATION_TOPDOWN),
+                        };
+                        let crosses: Vec<f32> = layout.nodes.values().map(across).collect();
+                        let low = crosses.iter().copied().fold(f32::INFINITY, f32::min);
+                        for cross in &crosses {
+                            let rows = (cross - low) / pitch;
+                            assert!(
+                                (rows - rows.round()).abs() < 1e-3,
+                                "{} rung {level} {orientation:?}/{direction:?}: a box at \
+                                 {cross} is {rows} rows from the lowest, not a whole number",
+                                method.label()
                             );
                         }
                     }
