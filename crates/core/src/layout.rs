@@ -48,6 +48,50 @@ pub const LEVEL_SEPARATION_TOPDOWN: f32 = NODE_HEIGHT + LEVEL_GUTTER_TOPDOWN;
 pub const NODE_SEPARATION_TOPDOWN: f32 = NODE_WIDTH + SIBLING_GUTTER_TOPDOWN;
 pub const SUBTREE_SEPARATION_TOPDOWN: f32 = NODE_SEPARATION_TOPDOWN + SIBLING_GUTTER_TOPDOWN;
 
+// The cluster map has gutters of its own, because adjacency means something
+// different there. In the rooted tree two nodes stacked in a column are
+// siblings — the same caller reached both — so the tight `ROW_GUTTER` reads as
+// kinship, and it is right that it does. On the map two boxes stacked in a
+// column are unrelated modules that happen to have averaged into the same
+// layer, and 26px between them asserts a relationship that is not there; the
+// map used the tree's pitch only because it borrowed the tree's constants
+// along with its geometry. So the map's floor is wider on both axes: a gap and
+// a half of the node's own height left-to-right, and about the same proportion
+// of the tree's top-down gutter for a 150px-wide box side by side. The map's
+// pitches are the same size-plus-gutter sums as the tree's, for the same reason
+// those are spelt out.
+pub const MAP_ROW_GUTTER: f32 = 48.0;
+pub const MAP_SIBLING_GUTTER_TOPDOWN: f32 = 64.0;
+pub const MAP_NODE_SEPARATION: f32 = NODE_HEIGHT + MAP_ROW_GUTTER;
+pub const MAP_NODE_SEPARATION_TOPDOWN: f32 = NODE_WIDTH + MAP_SIBLING_GUTTER_TOPDOWN;
+
+/// How far apart, in map pitches, the boxes of the map's busiest column are
+/// spread on average. `place_boxes` scales the frame's cross axis so that the
+/// column holding the most boxes averages this many pitches between one box
+/// and the next, and the columns around it get the same scale.
+///
+/// This is a *target*, and the count of boxes is only the floor beneath it.
+/// The scale used to be chosen from the count alone — the span the busiest
+/// column would need stacked back to back at the minimum pitch — so on every
+/// rung, of every method, on every graph, that column came out at the floor by
+/// construction, and since the span it was mapped onto was the whole map's
+/// rather than its own, it usually came out tighter than that and the
+/// collision push placed it, which threw the frame's distances away before the
+/// step meant to defend them ever saw them. One is the floor itself: half the
+/// gaps of any real column fall below the average, so at 1.0 half the column
+/// is still pushed. Two is airy enough that the push rarely has to act, and
+/// is what the aspect cap below then holds within reason.
+pub const MAP_CROSS_SPREAD: f32 = 2.0;
+/// How far, as a multiple of the span the busiest column asks for, the whole
+/// map's cross extent may reach before the frame's distances are compressed
+/// to fit. Past this a box far from everything else is costing more panning
+/// than the distance is worth — the same point `MAX_LEVEL_STRETCH` makes on
+/// the other axis. Measured on the demo and on a 279-function export, it
+/// binds on one rung of one method, by under one per cent: on a real graph
+/// the busiest column spans most of the map, so it is a guard against the
+/// outlier, not a shape the map is pulled towards.
+pub const MAP_CROSS_CAP: f32 = 3.0;
+
 /// The bounding box a laid-out graph is pulled towards, as cross-axis extent
 /// over level-axis extent. A canvas is landscape, so a graph that is a little
 /// wider than it is tall reads well; a 5:1 stripe does not — and top-down is
@@ -709,9 +753,11 @@ pub fn compute_map_frame(graph: &CallGraph) -> MapFrame {
 ///
 /// This is a second path alongside [`compute_layout`], not a replacement. A
 /// rooted call tree starts from one function and walks outwards; the map draws
-/// a partition of the whole graph. The two share their geometry
-/// (`layout_config`, `balance_aspect`) and the frame the map is placed in
-/// ([`compute_map_frame`]), which is a `compute_layout`-shaped walk of its own.
+/// a partition of the whole graph. The two share their level pitch and
+/// `balance_aspect`, and the frame the map is placed in ([`compute_map_frame`])
+/// is a `compute_layout`-shaped walk of its own; the map's cross pitch is its
+/// own (`MAP_NODE_SEPARATION`), because adjacency in a column means something
+/// different on a map than it does in a tree — see the constants.
 ///
 /// A `level` the ladder does not have draws nothing, which is the right answer
 /// while a clustering is still being computed and the frontend is holding a
@@ -755,6 +801,14 @@ pub fn compute_cluster_layout(
 
     let edges = aggregate_calls(graph, &owner, direction);
     let mut nodes = place_boxes(&display, &seats, direction, orientation);
+    // Meaningful here in the one case `place_boxes` cannot help: a map whose
+    // columns are few and whose busiest column is tall — a scoped map, or any
+    // map read top-down, where a box is 150px wide and a column of six of
+    // them spans more than the columns do. The cross axis there is what it
+    // has to be, the count floor times the pitch, and the only thing left to
+    // improve the shape is the level pitch. Before the map had a pitch of its
+    // own this call never fired: every map came out at the floor, and the
+    // floor is a stripe the other way round.
     balance_aspect(&mut nodes, orientation);
 
     GraphLayout {
@@ -774,12 +828,24 @@ pub fn compute_cluster_layout(
 ///    column is a stretch of blank canvas saying nothing. Reading the map
 ///    incoming turns the columns round, which is what reversing every edge
 ///    does to a layering.
-/// 2. **A shared cross axis, scaled to fit.** The frame spreads a project over
-///    thousands of slots and a rung holds a few dozen boxes, so the cross
-///    coordinates are scaled onto the span the busiest column actually needs.
-///    It is one scale for the whole map, not one per column: what makes the map
-///    readable as the same picture is that a box and the box it calls line up
-///    across columns.
+/// 2. **A shared cross axis, scaled to a pitch.** The frame spreads a project
+///    over thousands of slots and a rung holds a few dozen boxes, so the cross
+///    coordinates are rescaled — by one scale for the whole map, not one per
+///    column, because what makes the map readable as the same picture is that
+///    a box and the box it calls line up across columns. The scale is chosen
+///    so that the busiest column, over the span *its own* boxes occupy in the
+///    frame, averages `MAP_CROSS_SPREAD` pitches between neighbours; the box
+///    count is the floor the push below enforces, never the target. It used to
+///    be the target — the whole map's extent onto `crowd - 1` slots, which is
+///    the span that column needs at the minimum pitch — so every column came
+///    out at the floor on every rung of every method, a single outlying box in
+///    a sparse column squeezed the rest of the map tighter still, and the push
+///    ended up placing everything. Measuring the busiest column's own span is
+///    what keeps an outlier elsewhere from squeezing it; a cap on the map's
+///    cross extent (`MAP_CROSS_CAP` times what that column asks for) is what
+///    keeps a tight busiest column from flinging the outlier off the canvas.
+///    One linear scale cannot do better than sit somewhere between those two,
+///    and the cap is where.
 /// 3. **Pushed apart only where they collide.** Averaging lands boxes on top of
 ///    one another; within a column they are separated in the order the frame
 ///    put them, by the least that clears a node, and the column is then slid
@@ -814,9 +880,9 @@ fn place_boxes(
         .collect();
     let unseated_column = used.len();
 
-    // 2. The cross axis, scaled onto what the busiest column needs. Boxes with
-    //    no seat are placed, not scaled — they have no position to preserve —
-    //    so they are kept out of both the extent and the scale.
+    // 2. The cross axis, scaled to the pitch the busiest column wants. Boxes
+    //    with no seat are placed, not scaled — they have no position to
+    //    preserve — so they are kept out of the extent, the crowd and the scale.
     let mut per_column: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (slot, seat) in seats.iter().enumerate() {
         let column = match seat {
@@ -825,24 +891,73 @@ fn place_boxes(
         };
         per_column.entry(column).or_default().push(slot);
     }
-    let crowd = per_column
+    let span_of = |boxes: &[usize]| -> f32 {
+        let (low, high) = boxes
+            .iter()
+            .filter_map(|&slot| seats[slot])
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), seat| {
+                (low.min(seat.cross), high.max(seat.cross))
+            });
+        high - low
+    };
+    let seated_columns = per_column
         .iter()
-        .filter(|(&column, _)| column != unseated_column)
+        .filter(|(&column, _)| column != unseated_column);
+    let crowd = seated_columns
+        .clone()
         .map(|(_, boxes)| boxes.len())
         .max()
         .unwrap_or(0);
-    let (low, high) = seats
-        .iter()
-        .flatten()
-        .fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), seat| {
-            (low.min(seat.cross), high.max(seat.cross))
+    // The busiest column's own span. Where several columns tie for busiest —
+    // on a real project's finer rungs most columns hold the crowd — the
+    // target is an average over all of their gaps together, which is the
+    // middle road between two bad rules: the widest of them sets a scale that
+    // leaves every tighter one to the push, so the median gap of the rung sits
+    // back at the floor, and the tightest sets one that flings every other
+    // column out to the cap. A column whose boxes all averaged to one spot is
+    // the push's to spread and is left out of both sums; if every busiest
+    // column is such a column the cap alone decides. `crowd - 1` gaps are
+    // what the target is an average over, so a column holding one box asks
+    // for nothing and the map falls in to a line — the frame has nothing to
+    // say about a chain that a straight line does not say better.
+    let (busiest_gaps, busiest_span) = seated_columns
+        .filter(|(_, boxes)| boxes.len() == crowd)
+        .map(|(_, boxes)| span_of(boxes))
+        .filter(|span| *span > f32::EPSILON)
+        .fold((0.0f32, 0.0f32), |(gaps, span), this| {
+            (gaps + (crowd - 1) as f32, span + this)
         });
-    let extent = high - low;
-    let scale = if extent > f32::EPSILON && crowd > 1 {
-        (crowd - 1) as f32 / extent
+    let wanted_slots = crowd.saturating_sub(1) as f32 * MAP_CROSS_SPREAD;
+    let scale_for_pitch = if crowd > 1 && busiest_span > f32::EPSILON {
+        busiest_gaps * MAP_CROSS_SPREAD / busiest_span
+    } else if crowd > 1 {
+        f32::INFINITY
     } else {
         0.0
     };
+    // The cap, in terms of the map's own content: the whole cross extent may
+    // reach `MAP_CROSS_CAP` times what the busiest column asks for, and past
+    // that the scale is the one that lands it there. It is measured against
+    // the busiest column and not against the map's level extent, because a
+    // scoped map two or three columns wide has a level extent that says
+    // nothing about how much room its boxes need, and a cap taken from it
+    // would squeeze such a map to the floor — the failure this replaces, back
+    // again for narrow maps.
+    let extent = span_of(&(0..seats.len()).collect::<Vec<_>>());
+    let scale_for_cap = if extent > f32::EPSILON {
+        wanted_slots * MAP_CROSS_CAP / extent
+    } else {
+        f32::INFINITY
+    };
+    let scale = match scale_for_pitch.min(scale_for_cap) {
+        scale if scale.is_finite() => scale,
+        _ => 0.0,
+    };
+    let low = seats
+        .iter()
+        .flatten()
+        .map(|seat| seat.cross)
+        .fold(f32::INFINITY, f32::min);
 
     // 3. Within a column: in the frame's order, pushed apart to clear a node,
     //    then slid back onto the middle the column asked for.
@@ -893,12 +1008,12 @@ fn place_boxes(
     }
 
     // Pixels, at last. Levels advance along the axis the orientation names, and
-    // a slot is that orientation's own sibling pitch — a node is 150x32, so the
+    // a slot is that orientation's own map pitch — a node is 150x32, so the
     // two axes are not interchangeable and reusing one pair for both would give
     // a top-down map a flat stripe, exactly as it would the rooted tree.
     let (level_pitch, cross_pitch) = match orientation {
-        LayoutOrientation::LeftRight => (LEVEL_SEPARATION, NODE_SEPARATION),
-        LayoutOrientation::TopDown => (LEVEL_SEPARATION_TOPDOWN, NODE_SEPARATION_TOPDOWN),
+        LayoutOrientation::LeftRight => (LEVEL_SEPARATION, MAP_NODE_SEPARATION),
+        LayoutOrientation::TopDown => (LEVEL_SEPARATION_TOPDOWN, MAP_NODE_SEPARATION_TOPDOWN),
     };
     display
         .iter()
@@ -1980,8 +2095,8 @@ mod tests {
         out.sort_by(|a, b| a.partial_cmp(b).unwrap());
         for pair in out.windows(2) {
             assert!(
-                pair[1] - pair[0] >= NODE_SEPARATION - 0.01,
-                "a box has to clear the one above it: {out:?}"
+                pair[1] - pair[0] >= MAP_NODE_SEPARATION - 0.01,
+                "a box has to clear the one above it, by the map's gutter: {out:?}"
             );
         }
         let middle = out.iter().sum::<f32>() / out.len() as f32;
@@ -2061,6 +2176,144 @@ mod tests {
             order,
             vec![3, 1, 2, 0],
             "top to bottom, as the frame had them"
+        );
+    }
+
+    /// Down one column, with every box in it, in order and edge to edge.
+    fn gaps_down(out: &[NodePos], column: &[usize], axis: fn(&NodePos) -> f32) -> Vec<f32> {
+        let mut along: Vec<f32> = column.iter().map(|&slot| axis(&out[slot])).collect();
+        along.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        along.windows(2).map(|pair| pair[1] - pair[0]).collect()
+    }
+
+    /// The count is the floor, not the target. Four boxes the frame spaced
+    /// evenly come out spaced evenly — the frame's distances kept, at the
+    /// spread the map asks for — and not stacked at the minimum pitch, which
+    /// is what scaling the extent onto `crowd - 1` slots used to produce for
+    /// every column of every map.
+    #[test]
+    fn boxes_keep_the_frames_distances_rather_than_stacking_at_the_floor() {
+        let display = boxes(4);
+        let seats: Vec<Option<Seat>> = [0.0, 10.0, 20.0, 30.0]
+            .into_iter()
+            .map(|cross| Some(Seat { layer: 0, cross }))
+            .collect();
+
+        let out = placed(&display, &seats, CallDirection::Outgoing);
+        let gaps = gaps_down(&out, &[0, 1, 2, 3], |p| p.y);
+        let target = MAP_CROSS_SPREAD * MAP_NODE_SEPARATION;
+        for gap in &gaps {
+            assert!(
+                (gap - target).abs() < 0.01,
+                "evenly spaced in the frame, evenly spaced on the map, at the target: {gaps:?}"
+            );
+        }
+        assert!(
+            target > MAP_NODE_SEPARATION + 0.01,
+            "the target sits above the floor"
+        );
+    }
+
+    /// The scale is taken from the span the busiest column's own boxes occupy.
+    /// A box off on its own in another column widens the map's extent and
+    /// used to squeeze the busiest column tighter than the floor with it,
+    /// which handed the whole column to the collision push.
+    #[test]
+    fn an_outlier_in_another_column_does_not_squeeze_the_busiest() {
+        let display = boxes(5);
+        let mut seats: Vec<Option<Seat>> = [0.0, 10.0, 20.0, 30.0]
+            .into_iter()
+            .map(|cross| Some(Seat { layer: 0, cross }))
+            .collect();
+        seats.push(Some(Seat {
+            layer: 1,
+            cross: 60.0,
+        }));
+
+        let out = placed(&display, &seats, CallDirection::Outgoing);
+        let gaps = gaps_down(&out, &[0, 1, 2, 3], |p| p.y);
+        let target = MAP_CROSS_SPREAD * MAP_NODE_SEPARATION;
+        for gap in &gaps {
+            assert!(
+                (gap - target).abs() < 0.01,
+                "the busiest column is spread as if the outlier were not there: {gaps:?}"
+            );
+        }
+        assert!(
+            out[4].y > out[3].y,
+            "and the outlier is still beyond it, where the frame had it"
+        );
+    }
+
+    /// The other way round: a tight busiest column must not fling a far-off box
+    /// to the edge of the canvas. The map's cross extent is held to
+    /// `MAP_CROSS_CAP` times what the busiest column asked for, and the
+    /// column, now under the floor, is the push's to spread.
+    #[test]
+    fn a_far_off_box_is_held_within_the_cap() {
+        let display = boxes(3);
+        let seats = vec![
+            Some(Seat {
+                layer: 0,
+                cross: 0.0,
+            }),
+            Some(Seat {
+                layer: 0,
+                cross: 1.0,
+            }),
+            Some(Seat {
+                layer: 1,
+                cross: 1000.0,
+            }),
+        ];
+
+        let out = placed(&display, &seats, CallDirection::Outgoing);
+        let extent = gaps_down(&out, &[0, 1, 2], |p| p.y).iter().sum::<f32>();
+        // One gap at the target for a crowd of two, capped, plus at most the
+        // one slot the push adds when it spreads the pair.
+        let allowed = (MAP_CROSS_SPREAD * MAP_CROSS_CAP + 1.0) * MAP_NODE_SEPARATION;
+        assert!(
+            extent <= allowed + 0.01,
+            "the far box is held within {allowed}px of the pair, not {extent}px"
+        );
+        let pair = gaps_down(&out, &[0, 1], |p| p.y);
+        assert!(
+            (pair[0] - MAP_NODE_SEPARATION).abs() < 0.01,
+            "under the cap the pair falls to the floor and is pushed apart: {pair:?}"
+        );
+    }
+
+    /// A box is 150x32, so the two orientations have floors of their own, and
+    /// top-down the boxes stand side by side at the map's sibling pitch, not
+    /// the tree's.
+    #[test]
+    fn a_top_down_column_clears_the_node_width_by_the_maps_gutter() {
+        let display = boxes(3);
+        let seats = vec![
+            Some(Seat {
+                layer: 0,
+                cross: 4.0
+            });
+            3
+        ];
+
+        let nodes = place_boxes(
+            &display,
+            &seats,
+            CallDirection::Outgoing,
+            LayoutOrientation::TopDown,
+        );
+        let out: Vec<NodePos> = display.iter().map(|node| nodes[node]).collect();
+        let gaps = gaps_down(&out, &[0, 1, 2], |p| p.x);
+        for gap in &gaps {
+            assert!(
+                (gap - MAP_NODE_SEPARATION_TOPDOWN).abs() < 0.01,
+                "side by side at the map's top-down pitch: {gaps:?}"
+            );
+        }
+        assert!(
+            out.iter().all(|p| p.y == out[0].y),
+            "one column is one row when read top-down"
         );
     }
 
