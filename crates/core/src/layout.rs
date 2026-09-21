@@ -640,7 +640,10 @@ impl MapFrame {
     ///
     /// The mean rather than the root-most member, because a box is the whole of
     /// what it holds — a module whose entry point is shallow and whose helpers
-    /// are deep belongs between them, not on top of its entry point. `None`
+    /// are deep belongs between them, not on top of its entry point. It is
+    /// where the box *wants* to be and not always where it can go: means do
+    /// not order, so one box can average deeper than a box it calls, and
+    /// `level_boxes` holds it to the layers the quotient allows. `None`
     /// when nothing in the cluster has a seat, which is what a frame one
     /// generation behind the graph says about a cluster made of functions that
     /// arrived after it.
@@ -800,7 +803,28 @@ pub fn compute_cluster_layout(
     }
 
     let edges = aggregate_calls(graph, &owner, direction);
-    let mut nodes = place_boxes(&display, &seats, direction, orientation);
+    // The quotient, as slot pairs in *call* order — caller's box to callee's
+    // box — whichever way the map is being read. `place_boxes` levels the map
+    // in the frame's own direction and turns the columns round for an incoming
+    // read, so it wants the calls the way the frame has them, and the flip
+    // `aggregate_calls` put on the edges is taken off again here rather than
+    // by asking it for both.
+    let slot_of: HashMap<LayoutNodeId, usize> = display
+        .iter()
+        .enumerate()
+        .map(|(slot, node)| (*node, slot))
+        .collect();
+    let calls: Vec<(usize, usize)> = edges
+        .iter()
+        .map(|edge| {
+            let (caller, callee) = match direction {
+                CallDirection::Outgoing => (edge.source, edge.target),
+                CallDirection::Incoming => (edge.target, edge.source),
+            };
+            (slot_of[&caller], slot_of[&callee])
+        })
+        .collect();
+    let mut nodes = place_boxes(&display, &seats, &calls, direction, orientation);
     // Meaningful here in the one case `place_boxes` cannot help: a map whose
     // columns are few and whose busiest column is tall — a scoped map, or any
     // map read top-down, where a box is 150px wide and a column of six of
@@ -822,12 +846,20 @@ pub fn compute_cluster_layout(
 ///
 /// Three steps, and each one gives up as little of the frame as it has to:
 ///
-/// 1. **A column per layer that is used.** A box's layer is the average of its
-///    members', so the layers a map lands on are a subset of the frame's with
-///    gaps in it; the gaps are closed rather than drawn, because an empty
-///    column is a stretch of blank canvas saying nothing. Reading the map
-///    incoming turns the columns round, which is what reversing every edge
-///    does to a layering.
+/// 1. **A column per layer, as many layers as the calls need, every call one
+///    column forward.** A box's layer is the average of its members', which
+///    is where the box belongs but is not a layering of the map — a mean pays
+///    no attention to the quotient's order — so `level_boxes` holds each box
+///    to the layers the quotient allows: the map is as many layers as its
+///    longest chain of calls, each box has a window of legal layers within
+///    that, and its mean is the preference clamped into the window. The
+///    layers a map lands on are then the map's own count, with no gaps to
+///    close unless a cycle got past `logic::cluster`; the ranking that closes
+///    them is kept because it is also what turns the columns round for an
+///    incoming read, which is what reversing every edge does to a layering.
+///    The levelling is done once, in the frame's own direction, so an
+///    incoming map is the outgoing one in a mirror rather than a different
+///    picture levelled the other way.
 /// 2. **A shared cross axis, scaled to a pitch.** The frame spreads a project
 ///    over thousands of slots and a rung holds a few dozen boxes, so the cross
 ///    coordinates are rescaled — by one scale for the whole map, not one per
@@ -857,16 +889,31 @@ pub fn compute_cluster_layout(
 /// go in a lane of their own past the last column, in the clustering's order:
 /// the frame is one generation behind a graph that just grew, so this is a box
 /// of functions that arrived after it, and stacking them where they cannot be
-/// confused for placed boxes says so better than dropping them.
+/// confused for placed boxes says so better than dropping them. The lane is
+/// outside the levelling too: a call from a box in it to a placed box runs
+/// backwards, and is left to, because lifting the placed box past the lane
+/// would put a position after what is by design not one, and the frame that
+/// seats the lane's boxes is already being computed.
+///
+/// `calls` is the rung's quotient as pairs of slots into `display`, caller's
+/// box first, in the direction the calls actually run — not the direction the
+/// map is read in.
 fn place_boxes(
     display: &[LayoutNodeId],
     seats: &[Option<Seat>],
+    calls: &[(usize, usize)],
     direction: CallDirection,
     orientation: LayoutOrientation,
 ) -> HashMap<LayoutNodeId, NodePos> {
-    // 1. Columns. A BTreeSet is what makes "the layers in use, in order" fall
-    //    out; the map from layer to column is then just the rank.
-    let used: std::collections::BTreeSet<u32> = seats.iter().flatten().map(|s| s.layer).collect();
+    // 1. Layers, then columns. The layer a box's members averaged to is the
+    //    box's preference, and `level_boxes` is where it is held to what the
+    //    quotient allows: as many layers as the longest chain of calls needs
+    //    and no more, every call one layer forward.
+    let layers = level_boxes(seats, calls);
+
+    //    A BTreeSet is what makes "the layers in use, in order" fall out; the
+    //    map from layer to column is then just the rank.
+    let used: std::collections::BTreeSet<u32> = layers.iter().flatten().copied().collect();
     let column_of: BTreeMap<u32, usize> = used
         .iter()
         .enumerate()
@@ -883,13 +930,13 @@ fn place_boxes(
     // 2. The cross axis, scaled to the pitch the busiest column wants. Boxes
     //    with no seat are placed, not scaled — they have no position to
     //    preserve — so they are kept out of the extent, the crowd and the scale.
+    let column_for = |slot: usize| match layers[slot] {
+        Some(layer) => column_of[&layer],
+        None => unseated_column,
+    };
     let mut per_column: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for (slot, seat) in seats.iter().enumerate() {
-        let column = match seat {
-            Some(seat) => column_of[&seat.layer],
-            None => unseated_column,
-        };
-        per_column.entry(column).or_default().push(slot);
+    for slot in 0..seats.len() {
+        per_column.entry(column_for(slot)).or_default().push(slot);
     }
     let span_of = |boxes: &[usize]| -> f32 {
         let (low, high) = boxes
@@ -1019,11 +1066,7 @@ fn place_boxes(
         .iter()
         .enumerate()
         .map(|(slot, node)| {
-            let column = match seats[slot] {
-                Some(seat) => column_of[&seat.layer],
-                None => unseated_column,
-            };
-            let level = column as f32 * level_pitch;
+            let level = column_for(slot) as f32 * level_pitch;
             let cross = slots[slot] * cross_pitch;
             let pos = match orientation {
                 LayoutOrientation::LeftRight => NodePos { x: level, y: cross },
@@ -1032,6 +1075,137 @@ fn place_boxes(
             (*node, pos)
         })
         .collect()
+}
+
+/// Give every seated box a layer: the one its members averaged to, held to
+/// the layers the quotient can be drawn in.
+///
+/// A mean is where a box belongs and is not a layering of the map: it pays no
+/// attention to the quotient's order, so a box whose members average deep can
+/// call a box whose members average shallow, and on a real project a fifth of
+/// the lines at the coarser rungs ran right to left while others joined two
+/// boxes in the same column and made no progress at all — on a canvas whose
+/// whole claim is that the picture flows the way the setting names. The first
+/// repair tried was to lift every box forward as far as what calls it forces,
+/// with its own mean as a floor. That reads forward, and it is the wrong shape:
+/// a lift can only push boxes apart, so the spread the means happened to have
+/// was kept and then amplified, and the export's opening rung — twelve boxes
+/// whose longest chain of calls is ten long — came out as twelve columns of
+/// one box each, a line 2,592px wide and one box tall, on which the cross axis
+/// and everything `place_boxes` does with it was moot.
+///
+/// So the quotient decides how many layers there are and the frame decides
+/// where in them each box goes. The longest path through the quotient is the
+/// fewest layers any forward-reading drawing of it can have, and it gives each
+/// box a window: the earliest layer it can take, one past the longest chain of
+/// callers behind it, and the latest, one short of the longest chain of callees
+/// ahead of it. Every layer in the window is legal for the box on its own, and
+/// the preference is clamped into it. Two boxes that share a call can still
+/// clamp to the same layer, or to layers in the wrong order, when their means
+/// agree, so the clamped layers are then walked once more in topological order
+/// and a box is lifted to one past the highest box calling it. A caller's late
+/// layer is at least one short of its callee's, so the lift never leaves the
+/// window and never adds a layer: the map is exactly as many layers as the
+/// longest chain, every call advances one, and the answer is the pointwise
+/// least such layering above the clamp — unique, whatever order the queue
+/// visits boxes in, so two runs and two rungs resolve the same conflict the
+/// same way.
+///
+/// The preference is the *column* the mean alone would have given the box —
+/// the rank of its layer among the layers this rung's boxes use — rescaled
+/// onto the layers the map has. The frame's layers count the whole program's
+/// depth and a rung's quotient is a few chains long, so a raw layer clamped
+/// into a window of the quotient's size would pin every deep box to the end
+/// of its window and keep only the shallow ones where they were; the rank
+/// rescaled keeps the boxes in the frame's order and spreads them over the
+/// room there is. Where the rank and the layer count agree it is the column
+/// the map drew before, unchanged.
+///
+/// Boxes with no seat are outside all of this; the calls touching them are
+/// not read and they come back `None`. `logic::cluster` guarantees the
+/// quotient is a DAG (`joins_a_cycle`) and this survives the guarantee
+/// failing rather than checking it: a box on a cycle is never dequeued and
+/// keeps the earliest layer the calls reaching it had lifted it to, and a
+/// map with a line running the wrong way is a better answer from the worker
+/// thread than no map at all.
+fn level_boxes(seats: &[Option<Seat>], calls: &[(usize, usize)]) -> Vec<Option<u32>> {
+    let n = seats.len();
+    let seated = |slot: usize| seats[slot].is_some();
+    let mut callers_left = vec![0usize; n];
+    let mut callees_of: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut callers_of: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for &(caller, callee) in calls {
+        if seated(caller) && seated(callee) {
+            callers_left[callee] += 1;
+            callees_of[caller].push(callee);
+            callers_of[callee].push(caller);
+        }
+    }
+
+    // The earliest layer of each box, and the boxes in an order that has every
+    // caller before its callees.
+    let mut early = vec![0u32; n];
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    let mut ready: VecDeque<usize> = (0..n)
+        .filter(|&slot| seated(slot) && callers_left[slot] == 0)
+        .collect();
+    while let Some(caller) = ready.pop_front() {
+        order.push(caller);
+        for &callee in &callees_of[caller] {
+            early[callee] = early[callee].max(early[caller] + 1);
+            callers_left[callee] -= 1;
+            if callers_left[callee] == 0 {
+                ready.push_back(callee);
+            }
+        }
+    }
+    // The longest chain ahead of each box, read back from the sinks, and with
+    // it the latest layer the box can take.
+    let count = (0..n)
+        .filter(|&slot| seated(slot))
+        .map(|slot| early[slot] + 1)
+        .max()
+        .unwrap_or(0);
+    let mut ahead = vec![0u32; n];
+    for &caller in order.iter().rev() {
+        for &callee in &callees_of[caller] {
+            ahead[caller] = ahead[caller].max(ahead[callee] + 1);
+        }
+    }
+
+    // The preference: the mean's rank among this rung's layers, rescaled onto
+    // the layers the map has.
+    let used: std::collections::BTreeSet<u32> = seats.iter().flatten().map(|s| s.layer).collect();
+    let rank_of: HashMap<u32, usize> = used
+        .iter()
+        .enumerate()
+        .map(|(rank, &layer)| (layer, rank))
+        .collect();
+    let preference = |slot: usize| -> u32 {
+        let rank = rank_of[&seats[slot].expect("a seated box").layer] as f64;
+        if used.len() > 1 && count > 1 {
+            (rank * f64::from(count - 1) / (used.len() - 1) as f64).round() as u32
+        } else {
+            0
+        }
+    };
+
+    // Clamp, then lift, in the same order.
+    let mut layers: Vec<Option<u32>> = (0..n)
+        .map(|slot| seated(slot).then(|| early[slot]))
+        .collect();
+    for &slot in &order {
+        let late = count - 1 - ahead[slot];
+        let wanted = preference(slot).clamp(early[slot], late);
+        let forced = callers_of[slot]
+            .iter()
+            .filter_map(|&caller| layers[caller])
+            .map(|layer| layer + 1)
+            .max()
+            .unwrap_or(0);
+        layers[slot] = Some(wanted.max(forced));
+    }
+    layers
 }
 
 /// Roll every call up to the pair of clusters it runs between.
@@ -2016,12 +2190,15 @@ mod tests {
         seats: &[Option<Seat>],
         direction: CallDirection,
     ) -> Vec<NodePos> {
-        let nodes = place_boxes(display, seats, direction, LayoutOrientation::LeftRight);
+        let nodes = place_boxes(display, seats, &[], direction, LayoutOrientation::LeftRight);
         display.iter().map(|node| nodes[node]).collect()
     }
 
-    /// A layer with no box in it is closed up rather than drawn: an empty
-    /// column is a stretch of blank canvas saying nothing.
+    /// The frame's layer numbers are not the map's columns: three boxes the
+    /// frame seated in layers 0, 2 and 9, calling down the line, are three
+    /// columns side by side. An empty column is a stretch of blank canvas
+    /// saying nothing. The map has as many columns as its calls need, so the
+    /// test gives it the calls the layering implies.
     #[test]
     fn a_column_per_layer_that_is_used() {
         let display = boxes(3);
@@ -2040,7 +2217,7 @@ mod tests {
             }),
         ];
 
-        let out = placed(&display, &seats, CallDirection::Outgoing);
+        let out = placed_with(&display, &seats, &[(0, 1), (1, 2)], CallDirection::Outgoing);
         assert_eq!(
             out.iter().map(|p| p.x).collect::<Vec<_>>(),
             vec![0.0, LEVEL_SEPARATION, 2.0 * LEVEL_SEPARATION]
@@ -2048,7 +2225,8 @@ mod tests {
     }
 
     /// Reading the map the other way round is what reversing every call does to
-    /// a layering: the callers end up on the far side.
+    /// a layering: the callers end up on the far side. A chain of calls, so
+    /// that there are three columns to turn round.
     #[test]
     fn reading_the_map_incoming_turns_the_columns_round() {
         let display = boxes(3);
@@ -2067,7 +2245,7 @@ mod tests {
             }),
         ];
 
-        let out = placed(&display, &seats, CallDirection::Incoming);
+        let out = placed_with(&display, &seats, &[(0, 1), (1, 2)], CallDirection::Incoming);
         assert_eq!(
             out.iter().map(|p| p.x).collect::<Vec<_>>(),
             vec![2.0 * LEVEL_SEPARATION, LEVEL_SEPARATION, 0.0]
@@ -2126,6 +2304,7 @@ mod tests {
         let out = place_boxes(
             &display,
             &seats,
+            &[],
             CallDirection::Outgoing,
             LayoutOrientation::LeftRight,
         );
@@ -2230,7 +2409,9 @@ mod tests {
             cross: 60.0,
         }));
 
-        let out = placed(&display, &seats, CallDirection::Outgoing);
+        // One call into the outlier, so that the map has the second column
+        // the frame put it in.
+        let out = placed_with(&display, &seats, &[(0, 4)], CallDirection::Outgoing);
         let gaps = gaps_down(&out, &[0, 1, 2, 3], |p| p.y);
         let target = MAP_CROSS_SPREAD * MAP_NODE_SEPARATION;
         for gap in &gaps {
@@ -2300,6 +2481,7 @@ mod tests {
         let nodes = place_boxes(
             &display,
             &seats,
+            &[],
             CallDirection::Outgoing,
             LayoutOrientation::TopDown,
         );
@@ -2335,9 +2517,263 @@ mod tests {
             None,
         ];
 
-        let out = placed(&display, &seats, CallDirection::Outgoing);
+        let out = placed_with(&display, &seats, &[(0, 1)], CallDirection::Outgoing);
         assert_eq!(out[2].x, 2.0 * LEVEL_SEPARATION);
         assert!(out[2].x > out[0].x && out[2].x > out[1].x);
+    }
+
+    // -- levelling ------------------------------------------------------------
+
+    fn seat(layer: u32, cross: f32) -> Option<Seat> {
+        Some(Seat { layer, cross })
+    }
+
+    fn columns(out: &[NodePos]) -> Vec<f32> {
+        out.iter().map(|p| p.x / LEVEL_SEPARATION).collect()
+    }
+
+    /// A frame that is already a layering of the quotient is drawn as it is:
+    /// every box in the column its functions are in, nothing moved.
+    #[test]
+    fn a_frame_that_already_reads_forward_is_left_alone() {
+        let display = boxes(4);
+        let seats = vec![seat(0, 0.0), seat(1, 0.0), seat(2, 0.0), seat(3, 0.0)];
+        let calls = [(0, 1), (1, 2), (2, 3)];
+
+        let out = placed_with(&display, &seats, &calls, CallDirection::Outgoing);
+        assert_eq!(columns(&out), vec![0.0, 1.0, 2.0, 3.0]);
+    }
+
+    /// The mean is where a box wants to be, not always where it can go. A box
+    /// whose members average deeper than a box it calls is held to the layers
+    /// the call allows — here the map is two columns, because its longest
+    /// chain is one call — while the boxes nothing calls or is called by keep
+    /// the column their functions asked for.
+    #[test]
+    fn a_caller_averaging_deeper_than_its_callee_is_held_to_the_calls() {
+        let display = boxes(4);
+        let seats = vec![seat(5, 0.0), seat(0, 0.0), seat(0, 0.0), seat(5, 0.0)];
+        let calls = [(0, 1)];
+
+        let out = placed_with(&display, &seats, &calls, CallDirection::Outgoing);
+        assert_eq!(
+            columns(&out),
+            vec![0.0, 1.0, 0.0, 1.0],
+            "caller before callee; the two boxes off the call stay where they were"
+        );
+    }
+
+    /// Boxes that all averaged to one layer and call each other in a chain
+    /// read as a chain, one column each — and no more columns than that.
+    #[test]
+    fn a_chain_of_boxes_in_one_layer_reads_as_a_chain() {
+        let display = boxes(3);
+        let seats = vec![seat(0, 0.0); 3];
+        let calls = [(0, 1), (1, 2)];
+
+        let out = placed_with(&display, &seats, &calls, CallDirection::Outgoing);
+        assert_eq!(columns(&out), vec![0.0, 1.0, 2.0]);
+    }
+
+    /// The longest chain of calls through a rung's quotient, in calls.
+    fn longest_chain(layout: &GraphLayout) -> usize {
+        let mut callers_left: HashMap<LayoutNodeId, usize> =
+            layout.nodes.keys().map(|id| (*id, 0)).collect();
+        let mut callees: HashMap<LayoutNodeId, Vec<LayoutNodeId>> = HashMap::new();
+        for edge in &layout.edges {
+            *callers_left.get_mut(&edge.target).unwrap() += 1;
+            callees.entry(edge.source).or_default().push(edge.target);
+        }
+        let mut behind: HashMap<LayoutNodeId, usize> =
+            layout.nodes.keys().map(|id| (*id, 0)).collect();
+        let mut ready: Vec<LayoutNodeId> = callers_left
+            .iter()
+            .filter(|(_, left)| **left == 0)
+            .map(|(id, _)| *id)
+            .collect();
+        while let Some(caller) = ready.pop() {
+            for callee in callees.get(&caller).into_iter().flatten() {
+                let through = behind[&caller] + 1;
+                behind.entry(*callee).and_modify(|b| *b = (*b).max(through));
+                let left = callers_left.get_mut(callee).unwrap();
+                *left -= 1;
+                if *left == 0 {
+                    ready.push(*callee);
+                }
+            }
+        }
+        behind.values().copied().max().unwrap_or(0)
+    }
+
+    /// The map is exactly as many columns as its longest chain of calls needs
+    /// — the fewest any forward-reading drawing of the quotient can have. The
+    /// first repair kept each box's own mean as a floor and only ever pushed
+    /// boxes apart, which spent twelve columns on the export's ten-layer
+    /// opening rung and drew it as a line of one box per column.
+    #[test]
+    fn the_map_is_as_many_columns_as_its_longest_chain() {
+        let graph = create_demo_call_graph();
+        let frame = compute_map_frame(&graph);
+        for &method in ClusterMethod::ALL {
+            let clustering = Clustering::compute(&graph, method);
+            for level in 0..clustering.level_count() {
+                for orientation in [LayoutOrientation::LeftRight, LayoutOrientation::TopDown] {
+                    for direction in [CallDirection::Outgoing, CallDirection::Incoming] {
+                        let layout = compute_cluster_layout(
+                            &graph,
+                            &clustering,
+                            &frame,
+                            level,
+                            direction,
+                            orientation,
+                        );
+                        let along: fn(&NodePos) -> f32 = match orientation {
+                            LayoutOrientation::LeftRight => |p| p.x,
+                            LayoutOrientation::TopDown => |p| p.y,
+                        };
+                        let columns: HashSet<i64> = layout
+                            .nodes
+                            .values()
+                            .map(|p| (along(p) * 100.0).round() as i64)
+                            .collect();
+                        assert_eq!(
+                            columns.len(),
+                            longest_chain(&layout) + 1,
+                            "{} rung {level} {orientation:?}/{direction:?}",
+                            method.label()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The levelling is done once, in the direction the calls run, and an
+    /// incoming read turns the columns round afterwards — so the incoming map
+    /// is the outgoing one in a mirror, column for column, not a different
+    /// picture levelled the other way.
+    #[test]
+    fn an_incoming_map_is_the_outgoing_one_in_a_mirror() {
+        let display = boxes(4);
+        let seats = vec![seat(3, 0.0), seat(1, 0.0), seat(1, 0.0), seat(0, 0.0)];
+        let calls = [(0, 1), (1, 2), (3, 0)];
+
+        let out = placed_with(&display, &seats, &calls, CallDirection::Outgoing);
+        let incoming = placed_with(&display, &seats, &calls, CallDirection::Incoming);
+        let last = columns(&out).iter().cloned().fold(0.0f32, f32::max);
+        for (slot, (a, b)) in out.iter().zip(&incoming).enumerate() {
+            assert!(
+                (a.x + b.x - last * LEVEL_SEPARATION).abs() < 0.01,
+                "box {slot}: {} outgoing, {} incoming",
+                a.x,
+                b.x
+            );
+        }
+    }
+
+    fn placed_with(
+        display: &[LayoutNodeId],
+        seats: &[Option<Seat>],
+        calls: &[(usize, usize)],
+        direction: CallDirection,
+    ) -> Vec<NodePos> {
+        let nodes = place_boxes(
+            display,
+            seats,
+            calls,
+            direction,
+            LayoutOrientation::LeftRight,
+        );
+        display.iter().map(|node| nodes[node]).collect()
+    }
+
+    /// The lane past the last column is a holding area, not a position, so the
+    /// levelling leaves it alone in both directions: a box in it does not lift
+    /// what it calls, and is not lifted by what calls it.
+    #[test]
+    fn the_unseated_lane_is_neither_levelled_nor_levelling() {
+        let display = boxes(3);
+        let seats = vec![seat(0, 0.0), seat(0, 0.0), None];
+
+        let out = placed_with(&display, &seats, &[(2, 0), (1, 2)], CallDirection::Outgoing);
+        assert_eq!(
+            columns(&out),
+            vec![0.0, 0.0, 1.0],
+            "the two seated boxes share the column they averaged to, the \
+             unseated one waits past them"
+        );
+    }
+
+    /// `logic::cluster` promises the quotient is a DAG. If that promise ever
+    /// broke, the levelling would leave the boxes on the cycle where they were
+    /// lifted to and draw the map anyway, rather than spin or panic on the
+    /// worker thread.
+    #[test]
+    fn a_cycle_in_the_quotient_still_draws_a_map() {
+        let display = boxes(3);
+        let seats = vec![seat(0, 0.0), seat(0, 0.0), seat(0, 0.0)];
+
+        let out = placed_with(
+            &display,
+            &seats,
+            &[(0, 1), (1, 2), (2, 1)],
+            CallDirection::Outgoing,
+        );
+        assert_eq!(out.len(), 3, "every box is still placed");
+        assert!(
+            out[1].x > out[0].x,
+            "the lift from the caller off the cycle is still honoured"
+        );
+        assert!(
+            (out[2].x - out[0].x).abs() < 0.01,
+            "a box the cycle keeps from being dequeued stays where it averaged to"
+        );
+    }
+
+    /// The complaint this answers, end to end: a map read left to right flows
+    /// left to right, and one read top-down flows down — every line advances
+    /// at least one column along the axis the orientation names, whichever way
+    /// the calls are being read and whichever method drew the boxes. A mean of
+    /// the members' layers is not a layering of the quotient, and before the
+    /// levelling up to a fifth of a coarse rung's lines ran the other way.
+    #[test]
+    fn every_call_on_the_map_advances_a_column() {
+        let graph = create_demo_call_graph();
+        let frame = compute_map_frame(&graph);
+        for &method in ClusterMethod::ALL {
+            let clustering = Clustering::compute(&graph, method);
+            for level in 0..clustering.level_count() {
+                for orientation in [LayoutOrientation::LeftRight, LayoutOrientation::TopDown] {
+                    for direction in [CallDirection::Outgoing, CallDirection::Incoming] {
+                        let layout = compute_cluster_layout(
+                            &graph,
+                            &clustering,
+                            &frame,
+                            level,
+                            direction,
+                            orientation,
+                        );
+                        let (along, pitch): (fn(&NodePos) -> f32, f32) = match orientation {
+                            LayoutOrientation::LeftRight => (|p| p.x, LEVEL_SEPARATION),
+                            LayoutOrientation::TopDown => (|p| p.y, LEVEL_SEPARATION_TOPDOWN),
+                        };
+                        assert!(!layout.edges.is_empty(), "a rung with something to check");
+                        for edge in &layout.edges {
+                            let from = along(&layout.nodes[&edge.source]);
+                            let to = along(&layout.nodes[&edge.target]);
+                            assert!(
+                                to - from >= pitch - 0.01,
+                                "{} rung {level} {orientation:?}/{direction:?}: {} -> {} runs \
+                                 from {from} to {to}, not a column forward",
+                                method.label(),
+                                edge.source,
+                                edge.target
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// The point of the whole thing, end to end: a box holding the entry point
