@@ -389,3 +389,113 @@ fn cxx_members_overloads_and_templates_resolve_across_files() {
     // main, the constructor, destructor, two members, two overloads, clamp.
     assert_eq!(report.graph.node_count(), 8);
 }
+
+/// `g++ a.c` compiles C++, where libclang on its own would read the file as C
+/// and lose the function a `class` is in to a syntax error.
+#[test]
+fn a_c_file_built_by_a_cxx_driver_is_parsed_as_cxx() {
+    let _guard = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.c",
+        "class Counter { public: int next() { return ++n; } int n = 0; };\n\
+         int main(void) { Counter c; return c.next(); }\n",
+    );
+    let report = index(
+        root,
+        &[job_with(root, "a.c", &["ccache", "g++"])],
+        |_, _| {},
+    )
+    .unwrap();
+    assert_eq!((report.parsed, report.failed, report.errors), (1, 0, 0));
+    assert_eq!(
+        pairs(&report.graph),
+        set(&["main(a.c) -> Counter::next(a.c)"])
+    );
+}
+
+/// A cross compiler's name is its target: the code under `#ifdef __aarch64__`
+/// is the code the build compiled.
+#[test]
+fn a_cross_compilers_name_sets_the_target() {
+    let _guard = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.c",
+        "#ifdef __aarch64__\n\
+         static void arm(void) {}\n\
+         void entry(void) { arm(); }\n\
+         #else\n\
+         #error built for the host\n\
+         #endif\n",
+    );
+    let report = index(
+        root,
+        &[job_with(
+            root,
+            "a.c",
+            &["/opt/cross/bin/aarch64-linux-gnu-gcc-12"],
+        )],
+        |_, _| {},
+    )
+    .unwrap();
+    assert_eq!((report.parsed, report.failed, report.errors), (1, 0, 0));
+    assert_eq!(pairs(&report.graph), set(&["entry(a.c) -> arm(a.c)"]));
+}
+
+/// A kernel-style gcc command line: flags clang does not have, and a
+/// dependency file asked for through `-Wp,`. The TU is read in full — the `-D`
+/// after the unknown flags included — nothing is written into the project, and
+/// the refused flags are reported rather than counted as errors in the code.
+#[test]
+fn gcc_only_flags_neither_fail_the_tu_nor_count_as_errors() {
+    let _guard = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let body = "#ifndef CONFIG_X\n#error the define was lost\n#endif\n\
+                static void helper(void) {}\n\
+                void entry(void) { helper(); }\n";
+    write(root, "a.c", body);
+    write(
+        root,
+        "b.c",
+        &body.replace("helper", "other").replace("entry", "start"),
+    );
+    let flags = [
+        "gcc",
+        "-Wp,-MD,.a.o.d",
+        "-MJ",
+        "a.json",
+        "-Werror",
+        "-fconserve-stack",
+        "-mindirect-branch=thunk-extern",
+        "-fno-allow-store-data-races",
+        "-mrecord-mcount",
+        "-falign-jumps=1",
+        "-Wno-maybe-uninitialized",
+        "-DCONFIG_X",
+    ];
+    let jobs = [job_with(root, "a.c", &flags), job_with(root, "b.c", &flags)];
+    let report = index(root, &jobs, |_, _| {}).unwrap();
+
+    assert_eq!((report.parsed, report.failed, report.errors), (2, 0, 0));
+    assert_eq!(
+        pairs(&report.graph),
+        set(&["entry(a.c) -> helper(a.c)", "start(b.c) -> other(b.c)"])
+    );
+    assert_eq!(
+        report.rejected_arguments,
+        [
+            "-fconserve-stack",
+            "-mindirect-branch=thunk-extern",
+            "-fno-allow-store-data-races",
+            "-mrecord-mcount",
+        ]
+    );
+    assert!(!root.join(".a.o.d").exists());
+    assert!(!root.join("a.json").exists());
+}

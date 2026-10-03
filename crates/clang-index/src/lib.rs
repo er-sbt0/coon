@@ -48,6 +48,9 @@ pub struct Report {
     /// Calls whose callee has no definition in the project — libc, the system
     /// headers, or a function the build declares and never defines.
     pub external_calls: usize,
+    /// Arguments libclang refused, in the order first met: gcc flags clang does
+    /// not have. Not counted in `errors`, since the code was read regardless.
+    pub rejected_arguments: Vec<String>,
 }
 
 /// One function definition, as first seen.
@@ -102,13 +105,22 @@ pub fn index(
     let mut parsed = 0usize;
     let mut failed = 0usize;
     let mut errors = 0usize;
+    // See `args::rejected_argument`. Once refused, an argument is left out of
+    // every later TU, so a flag the whole build passes is reported once rather
+    // than once per file.
+    let mut rejected: Vec<String> = Vec::new();
     let started = Instant::now();
 
     for (done, job) in jobs.iter().enumerate() {
         let tu_started = Instant::now();
+        let arguments: Vec<&String> = job
+            .arguments
+            .iter()
+            .filter(|a| !rejected.contains(a))
+            .collect();
         let tu = index
             .parser(&job.file)
-            .arguments(&job.arguments)
+            .arguments(&arguments)
             .keep_going(true)
             .parse();
         match tu {
@@ -117,6 +129,21 @@ pub fn index(
                 let mut tu_errors = 0usize;
                 for diagnostic in tu.get_diagnostics() {
                     if matches!(diagnostic.get_severity(), Severity::Error | Severity::Fatal) {
+                        if diagnostic.get_location().get_file_location().file.is_none() {
+                            if let Some(argument) =
+                                args::rejected_argument(&diagnostic.get_text(), &job.arguments)
+                            {
+                                log::info!(
+                                    "[clang-index] libclang ignores {argument} ({}); \
+                                     left out from here on",
+                                    diagnostic.get_text()
+                                );
+                                if !rejected.contains(&argument) {
+                                    rejected.push(argument);
+                                }
+                                continue;
+                            }
+                        }
                         if tu_errors < LOGGED_ERRORS_PER_TU {
                             log::warn!("[clang-index] {}: {}", job.file.display(), diagnostic);
                         }
@@ -162,6 +189,7 @@ pub fn index(
         failed,
         errors,
         external_calls,
+        rejected_arguments: rejected,
     })
 }
 
@@ -398,7 +426,7 @@ impl Scope {
 
 /// `path` with `.` and `..` resolved lexically, for a file that cannot be
 /// canonicalised.
-fn normalise(path: &Path) -> PathBuf {
+pub(crate) fn normalise(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
