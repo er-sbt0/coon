@@ -6,7 +6,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-use crate::compile_commands;
+use crate::clangd_database;
 use crate::{IndexProgress, LspClient, LspRequest, LspResponse, LspService};
 use model::lsp_status::{LspLoadPhase, LspUiMessage};
 use std::path::{Path, PathBuf};
@@ -88,7 +88,7 @@ pub struct LoaderOptions {
     /// entry of the compilation database compiled with the same defines.
     ///
     /// `None` hands clangd the database as it stands, which is every build at
-    /// once. See [`compile_commands::Flavour`] for why that is a choice and
+    /// once. See [`compdb::Flavour`] for why that is a choice and
     /// not a default.
     pub flavour: Option<PathBuf>,
 }
@@ -116,7 +116,7 @@ struct Build {
 /// guessed: on jemalloc the tests outnumber the library two to one, so
 /// "the biggest" would pick the build almost nobody means.
 async fn choose_build(root_path: &Path, options: &LoaderOptions) -> Result<Build, String> {
-    let entries = compile_commands::read_entries(root_path)
+    let entries = compdb::read_entries(root_path)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -129,7 +129,7 @@ async fn choose_build(root_path: &Path, options: &LoaderOptions) -> Result<Build
                 root_path.display()
             ));
         }
-        let mut source_files = compile_commands::parse_compile_commands(root_path)
+        let mut source_files = clangd_database::discover_source_files(root_path)
             .await
             .map_err(|e| e.to_string())?;
         source_files.sort();
@@ -140,7 +140,7 @@ async fn choose_build(root_path: &Path, options: &LoaderOptions) -> Result<Build
     };
 
     let total = entries.len();
-    let flavours = compile_commands::group_by_flavour(entries);
+    let flavours = compdb::group_by_flavour(entries);
 
     let Some(wanted) = &options.flavour else {
         if flavours.len() > 1 {
@@ -148,23 +148,23 @@ async fn choose_build(root_path: &Path, options: &LoaderOptions) -> Result<Build
                 "This project is {} builds in one compilation database; analysing all of them. \
                  Pass --flavour <file> to analyse one:\n  {}",
                 flavours.len(),
-                compile_commands::describe_flavours(&flavours, root_path).join("\n  ")
+                compdb::describe_flavours(&flavours, root_path).join("\n  ")
             );
         }
-        let entries: Vec<compile_commands::CompileCommand> =
+        let entries: Vec<compdb::CompileCommand> =
             flavours.into_iter().flat_map(|f| f.entries).collect();
         return Ok(Build {
-            source_files: compile_commands::canonical_files(&entries).await,
+            source_files: compdb::canonical_files(&entries).await,
             clangd_args: Vec::new(),
         });
     };
 
-    let flavour = compile_commands::select_flavour(&flavours, root_path, wanted).await?;
+    let flavour = compdb::select_flavour(&flavours, root_path, wanted).await?;
     // The database this flavour gets is written inside the project, so clangd
     // keeps a set of index shards per flavour and finds them again next time.
     // The first run of a flavour therefore indexes from cold, which is what
     // `INDEX_WAIT_TIMEOUT` and the re-query on a later `end` are there for.
-    let dir = compile_commands::write_flavour_database(root_path, flavour)
+    let dir = clangd_database::write_flavour_database(root_path, flavour)
         .await
         .map_err(|e| format!("could not write this flavour's compilation database: {e}"))?;
     info!(
@@ -175,7 +175,7 @@ async fn choose_build(root_path: &Path, options: &LoaderOptions) -> Result<Build
     );
 
     Ok(Build {
-        source_files: compile_commands::canonical_files(&flavour.entries).await,
+        source_files: compdb::canonical_files(&flavour.entries).await,
         clangd_args: vec![format!("--compile-commands-dir={}", dir.display())],
     })
 }

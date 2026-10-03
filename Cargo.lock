@@ -534,8 +534,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clang",
+ "compdb",
  "log",
- "lsp",
  "model",
  "tempfile",
 ]
@@ -622,6 +622,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "compdb"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "log",
+ "serde",
+ "serde_json",
+ "shlex",
+ "tokio",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -667,6 +679,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clang-index",
+ "compdb",
  "fern",
  "grid",
  "log",
@@ -2402,13 +2415,13 @@ name = "lsp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "compdb",
  "log",
  "lsp-types",
  "model",
  "pretty_env_logger",
  "serde",
  "serde_json",
- "shlex",
  "tempfile",
  "tokio",
  "uuid",

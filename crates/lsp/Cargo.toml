@@ -12,7 +12,7 @@ tokio.workspace = true
 lsp-types.workspace = true
 log.workspace = true
 uuid.workspace = true
-shlex.workspace = true
+compdb.workspace = true
 
 [dev-dependencies]
 pretty_env_logger.workspace = true

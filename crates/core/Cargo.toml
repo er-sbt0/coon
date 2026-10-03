@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 model.workspace = true
 lsp.workspace = true
+compdb.workspace = true
 clang-index.workspace = true
 anyhow.workspace = true
 logic.workspace = true

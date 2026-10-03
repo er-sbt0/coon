@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use clang_index::{index, Job};
-use lsp::compile_commands::CompileCommand;
+use compdb::CompileCommand;
 use model::CallGraph;
 
 /// libclang allows one `Clang` per process at a time, and the test harness runs

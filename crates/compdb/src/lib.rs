@@ -3,6 +3,13 @@
 //!
 //! A header compiled under two different `-D` sets is two different pieces of
 //! code, and a call graph is of one build. See [`Flavour`].
+//!
+//! Its own crate because it is about the build and not about either backend:
+//! the libclang index parses these commands and the clangd loader hands clangd
+//! a filtered copy of them, and the two have to agree on what a flavour is
+//! without one depending on the other. What only clangd needs — writing a
+//! flavour out as a database of its own, and guessing at files when there is no
+//! database at all — stays in `lsp::clangd_database`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -297,47 +304,6 @@ pub async fn check_flavour(project_path: &Path, wanted: &Path) -> Result<(), Str
         .map(|_| ())
 }
 
-/// Where a flavour's own compilation database lives: inside the project, one
-/// directory per flavour.
-///
-/// Inside the project rather than a temp dir because clangd keys its
-/// background-index storage by the directory the database is in. A temp dir
-/// would mean a cold index on every launch; a stable per-flavour directory
-/// means each build keeps its own shards and never mixes them with another's,
-/// which is the property the whole flag exists for. It is a cache and can be
-/// deleted at any time — the first run of a flavour indexes from cold again,
-/// which is what `INDEX_WAIT_TIMEOUT` and the re-query on a later `end` in
-/// `loader` are there to survive.
-pub fn flavour_database_dir(project_path: &Path, flavour: &Flavour) -> PathBuf {
-    project_path
-        .join(".cache")
-        .join("coon")
-        .join("flavours")
-        .join(flavour.key.short_hash())
-}
-
-/// Write `flavour`'s entries out as a compilation database of their own and
-/// answer with the directory to point clangd at.
-///
-/// The entries go out verbatim: they are what the project's build system said
-/// to run, and clangd is being told to read the same commands for fewer files,
-/// not different commands.
-pub async fn write_flavour_database(
-    project_path: &Path,
-    flavour: &Flavour,
-) -> anyhow::Result<PathBuf> {
-    let dir = flavour_database_dir(project_path, flavour);
-    tokio::fs::create_dir_all(&dir).await?;
-    let json = serde_json::to_string_pretty(&flavour.entries)?;
-    tokio::fs::write(dir.join("compile_commands.json"), json).await?;
-    log::info!(
-        "Wrote a {}-entry compilation database for this flavour to {}",
-        flavour.entries.len(),
-        dir.display()
-    );
-    Ok(dir)
-}
-
 /// Every entry of the project's compilation database, or `None` when there
 /// isn't one.
 pub async fn read_entries(project_path: &Path) -> anyhow::Result<Option<Vec<CompileCommand>>> {
@@ -381,76 +347,6 @@ pub async fn canonical_files(entries: &[CompileCommand]) -> Vec<PathBuf> {
     files.sort();
     files.dedup();
     files
-}
-
-/// Parse compile_commands.json to extract source file paths
-pub async fn parse_compile_commands(project_path: &Path) -> anyhow::Result<Vec<PathBuf>> {
-    let Some(entries) = read_entries(project_path).await? else {
-        // Fallback to directory walking if no compile_commands.json exists
-        log::info!("No compile_commands.json found, falling back to directory discovery");
-        let project_path = project_path.to_owned();
-        return tokio::task::spawn_blocking(move || discover_source_files_fallback(&project_path))
-            .await?;
-    };
-
-    let source_files = canonical_files(&entries).await;
-    log::info!(
-        "Found {} source files from compile_commands.json",
-        source_files.len()
-    );
-    Ok(source_files)
-}
-
-/// Fallback directory walking when compile_commands.json is not available
-fn discover_source_files_fallback(
-    project_path: &std::path::Path,
-) -> anyhow::Result<Vec<std::path::PathBuf>> {
-    let mut source_files = Vec::new();
-
-    let extensions = ["c", "cpp", "cxx", "cc", "h", "hpp", "hxx"];
-
-    // Walk the directory tree
-    fn walk_dir(
-        dir: &std::path::Path,
-        extensions: &[&str],
-        files: &mut Vec<std::path::PathBuf>,
-        max_files: usize,
-    ) -> anyhow::Result<()> {
-        if files.len() >= max_files {
-            return Ok(());
-        }
-
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_dir() {
-                // Skip common non-source directories
-                if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
-                    if !matches!(
-                        dir_name,
-                        "target" | "build" | "node_modules" | ".git" | ".svn" | "dist" | "out"
-                    ) {
-                        walk_dir(&path, extensions, files, max_files)?;
-                    }
-                }
-            } else if path.is_file() {
-                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    if extensions.contains(&ext) {
-                        files.push(path);
-                        if files.len() >= max_files {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    walk_dir(project_path, &extensions, &mut source_files, 100)?; // Limit to 100 files
-    Ok(source_files)
 }
 
 #[cfg(test)]

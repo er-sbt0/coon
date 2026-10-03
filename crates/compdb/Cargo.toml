@@ -1,0 +1,16 @@
+[package]
+name = "compdb"
+version = "0.1.0"
+edition = "2021"
+description = "The project's compilation database, and the builds it holds"
+
+# The build, not either backend that reads it: clangd is handed a flavour's
+# database and libclang parses its commands, and neither should have to depend
+# on the other to agree on what a flavour is.
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["fs"] }
+log.workspace = true
+shlex.workspace = true

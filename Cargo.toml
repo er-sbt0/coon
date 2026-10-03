@@ -4,6 +4,7 @@ members = [
     "crates/coon",
     "crates/model",
     "crates/lsp",
+    "crates/compdb",
     "crates/clang-index",
     "crates/logic",
     "crates/core",
@@ -24,6 +25,7 @@ default-members = [
     "crates/desktop",
     "crates/model",
     "crates/lsp",
+    "crates/compdb",
     "crates/clang-index",
     "crates/logic",
     "crates/core",
@@ -54,6 +56,7 @@ model = { path = "crates/model" }
 logic = { path = "crates/logic" }
 core = { path = "crates/core" }
 lsp = { path = "crates/lsp" }
+compdb = { path = "crates/compdb" }
 clang-index = { path = "crates/clang-index" }
 tui = { path = "crates/tui" }
 grid = { path = "crates/grid" }

@@ -135,10 +135,8 @@ async fn libclang_loader_task(
     options: LoaderOptions,
     ui_msg_tx: mpsc::UnboundedSender<LspUiMessage>,
 ) -> anyhow::Result<()> {
-    use lsp::compile_commands;
-
     let _ = ui_msg_tx.send(LspUiMessage::Progress(LspLoadPhase::DiscoveringFiles));
-    let entries = compile_commands::read_entries(&project_path)
+    let entries = compdb::read_entries(&project_path)
         .await?
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -146,13 +144,13 @@ async fn libclang_loader_task(
                 project_path.display()
             )
         })?;
-    let flavours = compile_commands::group_by_flavour(entries);
-    for line in compile_commands::describe_flavours(&flavours, &project_path) {
+    let flavours = compdb::group_by_flavour(entries);
+    for line in compdb::describe_flavours(&flavours, &project_path) {
         log::info!("[libclang] flavour: {line}");
     }
     let entries = match &options.flavour {
         Some(wanted) => {
-            compile_commands::select_flavour(&flavours, &project_path, wanted)
+            compdb::select_flavour(&flavours, &project_path, wanted)
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?
                 .entries
@@ -224,7 +222,7 @@ pub async fn check_flavour(
     project_path: &std::path::Path,
     flavour: &std::path::Path,
 ) -> Result<(), String> {
-    lsp::compile_commands::check_flavour(project_path, flavour).await
+    compdb::check_flavour(project_path, flavour).await
 }
 
 #[cfg(test)]

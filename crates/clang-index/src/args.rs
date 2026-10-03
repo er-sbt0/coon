@@ -21,7 +21,7 @@
 
 use std::path::{Path, PathBuf};
 
-use lsp::compile_commands::{CompileCommand, FlavourKey};
+use compdb::{CompileCommand, FlavourKey};
 
 use crate::normalise;
 

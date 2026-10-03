@@ -23,7 +23,7 @@
 //! function is the same code in every TU that includes it, so its body is
 //! walked once; but a database is often several builds, and the same function
 //! under `-DJEMALLOC_UNIT_TEST` can call what the library build does not. So a
-//! body is walked once per *flavour* (see `lsp::compile_commands::FlavourKey`)
+//! body is walked once per *flavour* (see `compdb::FlavourKey`)
 //! and the calls of every flavour land on the one node.
 
 pub mod args;
@@ -133,7 +133,7 @@ pub fn index(
     let started = Instant::now();
     // Flavours numbered in the order first met, so `Collected::defined` holds
     // an index rather than a copy of the key per function.
-    let mut flavours: HashMap<&lsp::compile_commands::FlavourKey, usize> = HashMap::new();
+    let mut flavours: HashMap<&compdb::FlavourKey, usize> = HashMap::new();
 
     for (done, job) in jobs.iter().enumerate() {
         let tu_started = Instant::now();

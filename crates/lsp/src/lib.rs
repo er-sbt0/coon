@@ -1,6 +1,6 @@
 mod call_hierarchy;
+pub mod clangd_database;
 pub mod client;
-pub mod compile_commands;
 pub mod loader;
 mod parsing;
 mod service;

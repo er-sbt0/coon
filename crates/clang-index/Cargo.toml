@@ -6,7 +6,7 @@ description = "Build a call graph by parsing every translation unit with libclan
 
 [dependencies]
 model.workspace = true
-lsp.workspace = true
+compdb.workspace = true
 log.workspace = true
 anyhow.workspace = true
 # `runtime`: libclang is dlopen'ed when the index starts rather than linked, so
