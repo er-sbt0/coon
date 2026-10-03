@@ -69,11 +69,13 @@ pub struct BackendCapabilities {
     /// arrives with every edge it will ever have, so every node is as loaded
     /// as it will ever be — see [`LspBridge::is_function_loaded`].
     pub call_hierarchy: bool,
-    /// Where a function is referenced from (`Command::FindReferences`).
+    /// Where a function is referenced from (`Command::FindReferences`):
+    /// asked of clangd, or read off the graph when it is whole.
     pub references: bool,
     /// Asking for the project's symbols again (`workspace/symbol`).
     pub symbol_query: bool,
-    /// Reloading what is on screen from the backend (`Command::Refresh`).
+    /// Reloading what is on screen from the backend (`Command::Refresh`):
+    /// a fresh symbol query under clangd, a whole re-parse under libclang.
     pub refresh: bool,
 }
 
@@ -86,14 +88,34 @@ impl BackendCapabilities {
         refresh: true,
     };
 
-    /// A backend that delivers the whole graph at once and keeps nothing to
-    /// ask afterwards: libclang, and the demo graph.
+    /// A graph delivered whole, with nothing behind it to ask: the demo graph.
+    ///
+    /// References are answered all the same — from the graph, by
+    /// `CoreApp`, since a graph that holds every edge holds every call site.
+    /// See [`BackendCapabilities::graph_is_whole`].
     pub const WHOLE_GRAPH: Self = Self {
         call_hierarchy: false,
-        references: false,
+        references: true,
         symbol_query: false,
         refresh: false,
     };
+
+    /// libclang: a whole graph, and a loader that can be asked to read the
+    /// build again — which is all a refresh means for it. See
+    /// [`LspBridge::send_reload`].
+    pub const LIBCLANG: Self = Self {
+        refresh: true,
+        ..Self::WHOLE_GRAPH
+    };
+
+    /// Whether the graph arrives with every edge it will ever have, so a
+    /// question about calls is answered from it rather than asked of a
+    /// server. The absence of a call hierarchy is what says so: a backend
+    /// that hands over edges per symbol is one whose graph is never known to
+    /// be complete.
+    pub fn graph_is_whole(&self) -> bool {
+        !self.call_hierarchy
+    }
 
     /// Whether `capability` is one of these.
     pub fn has(&self, capability: Capability) -> bool {
@@ -333,6 +355,10 @@ pub struct LspBridge {
     /// How much of the build the loader managed to parse, when it is a loader
     /// that parses one. `None` under clangd, and until the parse finishes.
     parse_summary: Option<model::ParseSummary>,
+    /// Asks a whole-graph loader to read the build again. `None` for clangd,
+    /// whose refresh is a symbol query, and for the demo, which has no loader.
+    /// See [`LspBridge::send_reload`].
+    reload_tx: Option<mpsc::UnboundedSender<()>>,
     /// One-shot channel to receive the LSP request/response channels once the loader is ready
     channels_rx: Option<
         oneshot::Receiver<(
@@ -367,6 +393,7 @@ impl LspBridge {
             loader_rx: None,
             arrived_graphs: Vec::new(),
             parse_summary: None,
+            reload_tx: None,
             channels_rx: None,
         }
     }
@@ -379,6 +406,20 @@ impl LspBridge {
         Self {
             loader_rx: Some(loader_rx),
             ..Self::new()
+        }
+    }
+
+    /// Create an `LspBridge` that hears from a whole-graph loader which can be
+    /// asked to load again: libclang. `reload_tx` is the loader's ear — one
+    /// `()` is one more parse of the build. See [`LspBridge::send_reload`].
+    pub fn new_with_reloader(
+        loader_rx: mpsc::UnboundedReceiver<LspUiMessage>,
+        reload_tx: mpsc::UnboundedSender<()>,
+    ) -> Self {
+        Self {
+            capabilities: BackendCapabilities::LIBCLANG,
+            reload_tx: Some(reload_tx),
+            ..Self::new_with_status(loader_rx)
         }
     }
 
@@ -402,6 +443,7 @@ impl LspBridge {
             loader_rx: Some(loader_rx),
             arrived_graphs: Vec::new(),
             parse_summary: None,
+            reload_tx: None,
             channels_rx: Some(channels_rx),
         }
     }
@@ -498,7 +540,8 @@ impl LspBridge {
         new_symbols
     }
 
-    /// Whole graphs delivered since the last call, for the caller to merge.
+    /// Whole graphs delivered since the last call. Each one is the whole
+    /// graph, so the caller replaces what it holds with the last of them.
     pub fn take_graphs(&mut self) -> Vec<model::CallGraph> {
         std::mem::take(&mut self.arrived_graphs)
     }
@@ -757,6 +800,51 @@ impl LspBridge {
             return SendOutcome::Failed(Some(AppEvent::FailedToSendRequest));
         }
         SendOutcome::Sent(Some(AppEvent::FindingReferences { name }))
+    }
+
+    /// Whether a load is still under way: from the moment the loader is
+    /// spawned, or a reload asked for, until it reports `Completed` or
+    /// `Failed`. Read off the phase rather than kept as a flag beside it,
+    /// because the phase is what the loader says and a flag is what this
+    /// bridge remembers asking — and those two disagreeing is the bug a
+    /// second flag would add.
+    pub fn load_in_progress(&self) -> bool {
+        !matches!(self.status, LspLoadPhase::Completed | LspLoadPhase::Failed(_))
+    }
+
+    /// Ask a whole-graph loader to parse the build again.
+    ///
+    /// The phase moves to `DiscoveringFiles` here, before the loader says so,
+    /// so that `CoreApp::loading` is true from the moment of asking: a
+    /// clustering started in the gap would be computed over the graph about to
+    /// be replaced. The answer arrives the way the first one did, as a whole
+    /// graph followed by `Completed`, and `CoreApp` replaces rather than
+    /// merges it.
+    ///
+    /// Never sent while a load is running — the caller checks
+    /// [`LspBridge::load_in_progress`] first and says so instead — which is
+    /// what makes the loader's side simple: every `()` it receives is one
+    /// parse, and none arrives while it is parsing.
+    ///
+    /// Answers in the convention of [`SendOutcome`]. On success the event is
+    /// the new phase, so the status line moves on the keypress rather than a
+    /// tick later.
+    pub fn send_reload(&mut self) -> SendOutcome {
+        if let Err(outcome) = self.require(Capability::Refresh) {
+            return outcome;
+        }
+        let Some(reload_tx) = &self.reload_tx else {
+            return SendOutcome::Declined;
+        };
+        if reload_tx.send(()).is_err() {
+            // The loader task is gone — it only stops when this bridge does,
+            // or when it panicked, which the log has already said.
+            log::error!("core::LspBridge the loader is not listening for a reload");
+            return SendOutcome::Failed(Some(AppEvent::FailedToSendRequest));
+        }
+        log::info!("core::LspBridge asked the loader to read the build again");
+        self.status = LspLoadPhase::DiscoveringFiles;
+        SendOutcome::Sent(Some(AppEvent::LspProgress(self.status.clone())))
     }
 
     /// Send a workspace symbols request.

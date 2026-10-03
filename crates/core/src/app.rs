@@ -229,6 +229,82 @@ struct Clustered {
     frame: Option<MapFrame>,
 }
 
+/// The functions of `old` that are not in `new` under their id but are there
+/// under another: same qualified name, same file, a different line. Each maps
+/// to the candidate nearest its old line, ties to the earlier one, and a
+/// candidate that was itself in `old` is not one — it is a different
+/// function that already had that name, an overload or a `static` twin, and
+/// is carried across under its own id.
+fn moved_symbols(old: &CallGraph, new: &CallGraph) -> HashMap<SymbolId, SymbolId> {
+    let mut arrived: HashMap<(&str, &str), Vec<(u32, SymbolId)>> = HashMap::new();
+    for function in new.functions() {
+        if old.get_function(&function.id).is_none() {
+            arrived
+                .entry((
+                    function.qualified_name.as_str(),
+                    function.definition_location.file_path.as_str(),
+                ))
+                .or_default()
+                .push((function.definition_location.line, function.id));
+        }
+    }
+    old.functions()
+        .filter(|function| new.get_function(&function.id).is_none())
+        .filter_map(|function| {
+            let line = function.definition_location.line;
+            let candidates = arrived.get(&(
+                function.qualified_name.as_str(),
+                function.definition_location.file_path.as_str(),
+            ))?;
+            let (_, id) = candidates
+                .iter()
+                .min_by_key(|(at, _)| (at.abs_diff(line), *at))?;
+            Some((function.id, *id))
+        })
+        .collect()
+}
+
+/// Where `id` is referenced, read off a graph that holds every edge: its
+/// definition, then every call site of it, in source order.
+///
+/// Narrower than clangd's answer, which is `textDocument/references` with
+/// `includeDeclaration` and so also names every declaration — a prototype in
+/// a header, a forward declaration — and any reference outside a function
+/// body, such as a function pointer in a static table's initialiser. What the
+/// graph holds is the references *inside* the functions it knows, which
+/// includes a function passed as a callback (libclang records references, not
+/// only calls), each with the function it sits in as the referencing symbol.
+fn references_in_graph(graph: &CallGraph, id: &SymbolId) -> Vec<model::Reference> {
+    let Some(function) = graph.get_function(id) else {
+        return Vec::new();
+    };
+    let from = |caller: &FunctionNode| model::ReferencingSymbol {
+        name: caller.name.clone(),
+        qualified_name: caller.qualified_name.clone(),
+        kind: model::ReferenceSymbolKind::Function,
+    };
+    let mut call_sites: Vec<model::Reference> = graph
+        .edges()
+        .filter(|edge| edge.callee == *id)
+        .map(|edge| model::Reference {
+            location: edge.call_location.clone(),
+            referencing_symbol: graph.get_function(&edge.caller).map(from),
+        })
+        .collect();
+    call_sites.sort_by(|a, b| {
+        let (a, b) = (&a.location, &b.location);
+        (&a.file_path, a.line, a.column).cmp(&(&b.file_path, b.line, b.column))
+    });
+    // The definition first, as the function itself referencing it: that is
+    // what clangd's containing-symbol lookup names for a definition, too.
+    let mut references = vec![model::Reference {
+        location: function.definition_location.clone(),
+        referencing_symbol: Some(from(function)),
+    }];
+    references.extend(call_sites);
+    references
+}
+
 /// Frontend-agnostic application core.
 ///
 /// Owns the call graph, workspace state, and LSP bridge. Emits `AppEvent`
@@ -567,25 +643,14 @@ impl CoreApp {
             );
         }
 
-        // Merge whole graphs from a backend that reads the build up front. They
+        // Take whole graphs from a backend that reads the build up front. They
         // arrive with their edges, and nothing is marked on the way in: that
         // every node is as loaded as it will ever be follows from the backend
         // having no call hierarchy to ask (see `BackendCapabilities`), which
-        // is also what keeps the warmup and a click from asking it.
-        for graph in self.lsp.take_graphs() {
-            for function in graph.functions() {
-                self.call_graph.add_function(function.clone());
-            }
-            for edge in graph.edges() {
-                self.call_graph
-                    .add_call(edge.caller, edge.callee, edge.call_location.clone());
-            }
-            self.mark_graph_changed();
-            log::info!(
-                "CoreApp::tick merged a graph of {} function(s) and {} edge(s)",
-                graph.node_count(),
-                graph.edge_count()
-            );
+        // is also what keeps the warmup and a click from asking it. Only the
+        // last one counts, since each is the whole of it.
+        if let Some(graph) = self.lsp.take_graphs().pop() {
+            self.replace_graph(graph);
         }
 
         // Emit current LSP phase as a progress event
@@ -714,9 +779,7 @@ impl CoreApp {
             } => {
                 if let Some(pending) = self.lsp.take_pending(&request_id) {
                     if let Some(symbol_id) = pending.symbol_id {
-                        if let Some(function) = self.call_graph.get_function_mut(&symbol_id) {
-                            function.references = references;
-                        }
+                        events.extend(self.record_references(symbol_id, references));
                         self.lsp.set_loading_state(symbol_id, LoadingState::Loaded);
                     }
                 }
@@ -867,29 +930,68 @@ impl CoreApp {
 
     fn cmd_find_references(&mut self) -> Vec<AppEvent> {
         let symbol_id = self.workspaces.current().and_then(|w| w.root_symbol());
-        if let Some(id) = symbol_id {
-            // Nothing on the canvas changes, so there is no `LayoutDirty`
-            // here: the answer arrives as its own event later.
-            self.lsp
-                .send_references(&self.call_graph, &id)
-                .event()
-                .into_iter()
-                .collect()
-        } else {
-            vec![]
+        let Some(id) = symbol_id else {
+            return vec![];
+        };
+        // Nothing on the canvas changes, so there is no `LayoutDirty` here.
+        // Where the answer comes from is the capability's to say: a whole
+        // graph holds every call site already, and is answered on the spot;
+        // anything else is asked of clangd, and the answer arrives as its own
+        // event later — or is declined as unsupported, by the sender.
+        let capabilities = self.lsp.capabilities();
+        if capabilities.references && capabilities.graph_is_whole() {
+            let references = references_in_graph(&self.call_graph, &id);
+            return self.record_references(id, references).into_iter().collect();
         }
+        self.lsp
+            .send_references(&self.call_graph, &id)
+            .event()
+            .into_iter()
+            .collect()
+    }
+
+    /// Store the references found for `symbol_id` on its node, and say how
+    /// many there were — the one place both sources of an answer land, so a
+    /// frontend hears the same thing whichever backend found them.
+    fn record_references(
+        &mut self,
+        symbol_id: SymbolId,
+        references: Vec<model::Reference>,
+    ) -> Option<AppEvent> {
+        let function = self.call_graph.get_function_mut(&symbol_id)?;
+        let count = references.len();
+        function.references = references;
+        Some(if count == 0 {
+            AppEvent::NoReferencesFound { symbol_id }
+        } else {
+            AppEvent::ReferencesFound { symbol_id, count }
+        })
     }
 
     fn cmd_refresh(&mut self) -> Vec<AppEvent> {
         // Decided before anything is cleared: a backend that cannot reload has
         // nothing to clear for, and its graph is the one it will always have.
-        if !self.lsp.capabilities().refresh {
+        let capabilities = self.lsp.capabilities();
+        if !capabilities.refresh {
             return self
                 .lsp
                 .unsupported(Capability::Refresh)
                 .event()
                 .into_iter()
                 .collect();
+        }
+        // A whole graph is refreshed by loading it again, not by re-asking for
+        // symbols: there is nothing to clear here either, because the graph
+        // on screen stays until its replacement arrives whole. A refresh
+        // while a load is running is not a second parse — the one running
+        // already reads the build as it stands — and the user is told so,
+        // since a key that does nothing looks broken.
+        if capabilities.graph_is_whole() {
+            if self.lsp.load_in_progress() {
+                log::info!("CoreApp: refresh while a load is running; not starting another");
+                return vec![AppEvent::AlreadyLoading];
+            }
+            return self.lsp.send_reload().event().into_iter().collect();
         }
         let direction = self.current_direction();
         // Everything in flight is about to become unanswerable — see
@@ -1334,6 +1436,54 @@ impl CoreApp {
     /// the marks in [`Self::sync_clusterings`], which starts nothing while the
     /// project is still arriving — so the settling a growing graph needs comes
     /// from `loading()` going false, not from a timestamp taken here.
+    /// Swap the graph for one a whole-graph backend just delivered.
+    ///
+    /// Replaced, not merged. Merging is right for clangd, whose replies each
+    /// add to a graph nobody claims is finished; it is wrong for a backend
+    /// whose every delivery is the whole program, because a union never
+    /// forgets — a function deleted from the source, or a call taken out of
+    /// one, would stay on the map after the refresh that was meant to show it
+    /// gone. The first delivery goes through here as well: replacing an empty
+    /// graph is the merge it used to be.
+    ///
+    /// The workspaces are carried across by symbol id. Ids are derived from
+    /// the qualified name, the file and the line, so a function no edit
+    /// touched keeps its id and everything pointing at it stays put. One
+    /// whose line moved — anything below an edit in the same file — has a new
+    /// id, and is found again by name and file, nearest line first, so a root
+    /// does not vanish because a comment was added above it. What is truly
+    /// gone falls back as [`CoreWorkspace::carry_over`] describes, and the
+    /// selection with it.
+    ///
+    /// Every cached map goes stale with the graph and is recomputed once the
+    /// load reports `Completed`, as after the first load; a stale map stays
+    /// drawable meanwhile, and a box naming a function that is gone draws
+    /// nothing for it.
+    fn replace_graph(&mut self, graph: CallGraph) {
+        let moved = moved_symbols(&self.call_graph, &graph);
+        let translate = |id: SymbolId| {
+            if graph.get_function(&id).is_some() {
+                Some(id)
+            } else {
+                moved.get(&id).copied()
+            }
+        };
+        for ws in &mut self.workspaces.workspaces {
+            ws.carry_over(translate);
+        }
+        self.selected_function = self.selected_function.and_then(translate);
+        log::info!(
+            "CoreApp: graph replaced: {} function(s) and {} edge(s), was {} and {}; {} moved",
+            graph.node_count(),
+            graph.edge_count(),
+            self.call_graph.node_count(),
+            self.call_graph.edge_count(),
+            moved.len()
+        );
+        self.call_graph = graph;
+        self.mark_graph_changed();
+    }
+
     fn mark_graph_changed(&mut self) {
         // Every map cached describes the graph as it was a moment ago.
         let cached: Vec<ClusterTarget> = self.clusterings.keys().copied().collect();
@@ -4300,12 +4450,11 @@ mod tests {
         app.dispatch(Command::SelectFunction(caller));
 
         assert!(app.dispatch(Command::Refresh).is_empty());
-        assert!(app.dispatch(Command::FindReferences).is_empty());
         assert_eq!(app.call_graph.node_count(), 2, "a refresh cleared nothing");
 
         assert!(matches!(
-            app.lsp.send_references(&app.call_graph, &caller),
-            SendOutcome::Unsupported(Capability::References)
+            app.lsp.send_reload(),
+            SendOutcome::Unsupported(Capability::Refresh)
         ));
         assert!(matches!(
             app.lsp.send_workspace_symbols(),
@@ -4320,6 +4469,195 @@ mod tests {
             ),
             SendOutcome::Unsupported(Capability::CallHierarchy)
         ));
+    }
+
+    /// A whole graph answers find-references itself, on the spot, from the
+    /// call sites it holds: the definition first, then every call in source
+    /// order, each named by the function it sits in. Nothing is asked.
+    #[test]
+    fn a_whole_graph_answers_references_from_its_call_sites() {
+        let mut graph = CallGraph::new();
+        let target = add(&mut graph, "target", 1);
+        let first = add(&mut graph, "first", 10);
+        let second = add(&mut graph, "second", 20);
+        call(&mut graph, second, target, 22);
+        call(&mut graph, first, target, 12);
+        call(&mut graph, first, target, 11);
+        call(&mut graph, first, second, 13);
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = CoreApp::new_with_lsp(CallGraph::new(), LspBridge::new_with_status(rx));
+        tx.send(model::LspUiMessage::AddGraph(Box::new(graph))).unwrap();
+        tx.send(model::LspUiMessage::Progress(LspLoadPhase::Completed))
+            .unwrap();
+        app.tick();
+        assert!(app.capabilities().references);
+
+        app.dispatch(Command::StartGraphFromFunction(target));
+        let events = app.dispatch(Command::FindReferences);
+        assert!(
+            matches!(
+                events.as_slice(),
+                [AppEvent::ReferencesFound { symbol_id, count: 4 }] if *symbol_id == target
+            ),
+            "{events:?}"
+        );
+        assert_eq!(app.lsp.pending_count(), 0, "answered here, not asked");
+
+        let found: Vec<(u32, &str)> = app.call_graph.get_function(&target).unwrap()
+            .references
+            .iter()
+            .map(|r| {
+                let from = r.referencing_symbol.as_ref().expect("every one has a function");
+                (r.location.line, from.name.as_str())
+            })
+            .collect();
+        assert_eq!(
+            found,
+            [(1, "target"), (11, "first"), (12, "first"), (22, "second")]
+        );
+    }
+
+    /// A libclang-shaped app whose loader can be asked to load again: the
+    /// graph handed over, the load finished, the map settled. Hands back the
+    /// loader's two ends — what it says, and what it is asked.
+    fn reloadable_app(
+        graph: CallGraph,
+    ) -> (
+        CoreApp,
+        mpsc::UnboundedSender<model::LspUiMessage>,
+        mpsc::UnboundedReceiver<()>,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (reload_tx, reload_rx) = mpsc::unbounded_channel();
+        let mut app = CoreApp::new_with_lsp(
+            CallGraph::new(),
+            LspBridge::new_with_reloader(rx, reload_tx),
+        );
+        deliver(&tx, graph);
+        tick_until_settled(&mut app);
+        (app, tx, reload_rx)
+    }
+
+    /// What the libclang loader sends at the end of every load.
+    fn deliver(tx: &mpsc::UnboundedSender<model::LspUiMessage>, graph: CallGraph) {
+        tx.send(model::LspUiMessage::Progress(LspLoadPhase::IndexingProject {
+            done: 1,
+            total: 1,
+        }))
+        .unwrap();
+        tx.send(model::LspUiMessage::AddGraph(Box::new(graph))).unwrap();
+        tx.send(model::LspUiMessage::Progress(LspLoadPhase::Completed))
+            .unwrap();
+    }
+
+    /// A refresh under libclang asks the loader for the whole load again, and
+    /// what comes back replaces the graph rather than joining it: a function
+    /// that is gone from the source is gone from the graph and from the map,
+    /// and the root that survived is still the root.
+    #[test]
+    fn a_refresh_replaces_a_whole_graph_and_keeps_what_survived() {
+        let (graph, left, right) = two_triangles();
+        let (mut app, tx, mut reload_rx) = reloadable_app(graph);
+        assert!(app.capabilities().refresh);
+        assert!(active(&app).cluster_of(&right[0]).is_some());
+        app.dispatch(Command::StartGraphFromFunction(left[0]));
+        app.dispatch(Command::SelectFunction(left[0]));
+
+        assert_eq!(shapes(&app.dispatch(Command::Refresh)), ["LspProgress"]);
+        assert!(reload_rx.try_recv().is_ok(), "the loader was asked");
+        assert!(app.loading(), "loading from the moment it is asked");
+
+        // The left triangle alone, at the same lines: the same ids.
+        let mut edited = CallGraph::new();
+        triangle(&mut edited, "left", 10);
+        deliver(&tx, edited);
+        tick_until_settled(&mut app);
+
+        assert_eq!(app.call_graph.node_count(), 3);
+        assert_eq!(app.call_graph.edge_count(), 3, "the call across is gone too");
+        assert!(app.call_graph.get_function(&right[0]).is_none());
+        let ws = app.workspaces.current().unwrap();
+        assert_eq!(ws.root_symbol(), Some(left[0]));
+        assert_eq!(ws.view(), ViewMode::Rooted);
+        assert_eq!(app.selected_function, Some(left[0]));
+        assert!(
+            active(&app).cluster_of(&right[0]).is_none(),
+            "the map was recomputed over the new graph"
+        );
+        assert!(!app.loading());
+        assert!(
+            serde_json::to_value(crate::protocol::snapshot_of(&app)).is_ok(),
+            "the snapshot draws"
+        );
+    }
+
+    /// A function whose line moved has a new id, and is found again by name
+    /// and file; a root that is gone outright lets its tab fall back to the
+    /// map rather than a tree grown from nothing.
+    #[test]
+    fn a_refresh_follows_a_moved_root_and_lets_go_of_a_vanished_one() {
+        let (graph, left, right) = two_triangles();
+        let (mut app, tx, _reload_rx) = reloadable_app(graph);
+        // Each opens a tab of its own, beside the one the app opened on.
+        app.dispatch(Command::StartGraphFromFunction(left[0]));
+        app.dispatch(Command::StartGraphFromFunction(right[0]));
+        app.dispatch(Command::SelectFunction(right[0]));
+        app.dispatch(Command::Refresh);
+
+        // Two lines added above the left triangle, and the right one deleted.
+        let mut edited = CallGraph::new();
+        let moved = triangle(&mut edited, "left", 12);
+        assert_ne!(moved[0], left[0], "a moved line is a new id");
+        deliver(&tx, edited);
+        tick_until_settled(&mut app);
+
+        let [_, kept, dropped] = &app.workspaces.workspaces[..] else {
+            panic!("three workspaces");
+        };
+        assert_eq!(kept.root_symbol(), Some(moved[0]), "found again by name");
+        assert_eq!(kept.view(), ViewMode::Rooted);
+        assert_eq!(dropped.root_symbol(), None);
+        assert_eq!(dropped.view(), ViewMode::ClusterMap, "back to the map");
+        assert_eq!(app.selected_function, None);
+    }
+
+    /// A refresh while a load is running starts no second one, during the
+    /// first load and during a reload alike, and says so.
+    #[test]
+    fn a_refresh_during_a_load_starts_nothing() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (reload_tx, mut reload_rx) = mpsc::unbounded_channel();
+        let mut app = CoreApp::new_with_lsp(
+            CallGraph::new(),
+            LspBridge::new_with_reloader(rx, reload_tx),
+        );
+        app.tick();
+        assert_eq!(shapes(&app.dispatch(Command::Refresh)), ["AlreadyLoading"]);
+
+        let (graph, _, _) = two_triangles();
+        deliver(&tx, graph);
+        tick_until_settled(&mut app);
+        assert!(reload_rx.try_recv().is_err(), "nothing was asked during the load");
+
+        assert_eq!(shapes(&app.dispatch(Command::Refresh)), ["LspProgress"]);
+        assert_eq!(shapes(&app.dispatch(Command::Refresh)), ["AlreadyLoading"]);
+        tx.send(model::LspUiMessage::Progress(LspLoadPhase::IndexingProject {
+            done: 0,
+            total: 1,
+        }))
+        .unwrap();
+        app.tick();
+        assert_eq!(shapes(&app.dispatch(Command::Refresh)), ["AlreadyLoading"]);
+        assert!(reload_rx.try_recv().is_ok());
+        assert!(reload_rx.try_recv().is_err(), "one parse, however often asked");
+
+        // A failed reload is over too, and can be retried.
+        tx.send(model::LspUiMessage::Progress(LspLoadPhase::Failed("x".into())))
+            .unwrap();
+        app.tick();
+        assert_eq!(app.call_graph.node_count(), 6, "a failure keeps the graph");
+        assert_eq!(shapes(&app.dispatch(Command::Refresh)), ["LspProgress"]);
     }
 
     /// A clangd bridge is capable before it is wired: the worker arriving late

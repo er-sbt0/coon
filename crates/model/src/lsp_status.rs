@@ -31,7 +31,9 @@ pub enum LspLoadPhase {
 pub enum LspUiMessage {
     Progress(LspLoadPhase),
     AddFunction(crate::WorkspaceSymbolInfo),
-    /// A finished call graph, functions and edges together, to merge in whole.
+    /// A finished call graph, functions and edges together: the whole of it,
+    /// replacing whatever the app held — a reload's graph included, so what
+    /// was deleted from the source is gone.
     ///
     /// What a backend sends that reads the whole build before it answers — the
     /// libclang indexer — rather than discovering symbols and asking for their

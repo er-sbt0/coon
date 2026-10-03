@@ -74,6 +74,11 @@ pub enum AppEvent {
     },
     /// Workspace symbols refresh is in flight.
     RefreshingWorkspaceSymbols,
+    /// A refresh was asked for while the backend is still loading, and was
+    /// not started: the load under way already reads the project as it
+    /// stands. Only a whole-graph backend says this, since its refresh is a
+    /// load.
+    AlreadyLoading,
     /// Workspace symbols loaded after a refresh.
     WorkspaceSymbolsLoaded {
         count: usize,

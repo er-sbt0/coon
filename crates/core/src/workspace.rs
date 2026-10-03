@@ -303,6 +303,38 @@ impl CoreWorkspace {
         true
     }
 
+    /// Carry this workspace across a graph that was replaced rather than
+    /// grown — a whole-graph backend's refresh. `translate` says what each
+    /// symbol is called in the new graph, or `None` if it is gone.
+    ///
+    /// What survives keeps its place; what vanished is let go of in the way
+    /// that leaves a view still worth looking at. A root that is gone takes
+    /// the rooted view with it, back to the map — a tree grown from nothing is
+    /// a blank canvas under a breadcrumb naming a function that no longer
+    /// exists — and a scope that is gone widens to the whole program.
+    /// Collapsed and expanded nodes are per-node marks and simply drop.
+    /// The zoom is kept unless the scope moved, the rule
+    /// [`Self::set_map_scope`] applies; a ladder rebuilt over an edited
+    /// program is still about as tall, and `CoreApp` clamps it either way.
+    ///
+    /// Not through `set_root`: a root that survived is the *same* tree, and
+    /// `set_root` would throw its collapse marks away as if it were a new one.
+    pub fn carry_over(&mut self, translate: impl Fn(SymbolId) -> Option<SymbolId>) {
+        self.root_symbol = self.root_symbol.and_then(&translate);
+        if self.root_symbol.is_none() && self.view == ViewMode::Rooted {
+            self.view = ViewMode::ClusterMap;
+        }
+        self.collapsed = self.collapsed.iter().filter_map(|&id| translate(id)).collect();
+        self.expanded = self.expanded.iter().filter_map(|&id| translate(id)).collect();
+        if let Some(scope) = self.map_scope {
+            let carried = translate(scope);
+            if carried != Some(scope) {
+                self.map_level = None;
+            }
+            self.map_scope = carried;
+        }
+    }
+
     // ---- Readers ----
     //
     // The fields behind these are private, and the setters above are why. Each

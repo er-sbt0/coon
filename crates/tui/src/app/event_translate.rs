@@ -57,6 +57,8 @@ pub fn app_event_to_status(event: &AppEvent) -> Option<StatusMessage> {
             Some(StatusMessage::FindingReferences { name: name.clone() })
         }
         AppEvent::RefreshingWorkspaceSymbols => Some(StatusMessage::RefreshingWorkspaceSymbols),
+        // Only the libclang backend says this, and the TUI runs on clangd.
+        AppEvent::AlreadyLoading => None,
         AppEvent::WorkspaceSymbolsLoaded { count } => {
             Some(StatusMessage::WorkspaceSymbolsLoaded { count: *count })
         }

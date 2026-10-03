@@ -469,6 +469,16 @@ impl EventRouter {
                         forward.push(event.clone());
                     }
                 }
+                // Any other phase means a load is running again — a libclang
+                // refresh re-parses from `DiscoveringFiles` — so the next
+                // `Completed` is news and must go out, with the snapshot that
+                // carries the graph it finished. Without this the latch held
+                // across the reload: the client was never told stage 1 had
+                // ended, and never sent the new graph.
+                AppEvent::LspProgress(_) => {
+                    self.lsp_completed_sent = false;
+                    forward.push(event.clone());
+                }
                 // Graph is now fully populated — resnapshot so the client can
                 // show the function picker with all loaded symbols. Deliberately
                 // not also forwarded as an Event: the snapshot supersedes it and
@@ -581,6 +591,22 @@ mod tests {
 
         assert_eq!(routed.forward.len(), 2);
         assert!(!routed.resnapshot);
+    }
+
+    /// `Completed` goes out once per load, not once per router: a libclang
+    /// refresh is a second load, and its end has to reach the client with the
+    /// snapshot carrying the new graph.
+    #[test]
+    fn completed_goes_out_again_after_a_reload() {
+        let mut router = EventRouter::new();
+        let done = AppEvent::LspProgress(LspLoadPhase::Completed);
+        assert!(router.route(&[done.clone()]).resnapshot);
+        assert!(router.route(&[done.clone()]).forward.is_empty(), "latched");
+
+        router.route(&[AppEvent::LspProgress(LspLoadPhase::DiscoveringFiles)]);
+        let routed = router.route(&[done]);
+        assert_eq!(routed.forward.len(), 1);
+        assert!(routed.resnapshot);
     }
 
     #[test]

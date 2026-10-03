@@ -115,19 +115,42 @@ pub fn spawn_bridge(backend: Backend, project_path: &str, options: LoaderOptions
 /// status bar already shows for clangd's own indexing.
 ///
 /// The bridge has no worker: there is nothing to ask afterwards, since the
-/// graph arrives with all its edges.
+/// graph arrives with all its edges. What it has instead is a way to ask for
+/// the whole load again — `Command::Refresh`, through
+/// [`LspBridge::send_reload`] — and the task stays alive between loads to hear
+/// it. Same project, same options, every time: a refresh re-reads the build as
+/// it now stands on disk, `compile_commands.json` included, and is not a way
+/// to pick a different one.
+///
+/// The task loads once on spawn and then once per `()` on the reload channel,
+/// until the bridge, and with it the sender, is dropped. It does not coalesce
+/// requests itself: the bridge never sends one while a load is running (see
+/// [`LspBridge::load_in_progress`]), so every request is one parse. Draining
+/// the channel here instead would be a race — the loader sends `Completed`,
+/// the user asks again at once, and a drain that runs after the ask swallows
+/// it.
 pub fn spawn_libclang_bridge(project_path: &str, options: LoaderOptions) -> LspBridge {
     let (ui_msg_tx, ui_msg_rx) = mpsc::unbounded_channel::<LspUiMessage>();
+    let (reload_tx, mut reload_rx) = mpsc::unbounded_channel::<()>();
     let project_path = std::path::PathBuf::from(project_path);
     tokio::spawn(async move {
-        if let Err(e) = libclang_loader_task(project_path, options, ui_msg_tx.clone()).await {
-            log::error!("libclang loader failed: {e:#}");
-            let _ = ui_msg_tx.send(LspUiMessage::Progress(LspLoadPhase::Failed(format!(
-                "{e:#}"
-            ))));
+        loop {
+            if let Err(e) =
+                libclang_loader_task(project_path.clone(), options.clone(), ui_msg_tx.clone())
+                    .await
+            {
+                log::error!("libclang loader failed: {e:#}");
+                let _ = ui_msg_tx.send(LspUiMessage::Progress(LspLoadPhase::Failed(format!(
+                    "{e:#}"
+                ))));
+            }
+            if reload_rx.recv().await.is_none() {
+                break;
+            }
+            log::info!("[libclang] reloading {}", project_path.display());
         }
     });
-    LspBridge::new_with_status(ui_msg_rx)
+    LspBridge::new_with_reloader(ui_msg_rx, reload_tx)
 }
 
 async fn libclang_loader_task(
