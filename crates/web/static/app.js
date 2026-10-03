@@ -166,6 +166,7 @@ let clusterTopSpec   = null;          // the knob that belongs to no one method
 let selectedClusterId = null;         // the box pointed at on the map, if it is still on this rung
 let lastFitKey       = null;                      // refit only on root/direction change
 let parseReport      = null;          // how much of the build was parsed; null under clangd
+let capabilities     = null;          // what the backend can be asked; null until the first snapshot
 let readyShown       = false;         // whether the status line is the ready line, to redraw it
 
 const MAX_FIT_ZOOM = 1.15;
@@ -220,7 +221,11 @@ function handleSnapshot(msg) {
   workspaces      = msg.workspaces || [];
   activeWorkspace = msg.active_workspace ?? 0;
   parseReport     = msg.parse ?? null;
+  capabilities    = msg.capabilities ?? null;
   if (readyShown) showReady();
+  // The demo has nothing to reload from, so it gets no button that does
+  // nothing. Before the first snapshot the button stays, as it always was.
+  $('refresh-btn').hidden = canRefresh() === false;
 
   const active = workspaces[activeWorkspace];
   rootNodeId = active?.selected ?? null;
@@ -1517,6 +1522,13 @@ function updateStatusFromEvent(key, payload) {
     if (!loading()) showReady();
   } else if (key === 'RefreshingWorkspaceSymbols') {
     setStatus('Refreshing', 'busy');
+  } else if (key === 'AlreadyLoading') {
+    setInfo('Already loading — the project is being read as it stands');
+  } else if (key === 'ReferencesFound' || key === 'NoReferencesFound') {
+    // The count is the answer: the locations stay on the backend's node, and
+    // nothing here draws them yet. Held, because it answers a command.
+    const name = allFunctions[payload?.symbol_id]?.name || 'this function';
+    holdInfo(`${plural(payload?.count ?? 0, 'reference', 'references')} to ${name}`);
   } else if (key === 'CannotCloseLastWorkspace') {
     setInfo('Cannot close the last graph');
   } else if (key === 'LspError') {
@@ -2056,8 +2068,17 @@ function buildCommands() {
     // — so this is the one graph command that is never greyed out on the map.
     { id: 'graph.export', label: 'Graph: Export as Graphviz (DOT)', hint: 'Ctrl+E', run: exportGraph },
 
-    { id: 'lsp.refresh', label: 'LSP: Refresh Symbols', hint: 'Ctrl+R', run: () => sendCommand('Refresh') },
-    { id: 'lsp.refs', label: 'LSP: Find References', disabled: !selectedNodeId, run: () => sendCommand('FindReferences') },
+    // Offered only where the backend can answer: a command that is sent and
+    // silently declined looks like a broken key. Under libclang a refresh is
+    // a whole re-parse, so it says that rather than "symbols".
+    {
+      id: 'lsp.refresh',
+      label: capabilities?.call_hierarchy === false ? 'Project: Re-index' : 'LSP: Refresh Symbols',
+      hint: 'Ctrl+R',
+      disabled: canRefresh() === false,
+      run: () => sendCommand('Refresh'),
+    },
+    { id: 'lsp.refs', label: 'LSP: Find References', disabled: !selectedNodeId || capabilities?.references === false, run: () => sendCommand('FindReferences') },
   ];
 
   // One entry per clustering method, so a method added in `logic` is reachable
@@ -2090,6 +2111,12 @@ function buildCommands() {
 /// The backend does the rendering and hands back `{ filename, contents }`;
 /// `GraphExported` below is where it lands. Nothing is drawn or re-fetched, so
 /// this costs no snapshot.
+/// Whether the backend can refresh: true, false, or undefined before the first
+/// snapshot has said — which is treated as yes, the way it always was.
+function canRefresh() {
+  return capabilities?.refresh;
+}
+
 function exportGraph() {
   sendCommand({ ExportGraph: 'Dot' });
 }
@@ -2152,7 +2179,7 @@ document.addEventListener('keydown', (e) => {
     if (workspaces.length > 1) sendCommand({ CloseWorkspace: activeWorkspace });
   }
   else if (key === 'f') { e.preventDefault(); searchEl.focus(); searchEl.select(); }
-  else if (key === 'r') { e.preventDefault(); sendCommand('Refresh'); }
+  else if (key === 'r') { e.preventDefault(); if (canRefresh() !== false) sendCommand('Refresh'); }
   else if (key === 'e') { e.preventDefault(); exportGraph(); }
   else if (key === 'm' && e.shiftKey) { e.preventDefault(); clusterThisFunction(); }
   else if (key === 'm') { e.preventDefault(); toggleView(); }

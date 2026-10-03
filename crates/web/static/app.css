@@ -615,6 +615,9 @@ body.resizing { cursor: col-resize; user-select: none; }
 
 #palette { position: fixed; inset: 0; z-index: 1000; }
 #palette[hidden] { display: none; }
+/* A pill is `display: flex`, which outranks the attribute; the refresh pill is
+   hidden where the backend has nothing to reload from. */
+.pill[hidden] { display: none; }
 
 #palette-backdrop { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.45); }
 
