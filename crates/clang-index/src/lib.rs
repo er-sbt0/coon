@@ -7,8 +7,8 @@
 //! in it and the calls inside their bodies, and drops the AST before the next.
 //! The parsers are worker processes (see `pool`), one AST each, so a crash or
 //! a hang in libclang costs one TU rather than the app; and since the result
-//! of every TU is merged in job order once all are in (see `merge`), how many
-//! there are and which finishes first change nothing in the graph.
+//! of every TU is merged in job order (see `Merge`), how many there are and
+//! which finishes first change nothing in the graph.
 //!
 //! libclang has no index that spans translation units, so a TU only knows the
 //! calls written in it. That is enough for a function's *callees* — they are
@@ -34,7 +34,7 @@ pub mod args;
 mod pool;
 pub mod worker;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
@@ -78,15 +78,24 @@ pub struct Report {
 struct Definition {
     name: String,
     qualified_name: String,
-    location: Location,
+    location: Site,
 }
 
-/// One call, by USR on both ends.
+/// One call, by USR on both ends, every string a number in the run's
+/// [`Strings`].
 struct Call {
-    caller: String,
-    callee: String,
-    location: Location,
+    caller: u32,
+    callee: u32,
+    location: Site,
 }
+
+/// A place in the source: the file as a number into whichever string table the
+/// value travels with, then line and column, 1-based as `model::Location` is.
+///
+/// A tuple so that on the wire it is `[file,line,column]`: there is one per
+/// call, and field names would be most of each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct Site(u32, u32, u32);
 
 /// One translation unit to parse, as handed to whoever parses it: a [`Job`]
 /// with the arguments already refused left out, and its flavour as a number.
@@ -117,6 +126,12 @@ pub(crate) struct Parsed {
     error_samples: Vec<String>,
     /// Each argument libclang refused, with the diagnostic that said so.
     rejected: Vec<(String, String)>,
+    /// Every USR and file path the walk below names, once each, which the
+    /// numbers in it index. A header's path is otherwise written out once per
+    /// call made in it and a hot callee's USR once per call of it; most of
+    /// what a TU sends was those repeats. Emptied by [`Strings::adopt`], once
+    /// the numbers have been made the run's.
+    strings: Vec<String>,
     /// The definitions whose bodies this parse walked, in source order.
     walked: Vec<Walked>,
     elapsed_ms: u64,
@@ -125,12 +140,83 @@ pub(crate) struct Parsed {
 /// One definition and the calls in its body.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Walked {
-    usr: String,
+    usr: u32,
     name: String,
     qualified_name: String,
-    location: Location,
+    location: Site,
     /// Callee USR and where the call is written, in source order.
-    calls: Vec<(String, Location)>,
+    calls: Vec<(u32, Site)>,
+}
+
+/// Strings given numbers in the order first met, each kept once.
+///
+/// A parse numbers what it names in a table of its own, since it cannot know
+/// the run's; the parent folds each into the run's table as it arrives
+/// ([`Strings::adopt`]), so a result waiting its turn in the merge holds
+/// numbers rather than copies of strings every other result also holds.
+#[derive(Default)]
+struct Strings {
+    numbers: HashMap<String, u32>,
+}
+
+impl Strings {
+    fn number(&mut self, text: &str) -> u32 {
+        if let Some(&n) = self.numbers.get(text) {
+            return n;
+        }
+        let n = self.numbers.len() as u32;
+        self.numbers.insert(text.to_owned(), n);
+        n
+    }
+
+    /// Renumber a result from its own table into this one, and drop its table.
+    ///
+    /// `None` for a result naming a number its table does not have. Only a
+    /// broken worker sends one, and it is checked rather than indexed because
+    /// a panic here would take down the process the workers exist to protect.
+    fn adopt(&mut self, parsed: &mut Parsed) -> Option<()> {
+        let map: Vec<u32> = parsed.strings.iter().map(|s| self.number(s)).collect();
+        parsed.strings = Vec::new();
+        let renumber = |n: &mut u32| -> Option<()> {
+            *n = *map.get(*n as usize)?;
+            Some(())
+        };
+        for walked in &mut parsed.walked {
+            renumber(&mut walked.usr)?;
+            renumber(&mut walked.location.0)?;
+            for (callee, location) in &mut walked.calls {
+                renumber(callee)?;
+                renumber(&mut location.0)?;
+            }
+        }
+        Some(())
+    }
+
+    /// Every string, indexed by its number.
+    fn by_number(&self) -> Vec<&str> {
+        let mut out = vec![""; self.numbers.len()];
+        for (text, &n) in &self.numbers {
+            out[n as usize] = text;
+        }
+        out
+    }
+}
+
+/// A parse's own string table, as it fills.
+#[derive(Default)]
+struct LocalStrings {
+    table: Strings,
+    list: Vec<String>,
+}
+
+impl LocalStrings {
+    fn number(&mut self, text: &str) -> u32 {
+        let n = self.table.number(text);
+        if n as usize == self.list.len() {
+            self.list.push(text.to_owned());
+        }
+        n
+    }
 }
 
 /// Parse every job in order, in this process, and build the call graph of what
@@ -166,10 +252,11 @@ pub fn index(
 /// (see [`worker`]), or done in this process at zero.
 ///
 /// The graph does not depend on the worker count or on which TU finishes
-/// first: every TU's result is held until the run ends and merged in job
-/// order, by the same rule a serial run follows. A worker that crashes or runs
-/// past `options.timeout` costs the TU it was on, counted in `failed`, and is
-/// replaced. Cancelling `cancel` kills the workers and returns an error.
+/// first: results are merged in job order, by the same rule a serial run
+/// follows, each as soon as every job before it is in (see [`Merge`]). A
+/// worker that crashes or runs past `options.timeout` costs the TU it was on,
+/// counted in `failed`, and is replaced. Cancelling `cancel` kills the
+/// workers and returns an error.
 pub fn index_with(
     root: &Path,
     jobs: &[Job],
@@ -189,11 +276,10 @@ pub fn index_with(
         })
         .collect();
 
+    let mut merge = Merge::new(jobs, &flavours);
     let workers = options.workers.min(jobs.len());
-    let outcomes = if workers == 0 {
-        None
-    } else {
-        pool::run(
+    let in_workers = workers > 0
+        && pool::run(
             root,
             jobs,
             &flavours,
@@ -201,28 +287,34 @@ pub fn index_with(
             options,
             cancel,
             &mut on_progress,
-        )?
-    };
-    let outcomes = match outcomes {
-        Some(outcomes) => outcomes,
-        None => in_process(root, jobs, &flavours, cancel, &mut on_progress)?,
-    };
-    Ok(merge(jobs, &flavours, numbers.len(), outcomes, started))
+            &mut |i, outcome| merge.arrive(i, outcome),
+        )?;
+    if !in_workers {
+        in_process(
+            root,
+            jobs,
+            &flavours,
+            cancel,
+            &mut on_progress,
+            &mut |i, outcome| merge.arrive(i, outcome),
+        )?;
+    }
+    Ok(merge.finish(numbers.len(), started))
 }
 
-/// Parse every job here, one after another.
+/// Parse every job here, one after another, handing each outcome to `sink`.
 fn in_process(
     root: &Path,
     jobs: &[Job],
     flavours: &[usize],
     cancel: &Cancel,
     on_progress: &mut impl FnMut(usize, usize),
-) -> anyhow::Result<Vec<Outcome>> {
+    sink: &mut impl FnMut(usize, Outcome),
+) -> anyhow::Result<()> {
     let clang = Clang::new().map_err(|e| anyhow::anyhow!("could not load libclang: {e}"))?;
     let index = Index::new(&clang, false, false);
     let mut parser = Parser::new(root);
     let mut rejected: Vec<String> = Vec::new();
-    let mut outcomes = Vec::with_capacity(jobs.len());
     for (i, job) in jobs.iter().enumerate() {
         if cancel.is_cancelled() {
             anyhow::bail!("the index run was cancelled");
@@ -235,10 +327,10 @@ fn in_process(
                 }
             }
         }
-        outcomes.push(outcome);
+        sink(i, outcome);
         on_progress(i + 1, jobs.len());
     }
-    Ok(outcomes)
+    Ok(())
 }
 
 /// The request for job `i`, without the arguments already refused.
@@ -262,7 +354,7 @@ pub(crate) fn request(i: usize, job: &Job, flavour: usize, rejected: &[String]) 
     }
 }
 
-/// Fold every TU's result into one report, in job order.
+/// Every TU's result folded into one, in job order.
 ///
 /// This is where the serial rule is applied, whoever did the parsing: a body
 /// is kept from the first job of its flavour, in job order, to walk it, and a
@@ -271,66 +363,112 @@ pub(crate) fn request(i: usize, job: &Job, flavour: usize, rejected: &[String]) 
 /// be walked by more than one of them; but each is handed jobs in increasing
 /// order, so the lowest job to define it is always among those that report it,
 /// and the rest are dropped here.
-fn merge(
-    jobs: &[Job],
-    flavours: &[usize],
-    flavour_count: usize,
-    outcomes: Vec<Outcome>,
-    started: Instant,
-) -> Report {
-    let mut definitions: Vec<(String, Definition)> = Vec::new();
-    // Per USR, the flavours whose body of it has been kept.
-    let mut defined: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut calls: Vec<Call> = Vec::new();
-    let mut parsed = 0usize;
-    let mut failed = 0usize;
-    let mut errors = 0usize;
-    let mut tus_with_errors = 0usize;
-    let mut rejected: Vec<String> = Vec::new();
+///
+/// Results are folded as they arrive, not once the run is over. A result
+/// ahead of the next in job order waits in `waiting` until the ones before it
+/// are in, and then they go in together; so what the parent holds is the
+/// merged graph so far plus the results that overtook a slower TU, rather
+/// than every result of the run. That matters because with N parsers a
+/// header's inline bodies are walked up to N times per flavour, and all but
+/// one of those walks are dropped here: holding them all to the end held the
+/// duplicates too.
+struct Merge<'a> {
+    jobs: &'a [Job],
+    flavours: &'a [usize],
+    strings: Strings,
+    /// Results that came in ahead of `next`, by job index.
+    waiting: BTreeMap<usize, Outcome>,
+    /// The first job not yet folded in.
+    next: usize,
+    definitions: Vec<(u32, Definition)>,
+    /// Per USR, the flavours whose body of it has been kept.
+    defined: HashMap<u32, Vec<usize>>,
+    calls: Vec<Call>,
+    parsed: usize,
+    failed: usize,
+    errors: usize,
+    tus_with_errors: usize,
+    rejected: Vec<String>,
+}
 
-    for ((job, &flavour), outcome) in jobs.iter().zip(flavours).zip(outcomes) {
+impl<'a> Merge<'a> {
+    fn new(jobs: &'a [Job], flavours: &'a [usize]) -> Self {
+        Self {
+            jobs,
+            flavours,
+            strings: Strings::default(),
+            waiting: BTreeMap::new(),
+            next: 0,
+            definitions: Vec::new(),
+            defined: HashMap::new(),
+            calls: Vec::new(),
+            parsed: 0,
+            failed: 0,
+            errors: 0,
+            tus_with_errors: 0,
+            rejected: Vec::new(),
+        }
+    }
+
+    /// Take job `i`'s outcome, in whatever order they come.
+    fn arrive(&mut self, i: usize, mut outcome: Outcome) {
+        if let Outcome::Parsed(parsed) = &mut outcome {
+            if self.strings.adopt(parsed).is_none() {
+                outcome = Outcome::Failed("its result named strings it did not send".into());
+            }
+        }
+        self.waiting.insert(i, outcome);
+        while let Some(outcome) = self.waiting.remove(&self.next) {
+            self.fold(self.next, outcome);
+            self.next += 1;
+        }
+    }
+
+    fn fold(&mut self, i: usize, outcome: Outcome) {
+        let (job, flavour) = (&self.jobs[i], self.flavours[i]);
         let result = match outcome {
             Outcome::Parsed(result) => result,
             Outcome::Failed(reason) => {
-                failed += 1;
+                self.failed += 1;
                 log::warn!(
                     "[clang-index] could not parse {}: {reason}",
                     job.file.display()
                 );
-                continue;
+                return;
             }
         };
-        parsed += 1;
+        self.parsed += 1;
         for (argument, text) in result.rejected {
-            if !rejected.contains(&argument) {
+            if !self.rejected.contains(&argument) {
                 log::info!(
                     "[clang-index] libclang ignores {argument} ({text}); left out from here on"
                 );
-                rejected.push(argument);
+                self.rejected.push(argument);
             }
         }
         for sample in &result.error_samples {
             log::warn!("[clang-index] {}: {sample}", job.file.display());
         }
-        errors += result.errors;
+        self.errors += result.errors;
         if result.errors > 0 {
-            tus_with_errors += 1;
+            self.tus_with_errors += 1;
         }
-        let before = (definitions.len(), calls.len());
+        let before = (self.definitions.len(), self.calls.len());
         for walked in result.walked {
-            let kept = defined.entry(walked.usr.clone()).or_default();
+            let kept = self.defined.entry(walked.usr).or_default();
             if kept.contains(&flavour) {
                 continue;
             }
             let first = kept.is_empty();
             kept.push(flavour);
-            calls.extend(walked.calls.into_iter().map(|(callee, location)| Call {
-                caller: walked.usr.clone(),
-                callee,
-                location,
-            }));
+            self.calls
+                .extend(walked.calls.into_iter().map(|(callee, location)| Call {
+                    caller: walked.usr,
+                    callee,
+                    location,
+                }));
             if first {
-                definitions.push((
+                self.definitions.push((
                     walked.usr,
                     Definition {
                         name: walked.name,
@@ -344,42 +482,49 @@ fn merge(
             "[clang-index] {} in {}ms: {} new function(s), {} call(s), {} error(s)",
             job.file.display(),
             result.elapsed_ms,
-            definitions.len() - before.0,
-            calls.len() - before.1,
+            self.definitions.len() - before.0,
+            self.calls.len() - before.1,
             result.errors
         );
     }
 
-    if flavour_count > 1 {
-        let shared = defined.values().filter(|f| f.len() > 1).count();
-        log::info!(
-            "[clang-index] {} build flavour(s) in one graph: {} function(s) defined under more \
-             than one, their calls unioned",
-            flavour_count,
-            shared
+    fn finish(self, flavour_count: usize, started: Instant) -> Report {
+        debug_assert!(
+            self.waiting.is_empty() && self.next == self.jobs.len(),
+            "every job's outcome is in before the merge finishes"
         );
-    }
-    let (graph, external_calls) = build_graph(definitions, calls);
-    log::info!(
-        "[clang-index] {} TU(s) parsed ({} failed, {} with {} error diagnostic(s)) in {:.1?}: \
-         {} function(s), {} edge(s), {} call(s) out of the project",
-        parsed,
-        failed,
-        tus_with_errors,
-        errors,
-        started.elapsed(),
-        graph.node_count(),
-        graph.edge_count(),
-        external_calls
-    );
-    Report {
-        graph,
-        parsed,
-        failed,
-        errors,
-        tus_with_errors,
-        external_calls,
-        rejected_arguments: rejected,
+        if flavour_count > 1 {
+            let shared = self.defined.values().filter(|f| f.len() > 1).count();
+            log::info!(
+                "[clang-index] {} build flavour(s) in one graph: {} function(s) defined under \
+                 more than one, their calls unioned",
+                flavour_count,
+                shared
+            );
+        }
+        drop(self.defined);
+        let (graph, external_calls) = build_graph(self.definitions, self.calls, &self.strings);
+        log::info!(
+            "[clang-index] {} TU(s) parsed ({} failed, {} with {} error diagnostic(s)) in \
+             {:.1?}: {} function(s), {} edge(s), {} call(s) out of the project",
+            self.parsed,
+            self.failed,
+            self.tus_with_errors,
+            self.errors,
+            started.elapsed(),
+            graph.node_count(),
+            graph.edge_count(),
+            external_calls
+        );
+        Report {
+            graph,
+            parsed: self.parsed,
+            failed: self.failed,
+            errors: self.errors,
+            tus_with_errors: self.tus_with_errors,
+            external_calls,
+            rejected_arguments: self.rejected,
+        }
     }
 }
 
@@ -437,6 +582,7 @@ impl Parser {
             scope: &mut self.scope,
             seen: &mut self.walked,
             flavour: request.flavour,
+            strings: LocalStrings::default(),
             out: Vec::new(),
         };
         walk_translation_unit(tu.get_entity(), &mut walk);
@@ -444,6 +590,7 @@ impl Parser {
             errors,
             error_samples,
             rejected,
+            strings: walk.strings.list,
             walked: walk.out,
             elapsed_ms: started.elapsed().as_millis() as u64,
         })
@@ -456,6 +603,8 @@ struct Walk<'a> {
     seen: &'a mut HashMap<String, Vec<usize>>,
     /// The flavour of the TU being walked.
     flavour: usize,
+    /// What `out` names, numbered.
+    strings: LocalStrings,
     out: Vec<Walked>,
 }
 
@@ -474,32 +623,37 @@ impl Report {
 
 /// Turn what was collected into a graph, keeping only calls between two
 /// functions the project defines.
-fn build_graph(definitions: Vec<(String, Definition)>, calls: Vec<Call>) -> (CallGraph, usize) {
+fn build_graph(
+    definitions: Vec<(u32, Definition)>,
+    calls: Vec<Call>,
+    strings: &Strings,
+) -> (CallGraph, usize) {
+    let text = strings.by_number();
+    let location = |site: Site| Location {
+        file_path: text[site.0 as usize].to_owned(),
+        line: site.1,
+        column: site.2,
+        length: None,
+    };
     let mut graph = CallGraph::new();
-    let mut ids = HashMap::with_capacity(definitions.len());
+    let mut ids = vec![None; text.len()];
     for (usr, definition) in definitions {
         let id = graph.add_function(FunctionNode::new(
             definition.name,
             definition.qualified_name,
-            definition.location,
+            location(definition.location),
         ));
-        ids.insert(usr, id);
+        ids[usr as usize] = Some(id);
     }
     // A call site met twice — a header body walked under two flavours — is one
     // edge, because `add_call` keys an edge by its site; the external count is
     // held to the same rule, so it does not grow with the number of flavours.
     let mut external = HashSet::new();
     for call in calls {
-        match (ids.get(&call.caller), ids.get(&call.callee)) {
-            (Some(&caller), Some(&callee)) => graph.add_call(caller, callee, call.location),
+        match (ids[call.caller as usize], ids[call.callee as usize]) {
+            (Some(caller), Some(callee)) => graph.add_call(caller, callee, location(call.location)),
             _ => {
-                external.insert((
-                    call.caller,
-                    call.callee,
-                    call.location.file_path,
-                    call.location.line,
-                    call.location.column,
-                ));
+                external.insert((call.caller, call.callee, call.location));
             }
         }
     }
@@ -568,7 +722,7 @@ fn record_definition(entity: Entity<'_>, walk: &mut Walk<'_>) {
     {
         return;
     }
-    let Some(location) = location_of(entity, walk.scope) else {
+    let Some(location) = location_of(entity, walk.scope, &mut walk.strings) else {
         // Defined outside the project.
         return;
     };
@@ -577,6 +731,7 @@ fn record_definition(entity: Entity<'_>, walk: &mut Walk<'_>) {
     };
     let qualified_name = qualify(entity, &name);
     let scope = &mut *walk.scope;
+    let strings = &mut walk.strings;
     let mut calls = Vec::new();
 
     // A *reference* to a function, not only a call of it: that is what clangd's
@@ -613,16 +768,17 @@ fn record_definition(entity: Entity<'_>, walk: &mut Walk<'_>) {
             let Some(callee) = callee.get_usr() else {
                 continue;
             };
-            if let Some(location) = location_of(child, scope) {
-                calls.push((callee.0, location));
+            if let Some(location) = location_of(child, scope, strings) {
+                calls.push((strings.number(&callee.0), location));
             }
         }
         EntityVisitResult::Recurse
     });
 
-    walk.seen.entry(usr.clone()).or_default().push(walk.flavour);
+    let number = walk.strings.number(&usr);
+    walk.seen.entry(usr).or_default().push(walk.flavour);
     walk.out.push(Walked {
-        usr,
+        usr: number,
         name,
         qualified_name,
         location,
@@ -656,16 +812,15 @@ fn qualify(entity: Entity<'_>, name: &str) -> String {
 /// The file location rather than the spelling location: inside a macro
 /// expansion that is where the macro was used, which is the line a reader looks
 /// for the call on.
-fn location_of(entity: Entity<'_>, scope: &mut Scope) -> Option<Location> {
+fn location_of(entity: Entity<'_>, scope: &mut Scope, strings: &mut LocalStrings) -> Option<Site> {
     let location = entity.get_location()?.get_file_location();
     let file = location.file?;
     let file_path = scope.resolve(&file.get_path())?;
-    Some(Location {
-        file_path,
-        line: location.line,
-        column: location.column,
-        length: None,
-    })
+    Some(Site(
+        strings.number(file_path),
+        location.line,
+        location.column,
+    ))
 }
 
 /// The project root, and a cache of which files libclang names lie under it.
@@ -696,7 +851,7 @@ impl Scope {
     }
 
     /// The path to report for `path`, if it is project code.
-    fn resolve(&mut self, path: &Path) -> Option<String> {
+    fn resolve(&mut self, path: &Path) -> Option<&str> {
         let joined;
         let path = if path.is_relative() {
             joined = self.directory.join(path);
@@ -704,15 +859,14 @@ impl Scope {
         } else {
             path
         };
-        if let Some(known) = self.files.get(path) {
-            return known.clone();
+        if !self.files.contains_key(path) {
+            let canonical = path.canonicalize().unwrap_or_else(|_| normalise(path));
+            let resolved = canonical
+                .starts_with(&self.root)
+                .then(|| canonical.to_string_lossy().into_owned());
+            self.files.insert(path.to_path_buf(), resolved);
         }
-        let canonical = path.canonicalize().unwrap_or_else(|_| normalise(path));
-        let resolved = canonical
-            .starts_with(&self.root)
-            .then(|| canonical.to_string_lossy().into_owned());
-        self.files.insert(path.to_path_buf(), resolved.clone());
-        resolved
+        self.files[path].as_deref()
     }
 }
 

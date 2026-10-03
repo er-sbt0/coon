@@ -10,7 +10,7 @@
 //!
 //! Each worker gets a thread here that hands it one job at a time from a
 //! shared counter, so every worker sees an increasing run of job indices —
-//! which is what lets `merge` reproduce the serial graph exactly (see there).
+//! which is what lets `Merge` reproduce the serial graph exactly (see there).
 //! A worker that dies, or that is still on one TU after the timeout, is
 //! killed; the TU counts as failed and the next job goes to a fresh worker.
 //!
@@ -40,6 +40,14 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 /// the reason this backend exists; past eight the parse is mostly waiting on
 /// the slowest TU anyway.
 const DEFAULT_MAX_WORKERS: usize = 8;
+
+/// What one more worker is allowed to cost, for sizing the default against
+/// the memory the machine has free. Measured on jemalloc a worker's own pages
+/// peak at 50–80 MB, and its RSS at ~120 MB of which ~70 MB is libclang,
+/// mapped from the one file and shared by every worker; its proportional
+/// share comes to ~60 MB. This is several times that, for the AST of a large
+/// C++ TU, which is where a worker's private pages go.
+const WORKER_MEMORY: u64 = 256 << 20;
 
 /// How long a new worker has to load libclang and say it is ready.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -80,12 +88,12 @@ impl WorkerCommand {
 }
 
 impl Default for Options {
-    /// One worker per core, up to [`DEFAULT_MAX_WORKERS`], each this
-    /// executable re-run.
+    /// One worker per core, up to [`DEFAULT_MAX_WORKERS`] and to as many as
+    /// fit in the memory available at [`WORKER_MEMORY`] each, but at least
+    /// one; each this executable re-run.
     fn default() -> Self {
-        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
         Self {
-            workers: cores.min(DEFAULT_MAX_WORKERS),
+            workers: default_workers(),
             timeout: DEFAULT_TIMEOUT,
             worker: WorkerCommand::current_exe(),
         }
@@ -105,6 +113,44 @@ impl Options {
         }
         options
     }
+}
+
+/// See [`Options::default`]. The memory check is what keeps a machine that is
+/// already short from being pushed into swap by a parse it did not size: eight
+/// workers summed to ~400 MB proportional (~900 MB RSS) on jemalloc against
+/// ~120 MB for one. It only ever lowers the count; `COON_INDEX_JOBS` overrides
+/// it either way.
+fn default_workers() -> usize {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let wanted = cores.min(DEFAULT_MAX_WORKERS);
+    let Some(available) = available_memory() else {
+        return wanted;
+    };
+    let fit = usize::try_from(available / WORKER_MEMORY)
+        .unwrap_or(usize::MAX)
+        .max(1);
+    if fit < wanted {
+        log::info!(
+            "[clang-index] {} MB of memory available: {fit} worker(s) rather than {wanted}",
+            available >> 20
+        );
+    }
+    wanted.min(fit)
+}
+
+/// `MemAvailable` from `/proc/meminfo`: the kernel's estimate of what can be
+/// allocated without swapping, page cache included, which free memory is not.
+#[cfg(target_os = "linux")]
+fn available_memory() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = meminfo.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn available_memory() -> Option<u64> {
+    None
 }
 
 fn env_number(name: &str) -> Option<usize> {
@@ -139,9 +185,11 @@ struct Dispatch {
     rejected: Vec<String>,
 }
 
-/// Parse `jobs` in `workers` processes and return every TU's outcome in job
-/// order, or `None` if not even one worker would start — the caller then
-/// parses in process rather than not at all.
+/// Parse `jobs` in `workers` processes, handing each TU's outcome to `sink` as
+/// it comes in — in no particular order, and every job exactly once. Returns
+/// `false` if not even one worker would start, having handed over nothing:
+/// the caller then parses in process rather than not at all.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     root: &Path,
     jobs: &[Job],
@@ -150,7 +198,8 @@ pub(crate) fn run(
     options: &Options,
     cancel: &Cancel,
     on_progress: &mut impl FnMut(usize, usize),
-) -> anyhow::Result<Option<Vec<Outcome>>> {
+    sink: &mut impl FnMut(usize, Outcome),
+) -> anyhow::Result<bool> {
     // The first worker is started here, so that a binary that cannot be one
     // is found out once rather than once per job.
     let first = match Worker::spawn(&options.worker, root) {
@@ -162,7 +211,7 @@ pub(crate) fn run(
                 options.worker.program.display(),
                 options.worker.args
             );
-            return Ok(None);
+            return Ok(false);
         }
     };
     log::info!(
@@ -176,7 +225,7 @@ pub(crate) fn run(
         rejected: Vec::new(),
     });
     let (results_tx, results_rx) = mpsc::channel::<(usize, Outcome)>();
-    let mut outcomes: Vec<Option<Outcome>> = (0..jobs.len()).map(|_| None).collect();
+    let mut delivered = vec![false; jobs.len()];
 
     std::thread::scope(|threads| {
         let mut first = Some(first);
@@ -204,7 +253,8 @@ pub(crate) fn run(
                             }
                         }
                     }
-                    outcomes[i] = Some(outcome);
+                    delivered[i] = true;
+                    sink(i, outcome);
                     done += 1;
                     on_progress(done, jobs.len());
                 }
@@ -218,12 +268,10 @@ pub(crate) fn run(
     if cancel.is_cancelled() {
         anyhow::bail!("the index run was cancelled");
     }
-    Ok(Some(
-        outcomes
-            .into_iter()
-            .map(|o| o.unwrap_or_else(|| Outcome::Failed("no worker returned it".into())))
-            .collect(),
-    ))
+    for (i, _) in delivered.iter().enumerate().filter(|(_, d)| !**d) {
+        sink(i, Outcome::Failed("no worker returned it".into()));
+    }
+    Ok(true)
 }
 
 /// One worker's thread: take the next job, have the worker parse it, send the
