@@ -153,6 +153,10 @@ pub enum ServerMsg<'a> {
         /// under clangd and in demo mode, where the status bar says "Ready".
         #[serde(skip_serializing_if = "Option::is_none")]
         parse: Option<WireParse<'a>>,
+        /// What the backend can be asked after the load, so a client can leave
+        /// out a command this one cannot answer instead of offering it and
+        /// saying nothing. On the snapshot for the same reason `parse` is.
+        capabilities: crate::lsp_bridge::BackendCapabilities,
     },
     /// A single `AppEvent` forwarded verbatim for status display.
     Event { event: AppEvent },
@@ -289,6 +293,7 @@ pub fn snapshot_of(core: &CoreApp) -> ServerMsg<'_> {
         active_workspace: core.workspaces.current_index,
         selected: core.selected_function,
         parse: core.lsp.parse_summary().map(WireParse::of),
+        capabilities: core.capabilities(),
     }
 }
 
@@ -961,6 +966,24 @@ mod tests {
         assert_eq!(parse["external_calls"], 1234);
         assert_eq!(parse["rejected_arguments"][0], "-fconserve-stack");
         assert_eq!(parse["quality"], "partial");
+    }
+
+    /// The snapshot says what the backend can be asked, so the client can
+    /// leave out what it cannot.
+    #[test]
+    fn snapshot_carries_the_backend_capabilities() {
+        let mut core = CoreApp::new(CallGraph::new());
+        let json = serde_json::to_value(snapshot_of(&core)).expect("snapshot serialises");
+        assert_eq!(json["capabilities"]["call_hierarchy"], false, "the demo is whole");
+        assert_eq!(json["capabilities"]["refresh"], false);
+
+        let (_loader_tx, loader_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_channels_tx, channels_rx) = tokio::sync::oneshot::channel();
+        core.lsp = crate::lsp_bridge::LspBridge::new_with_loader(loader_rx, channels_rx);
+        let json = serde_json::to_value(snapshot_of(&core)).expect("snapshot serialises");
+        for capability in ["call_hierarchy", "references", "symbol_query", "refresh"] {
+            assert_eq!(json["capabilities"][capability], true, "{capability}");
+        }
     }
 
     /// A knob moved in the panel has to survive the round trip and land on

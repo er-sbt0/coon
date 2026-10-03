@@ -19,6 +19,9 @@ pub use events::AppEvent;
 pub use export::{Export, ExportFormat};
 pub use layout::{compute_layout, NodePos};
 pub use lsp::LoaderOptions;
-pub use lsp_bridge::{LoadingState, LspBridge, PendingRequest, RequestOrigin, SendOutcome};
+pub use lsp_bridge::{
+    BackendCapabilities, Capability, LoadingState, LspBridge, PendingRequest, RequestOrigin,
+    SendOutcome,
+};
 pub use protocol::{snapshot_of, ClientMsg, EventRouter, Routed, ServerMsg, WorkspaceInfo};
 pub use workspace::{CoreWorkspace, CoreWorkspaceManager, ViewMode};

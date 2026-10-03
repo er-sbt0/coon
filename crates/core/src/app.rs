@@ -9,7 +9,10 @@ use model::{CallDirection, CallGraph, FunctionNode, Location, LspLoadPhase, Symb
 use crate::command::Command;
 use crate::events::AppEvent;
 use crate::layout::{compute_map_frame, GraphDepth, LayoutOrientation, MapFrame};
-use crate::lsp_bridge::{LoadingState, LspBridge, PendingRequest, RequestOrigin, SendOutcome};
+use crate::lsp_bridge::{
+    BackendCapabilities, Capability, LoadingState, LspBridge, PendingRequest, RequestOrigin,
+    SendOutcome,
+};
 use crate::warmup::WarmupQueue;
 use crate::workspace::{CoreWorkspace, CoreWorkspaceManager, ViewMode};
 
@@ -398,6 +401,12 @@ impl CoreApp {
         }
     }
 
+    /// What the backend behind this app can be asked. See
+    /// [`BackendCapabilities`].
+    pub fn capabilities(&self) -> BackendCapabilities {
+        self.lsp.capabilities()
+    }
+
     /// The cluster map this workspace is looking at: its method, over its
     /// scope, in its direction.
     ///
@@ -559,13 +568,13 @@ impl CoreApp {
         }
 
         // Merge whole graphs from a backend that reads the build up front. They
-        // arrive with their edges, so every node is already as loaded as it
-        // will ever be: marking it so is what stops a click from asking a
-        // worker that does not exist.
+        // arrive with their edges, and nothing is marked on the way in: that
+        // every node is as loaded as it will ever be follows from the backend
+        // having no call hierarchy to ask (see `BackendCapabilities`), which
+        // is also what keeps the warmup and a click from asking it.
         for graph in self.lsp.take_graphs() {
             for function in graph.functions() {
-                let id = self.call_graph.add_function(function.clone());
-                self.lsp.set_loading_state(id, LoadingState::Loaded);
+                self.call_graph.add_function(function.clone());
             }
             for edge in graph.edges() {
                 self.call_graph
@@ -872,6 +881,16 @@ impl CoreApp {
     }
 
     fn cmd_refresh(&mut self) -> Vec<AppEvent> {
+        // Decided before anything is cleared: a backend that cannot reload has
+        // nothing to clear for, and its graph is the one it will always have.
+        if !self.lsp.capabilities().refresh {
+            return self
+                .lsp
+                .unsupported(Capability::Refresh)
+                .event()
+                .into_iter()
+                .collect();
+        }
         let direction = self.current_direction();
         // Everything in flight is about to become unanswerable — see
         // `LspBridge::clear` — so the symbols those requests named go back on
@@ -1564,7 +1583,12 @@ impl CoreApp {
         // live: before that there is nothing to send on. Everything already in
         // the graph goes in here; everything arriving after queues itself
         // through `ingest_symbol`.
+        // Never on a backend with no call hierarchy: its graph arrived with
+        // every edge, and there is nothing to warm. Asked of the capability
+        // rather than inferred from the missing worker, which a clangd bridge
+        // also lacks until its channels are handed over.
         if !self.warmup_seeded
+            && self.lsp.capabilities().call_hierarchy
             && matches!(self.lsp.status(), LspLoadPhase::Completed)
             && self.lsp.has_worker()
         {
@@ -4224,5 +4248,95 @@ mod tests {
             app.handle_lsp_response(prepared(request_id)).is_empty(),
             "a follow-up that could not be sent tells the frontend nothing"
         );
+    }
+
+    /// A libclang-shaped app: a bridge that hears from a loader and has nothing
+    /// to ask, handed one graph of two functions and one call, loaded.
+    fn whole_graph_app() -> (CoreApp, SymbolId, SymbolId) {
+        let mut graph = CallGraph::new();
+        let caller = add(&mut graph, "caller", 1);
+        let callee = add(&mut graph, "callee", 2);
+        graph.add_call(caller, callee, Location::new("test.c".to_string(), 1, 0));
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = CoreApp::new_with_lsp(CallGraph::new(), LspBridge::new_with_status(rx));
+        tx.send(model::LspUiMessage::AddGraph(Box::new(graph))).unwrap();
+        tx.send(model::LspUiMessage::Progress(LspLoadPhase::Completed))
+            .unwrap();
+        app.tick();
+        (app, caller, callee)
+    }
+
+    /// A backend that hands the graph over whole has every node loaded because
+    /// it has no call hierarchy, not because each node was marked on the way
+    /// in — and so nothing is ever fetched: no warmup, no loading state from a
+    /// click, nothing pending.
+    #[test]
+    fn a_whole_graph_backend_never_fetches_edges() {
+        let (mut app, caller, callee) = whole_graph_app();
+        assert_eq!(app.capabilities(), BackendCapabilities::WHOLE_GRAPH);
+        assert_eq!(app.call_graph.edge_count(), 1);
+        assert!(app.lsp.is_function_loaded(&caller));
+        assert_eq!(app.lsp.get_loading_state(&callee), &LoadingState::Loaded);
+
+        app.dispatch(Command::SelectFunction(caller));
+        app.dispatch(Command::ExpandFunction(callee));
+        app.dispatch(Command::StartGraphFromFunction(callee));
+        tick_until_settled(&mut app);
+
+        assert!(!app.lsp.is_function_loading(&caller));
+        assert!(!app.lsp.is_function_loading(&callee));
+        assert_eq!(app.lsp.pending_count(), 0, "nothing was asked");
+        assert!(!app.warmup_seeded, "there is nothing to warm");
+        assert!(!app.loading(), "the load is over once the graph is in");
+    }
+
+    /// What a whole-graph backend cannot answer is answered once, as
+    /// unsupported, and says nothing to the frontend — and a refresh does not
+    /// clear what it cannot bring back.
+    #[test]
+    fn a_whole_graph_backend_answers_unsupported_and_keeps_its_graph() {
+        let (mut app, caller, _) = whole_graph_app();
+        app.dispatch(Command::SelectFunction(caller));
+
+        assert!(app.dispatch(Command::Refresh).is_empty());
+        assert!(app.dispatch(Command::FindReferences).is_empty());
+        assert_eq!(app.call_graph.node_count(), 2, "a refresh cleared nothing");
+
+        assert!(matches!(
+            app.lsp.send_references(&app.call_graph, &caller),
+            SendOutcome::Unsupported(Capability::References)
+        ));
+        assert!(matches!(
+            app.lsp.send_workspace_symbols(),
+            SendOutcome::Unsupported(Capability::SymbolQuery)
+        ));
+        assert!(matches!(
+            app.lsp.send_call_hierarchy(
+                &app.call_graph,
+                &caller,
+                RequestOrigin::User,
+                CallDirection::Outgoing
+            ),
+            SendOutcome::Unsupported(Capability::CallHierarchy)
+        ));
+    }
+
+    /// A clangd bridge is capable before it is wired: the worker arriving late
+    /// is a different question from what the backend can do.
+    #[test]
+    fn a_clangd_bridge_is_capable_before_its_worker_arrives() {
+        let (_loader_tx, loader_rx) = mpsc::unbounded_channel();
+        let (_channels_tx, channels_rx) = tokio::sync::oneshot::channel();
+        let bridge = LspBridge::new_with_loader(loader_rx, channels_rx);
+        assert_eq!(bridge.capabilities(), BackendCapabilities::CLANGD);
+        assert!(!bridge.has_worker());
+
+        let (mut app, _rx) = loaded_app(1);
+        assert_eq!(app.capabilities(), BackendCapabilities::CLANGD);
+        let id = only_symbol(&app);
+        assert!(!app.lsp.is_function_loaded(&id), "clangd edges are fetched");
+        app.dispatch(Command::SelectFunction(id));
+        assert!(app.lsp.is_function_loading(&id));
     }
 }

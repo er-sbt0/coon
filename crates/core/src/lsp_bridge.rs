@@ -42,11 +42,86 @@ pub enum RequestOrigin {
     Warmup,
 }
 
+/// What the backend behind a bridge can answer once the load is over.
+///
+/// The two backends are different shapes, not one shape with a missing
+/// channel. clangd hands over symbols and answers questions about them for as
+/// long as it runs: edges per symbol, references, a fresh symbol query.
+/// libclang reads the whole build and hands over one finished graph, and there
+/// is no one left to ask. Before this was a value the difference was a side
+/// effect — the libclang bridge had no worker, every request was declined on
+/// the way to a channel that did not exist, and every node had to be marked
+/// `Loaded` on arrival so a click would not try. Now `CoreApp` asks this up
+/// front, and the answer for a capability a backend lacks comes from one
+/// place, [`LspBridge::unsupported`].
+///
+/// Fixed for the life of a bridge, by the constructor: what a backend can do
+/// does not change while it loads. A clangd bridge whose worker has not been
+/// handed over yet is *capable* and not yet *wired*, which is
+/// [`LspBridge::has_worker`]'s question and a different one.
+///
+/// Serialised onto the snapshot so a client can leave out what this backend
+/// cannot do rather than offer it and say nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct BackendCapabilities {
+    /// Edges are fetched per symbol, on demand and by the warmup
+    /// (`prepareCallHierarchy` and its follow-ups). Without it the graph
+    /// arrives with every edge it will ever have, so every node is as loaded
+    /// as it will ever be — see [`LspBridge::is_function_loaded`].
+    pub call_hierarchy: bool,
+    /// Where a function is referenced from (`Command::FindReferences`).
+    pub references: bool,
+    /// Asking for the project's symbols again (`workspace/symbol`).
+    pub symbol_query: bool,
+    /// Reloading what is on screen from the backend (`Command::Refresh`).
+    pub refresh: bool,
+}
+
+impl BackendCapabilities {
+    /// clangd over LSP: everything, on demand.
+    pub const CLANGD: Self = Self {
+        call_hierarchy: true,
+        references: true,
+        symbol_query: true,
+        refresh: true,
+    };
+
+    /// A backend that delivers the whole graph at once and keeps nothing to
+    /// ask afterwards: libclang, and the demo graph.
+    pub const WHOLE_GRAPH: Self = Self {
+        call_hierarchy: false,
+        references: false,
+        symbol_query: false,
+        refresh: false,
+    };
+
+    /// Whether `capability` is one of these.
+    pub fn has(&self, capability: Capability) -> bool {
+        match capability {
+            Capability::CallHierarchy => self.call_hierarchy,
+            Capability::References => self.references,
+            Capability::SymbolQuery => self.symbol_query,
+            Capability::Refresh => self.refresh,
+        }
+    }
+}
+
+/// One of [`BackendCapabilities`], named, for the answer that says it is
+/// missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+    CallHierarchy,
+    References,
+    SymbolQuery,
+    Refresh,
+}
+
 /// What became of a request, and the one thing the frontend is told about it.
 ///
 /// This is the convention every `LspBridge::send_*` method answers in, and it
-/// has exactly three outcomes: the request went out, there was nothing to ask
-/// or nowhere to ask it, or it could not be made. Each of the two that reach
+/// has exactly four outcomes: the request went out, there was nothing to ask
+/// or nowhere to ask it, the backend cannot answer that kind of question at
+/// all, or it could not be made. Each of the two that reach
 /// the worker's door carries the single [`AppEvent`] a frontend should hear —
 /// a status line naming what is being fetched, or a failure worth reporting.
 /// A `None` inside a variant means "and nothing to say about it"; it never
@@ -72,6 +147,12 @@ pub enum SendOutcome {
     /// graph, or no channel is wired up yet (demo mode, or a loader that has
     /// not handed its channels over). Nothing is coming, and nothing failed.
     Declined,
+    /// This backend cannot answer this kind of question, whatever the symbol
+    /// and however long it is waited for. Says nothing to the frontend today,
+    /// as the decline it replaced did; it is its own variant so that the
+    /// backend which learns to answer has one place to plug in, and a
+    /// frontend that wants to say "not available" has one thing to match.
+    Unsupported(Capability),
     /// The request could not be made. Whatever per-symbol [`LoadingState`] the
     /// failure deserves has already been recorded by the sender; this carries
     /// only what to tell the user.
@@ -87,7 +168,7 @@ impl SendOutcome {
     pub fn event(self) -> Option<AppEvent> {
         match self {
             SendOutcome::Sent(event) | SendOutcome::Failed(event) => event,
-            SendOutcome::Declined => None,
+            SendOutcome::Declined | SendOutcome::Unsupported(_) => None,
         }
     }
 }
@@ -186,6 +267,8 @@ pub struct LspBridge {
     /// a bridge that can ask questions but has nowhere to hear the answers is
     /// a state no loader ever produces, and every reply sent into one is lost.
     request_tx: Option<mpsc::UnboundedSender<LspRequest>>,
+    /// What the backend can be asked. See [`BackendCapabilities`].
+    capabilities: BackendCapabilities,
     /// Channel to receive responses from the LSP service worker
     response_rx: Option<mpsc::UnboundedReceiver<LspResponse>>,
     /// Raised whenever a reply is waiting in `response_rx`.
@@ -267,9 +350,14 @@ impl Default for LspBridge {
 
 impl LspBridge {
     /// Create an `LspBridge` with no active channels (demo / offline mode).
+    ///
+    /// The demo graph is handed over whole, so this bridge can answer nothing:
+    /// [`BackendCapabilities::WHOLE_GRAPH`] until [`LspBridge::set_channels`]
+    /// wires a worker in.
     pub fn new() -> Self {
         Self {
             request_tx: None,
+            capabilities: BackendCapabilities::WHOLE_GRAPH,
             response_rx: None,
             response_ready: Arc::new(Notify::new()),
             pending_requests: HashMap::new(),
@@ -285,7 +373,8 @@ impl LspBridge {
 
     /// Create an `LspBridge` that hears from a loader but will never have a
     /// worker to ask: a backend that hands over the whole graph at once, so
-    /// nothing is ever fetched on demand and every sender declines.
+    /// nothing is ever fetched on demand and every sender answers
+    /// [`SendOutcome::Unsupported`].
     pub fn new_with_status(loader_rx: mpsc::UnboundedReceiver<LspUiMessage>) -> Self {
         Self {
             loader_rx: Some(loader_rx),
@@ -303,6 +392,7 @@ impl LspBridge {
     ) -> Self {
         Self {
             request_tx: None,
+            capabilities: BackendCapabilities::CLANGD,
             response_rx: None,
             response_ready: Arc::new(Notify::new()),
             pending_requests: HashMap::new(),
@@ -324,6 +414,34 @@ impl LspBridge {
     ) {
         self.response_rx = Some(response_rx);
         self.request_tx = Some(request_tx);
+        // A worker is a clangd worker: nothing else hands a bridge channels.
+        // Said here rather than only in `new_with_loader` because the TUI and
+        // the tests wire one into a bridge that started as `new()`.
+        self.capabilities = BackendCapabilities::CLANGD;
+    }
+
+    /// What the backend behind this bridge can be asked.
+    pub fn capabilities(&self) -> BackendCapabilities {
+        self.capabilities
+    }
+
+    /// The answer to a question this backend cannot take: the one place that
+    /// says so, for every sender and for `CoreApp`'s commands alike.
+    ///
+    /// Logged at debug, not warn: a click on a libclang node lands here by
+    /// design, not by accident.
+    pub fn unsupported(&self, capability: Capability) -> SendOutcome {
+        log::debug!("core::LspBridge {capability:?} is not something this backend answers");
+        SendOutcome::Unsupported(capability)
+    }
+
+    /// [`LspBridge::unsupported`] if the backend lacks `capability`.
+    fn require(&self, capability: Capability) -> Result<(), SendOutcome> {
+        if self.capabilities.has(capability) {
+            Ok(())
+        } else {
+            Err(self.unsupported(capability))
+        }
     }
 
     /// The signal raised when a reply is waiting to be drained.
@@ -503,6 +621,9 @@ impl LspBridge {
         origin: RequestOrigin,
         direction: CallDirection,
     ) -> SendOutcome {
+        if let Err(outcome) = self.require(Capability::CallHierarchy) {
+            return outcome;
+        }
         let (file_path, line, column, name) = {
             if let Some(function) = call_graph.get_function(function_id) {
                 (
@@ -588,6 +709,9 @@ impl LspBridge {
         call_graph: &CallGraph,
         function_id: &SymbolId,
     ) -> SendOutcome {
+        if let Err(outcome) = self.require(Capability::References) {
+            return outcome;
+        }
         let (file_path, line, column, name) = match call_graph.get_function(function_id) {
             Some(function) => (
                 function.definition_location.file_path.clone(),
@@ -639,6 +763,9 @@ impl LspBridge {
     ///
     /// Answers in the convention of [`SendOutcome`].
     pub fn send_workspace_symbols(&mut self) -> SendOutcome {
+        if let Err(outcome) = self.require(Capability::SymbolQuery) {
+            return outcome;
+        }
         let Some(request_tx) = self.request_tx.clone() else {
             return SendOutcome::Declined;
         };
@@ -752,6 +879,10 @@ impl LspBridge {
     /// the next tick; it is registered at all only because every request that
     /// gets an answer is, see [`LspBridge::dispatch`].
     pub fn send_preload(&mut self, documents: Vec<lsp_types::Url>) -> SendOutcome {
+        // Opening files ahead is for the warmup's prepares, so it goes with them.
+        if let Err(outcome) = self.require(Capability::CallHierarchy) {
+            return outcome;
+        }
         let Some(request_tx) = self.request_tx.clone() else {
             return SendOutcome::Declined;
         };
@@ -898,7 +1029,17 @@ impl LspBridge {
         self.pending_requests.len()
     }
 
+    /// Whether a symbol's edges are all in the graph.
+    ///
+    /// Always, under a backend with no call hierarchy: its graph arrived with
+    /// every edge it will ever have. That is a fact about the backend, so it
+    /// is read off the capability rather than stamped on each node as it
+    /// lands — which is what it used to be, and what stopped a click asking a
+    /// worker that does not exist only as long as no node arrived another way.
     pub fn is_function_loaded(&self, symbol_id: &SymbolId) -> bool {
+        if !self.capabilities.call_hierarchy {
+            return true;
+        }
         matches!(
             self.loading_states.get(symbol_id),
             Some(LoadingState::Loaded)
@@ -906,6 +1047,9 @@ impl LspBridge {
     }
 
     pub fn is_function_loading(&self, symbol_id: &SymbolId) -> bool {
+        if !self.capabilities.call_hierarchy {
+            return false;
+        }
         matches!(
             self.loading_states.get(symbol_id),
             Some(LoadingState::Loading)
@@ -913,6 +1057,10 @@ impl LspBridge {
     }
 
     pub fn get_loading_state(&self, symbol_id: &SymbolId) -> &LoadingState {
+        static LOADED: LoadingState = LoadingState::Loaded;
+        if !self.capabilities.call_hierarchy {
+            return &LOADED;
+        }
         self.loading_states
             .get(symbol_id)
             .unwrap_or(&LoadingState::NotLoaded)
@@ -1032,6 +1180,7 @@ mod tests {
         drop(rx);
         let mut bridge = LspBridge::new();
         bridge.request_tx = Some(tx);
+        bridge.capabilities = BackendCapabilities::CLANGD;
         bridge
     }
 
@@ -1041,6 +1190,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut bridge = LspBridge::new();
         bridge.request_tx = Some(tx);
+        bridge.capabilities = BackendCapabilities::CLANGD;
         (bridge, rx)
     }
 
@@ -1095,7 +1245,10 @@ mod tests {
     #[test]
     fn a_follow_up_with_no_channel_leaves_nothing_pending() {
         let (_, id) = one_function();
+        // A clangd bridge whose loader has not handed its channels over: the
+        // demo's bridge has no call hierarchy, so it has no loading states.
         let mut bridge = LspBridge::new();
+        bridge.capabilities = BackendCapabilities::CLANGD;
 
         let outcome = bridge.send_follow_up_call(
             &id,
