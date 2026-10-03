@@ -170,9 +170,48 @@ impl CallGraph {
         let is_new = !self.nodes.contains_key(&id);
         self.nodes.entry(id).or_insert(function);
         if is_new {
-            self.name_index.entry(name).or_insert(id);
+            self.index_name(name, id);
         }
         id
+    }
+
+    /// Point `name` at `id` unless a function already there wins
+    /// [`name_precedence`](Self::name_precedence).
+    ///
+    /// Two functions can share a name — a `static helper` in each of two
+    /// files — and the index holds one. Keeping whichever was inserted first
+    /// made the answer depend on insertion order, which nothing holds still:
+    /// the nodes live in a `HashMap`, so a merge of one graph into another or
+    /// a deserialisation walks them in a different order every run, and the
+    /// clangd backend learns symbols in the order replies happen to land. A
+    /// rule on the functions themselves gives the same answer however they
+    /// arrived.
+    fn index_name(&mut self, name: String, id: SymbolId) {
+        let Some(candidate) = self.nodes.get(&id).map(Self::name_precedence) else {
+            return;
+        };
+        match self.name_index.entry(name) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(id);
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                let wins = self
+                    .nodes
+                    .get(slot.get())
+                    .is_none_or(|held| candidate < Self::name_precedence(held));
+                if wins {
+                    slot.insert(id);
+                }
+            }
+        }
+    }
+
+    /// The order in which same-named functions claim the name index: the
+    /// earliest definition, by file and then position, with the id to settle
+    /// two at one position.
+    fn name_precedence(node: &FunctionNode) -> (&str, u32, u32, uuid::Uuid) {
+        let at = &node.definition_location;
+        (&at.file_path, at.line, at.column, node.id.0)
     }
 
     pub fn add_call(&mut self, caller: SymbolId, callee: SymbolId, call_location: Location) {
@@ -283,10 +322,13 @@ impl CallGraph {
         self.callers_map.clear();
         self.callees_map.clear();
         self.name_index.clear();
-        for (id, node) in &self.nodes {
-            self.name_index
-                .entry(node.name.clone())
-                .or_insert_with(|| *id);
+        let named: Vec<(String, SymbolId)> = self
+            .nodes
+            .values()
+            .map(|node| (node.name.clone(), node.id))
+            .collect();
+        for (name, id) in named {
+            self.index_name(name, id);
         }
         for edge in &self.edges {
             let key = edge_hash(
@@ -318,6 +360,33 @@ impl Default for CallGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two functions with one name — a `static helper` in each of two files —
+    /// resolve by name to the same one whichever was inserted first, and after
+    /// a round trip through serde, which rebuilds the index from a `HashMap`.
+    #[test]
+    fn a_shared_name_resolves_the_same_in_any_insertion_order() {
+        let a = FunctionNode::new(
+            "helper".to_string(),
+            "helper".to_string(),
+            Location::new("a.c".to_string(), 7, 1),
+        );
+        let b = FunctionNode::new(
+            "helper".to_string(),
+            "helper".to_string(),
+            Location::new("b.c".to_string(), 2, 1),
+        );
+        for order in [[&a, &b], [&b, &a]] {
+            let mut graph = CallGraph::new();
+            for function in order {
+                graph.add_function(function.clone());
+            }
+            assert_eq!(graph.find_function_by_name("helper").unwrap().id, a.id);
+            let json = serde_json::to_string(&graph).unwrap();
+            let back: CallGraph = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.find_function_by_name("helper").unwrap().id, a.id);
+        }
+    }
 
     #[test]
     fn test_function_node_creation() {

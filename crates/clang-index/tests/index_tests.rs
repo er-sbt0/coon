@@ -142,6 +142,52 @@ fn callers_come_from_every_translation_unit() {
     assert_eq!(report.graph.node_count(), 7);
 }
 
+/// Two `static` functions share a name, and the name index holds one of them.
+/// Which one must not depend on the order the TUs were parsed in, nor on the
+/// order the graph's nodes happen to be walked in when it is merged into the
+/// app's — the same function every time, the one defined first by path.
+#[test]
+fn a_shared_name_resolves_to_the_same_function_in_any_parse_order() {
+    let _guard = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.c",
+        "static void helper(void) {}\nvoid a(void) { helper(); }\n",
+    );
+    write(
+        root,
+        "b.c",
+        "static void helper(void) {}\nvoid b(void) { helper(); }\n",
+    );
+
+    let resolved = |jobs: &[Job]| {
+        let graph = index(root, jobs, |_, _| {}).unwrap().graph;
+        let helper = graph.find_function_by_name("helper").unwrap();
+        let file = Path::new(&helper.definition_location.file_path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        // Merged node by node, as `CoreApp` does with a graph from this
+        // backend, which walks the nodes in hash order.
+        let mut merged = CallGraph::new();
+        for function in graph.functions() {
+            merged.add_function(function.clone());
+        }
+        assert_eq!(
+            merged.find_function_by_name("helper").unwrap().id,
+            helper.id
+        );
+        file
+    };
+    for _ in 0..3 {
+        assert_eq!(resolved(&[job(root, "a.c"), job(root, "b.c")]), "a.c");
+        assert_eq!(resolved(&[job(root, "b.c"), job(root, "a.c")]), "a.c");
+    }
+}
+
 #[test]
 fn the_dependency_file_flag_writes_nothing() {
     let _guard = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());

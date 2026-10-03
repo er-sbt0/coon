@@ -21,7 +21,7 @@
 
 pub mod args;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
@@ -65,9 +65,17 @@ struct Call {
 }
 
 /// Everything collected so far, keyed by USR.
+///
+/// The definitions are a list in the order they were first seen — parse order,
+/// then source order within a TU — rather than a map, because the graph is
+/// built by walking them, and a `HashMap` walks in a different order every
+/// run. That is the order the indexer already promises the graph is decided
+/// by (the first TU to define a USR wins), so the build follows it too rather
+/// than imposing a second order, by USR or by path, that only the build reads.
 #[derive(Default)]
 struct Collected {
-    definitions: HashMap<String, Definition>,
+    definitions: Vec<(String, Definition)>,
+    defined: HashSet<String>,
     calls: Vec<Call>,
 }
 
@@ -234,7 +242,7 @@ fn record_definition(entity: Entity<'_>, scope: &mut Scope, out: &mut Collected)
     let Some(usr) = entity.get_usr().map(|usr| usr.0) else {
         return;
     };
-    if out.definitions.contains_key(&usr) {
+    if out.defined.contains(&usr) {
         return;
     }
     let Some(location) = location_of(entity, scope) else {
@@ -291,14 +299,15 @@ fn record_definition(entity: Entity<'_>, scope: &mut Scope, out: &mut Collected)
         EntityVisitResult::Recurse
     });
 
-    out.definitions.insert(
+    out.defined.insert(usr.clone());
+    out.definitions.push((
         usr,
         Definition {
             name,
             qualified_name,
             location,
         },
-    );
+    ));
 }
 
 /// `ns::Class::name` for C++, `name` for C — the same shape the clangd backend
