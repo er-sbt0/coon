@@ -1,0 +1,20 @@
+# Known clangd-only entries on jemalloc's library flavour:
+#   cargo run --release -p core --example parity -- ~/code/jemalloc \
+#       --flavour src/jemalloc.c --allow crates/core/examples/parity-jemalloc.allow
+#
+# Declared in a project header and defined nowhere in the build. clangd's
+# workspace/symbol lists declarations; libclang records only definitions. No
+# calls either way.
+arena_time_until_deferred @ include/jemalloc/internal/arena_externs.h:64
+pa_shard_try_deferred_work @ include/jemalloc/internal/pa.h:202
+
+# tsd_generic.h is the `#else` of tsd.h's backend choice, and this build
+# defines JEMALLOC_TLS, so it compiles tsd_tls.h instead. clangd's index also
+# holds the inactive header's definitions, and resolves these three calls to
+# them. libclang has the same three calls, into tsd_tls.h.
+tsd_booted_get @ include/jemalloc/internal/tsd_generic.h:154
+tsd_get @ include/jemalloc/internal/tsd_generic.h:165
+tsd_get_allocates @ include/jemalloc/internal/tsd_generic.h:159
+tsd_fetch_impl @ include/jemalloc/internal/tsd.h:118 -> tsd_get @ include/jemalloc/internal/tsd_generic.h:165
+tsd_fetch_impl @ include/jemalloc/internal/tsd.h:118 -> tsd_get_allocates @ include/jemalloc/internal/tsd_generic.h:159
+tsdn_fetch @ include/jemalloc/internal/tsd.h:165 -> tsd_booted_get @ include/jemalloc/internal/tsd_generic.h:154

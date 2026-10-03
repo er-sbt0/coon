@@ -24,3 +24,9 @@ chrono.workspace = true
 # The `load` example drives the loader, so it needs a runtime to drive it with;
 # the library itself only ever borrows the caller's.
 tokio = { workspace = true }
+
+# The comparison logic is pure and has unit tests; this runs them with the
+# crate's own, without needing clangd.
+[[example]]
+name = "parity"
+test = true
