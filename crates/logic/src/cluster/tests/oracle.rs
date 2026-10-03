@@ -150,44 +150,13 @@ impl Reference {
     /// the box of function `i`, `None` for one no box holds — which must be
     /// one no call touches, or the partition is not one of this graph.
     pub fn modularity(&self, box_of: &[Option<usize>], resolution: f64) -> f64 {
-        let m = self.calls.len() as f64;
-        let mut inside: HashMap<usize, f64> = HashMap::new();
-        let mut degree: HashMap<usize, f64> = HashMap::new();
-        for &(a, b) in &self.calls {
-            let (ca, cb) = (
-                box_of[a].expect("every called function is in a box"),
-                box_of[b].expect("every called function is in a box"),
-            );
-            if ca == cb {
-                *inside.entry(ca).or_default() += 1.0;
-            }
-            *degree.entry(ca).or_default() += 1.0;
-            *degree.entry(cb).or_default() += 1.0;
-        }
-        degree
-            .iter()
-            .map(|(c, d)| {
-                inside.get(c).copied().unwrap_or(0.0) / m - resolution * (d / (2.0 * m)).powi(2)
-            })
-            .sum()
+        modularity_of(&self.calls, self.calls.len(), box_of, resolution)
     }
 
     /// The cluster graph of a partition: calls between each ordered pair of
     /// boxes, and calls kept inside each box.
     pub fn quotient(&self, box_of: &[Option<usize>]) -> Quotient {
-        let mut quotient = Quotient::default();
-        for &(a, b) in &self.calls {
-            let (ca, cb) = (
-                box_of[a].expect("every called function is in a box"),
-                box_of[b].expect("every called function is in a box"),
-            );
-            if ca == cb {
-                *quotient.inside.entry(ca).or_default() += 1;
-            } else {
-                *quotient.between.entry((ca, cb)).or_default() += 1;
-            }
-        }
-        quotient
+        quotient_of(&self.calls, box_of)
     }
 
     /// Every way of partitioning the clustered functions whose modularity is
@@ -195,15 +164,65 @@ impl Reference {
     /// is. With `acyclic_only`, partitions whose cluster graph has a cycle are
     /// not candidates, which is the optimum the clusterer is held to.
     ///
+    /// Each connected part of the program is searched on its own and the
+    /// winners combined. That is exact, not an approximation: a box's term in
+    /// Q reads only its own members and the global `m`, and joining two boxes
+    /// with no call between them changes Q by −2γ·d_a·d_b/(2m)², which is
+    /// never a gain — so no optimum has a box spanning two parts, and a cycle
+    /// cannot pass between parts either.
+    ///
     /// The partitions of a set of `n` are the Bell number of `n`: 115,975 at
-    /// ten, 678,570 at eleven. Ten is the cap.
+    /// ten, 678,570 at eleven. Ten per part is the cap.
     pub fn best_partitions(
         &self,
         resolution: f64,
         acyclic_only: bool,
     ) -> (f64, Vec<Vec<BTreeSet<usize>>>) {
-        let nodes: Vec<usize> = self.clustered().into_iter().collect();
-        assert!(nodes.len() <= 10, "brute force is capped at ten functions");
+        let clustered = self.clustered();
+        let mut total = 0.0;
+        let mut combined: Vec<Vec<BTreeSet<usize>>> = vec![Vec::new()];
+        for part in self.weak_components() {
+            if !part.iter().any(|node| clustered.contains(node)) {
+                continue;
+            }
+            let (q, winners) = self.best_partitions_of(&part, resolution, acyclic_only);
+            total += q;
+            combined = combined
+                .iter()
+                .flat_map(|so_far| {
+                    winners.iter().map(move |winner| {
+                        let mut joined = so_far.clone();
+                        joined.extend(winner.iter().cloned());
+                        joined.sort();
+                        joined
+                    })
+                })
+                .collect();
+        }
+        (total, combined)
+    }
+
+    /// The exhaustive search over one connected part, and that part's share
+    /// of Q.
+    fn best_partitions_of(
+        &self,
+        part: &BTreeSet<usize>,
+        resolution: f64,
+        acyclic_only: bool,
+    ) -> (f64, Vec<Vec<BTreeSet<usize>>>) {
+        let nodes: Vec<usize> = part.iter().copied().collect();
+        assert!(
+            nodes.len() <= 10,
+            "brute force is capped at ten functions a part"
+        );
+
+        // Every call touching a part has both ends in it.
+        let calls: Vec<(usize, usize)> = self
+            .calls
+            .iter()
+            .copied()
+            .filter(|(a, _)| part.contains(a))
+            .collect();
 
         let mut best = f64::NEG_INFINITY;
         let mut winners: Vec<Vec<usize>> = Vec::new();
@@ -212,10 +231,10 @@ impl Reference {
             for (slot, &node) in nodes.iter().enumerate() {
                 box_of[node] = Some(assignment[slot]);
             }
-            if acyclic_only && !self.quotient(&box_of).is_acyclic() {
+            if acyclic_only && !quotient_of(&calls, &box_of).is_acyclic() {
                 return;
             }
-            let q = self.modularity(&box_of, resolution);
+            let q = modularity_of(&calls, self.calls.len(), &box_of, resolution);
             if q > best + 1e-9 {
                 best = q;
                 winners.clear();
@@ -247,6 +266,53 @@ impl Reference {
         out.sort();
         out
     }
+}
+
+/// Q's terms for the boxes `calls` touch, against a graph of `m` calls in
+/// all — the whole of Q when `calls` is every call, one part's share of it
+/// when it is that part's.
+fn modularity_of(
+    calls: &[(usize, usize)],
+    m: usize,
+    box_of: &[Option<usize>],
+    resolution: f64,
+) -> f64 {
+    let m = m as f64;
+    let mut inside: HashMap<usize, f64> = HashMap::new();
+    let mut degree: HashMap<usize, f64> = HashMap::new();
+    for &(a, b) in calls {
+        let (ca, cb) = (
+            box_of[a].expect("every called function is in a box"),
+            box_of[b].expect("every called function is in a box"),
+        );
+        if ca == cb {
+            *inside.entry(ca).or_default() += 1.0;
+        }
+        *degree.entry(ca).or_default() += 1.0;
+        *degree.entry(cb).or_default() += 1.0;
+    }
+    degree
+        .iter()
+        .map(|(c, d)| {
+            inside.get(c).copied().unwrap_or(0.0) / m - resolution * (d / (2.0 * m)).powi(2)
+        })
+        .sum()
+}
+
+fn quotient_of(calls: &[(usize, usize)], box_of: &[Option<usize>]) -> Quotient {
+    let mut quotient = Quotient::default();
+    for &(a, b) in calls {
+        let (ca, cb) = (
+            box_of[a].expect("every called function is in a box"),
+            box_of[b].expect("every called function is in a box"),
+        );
+        if ca == cb {
+            *quotient.inside.entry(ca).or_default() += 1;
+        } else {
+            *quotient.between.entry((ca, cb)).or_default() += 1;
+        }
+    }
+    quotient
 }
 
 /// Calls between boxes and inside them, boxes named by index.
