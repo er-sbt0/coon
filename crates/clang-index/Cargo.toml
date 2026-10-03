@@ -9,6 +9,9 @@ model.workspace = true
 compdb.workspace = true
 log.workspace = true
 anyhow.workspace = true
+# The line-delimited JSON spoken with the worker processes (see `worker`).
+serde.workspace = true
+serde_json.workspace = true
 # `runtime`: libclang is dlopen'ed when the index starts rather than linked, so
 # the workspace builds on a machine with no unversioned `libclang.so` (Ubuntu
 # ships only `libclang-20.so.20` without the -dev package), and clangd mode
@@ -16,5 +19,17 @@ anyhow.workspace = true
 # any newer libclang answers it.
 clang = { version = "2.1", features = ["runtime", "clang_10_0"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# `PR_SET_PDEATHSIG`, so a worker dies with the app even when the app is killed.
+libc = "0.2"
+
 [dev-dependencies]
 tempfile.workspace = true
+
+# A worker is the running executable started again, and a test harness's own
+# `main` cannot be made to start as one, so the tests of the out-of-process
+# path bring their own `main`: it serves as a worker when started as one, and
+# runs the tests otherwise.
+[[test]]
+name = "workers"
+harness = false

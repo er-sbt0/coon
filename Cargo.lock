@@ -535,8 +535,11 @@ dependencies = [
  "anyhow",
  "clang",
  "compdb",
+ "libc",
  "log",
  "model",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 

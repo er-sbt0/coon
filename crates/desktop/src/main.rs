@@ -207,6 +207,10 @@ async fn save_export(
 }
 
 fn main() {
+    // The libclang backend's workers are this executable started again, and
+    // one must become a worker before it logs, parses arguments or opens a
+    // window.
+    coon_core::run_if_index_worker();
     if let Err(e) = coon_core::logging::init_logging() {
         eprintln!("Failed to initialize logging: {}", e);
     }

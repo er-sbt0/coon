@@ -12,7 +12,10 @@ mod warmup;
 pub mod workspace;
 
 pub use app::CoreApp;
-pub use boot::{check_flavour, spawn_bridge, spawn_libclang_bridge, spawn_lsp_bridge, Backend};
+pub use boot::{
+    check_flavour, run_if_index_worker, spawn_bridge, spawn_libclang_bridge, spawn_lsp_bridge,
+    Backend,
+};
 pub use command::Command;
 pub use demo::create_demo_call_graph;
 pub use events::AppEvent;

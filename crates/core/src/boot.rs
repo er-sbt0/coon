@@ -68,6 +68,17 @@ pub fn spawn_lsp_bridge(project_path: &str, options: LoaderOptions) -> LspBridge
     bridge
 }
 
+/// Become a libclang worker and never return, if this process was started as
+/// one; otherwise do nothing.
+///
+/// The libclang backend parses in copies of the running executable (see
+/// `clang_index::worker`), so every binary that can call [`spawn_bridge`] must
+/// call this first thing in `main` — before logging, argument parsing or a
+/// window, any of which a worker must not do.
+pub fn run_if_index_worker() {
+    clang_index::worker::run_if_worker();
+}
+
 /// Which analysis backend builds the call graph of a project.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Backend {
@@ -107,7 +118,8 @@ pub fn spawn_bridge(backend: Backend, project_path: &str, options: LoaderOptions
 ///
 /// The alternative to [`spawn_lsp_bridge`] for projects where clangd's resident
 /// index is more memory than the machine has. Every translation unit of the
-/// build `options` names is parsed, one at a time on a blocking thread, and the
+/// build `options` names is parsed, in worker processes driven from a blocking
+/// thread (see `clang_index::Options::from_env` for how many), and the
 /// finished graph is handed over in one [`LspUiMessage::AddGraph`] followed by
 /// `Completed` — never a partial one, because a function's callers are only
 /// known once every TU that could call it has been read (see `clang_index`).
@@ -191,14 +203,26 @@ async fn libclang_loader_task(
         project_path.display()
     );
 
+    // Cancelled if this task is dropped mid-parse — the runtime shutting down
+    // with the app — so the workers are killed then rather than left parsing
+    // for nobody. They die with the process regardless; this is the orderly
+    // half of that.
+    let cancel = clang_index::Cancel::default();
+    let _cancel_on_drop = CancelOnDrop(cancel.clone());
     let progress_tx = ui_msg_tx.clone();
     let report = tokio::task::spawn_blocking(move || {
-        clang_index::index(&project_path, &jobs, |done, total| {
-            let _ = progress_tx.send(LspUiMessage::Progress(LspLoadPhase::IndexingProject {
-                done,
-                total,
-            }));
-        })
+        clang_index::index_with(
+            &project_path,
+            &jobs,
+            &clang_index::Options::from_env(),
+            &cancel,
+            |done, total| {
+                let _ = progress_tx.send(LspUiMessage::Progress(LspLoadPhase::IndexingProject {
+                    done,
+                    total,
+                }));
+            },
+        )
     })
     .await??;
 
@@ -213,6 +237,15 @@ async fn libclang_loader_task(
     let _ = ui_msg_tx.send(LspUiMessage::AddGraph(Box::new(report.graph)));
     let _ = ui_msg_tx.send(LspUiMessage::Progress(LspLoadPhase::Completed));
     Ok(())
+}
+
+/// Cancels a libclang run when dropped, which a run that finished ignores.
+struct CancelOnDrop(clang_index::Cancel);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 /// Why a parse that read nothing is a failed load, or `None` if it read

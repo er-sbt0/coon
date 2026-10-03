@@ -33,8 +33,15 @@ const WARMUP_GRACE: Duration = Duration::from_secs(5);
 /// than hanging it.
 const DEADLINE: Duration = Duration::from_secs(600);
 
+fn main() {
+    // A libclang worker is this executable started again; it must not get as
+    // far as loading anything itself.
+    core::run_if_index_worker();
+    run();
+}
+
 #[tokio::main]
-async fn main() {
+async fn run() {
     if let Err(e) = core::logging::init_logging() {
         eprintln!("failed to initialize logging: {e}");
     }
