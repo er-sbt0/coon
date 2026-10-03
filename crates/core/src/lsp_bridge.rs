@@ -244,6 +244,9 @@ pub struct LspBridge {
     status: LspLoadPhase,
     /// Channel for progress/add-function messages from the background loader
     loader_rx: Option<mpsc::UnboundedReceiver<LspUiMessage>>,
+    /// Whole graphs a loader has delivered, waiting for `CoreApp::tick` to
+    /// merge them. See [`LspUiMessage::AddGraph`].
+    arrived_graphs: Vec<model::CallGraph>,
     /// One-shot channel to receive the LSP request/response channels once the loader is ready
     channels_rx: Option<
         oneshot::Receiver<(
@@ -271,7 +274,18 @@ impl LspBridge {
             hierarchy_items: HashMap::new(),
             status: LspLoadPhase::NotStarted,
             loader_rx: None,
+            arrived_graphs: Vec::new(),
             channels_rx: None,
+        }
+    }
+
+    /// Create an `LspBridge` that hears from a loader but will never have a
+    /// worker to ask: a backend that hands over the whole graph at once, so
+    /// nothing is ever fetched on demand and every sender declines.
+    pub fn new_with_status(loader_rx: mpsc::UnboundedReceiver<LspUiMessage>) -> Self {
+        Self {
+            loader_rx: Some(loader_rx),
+            ..Self::new()
         }
     }
 
@@ -292,6 +306,7 @@ impl LspBridge {
             hierarchy_items: HashMap::new(),
             status: LspLoadPhase::NotStarted,
             loader_rx: Some(loader_rx),
+            arrived_graphs: Vec::new(),
             channels_rx: Some(channels_rx),
         }
     }
@@ -348,10 +363,18 @@ impl LspBridge {
                     LspUiMessage::AddFunction(symbol) => {
                         new_symbols.push(symbol);
                     }
+                    LspUiMessage::AddGraph(graph) => {
+                        self.arrived_graphs.push(*graph);
+                    }
                 }
             }
         }
         new_symbols
+    }
+
+    /// Whole graphs delivered since the last call, for the caller to merge.
+    pub fn take_graphs(&mut self) -> Vec<model::CallGraph> {
+        std::mem::take(&mut self.arrived_graphs)
     }
 
     /// Drain all available responses from the LSP response channel.

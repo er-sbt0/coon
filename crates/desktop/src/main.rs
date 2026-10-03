@@ -19,7 +19,7 @@ use tauri_plugin_dialog::DialogExt;
 use tokio::sync::Mutex;
 
 use coon_core::{
-    create_demo_call_graph, snapshot_of, spawn_lsp_bridge, AppEvent, Command, CoreApp, EventRouter,
+    create_demo_call_graph, snapshot_of, spawn_bridge, AppEvent, Command, CoreApp, EventRouter,
     LoaderOptions, ServerMsg,
 };
 use model::CallGraph;
@@ -57,6 +57,13 @@ struct Args {
     /// the builds on offer are listed in the log.
     #[arg(long, value_name = "FILE")]
     flavour: Option<std::path::PathBuf>,
+
+    /// What builds the call graph: `clangd` (the default) asks a language
+    /// server; `libclang` parses every translation unit up front, holding one
+    /// at a time, for projects where clangd's index is more memory than the
+    /// machine has.
+    #[arg(long, value_name = "BACKEND", default_value = "clangd")]
+    backend: coon_core::Backend,
 }
 
 /// Shared backend state. One window, one `CoreApp` — unlike the web frontend
@@ -230,11 +237,11 @@ fn main() {
                     std::process::exit(1);
                 }
             }
-            log::info!("[desktop] starting LSP loader for {}", path);
+            log::info!("[desktop] starting {:?} loader for {}", args.backend, path);
             let options = LoaderOptions {
                 flavour: args.flavour.clone(),
             };
-            CoreApp::new_with_lsp(CallGraph::new(), spawn_lsp_bridge(path, options))
+            CoreApp::new_with_lsp(CallGraph::new(), spawn_bridge(args.backend, path, options))
         }
         None => {
             if args.flavour.is_some() {

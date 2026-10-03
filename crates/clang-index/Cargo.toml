@@ -1,0 +1,20 @@
+[package]
+name = "clang-index"
+version = "0.1.0"
+edition = "2021"
+description = "Build a call graph by parsing every translation unit with libclang"
+
+[dependencies]
+model.workspace = true
+lsp.workspace = true
+log.workspace = true
+anyhow.workspace = true
+# `runtime`: libclang is dlopen'ed when the index starts rather than linked, so
+# the workspace builds on a machine with no unversioned `libclang.so` (Ubuntu
+# ships only `libclang-20.so.20` without the -dev package), and clangd mode
+# never loads it at all. `clang_10_0` is the newest API level the crate knows;
+# any newer libclang answers it.
+clang = { version = "2.1", features = ["runtime", "clang_10_0"] }
+
+[dev-dependencies]
+tempfile.workspace = true

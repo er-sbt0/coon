@@ -31,4 +31,11 @@ pub enum LspLoadPhase {
 pub enum LspUiMessage {
     Progress(LspLoadPhase),
     AddFunction(crate::WorkspaceSymbolInfo),
+    /// A finished call graph, functions and edges together, to merge in whole.
+    ///
+    /// What a backend sends that reads the whole build before it answers — the
+    /// libclang indexer — rather than discovering symbols and asking for their
+    /// edges one at a time. Boxed: a graph is large and every other message is
+    /// a few words.
+    AddGraph(Box<crate::CallGraph>),
 }

@@ -558,6 +558,27 @@ impl CoreApp {
             );
         }
 
+        // Merge whole graphs from a backend that reads the build up front. They
+        // arrive with their edges, so every node is already as loaded as it
+        // will ever be: marking it so is what stops a click from asking a
+        // worker that does not exist.
+        for graph in self.lsp.take_graphs() {
+            for function in graph.functions() {
+                let id = self.call_graph.add_function(function.clone());
+                self.lsp.set_loading_state(id, LoadingState::Loaded);
+            }
+            for edge in graph.edges() {
+                self.call_graph
+                    .add_call(edge.caller, edge.callee, edge.call_location.clone());
+            }
+            self.mark_graph_changed();
+            log::info!(
+                "CoreApp::tick merged a graph of {} function(s) and {} edge(s)",
+                graph.node_count(),
+                graph.edge_count()
+            );
+        }
+
         // Emit current LSP phase as a progress event
         events.push(AppEvent::LspProgress(self.lsp.status().clone()));
 

@@ -7,7 +7,7 @@
 use tokio::sync::{mpsc, oneshot};
 
 use lsp::{LoaderOptions, LspRequest, LspResponse};
-use model::lsp_status::LspUiMessage;
+use model::lsp_status::{LspLoadPhase, LspUiMessage};
 
 use crate::lsp_bridge::LspBridge;
 
@@ -66,6 +66,124 @@ pub fn spawn_lsp_bridge(project_path: &str, options: LoaderOptions) -> LspBridge
     });
 
     bridge
+}
+
+/// Which analysis backend builds the call graph of a project.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Backend {
+    /// clangd over LSP: symbols first, edges fetched on demand and by the
+    /// warmup. The default.
+    #[default]
+    Clangd,
+    /// libclang, every translation unit parsed up front. Holds one AST at a
+    /// time, where clangd holds an index of the whole project.
+    Libclang,
+}
+
+impl std::str::FromStr for Backend {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "clangd" => Ok(Self::Clangd),
+            "libclang" => Ok(Self::Libclang),
+            other => Err(format!(
+                "`{other}` is not a backend; expected `clangd` or `libclang`"
+            )),
+        }
+    }
+}
+
+/// Spawn the loader `backend` names and return the bridge wired to it.
+pub fn spawn_bridge(backend: Backend, project_path: &str, options: LoaderOptions) -> LspBridge {
+    match backend {
+        Backend::Clangd => spawn_lsp_bridge(project_path, options),
+        Backend::Libclang => spawn_libclang_bridge(project_path, options),
+    }
+}
+
+/// Index `project_path` with libclang and return a bridge that will receive the
+/// graph.
+///
+/// The alternative to [`spawn_lsp_bridge`] for projects where clangd's resident
+/// index is more memory than the machine has. Every translation unit of the
+/// build `options` names is parsed, one at a time on a blocking thread, and the
+/// finished graph is handed over in one [`LspUiMessage::AddGraph`] followed by
+/// `Completed` — never a partial one, because a function's callers are only
+/// known once every TU that could call it has been read (see `clang_index`).
+/// Progress goes out as `IndexingProject`, one step per TU, which is what the
+/// status bar already shows for clangd's own indexing.
+///
+/// The bridge has no worker: there is nothing to ask afterwards, since the
+/// graph arrives with all its edges.
+pub fn spawn_libclang_bridge(project_path: &str, options: LoaderOptions) -> LspBridge {
+    let (ui_msg_tx, ui_msg_rx) = mpsc::unbounded_channel::<LspUiMessage>();
+    let project_path = std::path::PathBuf::from(project_path);
+    tokio::spawn(async move {
+        if let Err(e) = libclang_loader_task(project_path, options, ui_msg_tx.clone()).await {
+            log::error!("libclang loader failed: {e:#}");
+            let _ = ui_msg_tx.send(LspUiMessage::Progress(LspLoadPhase::Failed(format!(
+                "{e:#}"
+            ))));
+        }
+    });
+    LspBridge::new_with_status(ui_msg_rx)
+}
+
+async fn libclang_loader_task(
+    project_path: std::path::PathBuf,
+    options: LoaderOptions,
+    ui_msg_tx: mpsc::UnboundedSender<LspUiMessage>,
+) -> anyhow::Result<()> {
+    use lsp::compile_commands;
+
+    let _ = ui_msg_tx.send(LspUiMessage::Progress(LspLoadPhase::DiscoveringFiles));
+    let entries = compile_commands::read_entries(&project_path)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} has no compile_commands.json, which the libclang backend needs",
+                project_path.display()
+            )
+        })?;
+    let flavours = compile_commands::group_by_flavour(entries);
+    for line in compile_commands::describe_flavours(&flavours, &project_path) {
+        log::info!("[libclang] flavour: {line}");
+    }
+    let entries = match &options.flavour {
+        Some(wanted) => {
+            compile_commands::select_flavour(&flavours, &project_path, wanted)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?
+                .entries
+                .clone()
+        }
+        None => flavours.into_iter().flat_map(|f| f.entries).collect(),
+    };
+    let mut jobs: Vec<clang_index::Job> = entries.iter().map(clang_index::Job::from_entry).collect();
+    // Sorted so the first TU to define a header's inline function is the same
+    // one every run.
+    jobs.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.arguments.cmp(&b.arguments)));
+    log::info!(
+        "[libclang] indexing {} translation unit(s) of {}",
+        jobs.len(),
+        project_path.display()
+    );
+
+    let progress_tx = ui_msg_tx.clone();
+    let report = tokio::task::spawn_blocking(move || {
+        clang_index::index(&project_path, &jobs, |done, total| {
+            let _ = progress_tx.send(LspUiMessage::Progress(LspLoadPhase::IndexingProject {
+                done,
+                total,
+            }));
+        })
+    })
+    .await??;
+
+    let _ = ui_msg_tx.send(LspUiMessage::AddGraph(Box::new(report.graph)));
+    let _ = ui_msg_tx.send(LspUiMessage::Progress(LspLoadPhase::Completed));
+    Ok(())
 }
 
 /// Check a `--flavour` before anything is spawned, so a frontend can refuse to

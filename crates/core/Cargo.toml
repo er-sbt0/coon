@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 model.workspace = true
 lsp.workspace = true
+clang-index.workspace = true
+anyhow.workspace = true
 logic.workspace = true
 log.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
