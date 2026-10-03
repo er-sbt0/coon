@@ -557,7 +557,7 @@ fn star() -> CallGraph {
     graph
 }
 
-fn corpus() -> Vec<(&'static str, CallGraph)> {
+pub(super) fn corpus() -> Vec<(&'static str, CallGraph)> {
     vec![
         ("layered_dag(60)", layered_dag(60).0),
         ("layered_dag(25)", layered_dag(25).0),
@@ -574,7 +574,7 @@ fn corpus() -> Vec<(&'static str, CallGraph)> {
 
 /// The settings each method is run at: its grain at the low end, the default
 /// and the high end, each against the narrowest target and the default one.
-fn settings_matrix() -> Vec<ClusterSettings> {
+pub(super) fn settings_matrix() -> Vec<ClusterSettings> {
     let mut out = Vec::new();
     for &method in ClusterMethod::ALL {
         let grains: &[f64] = match method {

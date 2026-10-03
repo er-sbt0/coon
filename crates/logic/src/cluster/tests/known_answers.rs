@@ -17,7 +17,7 @@ use super::*;
 
 /// A graph from a list of calls, `(caller, callee, times)`. Functions are
 /// defined in the order they first appear, each call site on its own line.
-fn graph_of(calls: &[(&str, &str, u32)]) -> CallGraph {
+pub(super) fn graph_of(calls: &[(&str, &str, u32)]) -> CallGraph {
     let mut graph = CallGraph::new();
     let mut ids: HashMap<&str, SymbolId> = HashMap::new();
     let mut site = 10_000u32;
@@ -35,7 +35,7 @@ fn graph_of(calls: &[(&str, &str, u32)]) -> CallGraph {
 
 /// Every call of an ordered clique: each member calls every later one,
 /// `times` times. Cohesive as a DAG allows.
-fn clique<'a>(names: &[&'a str], times: u32) -> Vec<(&'a str, &'a str, u32)> {
+pub(super) fn clique<'a>(names: &[&'a str], times: u32) -> Vec<(&'a str, &'a str, u32)> {
     let mut calls = Vec::new();
     for i in 0..names.len() {
         for j in i + 1..names.len() {
