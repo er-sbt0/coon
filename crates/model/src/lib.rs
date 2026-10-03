@@ -10,7 +10,7 @@ pub use lsp_types;
 // Re-export public types explicitly
 pub use direction::CallDirection;
 pub use graph::{CallEdge, CallGraph, FunctionNode};
-pub use lsp_status::{LspLoadPhase, LspUiMessage};
+pub use lsp_status::{LspLoadPhase, LspUiMessage, ParseQuality, ParseSummary};
 pub use symbols::{
     Diagnostic, DiagnosticSeverity, Location, Reference, ReferenceSymbolKind, ReferencingSymbol,
     SymbolId,

@@ -27,7 +27,7 @@ use std::time::Instant;
 
 use clang::diagnostic::Severity;
 use clang::{Clang, Entity, EntityKind, EntityVisitResult, Index};
-use model::{CallGraph, FunctionNode, Location};
+use model::{CallGraph, FunctionNode, Location, ParseSummary};
 
 pub use args::Job;
 
@@ -45,6 +45,9 @@ pub struct Report {
     /// Error and fatal diagnostics over every parsed TU. Nonzero means some
     /// bodies may have been read incompletely — usually a missing include.
     pub errors: usize,
+    /// Parsed TUs with at least one of those errors — how much of the build is
+    /// in doubt, where `errors` may be one header counted once per includer.
+    pub tus_with_errors: usize,
     /// Calls whose callee has no definition in the project — libc, the system
     /// headers, or a function the build declares and never defines.
     pub external_calls: usize,
@@ -105,6 +108,7 @@ pub fn index(
     let mut parsed = 0usize;
     let mut failed = 0usize;
     let mut errors = 0usize;
+    let mut tus_with_errors = 0usize;
     // See `args::rejected_argument`. Once refused, an argument is left out of
     // every later TU, so a flag the whole build passes is reported once rather
     // than once per file.
@@ -151,6 +155,9 @@ pub fn index(
                     }
                 }
                 errors += tu_errors;
+                if tu_errors > 0 {
+                    tus_with_errors += 1;
+                }
                 let before = (collected.definitions.len(), collected.calls.len());
                 scope.directory = job.directory.clone();
                 walk_translation_unit(tu.get_entity(), &mut scope, &mut collected);
@@ -173,10 +180,11 @@ pub fn index(
 
     let (graph, external_calls) = build_graph(collected);
     log::info!(
-        "[clang-index] {} TU(s) parsed ({} failed, {} error diagnostic(s)) in {:.1?}: \
+        "[clang-index] {} TU(s) parsed ({} failed, {} with {} error diagnostic(s)) in {:.1?}: \
          {} function(s), {} edge(s), {} call(s) out of the project",
         parsed,
         failed,
+        tus_with_errors,
         errors,
         started.elapsed(),
         graph.node_count(),
@@ -188,9 +196,23 @@ pub fn index(
         parsed,
         failed,
         errors,
+        tus_with_errors,
         external_calls,
         rejected_arguments: rejected,
     })
+}
+
+impl Report {
+    /// The per-TU tallies a frontend shows, without the graph.
+    pub fn summary(&self) -> ParseSummary {
+        ParseSummary {
+            parsed: self.parsed,
+            failed: self.failed,
+            with_errors: self.tus_with_errors,
+            external_calls: self.external_calls,
+            rejected_arguments: self.rejected_arguments.clone(),
+        }
+    }
 }
 
 /// Turn what was collected into a graph, keeping only calls between two

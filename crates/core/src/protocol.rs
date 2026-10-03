@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use logic::{ClusterMethod, ClusterSettings, SettingSpec};
-use model::{CallDirection, CallGraph, LspLoadPhase, SymbolId};
+use model::{CallDirection, CallGraph, LspLoadPhase, ParseQuality, ParseSummary, SymbolId};
 use serde::{Deserialize, Serialize};
 
 use crate::app::CoreApp;
@@ -145,9 +145,35 @@ pub enum ServerMsg<'a> {
         /// tabs by index, so the client needs the index, not the id.
         active_workspace: usize,
         selected: Option<SymbolId>,
+        /// How much of the build was parsed, under a backend that parses it.
+        ///
+        /// On the snapshot rather than on an event because it is a fact about
+        /// the graph on screen, not a step of getting there: a client that
+        /// connects or reloads after the load has to be told it too. Absent
+        /// under clangd and in demo mode, where the status bar says "Ready".
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parse: Option<WireParse<'a>>,
     },
     /// A single `AppEvent` forwarded verbatim for status display.
     Event { event: AppEvent },
+}
+
+/// A [`ParseSummary`] with the verdict on it, so the client decides how loudly
+/// to show it by reading a word rather than by keeping its own thresholds.
+#[derive(Debug, Serialize)]
+pub struct WireParse<'a> {
+    #[serde(flatten)]
+    pub summary: &'a ParseSummary,
+    pub quality: ParseQuality,
+}
+
+impl<'a> WireParse<'a> {
+    pub fn of(summary: &'a ParseSummary) -> Self {
+        Self {
+            summary,
+            quality: summary.quality(),
+        }
+    }
 }
 
 /// Messages the client sends to the backend.
@@ -262,6 +288,7 @@ pub fn snapshot_of(core: &CoreApp) -> ServerMsg<'_> {
         workspaces: workspace_infos(core),
         active_workspace: core.workspaces.current_index,
         selected: core.selected_function,
+        parse: core.lsp.parse_summary().map(WireParse::of),
     }
 }
 
@@ -903,6 +930,37 @@ mod tests {
                 "workspace field `{field}` is read by the client"
             );
         }
+    }
+
+    /// The parse summary reaches the client on the snapshot, flattened, with
+    /// its verdict beside it — and is absent where no backend sent one, so a
+    /// clangd load or the demo shows a plain "Ready".
+    #[test]
+    fn snapshot_carries_the_parse_summary_when_there_is_one() {
+        let mut core = CoreApp::new(CallGraph::new());
+        let json = serde_json::to_value(snapshot_of(&core)).expect("snapshot serialises");
+        assert!(json.get("parse").is_none(), "no loader, no summary");
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        core.lsp = crate::lsp_bridge::LspBridge::new_with_status(rx);
+        tx.send(model::LspUiMessage::ParseReport(ParseSummary {
+            parsed: 212,
+            failed: 5,
+            with_errors: 40,
+            external_calls: 1234,
+            rejected_arguments: vec!["-fconserve-stack".into()],
+        }))
+        .unwrap();
+        core.lsp.poll_loader_messages();
+
+        let json = serde_json::to_value(snapshot_of(&core)).expect("snapshot serialises");
+        let parse = &json["parse"];
+        assert_eq!(parse["parsed"], 212);
+        assert_eq!(parse["failed"], 5);
+        assert_eq!(parse["with_errors"], 40);
+        assert_eq!(parse["external_calls"], 1234);
+        assert_eq!(parse["rejected_arguments"][0], "-fconserve-stack");
+        assert_eq!(parse["quality"], "partial");
     }
 
     /// A knob moved in the panel has to survive the round trip and land on

@@ -165,6 +165,8 @@ let clusterSettings  = null;          // and what the map was built to: method p
 let clusterTopSpec   = null;          // the knob that belongs to no one method
 let selectedClusterId = null;         // the box pointed at on the map, if it is still on this rung
 let lastFitKey       = null;                      // refit only on root/direction change
+let parseReport      = null;          // how much of the build was parsed; null under clangd
+let readyShown       = false;         // whether the status line is the ready line, to redraw it
 
 const MAX_FIT_ZOOM = 1.15;
 // Below roughly this scale a 12px label stops being readable, so auto-fit
@@ -217,6 +219,8 @@ function handleSnapshot(msg) {
   selectedNodeId  = msg.selected ?? null;
   workspaces      = msg.workspaces || [];
   activeWorkspace = msg.active_workspace ?? 0;
+  parseReport     = msg.parse ?? null;
+  if (readyShown) showReady();
 
   const active = workspaces[activeWorkspace];
   rootNodeId = active?.selected ?? null;
@@ -1272,11 +1276,55 @@ function handleEvent(event) {
 
 /// Write the status line. `content` is a string, or a list of strings and
 /// elements for the one writer — the load line — that needs a fixed-width field
-/// in the middle of its text.
-function setStatus(content, state) {
+/// in the middle of its text. `detail` is the tooltip, and is cleared by any
+/// writer that has none: details of a load are wrong under "Refreshing".
+function setStatus(content, state, detail) {
   if (Array.isArray(content)) statusEl.replaceChildren(...content);
   else statusEl.textContent = content;
   lspDotEl.className = state || '';
+  statusEl.classList.toggle('poor', state === 'poor');
+  statusEl.parentElement.title = detail || '';
+  readyShown = false;
+}
+
+// ── The parse report ─────────────────────────────────────────────────────────
+//
+// A backend that parses the build (libclang) says how much of it it read, and
+// "Ready" over half a build is a graph that looks complete and is not. So the
+// ready line carries the count. It rides on the snapshot, not on `Completed`,
+// because the snapshot is what a reconnecting client is sent; it lands just
+// after `Completed` on the live path, which is why a ready line already on
+// screen is redrawn when it does. Absent under clangd and the demo, where the
+// line stays a plain "Ready".
+//
+// Loudness follows the backend's verdict (`quality`) rather than thresholds of
+// the client's own: clean is calm, partial lights the dot, poor colours the
+// line and says where to look.
+const plural = (n, one, many) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
+
+function showReady() {
+  const p = parseReport;
+  if (!p) {
+    setStatus('Ready', 'ready');
+  } else {
+    const parts = [`${plural(p.parsed, 'file', 'files')} parsed`];
+    if (p.failed) parts.push(`${p.failed.toLocaleString()} failed`);
+    if (p.with_errors) parts.push(`${p.with_errors.toLocaleString()} with errors`);
+    const detail = [
+      `${p.parsed.toLocaleString()} of ${(p.parsed + p.failed).toLocaleString()} translation units parsed`,
+      p.failed ? `${p.failed.toLocaleString()} could not be parsed at all, and contributed nothing` : null,
+      p.with_errors ? `${plural(p.with_errors, 'file', 'files')} parsed with errors — some function bodies may be incomplete` : null,
+      `${plural(p.external_calls, 'call', 'calls')} to functions outside the project`,
+      p.rejected_arguments?.length ? `Flags libclang ignored: ${p.rejected_arguments.join(' ')}` : null,
+      p.quality === 'clean' ? null : 'Each file\'s diagnostics are in the log.',
+    ].filter(Boolean).join('\n');
+    if (p.quality === 'poor') {
+      setStatus(`Incomplete · ${parts.join(' · ')} — check compile_commands.json and the log`, 'poor', detail);
+    } else {
+      setStatus(`Ready · ${parts.join(' · ')}`, p.quality === 'clean' ? 'ready' : 'warn', detail);
+    }
+  }
+  readyShown = true;
 }
 
 // ── The hint line ────────────────────────────────────────────────────────────
@@ -1440,7 +1488,7 @@ function updateStatusFromEvent(key, payload) {
       // anything is still loading is now stage 2's to say.
       load.symbols = false;
       if (!load.edges) {
-        if (phase === 'Completed') setStatus('Ready', 'ready');
+        if (phase === 'Completed') showReady();
         else if (phase === 'NotStarted') setStatus('Idle');
         else if (phase === 'Failed') setStatus(typeof body === 'string' ? body : 'LSP failed', 'error');
       }
@@ -1453,7 +1501,7 @@ function updateStatusFromEvent(key, payload) {
       Object.assign(load, { stage: 'edges', label: 'Resolving calls', done, total, count: null });
     }
     renderLoad();
-    if (!loading()) setStatus('Ready', 'ready');
+    if (!loading()) showReady();
   } else if (key === 'LoadingCalls') {
     // Drowned out by the warmup, which fires one of these per symbol. While it
     // runs, the overlay is already saying the same thing with a number on it.
@@ -1466,7 +1514,7 @@ function updateStatusFromEvent(key, payload) {
   } else if (key === 'OutgoingCallsLoaded' || key === 'IncomingCallsLoaded') {
     // Not "Ready" mid-load: the warmup answers hundreds of these while the
     // graph is still filling in, and each one used to declare the wait over.
-    if (!loading()) setStatus('Ready', 'ready');
+    if (!loading()) showReady();
   } else if (key === 'RefreshingWorkspaceSymbols') {
     setStatus('Refreshing', 'busy');
   } else if (key === 'CannotCloseLastWorkspace') {

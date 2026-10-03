@@ -247,6 +247,9 @@ pub struct LspBridge {
     /// Whole graphs a loader has delivered, waiting for `CoreApp::tick` to
     /// merge them. See [`LspUiMessage::AddGraph`].
     arrived_graphs: Vec<model::CallGraph>,
+    /// How much of the build the loader managed to parse, when it is a loader
+    /// that parses one. `None` under clangd, and until the parse finishes.
+    parse_summary: Option<model::ParseSummary>,
     /// One-shot channel to receive the LSP request/response channels once the loader is ready
     channels_rx: Option<
         oneshot::Receiver<(
@@ -275,6 +278,7 @@ impl LspBridge {
             status: LspLoadPhase::NotStarted,
             loader_rx: None,
             arrived_graphs: Vec::new(),
+            parse_summary: None,
             channels_rx: None,
         }
     }
@@ -307,6 +311,7 @@ impl LspBridge {
             status: LspLoadPhase::NotStarted,
             loader_rx: Some(loader_rx),
             arrived_graphs: Vec::new(),
+            parse_summary: None,
             channels_rx: Some(channels_rx),
         }
     }
@@ -365,6 +370,9 @@ impl LspBridge {
                     }
                     LspUiMessage::AddGraph(graph) => {
                         self.arrived_graphs.push(*graph);
+                    }
+                    LspUiMessage::ParseReport(summary) => {
+                        self.parse_summary = Some(summary);
                     }
                 }
             }
@@ -855,6 +863,11 @@ impl LspBridge {
     /// How far the background load has got.
     pub fn status(&self) -> &LspLoadPhase {
         &self.status
+    }
+
+    /// How much of the build was parsed, if the loader is one that parses it.
+    pub fn parse_summary(&self) -> Option<&model::ParseSummary> {
+        self.parse_summary.as_ref()
     }
 
     /// Report a new phase.

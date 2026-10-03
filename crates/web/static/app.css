@@ -368,6 +368,12 @@ body.resizing { cursor: col-resize; user-select: none; }
 #lsp-dot.busy { background: var(--warn); animation: pulse 1.1s ease-in-out infinite; }
 #lsp-dot.ready { background: var(--ok); }
 #lsp-dot.error { background: var(--err); }
+/* A load that read only part of the build. The dot alone for a few files lost,
+   the line as well once most of the build was — then the graph is a fragment
+   and the text says where to look. Steady, not pulsing: nothing is pending. */
+#lsp-dot.warn,
+#lsp-dot.poor { background: var(--warn); }
+#status.poor { color: var(--warn); }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
 
 #info { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; }

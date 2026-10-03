@@ -499,3 +499,35 @@ fn gcc_only_flags_neither_fail_the_tu_nor_count_as_errors() {
     assert!(!root.join(".a.o.d").exists());
     assert!(!root.join("a.json").exists());
 }
+
+/// The summary counts files, not diagnostics: one TU with three errors is one
+/// file in doubt, and a TU libclang cannot open at all is a failure, not an
+/// error.
+#[test]
+fn the_summary_counts_translation_units() {
+    let _guard = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "good.c", "void ok(void) {}\n");
+    write(
+        root,
+        "bad.c",
+        "#include \"nowhere.h\"\n\
+         void f(void) { undeclared_a(); undeclared_b(); }\n",
+    );
+    let jobs = vec![
+        job(root, "good.c"),
+        job(root, "bad.c"),
+        job(root, "missing.c"),
+    ];
+    let report = index(root, &jobs, |_, _| {}).unwrap();
+    let summary = report.summary();
+    assert_eq!(
+        (summary.parsed, summary.failed, summary.with_errors),
+        (2, 1, 1),
+        "{} error diagnostic(s)",
+        report.errors
+    );
+    assert!(report.errors >= 1);
+    assert_eq!(summary.quality(), model::ParseQuality::Poor);
+}

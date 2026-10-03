@@ -181,9 +181,36 @@ async fn libclang_loader_task(
     })
     .await??;
 
+    let summary = report.summary();
+    if let Some(reason) = nothing_parsed(&summary) {
+        anyhow::bail!(reason);
+    }
+    // The summary goes ahead of `Completed`, so the snapshot that follows the
+    // graph carries it and the status bar never says "Ready" over a parse it
+    // has not been told the size of.
+    let _ = ui_msg_tx.send(LspUiMessage::ParseReport(summary));
     let _ = ui_msg_tx.send(LspUiMessage::AddGraph(Box::new(report.graph)));
     let _ = ui_msg_tx.send(LspUiMessage::Progress(LspLoadPhase::Completed));
     Ok(())
+}
+
+/// Why a parse that read nothing is a failed load, or `None` if it read
+/// something.
+///
+/// An empty graph reported as `Completed` is a blank canvas under a status bar
+/// saying all is well — the worst way to learn the build's arguments are wrong.
+fn nothing_parsed(summary: &model::ParseSummary) -> Option<String> {
+    if summary.parsed > 0 {
+        None
+    } else if summary.failed == 0 {
+        Some("The build has no translation units to parse".to_string())
+    } else {
+        Some(format!(
+            "None of the build's {} file(s) could be parsed — check \
+             compile_commands.json and the log",
+            summary.failed
+        ))
+    }
 }
 
 /// Check a `--flavour` before anything is spawned, so a frontend can refuse to
@@ -198,4 +225,30 @@ pub async fn check_flavour(
     flavour: &std::path::Path,
 ) -> Result<(), String> {
     lsp::compile_commands::check_flavour(project_path, flavour).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_parse_that_read_nothing_fails_the_load() {
+        let failed = model::ParseSummary {
+            failed: 3,
+            ..Default::default()
+        };
+        let reason = nothing_parsed(&failed).expect("three failures and nothing read");
+        assert!(reason.contains("compile_commands.json"), "{reason}");
+        assert!(nothing_parsed(&model::ParseSummary::default()).is_some());
+    }
+
+    #[test]
+    fn a_parse_that_read_anything_completes() {
+        let mostly_failed = model::ParseSummary {
+            parsed: 1,
+            failed: 200,
+            ..Default::default()
+        };
+        assert_eq!(nothing_parsed(&mostly_failed), None);
+    }
 }
