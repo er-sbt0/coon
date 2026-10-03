@@ -19,8 +19,15 @@ use std::path::{Path, PathBuf};
 /// has to be long enough to cover a cold process start.
 const INIT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(10);
 
-/// How long to wait for the initial `workspace/symbol` reply before giving up
-/// and wiring the bridge anyway.
+/// How long the initial `workspace/symbol` discovery may go without a word
+/// before the loader gives up on it and wires the bridge anyway.
+///
+/// An idle bound, not a total one. Discovery is a sweep of bounded queries
+/// (`service::discovery`) that reports progress after each, and on the Linux
+/// kernel it runs for most of a minute — longer than this — while never going
+/// more than a couple of seconds without a report. Each report pushes the
+/// deadline out again, so a sweep that is moving is never cut off and one
+/// that has stopped still is.
 ///
 /// Blocking here costs nothing the user can feel — there are no symbols to click
 /// until this lands. If the deadline does expire, the reply is not lost: it is
@@ -437,7 +444,7 @@ pub async fn lsp_loader_task(
         LspLoadPhase::LoadingWorkspaceSymbols { loaded: 0 },
     ))?;
 
-    let symbol_deadline = tokio::time::Instant::now() + INITIAL_SYMBOL_TIMEOUT;
+    let mut symbol_deadline = tokio::time::Instant::now() + INITIAL_SYMBOL_TIMEOUT;
     let mut loaded_count: usize = 0;
 
     'symbol_wait: loop {
@@ -465,6 +472,15 @@ pub async fn lsp_loader_task(
                 ))?;
                 break 'symbol_wait;
             }
+            Ok(Some(LspResponse::WorkspaceSymbolsProgress { request_id, found }))
+                if request_id == initial_request_id =>
+            {
+                symbol_deadline = tokio::time::Instant::now() + INITIAL_SYMBOL_TIMEOUT;
+                ui_tx.send(LspUiMessage::Progress(
+                    LspLoadPhase::LoadingWorkspaceSymbols { loaded: found },
+                ))?;
+                continue;
+            }
             Ok(Some(LspResponse::IndexProgress(progress))) => {
                 index_idle = progress == IndexProgress::Finished;
                 continue;
@@ -473,7 +489,7 @@ pub async fn lsp_loader_task(
             Ok(None) => break,       // channel closed
             Err(_) => {
                 log::warn!(
-                    "Initial workspace symbols did not arrive within {:?}; continuing. \
+                    "Initial workspace symbol discovery went {:?} without progress; continuing. \
                      A late reply will still reach the frontend via the bridge.",
                     INITIAL_SYMBOL_TIMEOUT
                 );

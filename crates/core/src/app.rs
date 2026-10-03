@@ -85,16 +85,22 @@ const WARMUP_PREFETCH: usize = 4;
 /// and for the files the lanes have just finished with, which is what makes
 /// the limit a ceiling on clangd's memory rather than a floor.
 ///
-/// Raising the concurrency is allowed — it just has to be paid for in
-/// [`lsp::OPEN_DOCUMENT_LIMIT`], which is clangd's memory, and saying so
-/// here is the point.
-const _: () = assert!(
-    (WARMUP_IN_FLIGHT + WARMUP_PREFETCH) * 2 <= lsp::OPEN_DOCUMENT_LIMIT,
-    "WARMUP_IN_FLIGHT + WARMUP_PREFETCH must stay at or below half of \
-     lsp::OPEN_DOCUMENT_LIMIT: each prepare in flight pins its document open and \
-     each file opened ahead holds a live preamble, and together they must leave \
-     room for the user's own requests. Raise OPEN_DOCUMENT_LIMIT too."
-);
+/// The limit is runtime — `COON_OPEN_DOCUMENT_LIMIT` may lower it — so the
+/// invariant is enforced by clamping here rather than by a `const` assertion:
+/// the budgets are capped at a quarter of the limit each (and never below
+/// one), which keeps their sum under half of it for any limit of four or
+/// more. Below four the warmup runs one prepare at a time and opens nothing
+/// ahead — slow, correct, and within the memory it was given.
+fn warmup_in_flight() -> usize {
+    WARMUP_IN_FLIGHT.min(lsp::open_document_limit() / 4).max(1)
+}
+
+fn warmup_prefetch() -> usize {
+    if lsp::open_document_limit() < 4 {
+        return 0;
+    }
+    WARMUP_PREFETCH.min(lsp::open_document_limit() / 4).max(1)
+}
 
 /// How often the edge warmup writes its state to the log while it runs.
 ///
@@ -723,6 +729,15 @@ impl CoreApp {
                 // ours, and there is nothing to do with it but retire the
                 // entry `send_preload` recorded.
                 self.lsp.take_pending(&request_id);
+            }
+            LspResponse::WorkspaceSymbolsProgress { request_id, found } => {
+                // A discovery sweep still moving: a refresh the bridge sent,
+                // or the tail of the loader's own. Keeps the request off the
+                // timeout while it reports — see `PendingRequest::heard_at` —
+                // and nothing else, since the functions arrive together in the
+                // `WorkspaceSymbols` that ends it.
+                log::debug!("CoreApp: discovery {request_id} has found {found} function(s)");
+                self.lsp.heard_from(&request_id);
             }
             LspResponse::IndexProgress(progress) => {
                 // The loader waits on this one before it ever hands the bridge
@@ -1570,7 +1585,7 @@ impl CoreApp {
             };
             let next = match next {
                 Some(id) => Some(id),
-                None if documents < WARMUP_IN_FLIGHT => self.edge_warmup.next_prepare(WARMUP_LANES),
+                None if documents < warmup_in_flight() => self.edge_warmup.next_prepare(WARMUP_LANES),
                 None => None,
             };
             let Some(id) = next else {
@@ -1620,7 +1635,7 @@ impl CoreApp {
         if self.warmup_seeded {
             let ahead: Vec<lsp_types::Url> = self
                 .edge_warmup
-                .files_to_prefetch(WARMUP_PREFETCH)
+                .files_to_prefetch(warmup_prefetch())
                 .iter()
                 .filter_map(|file| lsp_types::Url::from_file_path(file).ok())
                 .collect();
@@ -1689,7 +1704,7 @@ impl CoreApp {
             self.warmup_total,
             self.edge_warmup.len(),
             documents,
-            WARMUP_IN_FLIGHT,
+            warmup_in_flight(),
             self.lsp.pending_count().saturating_sub(documents),
             WARMUP_INDEX_IN_FLIGHT,
             still.as_secs_f32(),

@@ -27,8 +27,80 @@ pub struct LspClient {
 /// between 15 and 57 functions depending on which 100 the index happened to
 /// return — and since those functions are the only seeds the edge warmup ever
 /// expands, the whole graph came out a different size on every run. The seed
-/// for a call graph cannot be a 100-symbol sample. `0` means no limit.
-const CLANGD_ARGS: &[&str] = &["--limit-results=0"];
+/// for a call graph cannot be a 100-symbol sample.
+///
+/// Nor can it be one unbounded reply: clangd builds that in memory at ~25 KB a
+/// result, which on the Linux kernel's 344,769 was past 8 GB. So the limit is
+/// [`crate::DISCOVERY_CHUNK`], added in [`base_args`] rather than here because
+/// it is spelled from that constant, and the empty query that means "the whole
+/// project" is answered by a sweep of chunks that each stay under it — see
+/// `service::discovery`. The chunk size and the limit must be the same number:
+/// the sweep reads a reply of exactly that many as "cut off, split it".
+///
+/// `--malloc-trim` asks clangd to hand freed memory back to the OS
+/// periodically (it calls `malloc_trim` after requests). Without it, glibc
+/// arenas keep whatever the peak touched: on a kernel-scale project the
+/// warmup's open documents push RSS past 9 GB, and every byte of that peak
+/// is then held for the life of the process whether or not clangd freed the
+/// structures underneath. Measured on linux-7.2 (3,089 TUs): clangd's RSS
+/// converges on `OPEN_DOCUMENT_LIMIT × preamble`, and a kernel preamble is
+/// ~300 MB against jemalloc's ~15 MB.
+const CLANGD_ARGS: &[&str] = &["--malloc-trim"];
+
+/// Environment override for how many workers clangd runs (`-j`).
+///
+/// Unset, no `-j` is passed and clangd sizes its pools to the machine, which is
+/// the configuration everything in this crate was measured and tuned against.
+/// It is not capped by default, and that was tried: `-j=4` was added on the
+/// theory that the background indexer's workers were a kernel-sized project's
+/// startup spike. They were not — the spike was the discovery query (see
+/// `service::discovery`), and `-j=4` spiked exactly as the default did. It
+/// also cost edges: on jemalloc it lost 80–150 of 10,545, silently and a
+/// different number each run, where the default holds within the ~20 that
+/// `HEAD` wobbles by on its own. So the knob stays for a machine that needs
+/// fewer indexing workers on a cold cache, and is left alone otherwise.
+///
+/// Its own variable rather than part of [`CLANGD_EXTRA_ARGS_ENV`] because
+/// LLVM's option parser rejects a `-j` given twice instead of letting the
+/// later one win.
+const CLANGD_JOBS_ENV: &str = "COON_CLANGD_JOBS";
+
+/// The `-j=<n>` argument, when `COON_CLANGD_JOBS` asks for one.
+fn jobs_arg() -> Option<String> {
+    let jobs = std::env::var(CLANGD_JOBS_ENV)
+        .ok()?
+        .parse::<usize>()
+        .ok()
+        .filter(|v| *v > 0)?;
+    log::info!("passing clangd -j={jobs} from {CLANGD_JOBS_ENV}");
+    Some(format!("-j={jobs}"))
+}
+
+/// Environment override for extra command-line arguments to clangd.
+///
+/// Whitespace-split and appended after [`CLANGD_ARGS`]. The escape hatch for
+/// per-machine or per-project tuning that should not be baked into the
+/// binary — `--background-index-priority=low` and the like. A run that
+/// needs it spells it out; the startup log records what was passed.
+const CLANGD_EXTRA_ARGS_ENV: &str = "COON_CLANGD_EXTRA_ARGS";
+
+/// The arguments every spawned clangd gets: [`CLANGD_ARGS`], the result limit
+/// that bounds a discovery chunk, a `-j` if [`jobs_arg`] was asked for one,
+/// plus whatever [`CLANGD_EXTRA_ARGS_ENV`] adds for this run.
+fn base_args() -> Vec<String> {
+    let mut args: Vec<String> = CLANGD_ARGS.iter().map(|s| s.to_string()).collect();
+    args.push(format!("--limit-results={}", crate::DISCOVERY_CHUNK));
+    args.extend(jobs_arg());
+    if let Some(extra) = std::env::var_os(CLANGD_EXTRA_ARGS_ENV) {
+        let extra = extra.to_string_lossy().into_owned();
+        let split: Vec<String> = extra.split_whitespace().map(|s| s.to_string()).collect();
+        if !split.is_empty() {
+            log::info!("passing clangd extra args from {CLANGD_EXTRA_ARGS_ENV}: {}", split.join(" "));
+            args.extend(split);
+        }
+    }
+    args
+}
 
 /// Re-log one line of clangd's stderr at the level clangd gave it.
 ///
@@ -109,7 +181,7 @@ impl LspClient {
     /// Create a new LspClient with a custom clangd path
     pub async fn with_path(tx: mpsc::Sender<Value>, clangd_path: &str) -> Result<Self> {
         let process = Command::new(clangd_path)
-            .args(CLANGD_ARGS)
+            .args(base_args())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -125,7 +197,7 @@ impl LspClient {
         working_dir: &std::path::Path,
     ) -> Result<Self> {
         let process = Command::new(clangd_path)
-            .args(CLANGD_ARGS)
+            .args(base_args())
             .current_dir(working_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -156,7 +228,7 @@ impl LspClient {
             log::info!("passing clangd {}", extra_args.join(" "));
         }
         let process = Command::new(&clangd_path)
-            .args(CLANGD_ARGS)
+            .args(base_args())
             .args(extra_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -238,6 +310,34 @@ impl LspClient {
             next_id: 0,
             pending_requests: HashMap::new(),
         })
+    }
+
+    /// The server's resident set size in bytes, as the OS sees it.
+    ///
+    /// Read from `/proc/<pid>/status` on Linux; `None` on other platforms,
+    /// and every budget expressed in bytes is then simply off — the document
+    /// *count* limit still applies. This is the only honest unit for a memory
+    /// ceiling: a document count means 0.5 GB on jemalloc and 9 GB on the
+    /// Linux kernel, because the count says nothing about what a document
+    /// costs. See `service::document::clangd_rss_budget_bytes`.
+    pub fn rss_bytes(&self) -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            let pid = self.process.as_ref()?.id()?;
+            let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+            let kb: u64 = status
+                .lines()
+                .find_map(|line| line.strip_prefix("VmRSS:"))?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()?;
+            Some(kb * 1024)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
     }
 
     pub async fn send_request(&mut self, method: &str, params: Value) -> Result<i64> {

@@ -122,24 +122,7 @@ pub(super) async fn handle_workspace_symbols_response(
             );
         }
 
-        let function_symbols: Vec<model::FunctionNode> = ws_response
-            .symbols
-            .into_iter()
-            .filter(|sym| {
-                let is_function = matches!(
-                    sym.kind,
-                    lsp_types::SymbolKind::FUNCTION
-                        | lsp_types::SymbolKind::METHOD
-                        | lsp_types::SymbolKind::CONSTRUCTOR
-                );
-                // Under the project root, not in the compilation database:
-                // a C project's headers are in no database entry, and
-                // jemalloc defines ~736 functions in them. See
-                // `service::project`.
-                is_function && state.project_scope.contains_path(&sym.location.file_path)
-            })
-            .map(|sym| model::FunctionNode::new(sym.name, sym.qualified_name, sym.location))
-            .collect();
+        let function_symbols = project_functions(state, ws_response.symbols);
 
         log::info!("Filtered to {} function symbols", function_symbols.len());
         let _ = response_tx
@@ -161,6 +144,111 @@ pub(super) async fn handle_workspace_symbols_response(
             })
             .await;
     }
+}
+
+/// The functions among `symbols` that are defined in the project.
+///
+/// One definition for the plain query and for every chunk of a discovery
+/// sweep, so the two cannot disagree about what counts.
+fn project_functions(
+    state: &LspWorkerState,
+    symbols: Vec<model::WorkspaceSymbolInfo>,
+) -> Vec<model::FunctionNode> {
+    symbols
+        .into_iter()
+        .filter(|sym| {
+            let is_function = matches!(
+                sym.kind,
+                lsp_types::SymbolKind::FUNCTION
+                    | lsp_types::SymbolKind::METHOD
+                    | lsp_types::SymbolKind::CONSTRUCTOR
+            );
+            // Under the project root, not in the compilation database:
+            // a C project's headers are in no database entry, and
+            // jemalloc defines ~736 functions in them. See
+            // `service::project`.
+            is_function && state.project_scope.contains_path(&sym.location.file_path)
+        })
+        .map(|sym| model::FunctionNode::new(sym.name, sym.qualified_name, sym.location))
+        .collect()
+}
+
+/// Take in one chunk of the discovery sweep answering `request_id`, and send
+/// the next — or, when the sweep has nothing left to ask, the whole answer.
+///
+/// Every chunk is reported as progress, which is how a caller tells a sweep
+/// that is still moving from a server that has stopped answering: on the
+/// kernel the sweep takes most of a minute, and each of its replies arrives
+/// within a second or two of the last. See `service::discovery`.
+pub(super) async fn handle_workspace_symbols_chunk(
+    message: Value,
+    request_id: String,
+    query: String,
+    state: &mut LspWorkerState,
+    response_tx: &mpsc::Sender<LspResponse>,
+) {
+    if super::check_and_send_lsp_error(&message, &request_id, "workspace symbols", response_tx)
+        .await
+    {
+        state.sweeps.remove(&request_id);
+        return;
+    }
+    // A `null` reply — a query that matches nothing — parses as an empty
+    // chunk. `Ok(None)` is a reply the client was not expecting, which for a
+    // chunk it sent itself means the sweep lost track of one, and a sweep
+    // with a hole in it is not the whole project.
+    let symbols = match state.client.parse_workspace_symbol_response(&message) {
+        Ok(Some(ws_response)) => ws_response.symbols,
+        failed => {
+            let reason = match failed {
+                Err(e) => e.to_string(),
+                _ => "reply matched no pending workspace/symbol request".to_string(),
+            };
+            state.sweeps.remove(&request_id);
+            log::error!("Failed to parse discovery chunk {query:?} for {request_id}: {reason}");
+            let _ = response_tx
+                .send(LspResponse::Error {
+                    request_id,
+                    error: "Failed to parse workspace symbols response".to_string(),
+                })
+                .await;
+            return;
+        }
+    };
+    let raw_count = symbols.len();
+    let functions = project_functions(state, symbols);
+
+    let Some(sweep) = state.sweeps.get_mut(&request_id) else {
+        log::warn!("discovery chunk {query:?} for {request_id} has no sweep; dropped");
+        return;
+    };
+    sweep.absorb(&query, raw_count, functions);
+    let found = sweep.found();
+    log::debug!("discovery chunk {query:?}: {raw_count} raw result(s), {found} function(s) so far");
+
+    if let Some(next) = sweep.next_query() {
+        let _ = response_tx
+            .send(LspResponse::WorkspaceSymbolsProgress {
+                request_id: request_id.clone(),
+                found,
+            })
+            .await;
+        crate::service::request::send_sweep_chunk(state, response_tx, request_id, next).await;
+        return;
+    }
+
+    let sweep = state
+        .sweeps
+        .remove(&request_id)
+        .expect("the sweep was just read under this id");
+    let (functions, summary) = sweep.finish();
+    log::info!("{summary}");
+    let _ = response_tx
+        .send(LspResponse::WorkspaceSymbols {
+            request_id,
+            symbols: functions,
+        })
+        .await;
 }
 
 /// Handle a document-symbols response that was issued as a sub-request of the

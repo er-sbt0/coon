@@ -5,13 +5,15 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+mod discovery;
 mod document;
 mod project;
 mod request;
 mod response;
 mod worker;
 
-pub use document::OPEN_DOCUMENT_LIMIT;
+pub use discovery::DISCOVERY_CHUNK;
+pub use document::{clangd_rss_budget_bytes, open_document_limit, OPEN_DOCUMENT_LIMIT};
 
 /// Async LSP service that handles background requests
 pub struct LspService {
@@ -142,6 +144,15 @@ pub enum LspResponse {
     WorkspaceSymbols {
         request_id: String,
         symbols: Vec<model::FunctionNode>,
+    },
+    /// An empty-query discovery is a sweep of many bounded queries (see
+    /// `service::discovery`), and on a kernel-sized project it runs for most
+    /// of a minute. This says it is still moving: once per chunk, with how
+    /// many distinct functions it has found so far. The `WorkspaceSymbols`
+    /// that ends it carries them all; this carries none.
+    WorkspaceSymbolsProgress {
+        request_id: String,
+        found: usize,
     },
     PreloadComplete {
         request_id: String,

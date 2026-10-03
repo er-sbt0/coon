@@ -126,6 +126,14 @@ pub struct PendingRequest {
     /// answers it from its index. The warmup budgets the two kinds apart, and
     /// this is how it tells them apart: see `CoreApp::pump_edge_warmup`.
     pub opens_document: bool,
+    /// When this request last showed signs of life: when it was sent, or the
+    /// last progress report on it. The timeout reads this rather than
+    /// `timestamp`, because a request that reports progress is not stuck
+    /// however long it runs — a discovery sweep on the Linux kernel takes
+    /// most of a minute, well past the timeout, while reporting every second
+    /// or two. `timestamp` stays the send time, so `age` still says how long
+    /// the answer took.
+    pub heard_at: Instant,
 }
 
 impl PendingRequest {
@@ -137,6 +145,7 @@ impl PendingRequest {
         Self {
             symbol_id,
             timestamp: Instant::now(),
+            heard_at: Instant::now(),
             origin,
             label: label.into(),
             direction: None,
@@ -369,7 +378,7 @@ impl LspBridge {
         let mut timed_out = Vec::new();
 
         for (request_id, pending) in &self.pending_requests {
-            if now.duration_since(pending.timestamp) > timeout_duration {
+            if now.duration_since(pending.heard_at) > timeout_duration {
                 timed_out.push((request_id.clone(), pending.clone()));
             }
         }
@@ -762,6 +771,15 @@ impl LspBridge {
             .values()
             .filter(|p| p.origin == RequestOrigin::Warmup)
             .count()
+    }
+
+    /// Note that a request still in flight has reported progress, so the
+    /// timeout counts from now. A no-op for a request not pending — progress
+    /// on one the loader issued under its own id, say.
+    pub fn heard_from(&mut self, request_id: &str) {
+        if let Some(pending) = self.pending_requests.get_mut(request_id) {
+            pending.heard_at = Instant::now();
+        }
     }
 
     /// Remove and return a pending request by ID.
@@ -1183,5 +1201,41 @@ mod tests {
         };
         assert!(bridge.take_pending(&sent).is_some());
         assert!(bridge.pending_requests.is_empty());
+    }
+
+    /// A request sent long ago, as the timeout sees it.
+    fn sent_ago(secs: u64) -> PendingRequest {
+        let then = Instant::now() - std::time::Duration::from_secs(secs);
+        let mut pending = PendingRequest::new(None, "workspace symbols", RequestOrigin::User);
+        pending.timestamp = then;
+        pending.heard_at = then;
+        pending
+    }
+
+    #[test]
+    fn a_request_silent_past_the_timeout_is_retired() {
+        let mut bridge = LspBridge::new();
+        bridge.insert_pending("sweep", sent_ago(LSP_REQUEST_TIMEOUT_SECS + 1));
+
+        let events = bridge.check_timed_out_requests();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(bridge.pending().count(), 0);
+    }
+
+    /// A discovery sweep on the Linux kernel runs for most of a minute and
+    /// reports after every chunk. Sent long ago is not stuck when it spoke a
+    /// moment ago — and how long it took is still measured from the send.
+    #[test]
+    fn progress_keeps_a_long_request_off_the_timeout() {
+        let mut bridge = LspBridge::new();
+        bridge.insert_pending("sweep", sent_ago(LSP_REQUEST_TIMEOUT_SECS + 1));
+
+        bridge.heard_from("sweep");
+        let events = bridge.check_timed_out_requests();
+
+        assert!(events.is_empty(), "a request reporting progress is not timed out");
+        let pending = bridge.take_pending("sweep").expect("still pending");
+        assert!(pending.age().as_secs() > LSP_REQUEST_TIMEOUT_SECS, "age counts from the send");
     }
 }

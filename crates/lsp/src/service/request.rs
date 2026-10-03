@@ -1,3 +1,4 @@
+use super::discovery::SymbolSweep;
 use super::document;
 use super::worker::{LspWorkerState, RequestType};
 use super::LspResponse;
@@ -291,6 +292,40 @@ pub(super) async fn handle_document_symbols_request(
     .await;
 }
 
+/// Send one chunk of the discovery sweep answering `request_id`.
+///
+/// Called for the first chunk here and for every later one from the reply to
+/// the one before, so there is never more than one in flight. A chunk that
+/// cannot be sent ends the sweep with an error: a discovery missing a chunk
+/// is a graph missing whatever that chunk held, which is worth saying rather
+/// than handing back as if it were the whole project.
+pub(super) async fn send_sweep_chunk(
+    state: &mut LspWorkerState,
+    response_tx: &mpsc::Sender<LspResponse>,
+    request_id: String,
+    query: String,
+) {
+    log::debug!("discovery chunk {query:?} for {request_id}");
+    match state.client.workspace_symbol(&query).await {
+        Ok(lsp_id) => state.track_request(
+            lsp_id,
+            request_id,
+            RequestType::WorkspaceSymbolsChunk { query },
+            None,
+        ),
+        Err(e) => {
+            state.sweeps.remove(&request_id);
+            log::error!("Failed to send discovery chunk {query:?}: {e}");
+            let _ = response_tx
+                .send(LspResponse::Error {
+                    request_id,
+                    error: format!("Failed to query workspace symbols: {e}"),
+                })
+                .await;
+        }
+    }
+}
+
 pub(super) async fn handle_workspace_symbols_request(
     state: &mut LspWorkerState,
     response_tx: &mpsc::Sender<LspResponse>,
@@ -302,6 +337,21 @@ pub(super) async fn handle_workspace_symbols_request(
         query,
         request_id
     );
+
+    // An empty query is "every function in the project", and asking clangd
+    // that in one go is what took a kernel-sized machine down: see
+    // `service::discovery`. It is answered by a sweep of bounded queries
+    // instead, one in flight at a time, and the caller still gets one
+    // `WorkspaceSymbols` at the end.
+    if query.is_empty() {
+        let mut sweep = SymbolSweep::new();
+        let first = sweep
+            .next_query()
+            .expect("a new sweep starts with one query per character");
+        state.sweeps.insert(request_id.clone(), sweep);
+        send_sweep_chunk(state, response_tx, request_id, first).await;
+        return;
+    }
 
     let result = state.client.workspace_symbol(&query).await;
     track_or_error(

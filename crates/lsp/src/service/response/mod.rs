@@ -210,6 +210,16 @@ pub(super) async fn handle_lsp_message(
                 symbols::handle_workspace_symbols_response(message, request_id, state, response_tx)
                     .await;
             }
+            Some(RequestType::WorkspaceSymbolsChunk { query }) => {
+                symbols::handle_workspace_symbols_chunk(
+                    message,
+                    request_id,
+                    query,
+                    state,
+                    response_tx,
+                )
+                .await;
+            }
             None => {
                 log::warn!(
                     "No request type tracked for LSP request {}, falling back to content detection",

@@ -3,7 +3,7 @@ use anyhow::Result;
 use lsp_types::Url;
 use std::collections::VecDeque;
 
-/// How many documents clangd is allowed to hold open at once.
+/// How many documents clangd is allowed to hold open at once, by default.
 ///
 /// Every open document costs clangd a live AST worker and a resident preamble
 /// index, so the set of open documents — not the project's size — is what
@@ -19,9 +19,52 @@ use std::collections::VecDeque;
 /// is only how many documents sit idle before the oldest goes. Because pinned
 /// documents are skipped, the set can run over the limit by the number of
 /// requests in flight until they are answered, which is why `core` keeps its
-/// warmup concurrency well under it: see the `const` assertion next to
-/// `WARMUP_IN_FLIGHT` in `core::app`, which is why this is public.
+/// warmup concurrency well under it: see the clamp next to `WARMUP_IN_FLIGHT`
+/// in `core::app`, which is why this is public.
+///
+/// It is also a *count*, and a count is not a memory bound: 32 documents is
+/// ~0.5 GB of preambles on jemalloc and ~9 GB on the Linux kernel, whose TUs
+/// drag in two thousand headers each. The byte-denominated ceiling is
+/// [`clangd_rss_budget_bytes`]; this is the fallback when RSS cannot be read
+/// and a second line of defence when it can. `COON_OPEN_DOCUMENT_LIMIT`
+/// overrides the default for a project whose documents are known to be cheap
+/// or dear.
 pub const OPEN_DOCUMENT_LIMIT: usize = 32;
+
+/// The effective open-document limit: [`OPEN_DOCUMENT_LIMIT`], or
+/// `COON_OPEN_DOCUMENT_LIMIT` when set. Read once, on first use.
+pub fn open_document_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("COON_OPEN_DOCUMENT_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .inspect(|v| log::info!("open document limit overridden to {v} by COON_OPEN_DOCUMENT_LIMIT"))
+            .unwrap_or(OPEN_DOCUMENT_LIMIT)
+    })
+}
+
+/// The most memory clangd may hold before idle documents are evicted
+/// regardless of the count, in bytes. `None` disables the check.
+///
+/// The default is 3 GiB: comfortably above everything a jemalloc-scale
+/// project reaches (~1.7 GB all-in), comfortably below what a 32-document
+/// ceiling of kernel preambles converges on (~9.5 GB, which is a dead
+/// 14 GB machine). `COON_CLANGD_RSS_BUDGET_MB` overrides it, in MiB; `0`
+/// turns the check off and leaves the count as the only ceiling.
+///
+/// Where the RSS can be read at all is platform-dependent — see
+/// `LspClient::rss_bytes`; where it cannot, this budget is never consulted.
+pub fn clangd_rss_budget_bytes() -> Option<u64> {
+    static BUDGET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let mib = std::env::var("COON_CLANGD_RSS_BUDGET_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(3072);
+        (mib > 0).then(|| mib * 1024 * 1024)
+    })
+}
 
 /// The documents clangd currently has open, least-recently-used first.
 ///
@@ -56,19 +99,17 @@ impl OpenDocuments {
         self.lru.push_back(uri);
     }
 
-    /// The next document to close, or `None` once the set is within its limit
-    /// — or when everything over it is pinned.
+    /// The oldest document without a request outstanding, or `None` when
+    /// every open document is pinned.
     ///
     /// Least recently used first, skipping any document `pinned` says has a
     /// request outstanding: those are the ones clangd is about to read, and
-    /// a `didClose` overtaking that read answers it with an error. An overflow
-    /// made entirely of pinned documents is left alone rather than forced, and
-    /// the next open tries again; the pins are as many as the requests in
-    /// flight, so the overshoot is bounded by whoever is sending them.
-    fn evict_overflow(&mut self, pinned: impl Fn(&Url) -> bool) -> Option<Url> {
-        if self.lru.len() <= OPEN_DOCUMENT_LIMIT {
-            return None;
-        }
+    /// a `didClose` overtaking that read answers it with an error. Whether
+    /// anything *should* be evicted — over the count, over the RSS budget —
+    /// is the caller's policy, not this function's: the two triggers share
+    /// one eviction order, and an overflow made entirely of pinned documents
+    /// is left alone rather than forced in either case.
+    fn evict_oldest_idle(&mut self, pinned: impl Fn(&Url) -> bool) -> Option<Url> {
         let idx = self.lru.iter().position(|uri| !pinned(uri))?;
         self.lru.remove(idx)
     }
@@ -172,21 +213,52 @@ pub(super) async fn ensure_document_opened(
     // `LspWorkerState::request_documents` for what pins one. Copied out
     // first because the LRU is borrowed mutably for the eviction, and the set
     // is a handful of entries.
-    let pinned: Vec<Url> = state.request_documents.values().cloned().collect();
-    while let Some(evicted) = state
-        .opened_documents
-        .evict_overflow(|uri| pinned.contains(uri))
-    {
-        log::debug!("Closing least-recently-used document: {}", evicted);
+    //
+    // Two triggers, one policy. The count is the fallback bound; the RSS
+    // budget is the honest one — a count cannot know what a document costs,
+    // and on the Linux kernel 32 documents is ~9 GB of preambles. The RSS
+    // read reflects opens already made rather than the one just sent, which
+    // is fine: this is a feedback loop that converges as opens continue, not
+    // an admission check. When everything over the line is pinned the loop
+    // stops — a request in flight outranks the budget for as long as it runs.
+    let rss_budget = clangd_rss_budget_bytes();
+    loop {
+        let over_count = state.opened_documents.len() > open_document_limit();
+        let over_budget = match (rss_budget, state.client.rss_bytes()) {
+            (Some(budget), Some(rss)) => rss > budget,
+            _ => false,
+        };
+        if !over_count && !over_budget {
+            break;
+        }
+        let pinned: Vec<Url> = state.request_documents.values().cloned().collect();
+        let Some(evicted) = state
+            .opened_documents
+            .evict_oldest_idle(|uri| pinned.contains(uri))
+        else {
+            if over_budget {
+                log::debug!(
+                    "clangd over its RSS budget with {} document(s) open, all pinned: \
+                     the budget waits on the requests in flight",
+                    state.opened_documents.len()
+                );
+            }
+            break;
+        };
+        log::debug!(
+            "Closing least-recently-used document: {} (over {})",
+            evicted,
+            if over_budget && !over_count { "budget" } else { "count" }
+        );
         if let Err(e) = state.client.did_close(evicted.clone()).await {
             log::warn!("Failed to close document {}: {}", evicted, e);
         }
     }
-    if state.opened_documents.len() > OPEN_DOCUMENT_LIMIT {
+    if state.opened_documents.len() > open_document_limit() {
         log::debug!(
             "{} document(s) open, over the limit of {}: the rest have requests outstanding",
             state.opened_documents.len(),
-            OPEN_DOCUMENT_LIMIT
+            open_document_limit()
         );
     }
 
@@ -419,11 +491,26 @@ mod tests {
         open
     }
 
+    /// The eviction policy — over the count, or over the RSS budget — lives
+    /// in `ensure_document_opened`; these tests exercise the order it draws
+    /// in. Simulating the count policy means looping while over the limit,
+    /// exactly as the caller does.
+    fn evict_down_to(open: &mut OpenDocuments, limit: usize) -> Vec<Url> {
+        let mut evicted = Vec::new();
+        while open.len() > limit {
+            match open.evict_oldest_idle(|_| false) {
+                Some(uri) => evicted.push(uri),
+                None => break,
+            }
+        }
+        evicted
+    }
+
     #[test]
     fn stays_within_its_limit_by_dropping_the_oldest() {
         let mut open = fill(OPEN_DOCUMENT_LIMIT + 3);
 
-        let evicted: Vec<Url> = std::iter::from_fn(|| open.evict_overflow(|_| false)).collect();
+        let evicted = evict_down_to(&mut open, OPEN_DOCUMENT_LIMIT);
 
         assert_eq!(evicted, vec![uri(0), uri(1), uri(2)]);
         assert_eq!(open.len(), OPEN_DOCUMENT_LIMIT);
@@ -436,17 +523,11 @@ mod tests {
         open.touch(&uri(0));
         open.insert(uri(OPEN_DOCUMENT_LIMIT));
 
-        assert_eq!(open.evict_overflow(|_| false), Some(uri(1)));
+        assert_eq!(open.evict_oldest_idle(|_| false), Some(uri(1)));
         assert!(
             open.contains(&uri(0)),
             "the touched document should survive"
         );
-    }
-
-    #[test]
-    fn nothing_is_evicted_below_the_limit() {
-        let mut open = fill(OPEN_DOCUMENT_LIMIT);
-        assert_eq!(open.evict_overflow(|_| false), None);
     }
 
     /// A document clangd is about to read for a request still in flight is
@@ -458,7 +539,7 @@ mod tests {
         let oldest = uri(0);
 
         assert_eq!(
-            open.evict_overflow(|uri| *uri == oldest),
+            open.evict_oldest_idle(|uri| *uri == oldest),
             Some(uri(1)),
             "the oldest *idle* document goes instead"
         );
@@ -472,10 +553,10 @@ mod tests {
     fn an_overflow_of_pinned_documents_is_left_alone() {
         let mut open = fill(OPEN_DOCUMENT_LIMIT + 2);
 
-        assert_eq!(open.evict_overflow(|_| true), None);
+        assert_eq!(open.evict_oldest_idle(|_| true), None);
         assert_eq!(open.len(), OPEN_DOCUMENT_LIMIT + 2, "nothing was closed");
         // And goes the moment the pins do.
-        assert_eq!(open.evict_overflow(|_| false), Some(uri(0)));
+        assert_eq!(open.evict_oldest_idle(|_| false), Some(uri(0)));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use super::discovery::SymbolSweep;
 use super::document::OpenDocuments;
 use super::project::ProjectScope;
 use super::{LspRequest, LspResponse};
@@ -29,6 +30,12 @@ pub(super) enum RequestType {
         base_request_id: String,
     },
     WorkspaceSymbols,
+    /// One bounded query of an empty-query discovery sweep: see
+    /// `service::discovery`. `query` is the prefix this chunk asked for,
+    /// which the reply needs to decide whether to split it.
+    WorkspaceSymbolsChunk {
+        query: String,
+    },
 }
 
 pub(super) struct LspWorkerState {
@@ -61,6 +68,9 @@ pub(super) struct LspWorkerState {
     pub(super) project_scope: ProjectScope,
     pub(super) pending_enhanced_requests: HashMap<String, EnhancedRequestInfo>,
     pub(super) enhanced_lsp_requests: HashSet<i64>,
+    /// Empty-query discoveries in progress, by the service request they
+    /// answer. Each has exactly one chunk in flight at a time.
+    pub(super) sweeps: HashMap<String, SymbolSweep>,
 }
 
 impl LspWorkerState {
@@ -198,6 +208,7 @@ pub(super) async fn run_loop(
         project_scope: ProjectScope::default(),
         pending_enhanced_requests: HashMap::new(),
         enhanced_lsp_requests: HashSet::new(),
+        sweeps: HashMap::new(),
     };
 
     // Ticks only while the loop is back at the `select!`, so a silent heartbeat
