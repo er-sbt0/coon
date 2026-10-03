@@ -774,6 +774,14 @@ impl LspBridge {
         self.hierarchy_items.entry(symbol_id).or_insert(item);
     }
 
+    /// The item `symbol_id` is asked about with, if one is in hand. Every
+    /// calls request goes out carrying this one — the first learned wins, and
+    /// a prepare is only sent when there is none — so it names the file a
+    /// reply's `fromRanges` are positions in.
+    pub fn hierarchy_item(&self, symbol_id: &SymbolId) -> Option<&lsp_types::CallHierarchyItem> {
+        self.hierarchy_items.get(symbol_id)
+    }
+
     /// Whether `symbol_id` can be asked about without a prepare.
     pub fn has_hierarchy_item(&self, symbol_id: &SymbolId) -> bool {
         self.hierarchy_items.contains_key(symbol_id)

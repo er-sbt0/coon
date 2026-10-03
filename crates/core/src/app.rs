@@ -1917,9 +1917,27 @@ impl CoreApp {
         // no longer needs a prepare. See `LspBridge::hierarchy_items`.
         self.lsp.learn_hierarchy_item(other_id, item.clone());
         self.edge_warmup.promote(other_id);
+        // `fromRanges` are positions in the *caller's* file. On an incoming
+        // reply the caller is `item`; on an outgoing one it is the symbol the
+        // request was about, whose file is the one on the item it was asked
+        // with — not the callee's, which filed every cross-file call under the
+        // file of the function it called.
+        let site_file = if is_outgoing {
+            self.lsp
+                .hierarchy_item(&symbol_id)
+                .map(|asked| asked.uri.path().to_string())
+                .or_else(|| {
+                    self.call_graph
+                        .get_function(&symbol_id)
+                        .map(|caller| caller.definition_location.file_path.clone())
+                })
+                .unwrap_or(file_path)
+        } else {
+            file_path
+        };
         for from_range in from_ranges {
             let call_location = Location::new(
-                file_path.clone(),
+                site_file.clone(),
                 from_range.start.line + 1,
                 from_range.start.character + 1,
             );
@@ -2876,6 +2894,65 @@ mod tests {
             "but the warmup does not chase it"
         );
         assert_eq!(app.warmup_total, 1);
+    }
+
+    /// A call site is in the caller's file, whichever way the reply came.
+    /// `fromRanges` on an outgoing reply are positions in the function asked
+    /// about; filing them under the callee's file put a call written in
+    /// `app.c` at `config.c:74`, which on a small C project was 356 of its
+    /// 548 call sites.
+    #[test]
+    fn a_call_site_is_filed_under_the_callers_file() {
+        let site = lsp_types::Range {
+            start: lsp_types::Position {
+                line: 73,
+                character: 8,
+            },
+            end: lsp_types::Position {
+                line: 73,
+                character: 18,
+            },
+        };
+
+        // Outgoing: we asked about `app` in app.c, clangd names `config_set`.
+        let mut app = CoreApp::new(CallGraph::new());
+        let asked = call_item("app", Some("app"), "/src/app.c", 60);
+        let caller = app.call_graph.add_function(FunctionNode::new(
+            "app".to_string(),
+            "app".to_string(),
+            Location::new("/src/app.c".to_string(), 60, 5),
+        ));
+        app.lsp.learn_hierarchy_item(caller, asked);
+        app.process_call_entry(
+            caller,
+            &call_item("config_set", Some("config_set"), "/src/config.c", 12),
+            &[site],
+            true,
+        );
+
+        // Incoming: we asked about `config_set`, clangd names `app` as caller.
+        let mut other = CoreApp::new(CallGraph::new());
+        let callee = other.call_graph.add_function(FunctionNode::new(
+            "config_set".to_string(),
+            "config_set".to_string(),
+            Location::new("/src/config.c".to_string(), 12, 5),
+        ));
+        other.process_call_entry(
+            callee,
+            &call_item("app", Some("app"), "/src/app.c", 60),
+            &[site],
+            false,
+        );
+
+        for (way, graph) in [("outgoing", &app.call_graph), ("incoming", &other.call_graph)] {
+            let edges: Vec<_> = graph.edges().collect();
+            assert_eq!(edges.len(), 1, "{way}: one call site");
+            assert_eq!(
+                edges[0].call_location.file_path, "/src/app.c",
+                "{way}: the call is written in app.c"
+            );
+            assert_eq!(edges[0].call_location.line, 74);
+        }
     }
 
     /// A call-hierarchy item shaped the way clangd actually sends them.
