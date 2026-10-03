@@ -126,7 +126,11 @@ fn violations(
                     format!("{id:?} disagrees about who or where it is"),
                 );
             }
-            if !cluster.members.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+            if !cluster
+                .members
+                .windows(2)
+                .all(|pair| visit_key(graph, &pair[0]) < visit_key(graph, &pair[1]))
+            {
                 fail(
                     &mut out,
                     level,
@@ -165,7 +169,7 @@ fn violations(
             }
             if position > 0 {
                 let before = clustering.cluster(ids[position - 1]).unwrap();
-                if before.members[0].0 >= cluster.members[0].0 {
+                if visit_key(graph, &before.members[0]) >= visit_key(graph, &cluster.members[0]) {
                     fail(
                         &mut out,
                         level,
@@ -241,7 +245,7 @@ fn violations(
                     ),
                 }
             }
-            union.sort_by_key(|s| s.0);
+            union.sort_by_key(|s| visit_key(graph, s));
             if union != cluster.members {
                 fail(
                     &mut out,
@@ -703,7 +707,9 @@ fn the_invariants_catch_a_broken_clustering() {
         .members
         .retain(|m| *m != h);
     crossed.clusters[to.0 as usize].members.push(h);
-    crossed.clusters[to.0 as usize].members.sort_by_key(|s| s.0);
+    crossed.clusters[to.0 as usize]
+        .members
+        .sort_by_key(|s| visit_key(&graph, s));
     let problems = complain(&crossed);
     assert!(
         problems.iter().any(|p| p.contains("cycle")),

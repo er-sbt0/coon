@@ -950,7 +950,7 @@ fn a_key_anchors_on_the_lowest_member_and_resolves_back() {
 
     for cluster in clustering.clusters() {
         let mut sorted = cluster.members.clone();
-        sorted.sort_unstable_by_key(|s| s.0);
+        sorted.sort_unstable_by_key(|s| visit_key(&graph, s));
         assert_eq!(
             cluster.key.anchor, sorted[0],
             "the anchor is the lowest member"
@@ -1146,16 +1146,16 @@ fn the_labels_of_a_known_graph_do_not_move() {
         labels,
         vec![
             vec![
-                "f3", "f30", "f45", "f35", "f17", "f5", "f19", "f47", "f20", "f44", "f53", "f54",
-                "f0", "f24", "f51", "f4", "f16", "f32", "f39", "f23", "f29", "f15", "f40", "f8",
-                "f26", "f22", "f43", "f34",
+                "f0", "f3", "f4", "f5", "f15", "f16", "f17", "f19", "f20", "f22", "f23", "f24",
+                "f26", "f29", "f30", "f32", "f34", "f35", "f39", "f40", "f43", "f44", "f45", "f47",
+                "f52", "f53", "f54", "f8"
             ],
             vec![
-                "f3", "f30", "f43", "f35", "f15", "f5", "f19", "f47", "f20", "f53", "f54", "f0",
-                "f22", "f4", "f32", "f23", "f29", "f40", "f8", "f34",
+                "f0", "f3", "f4", "f5", "f15", "f20", "f19", "f22", "f23", "f29", "f30", "f32",
+                "f34", "f35", "f40", "f43", "f45", "f47", "f52", "f53", "f8"
             ],
-            vec!["f3", "f30", "f43", "f5", "f47", "f20", "f54", "f0", "f32", "f23", "f40", "f34",],
-            vec!["f0", "f30", "f43", "f5", "f20", "f40"],
+            vec!["f0", "f3", "f5", "f20", "f23", "f30", "f32", "f34", "f43", "f47"],
+            vec!["f0", "f5", "f20", "f30", "f40"],
         ]
     );
 }
