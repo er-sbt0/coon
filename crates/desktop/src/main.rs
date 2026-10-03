@@ -58,11 +58,11 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     flavour: Option<std::path::PathBuf>,
 
-    /// What builds the call graph: `clangd` (the default) asks a language
-    /// server; `libclang` parses every translation unit up front, holding one
-    /// at a time, for projects where clangd's index is more memory than the
-    /// machine has.
-    #[arg(long, value_name = "BACKEND", default_value = "clangd")]
+    /// What builds the call graph: `libclang` (the default) parses every
+    /// translation unit up front, holding one at a time; `clangd` asks a
+    /// language server, whose resident index is far more memory on a large
+    /// project. libclang needs a compile_commands.json; clangd copes without.
+    #[arg(long, value_name = "BACKEND", default_value = "libclang")]
     backend: coon_core::Backend,
 }
 

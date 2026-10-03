@@ -1,8 +1,8 @@
 # coon
 
-Interactive call graph explorer for C/C++ projects, powered by `clangd`.
+Interactive call graph explorer for C/C++ projects, built with libclang (or `clangd`).
 
-Analyzes a project via LSP and renders an interactive view for navigating function call hierarchies — incoming and outgoing calls, cross-file references, and reachability.
+Analyzes a project's translation units and renders an interactive view for navigating function call hierarchies — incoming and outgoing calls, cross-file references, and reachability.
 
 The **desktop app** is the frontend. Two older ones ship alongside it and still
 work, but they are deprecated and no longer developed:
@@ -21,8 +21,10 @@ features are not expected to reach them.
 ## Requirements
 
 - Rust (2021 edition)
-- `clangd` in `PATH` (for LSP mode), or `COON_CLANGD` set to the clangd binary to use
-- A `compile_commands.json` in the project root (or coon will fall back to directory walking)
+- libclang (`libclang-*.so`, loaded at runtime — no dev package needed) for the default backend
+- A `compile_commands.json` in the project root, which the default backend requires
+- `clangd` in `PATH`, or `COON_CLANGD` set to the clangd binary to use, for `--backend clangd`
+  and the deprecated frontends (clangd falls back to directory walking without a database)
 
 On Linux the desktop app needs Tauri's system dependencies:
 
@@ -37,8 +39,11 @@ sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev \
 # Demo mode — no project needed
 cargo run
 
-# Analyze a real C/C++ project
+# Analyze a real C/C++ project — every translation unit parsed with libclang
 cargo run -- /path/to/your/project
+
+# …or ask clangd over LSP instead
+cargo run -- /path/to/your/project --backend clangd
 ```
 
 `cargo run` launches the desktop app; `cargo run -p desktop` is the same thing

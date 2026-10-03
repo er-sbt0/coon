@@ -72,11 +72,11 @@ pub fn spawn_lsp_bridge(project_path: &str, options: LoaderOptions) -> LspBridge
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Backend {
     /// clangd over LSP: symbols first, edges fetched on demand and by the
-    /// warmup. The default.
-    #[default]
+    /// warmup.
     Clangd,
     /// libclang, every translation unit parsed up front. Holds one AST at a
-    /// time, where clangd holds an index of the whole project.
+    /// time, where clangd holds an index of the whole project. The default.
+    #[default]
     Libclang,
 }
 

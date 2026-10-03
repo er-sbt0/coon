@@ -1,7 +1,7 @@
 //! Load a project through the real bootstrap and print what came out.
 //!
 //! ```text
-//! cargo run -p core --example load -- <project> [--flavour <file>] [--dump <out>] [--functions <out>] [--backend clangd|libclang]
+//! cargo run -p core --example load -- <project> [--flavour <file>] [--dump <out>] [--functions <out>] [--backend libclang|clangd]
 //! ```
 //!
 //! The desktop app needs a display and the deprecated CLI deliberately has no
