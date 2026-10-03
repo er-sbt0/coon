@@ -4,8 +4,9 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
-use clang_index::{index, Job};
+use clang_index::{index, index_with, Cancel, Job, Options, Report};
 use compdb::CompileCommand;
 use model::CallGraph;
 
@@ -564,8 +565,16 @@ fn a_header_body_is_walked_once_per_flavour() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write_flavoured_header(root);
-    write(root, "a.c", "#include \"pick.h\"\nvoid a_main(void) { pick(); }\n");
-    write(root, "b.c", "#include \"pick.h\"\nvoid b_main(void) { pick(); }\n");
+    write(
+        root,
+        "a.c",
+        "#include \"pick.h\"\nvoid a_main(void) { pick(); }\n",
+    );
+    write(
+        root,
+        "b.c",
+        "#include \"pick.h\"\nvoid b_main(void) { pick(); }\n",
+    );
 
     // Two builds of the one database, as a run without `--flavour` sees it.
     let jobs = vec![
@@ -612,7 +621,11 @@ fn a_header_body_is_walked_once_within_a_flavour() {
         "a.c",
         "#define FLAV_A\n#include \"pick.h\"\nvoid a_main(void) { pick(); }\n",
     );
-    write(root, "b.c", "#include \"pick.h\"\nvoid b_main(void) { pick(); }\n");
+    write(
+        root,
+        "b.c",
+        "#include \"pick.h\"\nvoid b_main(void) { pick(); }\n",
+    );
 
     let jobs = vec![job(root, "a.c"), job(root, "b.c"), job(root, "defs.c")];
     let report = index(root, &jobs, |_, _| {}).unwrap();
@@ -639,8 +652,16 @@ fn an_external_call_two_flavours_make_is_counted_once() {
         "include/ext.h",
         "void elsewhere(void);\nstatic inline void wrap(void) { elsewhere(); }\n",
     );
-    write(root, "a.c", "#include \"ext.h\"\nvoid a_main(void) { wrap(); }\n");
-    write(root, "b.c", "#include \"ext.h\"\nvoid b_main(void) { wrap(); }\n");
+    write(
+        root,
+        "a.c",
+        "#include \"ext.h\"\nvoid a_main(void) { wrap(); }\n",
+    );
+    write(
+        root,
+        "b.c",
+        "#include \"ext.h\"\nvoid b_main(void) { wrap(); }\n",
+    );
 
     let jobs = vec![
         job_with(root, "a.c", &["cc", "-Iinclude", "-DONE"]),
@@ -648,4 +669,238 @@ fn an_external_call_two_flavours_make_is_counted_once() {
     ];
     let report = index(root, &jobs, |_, _| {}).unwrap();
     assert_eq!(report.external_calls, 1);
+}
+
+// ── The on-disk cache ────────────────────────────────────────────────────────
+
+/// A run that caches, in this process.
+fn cached_run(root: &Path, jobs: &[Job]) -> Report {
+    let options = Options {
+        workers: 0,
+        cache: true,
+        ..Options::default()
+    };
+    index_with(root, jobs, &options, &Cancel::default(), |_, _| {}).unwrap()
+}
+
+/// Everything a report says but `cached`, with every function where it is
+/// defined and every call site in full.
+fn fingerprint(report: &Report) -> (Vec<usize>, Vec<String>, BTreeSet<String>, BTreeSet<String>) {
+    let graph = &report.graph;
+    let functions = graph
+        .functions()
+        .map(|f| {
+            let at = &f.definition_location;
+            format!(
+                "{} @ {}:{}:{}",
+                f.qualified_name, at.file_path, at.line, at.column
+            )
+        })
+        .collect();
+    let calls = graph
+        .edges()
+        .map(|e| {
+            let name = |id| graph.get_function(id).unwrap().qualified_name.clone();
+            let at = &e.call_location;
+            format!(
+                "{} -> {} @ {}:{}:{}",
+                name(&e.caller),
+                name(&e.callee),
+                at.file_path,
+                at.line,
+                at.column
+            )
+        })
+        .collect();
+    (
+        vec![
+            report.parsed,
+            report.failed,
+            report.errors,
+            report.tus_with_errors,
+            report.external_calls,
+        ],
+        report.rejected_arguments.clone(),
+        functions,
+        calls,
+    )
+}
+
+/// Set every file under `dir` an hour into the past. A file modified within
+/// two seconds of a parse is not trusted to be what the parse read, and is not
+/// cached; every file a test writes is that new.
+fn age(dir: &Path) {
+    let then = SystemTime::now() - Duration::from_secs(3600);
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            age(&path);
+        } else {
+            let file = std::fs::File::options().write(true).open(&path).unwrap();
+            file.set_modified(then).unwrap();
+        }
+    }
+}
+
+/// A header included under two flavours and twice within one, so a cached
+/// result standing in for a parse has header bodies to get wrong, and a gcc
+/// flag clang refuses, so the arguments a run learns have something to differ
+/// over; and a second header only one TU includes.
+fn cached_project(root: &Path) -> Vec<Job> {
+    write_flavoured_header(root);
+    write(
+        root,
+        "include/only_c.h",
+        "void always(void);\nstatic inline void only_c(void) { always(); }\n",
+    );
+    write(
+        root,
+        "a.c",
+        "#include \"pick.h\"\nvoid a_main(void) { pick(); }\n",
+    );
+    write(
+        root,
+        "b.c",
+        "#include \"pick.h\"\nvoid b_main(void) { pick(); }\n",
+    );
+    write(
+        root,
+        "c.c",
+        "#include \"pick.h\"\n#include \"only_c.h\"\nvoid c_main(void) { pick(); only_c(); }\n",
+    );
+    age(root);
+    vec![
+        job_with(
+            root,
+            "a.c",
+            &["cc", "-Iinclude", "-DFLAV_A", "-fconserve-stack"],
+        ),
+        job_with(root, "b.c", &["cc", "-Iinclude", "-fconserve-stack"]),
+        job_with(root, "c.c", &["cc", "-Iinclude", "-fconserve-stack"]),
+        job_with(root, "defs.c", &["cc", "-Iinclude", "-fconserve-stack"]),
+    ]
+}
+
+#[test]
+fn a_second_run_is_answered_from_the_cache_with_the_same_graph() {
+    let _guard = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let jobs = cached_project(root);
+    let uncached = index(root, &jobs, |_, _| {}).unwrap();
+    assert_eq!(
+        uncached.rejected_arguments,
+        vec!["-fconserve-stack".to_string()]
+    );
+
+    let cold = cached_run(root, &jobs);
+    assert_eq!(cold.cached, 0);
+    assert_eq!(fingerprint(&cold), fingerprint(&uncached));
+    assert!(root.join(".cache/coon/libclang").is_dir());
+
+    let warm = cached_run(root, &jobs);
+    assert_eq!(warm.cached, jobs.len());
+    assert_eq!(fingerprint(&warm), fingerprint(&uncached));
+    assert_eq!(warm.summary().cached, jobs.len());
+}
+
+#[test]
+fn changing_an_included_header_invalidates_its_includers_only() {
+    let _guard = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let jobs = cached_project(root);
+    cached_run(root, &jobs);
+
+    write(
+        root,
+        "include/only_c.h",
+        "void call_b(void);\nstatic inline void only_c(void) { call_b(); }\n",
+    );
+    age(root);
+    let warm = cached_run(root, &jobs);
+    // a.c, b.c and defs.c never read it.
+    assert_eq!(warm.cached, 3);
+    assert!(sites(&warm.graph).contains("only_c -> call_b @ only_c.h:2"));
+    assert_eq!(
+        fingerprint(&warm),
+        fingerprint(&index(root, &jobs, |_, _| {}).unwrap())
+    );
+    // And the new result is what the next run is answered with.
+    assert_eq!(cached_run(root, &jobs).cached, 4);
+
+    std::fs::remove_file(root.join("include/only_c.h")).unwrap();
+    assert_eq!(
+        cached_run(root, &jobs).cached,
+        3,
+        "a missing input is a miss"
+    );
+}
+
+#[test]
+fn a_touched_file_whose_contents_did_not_change_is_still_a_hit() {
+    let _guard = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let jobs = cached_project(root);
+    cached_run(root, &jobs);
+
+    let header = std::fs::File::options()
+        .write(true)
+        .open(root.join("include/pick.h"))
+        .unwrap();
+    header
+        .set_modified(SystemTime::now() - Duration::from_secs(60))
+        .unwrap();
+    assert_eq!(cached_run(root, &jobs).cached, 4);
+}
+
+#[test]
+fn a_corrupt_entry_is_parsed_again() {
+    let _guard = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let jobs = cached_project(root);
+    let cold = cached_run(root, &jobs);
+
+    let entries: Vec<_> = std::fs::read_dir(root.join(".cache/coon/libclang/v1"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), jobs.len());
+    for (n, entry) in entries.iter().enumerate() {
+        let bytes = std::fs::read(entry).unwrap();
+        // Cut short, as a crash mid-write without the rename would leave it,
+        // or simply not JSON.
+        let broken = if n % 2 == 0 {
+            &bytes[..bytes.len() / 2]
+        } else {
+            &b"\0\xff"[..]
+        };
+        std::fs::write(entry, broken).unwrap();
+    }
+    let reparsed = cached_run(root, &jobs);
+    assert_eq!(reparsed.cached, 0);
+    assert_eq!(fingerprint(&reparsed), fingerprint(&cold));
+    assert_eq!(
+        cached_run(root, &jobs).cached,
+        jobs.len(),
+        "rewritten whole"
+    );
+}
+
+#[test]
+fn a_file_written_just_before_the_parse_is_not_cached() {
+    let _guard = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let jobs = cached_project(root);
+    write(
+        root,
+        "a.c",
+        "#include \"pick.h\"\nvoid a_main(void) { pick(); pick(); }\n",
+    );
+    cached_run(root, &jobs);
+    // It may have been read before the write or after it.
+    assert_eq!(cached_run(root, &jobs).cached, 3);
 }

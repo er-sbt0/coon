@@ -11,7 +11,9 @@
 //! on to open a window would be several windows.
 //!
 //! The protocol is a line of JSON each way. The worker announces itself with
-//! [`READY`] once libclang has loaded, then answers each request with one
+//! [`READY`] and the libclang version once libclang has loaded — the version
+//! is part of every cache key, and asking a worker spares the parent loading
+//! libclang just to read it — then answers each request with one
 //! reply; stdin closing is the end of the run, and the worker exits. Nothing
 //! else may be written to stdout, so a worker initialises no logging at all:
 //! everything worth logging travels back in the reply and the parent logs it,
@@ -32,7 +34,7 @@ pub const ARGUMENT: &str = "--coon-clang-index-worker";
 /// The line a worker writes once it is ready for requests. A process that does
 /// not write it in time is not a worker — a binary that forgot to call
 /// [`run_if_worker`] and started being itself instead.
-pub(crate) const READY: &str = "coon-clang-index-worker ready 1";
+pub(crate) const READY: &str = "coon-clang-index-worker ready 2";
 
 /// A worker's answer to one request.
 #[derive(Debug, Serialize, Deserialize)]
@@ -74,7 +76,7 @@ pub fn serve(root: &Path, mut before_each: impl FnMut(&Path)) -> anyhow::Result<
     let index = Index::new(&clang, false, false);
     let mut parser = Parser::new(root);
     let mut out = std::io::stdout().lock();
-    writeln!(out, "{READY}")?;
+    writeln!(out, "{READY} {}", clang::get_version())?;
     out.flush()?;
     for line in std::io::stdin().lock().lines() {
         let request: Request = serde_json::from_str(&line?)?;

@@ -29,7 +29,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::worker::{Reply, ARGUMENT, READY};
-use crate::{Job, Outcome, Request};
+use crate::{Outcome, Plan, Request};
 
 /// A parse that takes longer than this is assumed never to finish. The
 /// slowest TU of jemalloc takes well under a second; this is room for a
@@ -66,6 +66,10 @@ pub struct Options {
     pub timeout: Duration,
     /// What to run as a worker.
     pub worker: WorkerCommand,
+    /// Whether to keep each TU's result on disk and reuse it while its inputs
+    /// are unchanged (see `cache`). Off by default, which is what the tests
+    /// get; [`Options::from_env`] turns it on.
+    pub cache: bool,
 }
 
 /// A program and the arguments that make it a worker. The project root is
@@ -96,15 +100,20 @@ impl Default for Options {
             workers: default_workers(),
             timeout: DEFAULT_TIMEOUT,
             worker: WorkerCommand::current_exe(),
+            cache: false,
         }
     }
 }
 
 impl Options {
-    /// The defaults, with `COON_INDEX_JOBS` (worker count; 0 parses in this
-    /// process) and `COON_INDEX_TIMEOUT` (seconds per TU) applied.
+    /// The defaults, with the cache on unless `COON_INDEX_CACHE=0`, and
+    /// `COON_INDEX_JOBS` (worker count; 0 parses in this process) and
+    /// `COON_INDEX_TIMEOUT` (seconds per TU) applied.
     pub fn from_env() -> Self {
-        let mut options = Self::default();
+        let mut options = Self {
+            cache: env_number("COON_INDEX_CACHE") != Some(0),
+            ..Self::default()
+        };
         if let Some(workers) = env_number("COON_INDEX_JOBS") {
             options.workers = workers;
         }
@@ -178,32 +187,21 @@ impl Cancel {
     }
 }
 
-/// What the worker threads share: the next job to hand out, and the arguments
-/// libclang has refused so far, which no job handed out after is sent.
+/// What the worker threads share: the next job to hand out, as a place in the
+/// plan's `todo`, and the arguments libclang has refused so far, which no job
+/// handed out after is sent unless the run caches (see `Plan::request`).
 struct Dispatch {
     next: usize,
     rejected: Vec<String>,
 }
 
-/// Parse `jobs` in `workers` processes, handing each TU's outcome to `sink` as
-/// it comes in — in no particular order, and every job exactly once. Returns
-/// `false` if not even one worker would start, having handed over nothing:
-/// the caller then parses in process rather than not at all.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run(
-    root: &Path,
-    jobs: &[Job],
-    flavours: &[usize],
-    workers: usize,
-    options: &Options,
-    cancel: &Cancel,
-    on_progress: &mut impl FnMut(usize, usize),
-    sink: &mut impl FnMut(usize, Outcome),
-) -> anyhow::Result<bool> {
-    // The first worker is started here, so that a binary that cannot be one
-    // is found out once rather than once per job.
-    let first = match Worker::spawn(&options.worker, root) {
-        Ok(worker) => worker,
+/// The first worker of a run, or `None` if this binary cannot be one — found
+/// out once, before the run, rather than once per job; the caller then parses
+/// in process rather than not at all. Started ahead of the plan, because the
+/// libclang version it reports is part of the cache's keys.
+pub(crate) fn start(options: &Options, root: &Path) -> Option<Worker> {
+    match Worker::spawn(&options.worker, root) {
+        Ok(worker) => Some(worker),
         Err(e) => {
             log::error!(
                 "[clang-index] could not start a worker ({} {:?}): {e:#}; parsing in this \
@@ -211,12 +209,28 @@ pub(crate) fn run(
                 options.worker.program.display(),
                 options.worker.args
             );
-            return Ok(false);
+            None
         }
-    };
+    }
+}
+
+/// Parse the plan's jobs in `workers` processes, `first` among them, handing
+/// each TU's outcome to `sink` as it comes in — in no particular order, and
+/// every job exactly once.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run(
+    root: &Path,
+    plan: &Plan<'_>,
+    first: Worker,
+    workers: usize,
+    options: &Options,
+    cancel: &Cancel,
+    on_progress: &mut impl FnMut(usize, usize),
+    sink: &mut impl FnMut(usize, Outcome),
+) -> anyhow::Result<()> {
     log::info!(
         "[clang-index] parsing {} TU(s) in {} worker process(es)",
-        jobs.len(),
+        plan.todo.len(),
         workers
     );
 
@@ -225,7 +239,7 @@ pub(crate) fn run(
         rejected: Vec::new(),
     });
     let (results_tx, results_rx) = mpsc::channel::<(usize, Outcome)>();
-    let mut delivered = vec![false; jobs.len()];
+    let mut delivered = vec![false; plan.jobs.len()];
 
     std::thread::scope(|threads| {
         let mut first = Some(first);
@@ -233,16 +247,12 @@ pub(crate) fn run(
             let worker = first.take();
             let results = results_tx.clone();
             let dispatch = &dispatch;
-            threads.spawn(move || {
-                feed(
-                    root, jobs, flavours, options, cancel, dispatch, results, worker,
-                )
-            });
+            threads.spawn(move || feed(root, plan, options, cancel, dispatch, results, worker));
         }
         drop(results_tx);
 
         let mut done = 0;
-        while done < jobs.len() {
+        while done < plan.todo.len() {
             match results_rx.recv_timeout(POLL) {
                 Ok((i, outcome)) => {
                     if let Outcome::Parsed(parsed) = &outcome {
@@ -256,7 +266,7 @@ pub(crate) fn run(
                     delivered[i] = true;
                     sink(i, outcome);
                     done += 1;
-                    on_progress(done, jobs.len());
+                    on_progress(done, plan.todo.len());
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 // Every thread has stopped: the run was cancelled.
@@ -268,19 +278,17 @@ pub(crate) fn run(
     if cancel.is_cancelled() {
         anyhow::bail!("the index run was cancelled");
     }
-    for (i, _) in delivered.iter().enumerate().filter(|(_, d)| !**d) {
+    for &i in plan.todo.iter().filter(|&&i| !delivered[i]) {
         sink(i, Outcome::Failed("no worker returned it".into()));
     }
-    Ok(true)
+    Ok(())
 }
 
 /// One worker's thread: take the next job, have the worker parse it, send the
 /// outcome on, until the jobs run out or the run is cancelled.
-#[allow(clippy::too_many_arguments)]
 fn feed(
     root: &Path,
-    jobs: &[Job],
-    flavours: &[usize],
+    plan: &Plan<'_>,
     options: &Options,
     cancel: &Cancel,
     dispatch: &Mutex<Dispatch>,
@@ -293,14 +301,13 @@ fn feed(
         }
         let request = {
             let mut dispatch = dispatch.lock().unwrap();
-            let i = dispatch.next;
-            if i >= jobs.len() {
+            let Some(&i) = plan.todo.get(dispatch.next) else {
                 return;
-            }
+            };
             dispatch.next += 1;
-            crate::request(i, &jobs[i], flavours[i], &dispatch.rejected)
+            plan.request(i, &dispatch.rejected)
         };
-        let file = &jobs[request.index].file;
+        let file = &plan.jobs[request.index].file;
         let live = match worker.take() {
             Some(live) => Ok(live),
             None => Worker::spawn(&options.worker, root),
@@ -346,7 +353,9 @@ enum Fault {
 }
 
 /// A running worker process. Dropping it kills the process.
-struct Worker {
+pub(crate) struct Worker {
+    /// The libclang version it loaded, as it said when it started.
+    pub(crate) version: String,
     child: Child,
     stdin: ChildStdin,
     /// The worker's stdout, a line at a time, read on a thread of its own so
@@ -388,12 +397,16 @@ impl Worker {
             }
         });
         let mut worker = Self {
+            version: String::new(),
             child,
             stdin,
             lines,
         };
         match worker.lines.recv_timeout(HANDSHAKE_TIMEOUT) {
-            Ok(line) if line == READY => Ok(worker),
+            Ok(line) if line.starts_with(READY) => {
+                worker.version = line[READY.len()..].trim().to_owned();
+                Ok(worker)
+            }
             Ok(line) => anyhow::bail!("it did not answer as a worker: {line:?}"),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 anyhow::bail!("it did not answer as a worker within {HANDSHAKE_TIMEOUT:?}")

@@ -1317,6 +1317,7 @@ function showReady() {
     if (p.with_errors) parts.push(`${p.with_errors.toLocaleString()} with errors`);
     const detail = [
       `${p.parsed.toLocaleString()} of ${(p.parsed + p.failed).toLocaleString()} translation units parsed`,
+      p.cached ? `${p.cached.toLocaleString()} of them unchanged since a previous parse, and read from its cache` : null,
       p.failed ? `${p.failed.toLocaleString()} could not be parsed at all, and contributed nothing` : null,
       p.with_errors ? `${plural(p.with_errors, 'file', 'files')} parsed with errors — some function bodies may be incomplete` : null,
       `${plural(p.external_calls, 'call', 'calls')} to functions outside the project`,

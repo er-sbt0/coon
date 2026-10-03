@@ -980,6 +980,7 @@ mod tests {
             with_errors: 40,
             external_calls: 1234,
             rejected_arguments: vec!["-fconserve-stack".into()],
+            cached: 0,
         }))
         .unwrap();
         core.lsp.poll_loader_messages();

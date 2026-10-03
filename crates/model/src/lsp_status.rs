@@ -66,6 +66,10 @@ pub struct ParseSummary {
     pub external_calls: usize,
     /// Compiler arguments libclang refused and parsed without.
     pub rejected_arguments: Vec<String>,
+    /// Of `parsed`, TUs whose result was reused from the on-disk cache because
+    /// nothing they read had changed.
+    #[serde(default)]
+    pub cached: usize,
 }
 
 /// How far a [`ParseSummary`] should be trusted, for how loudly to show it.

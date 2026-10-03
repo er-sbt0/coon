@@ -29,14 +29,18 @@
 //! under `-DJEMALLOC_UNIT_TEST` can call what the library build does not. So a
 //! body is walked once per *flavour* (see `compdb::FlavourKey`)
 //! and the calls of every flavour land on the one node.
+//!
+//! What a TU came to is kept on disk (see `cache`), so reopening a project, or
+//! refreshing it after an edit, parses only the TUs whose inputs changed.
 
 pub mod args;
+mod cache;
 mod pool;
 pub mod worker;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use clang::diagnostic::Severity;
 use clang::{Clang, Entity, EntityKind, EntityVisitResult, Index};
@@ -72,6 +76,9 @@ pub struct Report {
     /// Arguments libclang refused, in the order first met: gcc flags clang does
     /// not have. Not counted in `errors`, since the code was read regardless.
     pub rejected_arguments: Vec<String>,
+    /// Of `parsed`, the TUs whose result came from the cache rather than a
+    /// parse.
+    pub cached: usize,
 }
 
 /// One function definition, as first seen.
@@ -108,6 +115,9 @@ pub(crate) struct Request {
     arguments: Vec<String>,
     /// The job's flavour, numbered in the order the run first meets each one.
     flavour: usize,
+    /// Where to cache the result, when the run caches: the parse then walks
+    /// every body, not only those its parser has not met (see `cache`).
+    store: Option<cache::Store>,
 }
 
 /// What parsing one translation unit produced, before it is merged with the
@@ -135,6 +145,20 @@ pub(crate) struct Parsed {
     /// The definitions whose bodies this parse walked, in source order.
     walked: Vec<Walked>,
     elapsed_ms: u64,
+    /// Whether the result was cached, when it was asked to be.
+    #[serde(default)]
+    cached: Cached,
+}
+
+/// What became of a request to cache a result.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub(crate) enum Cached {
+    #[default]
+    NotAsked,
+    Stored,
+    /// Why not: errors in the parse, a file that changed under it, a write
+    /// that failed.
+    NotStored(String),
 }
 
 /// One definition and the calls in its body.
@@ -277,36 +301,121 @@ pub fn index_with(
         .collect();
 
     let mut merge = Merge::new(jobs, &flavours);
-    let workers = options.workers.min(jobs.len());
-    let in_workers = workers > 0
-        && pool::run(
+    let first = (options.workers > 0 && !jobs.is_empty())
+        .then(|| pool::start(options, root))
+        .flatten();
+    let cache = if !options.cache {
+        None
+    } else if let Some(worker) = &first {
+        Some(cache::Cache::open(root, &worker.version))
+    } else {
+        cache::libclang_version().map(|version| cache::Cache::open(root, &version))
+    };
+    let mut plan = Plan {
+        jobs,
+        flavours: &flavours,
+        stores: Vec::new(),
+        todo: (0..jobs.len()).collect(),
+    };
+    let mut hits = 0;
+    if let Some(cache) = &cache {
+        let mut files = cache::Files::default();
+        plan.stores = jobs.iter().map(|job| Some(cache.store_for(job))).collect();
+        plan.todo.clear();
+        for (i, store) in plan.stores.iter_mut().enumerate() {
+            match store.as_ref().and_then(|s| cache.load(s, &mut files)) {
+                Some(parsed) => {
+                    *store = None;
+                    hits += 1;
+                    merge.arrive(i, Outcome::Parsed(parsed));
+                    on_progress(hits, jobs.len());
+                }
+                None => plan.todo.push(i),
+            }
+        }
+        log::info!(
+            "[clang-index] {hits} of {} TU(s) unchanged since cached in {}; {} to parse",
+            jobs.len(),
+            cache.dir().display(),
+            plan.todo.len()
+        );
+    }
+
+    let mut progress = |done: usize, _: usize| on_progress(hits + done, jobs.len());
+    let workers = options.workers.min(plan.todo.len());
+    let first = first.filter(|_| workers > 0);
+    let in_workers = first.is_some();
+    if let Some(first) = first {
+        pool::run(
             root,
-            jobs,
-            &flavours,
+            &plan,
+            first,
             workers,
             options,
             cancel,
-            &mut on_progress,
-            &mut |i, outcome| merge.arrive(i, outcome),
-        )?;
-    if !in_workers {
-        in_process(
-            root,
-            jobs,
-            &flavours,
-            cancel,
-            &mut on_progress,
+            &mut progress,
             &mut |i, outcome| merge.arrive(i, outcome),
         )?;
     }
-    Ok(merge.finish(numbers.len(), started))
+    if !in_workers && !plan.todo.is_empty() {
+        in_process(root, &plan, cancel, &mut progress, &mut |i, outcome| {
+            merge.arrive(i, outcome)
+        })?;
+    }
+    Ok(merge.finish(numbers.len(), hits, started))
 }
 
-/// Parse every job here, one after another, handing each outcome to `sink`.
+/// What a run has to parse, and how to ask for each.
+pub(crate) struct Plan<'a> {
+    jobs: &'a [Job],
+    flavours: &'a [usize],
+    /// Per job, where its result is to be cached: empty when the run does not
+    /// cache, `None` for a job the cache already answered.
+    stores: Vec<Option<cache::Store>>,
+    /// The jobs to parse, in increasing order — every job, less the cache's.
+    todo: Vec<usize>,
+}
+
+impl Plan<'_> {
+    fn caching(&self) -> bool {
+        !self.stores.is_empty()
+    }
+
+    /// The request for job `i`, without the arguments already refused — unless
+    /// the run caches.
+    ///
+    /// See `args::rejected_argument`. Once refused, an argument is left out of
+    /// every TU handed out afterwards, so libclang does not report it again
+    /// for every file. Leaving it out changes nothing but the diagnostic:
+    /// libclang ignored it anyway. But which arguments have been refused by
+    /// the time a job goes out depends on which jobs went before it, and a
+    /// cached result is keyed by the arguments it was parsed with, so a run
+    /// that caches sends every job whole: the key is then a function of the
+    /// job alone, and the merge reports each refused argument once regardless.
+    pub(crate) fn request(&self, i: usize, rejected: &[String]) -> Request {
+        let job = &self.jobs[i];
+        let strip = if self.caching() { &[][..] } else { rejected };
+        Request {
+            index: i,
+            file: job.file.clone(),
+            directory: job.directory.clone(),
+            arguments: job
+                .arguments
+                .iter()
+                .filter(|a| !strip.contains(a))
+                .cloned()
+                .collect(),
+            flavour: self.flavours[i],
+            store: self.stores.get(i).cloned().flatten(),
+        }
+    }
+}
+
+/// Parse every job of the plan here, one after another, handing each outcome
+/// to `sink`.
 fn in_process(
     root: &Path,
-    jobs: &[Job],
-    flavours: &[usize],
+    plan: &Plan<'_>,
     cancel: &Cancel,
     on_progress: &mut impl FnMut(usize, usize),
     sink: &mut impl FnMut(usize, Outcome),
@@ -315,11 +424,11 @@ fn in_process(
     let index = Index::new(&clang, false, false);
     let mut parser = Parser::new(root);
     let mut rejected: Vec<String> = Vec::new();
-    for (i, job) in jobs.iter().enumerate() {
+    for (done, &i) in plan.todo.iter().enumerate() {
         if cancel.is_cancelled() {
             anyhow::bail!("the index run was cancelled");
         }
-        let outcome = parser.parse(&index, &request(i, job, flavours[i], &rejected));
+        let outcome = parser.parse(&index, &plan.request(i, &rejected));
         if let Outcome::Parsed(parsed) = &outcome {
             for (argument, _) in &parsed.rejected {
                 if !rejected.contains(argument) {
@@ -328,30 +437,9 @@ fn in_process(
             }
         }
         sink(i, outcome);
-        on_progress(i + 1, jobs.len());
+        on_progress(done + 1, plan.todo.len());
     }
     Ok(())
-}
-
-/// The request for job `i`, without the arguments already refused.
-///
-/// See `args::rejected_argument`. Once refused, an argument is left out of
-/// every TU handed out afterwards, so a flag the whole build passes is reported
-/// once rather than once per file. Leaving it out changes nothing but the
-/// diagnostic: libclang ignored it anyway.
-pub(crate) fn request(i: usize, job: &Job, flavour: usize, rejected: &[String]) -> Request {
-    Request {
-        index: i,
-        file: job.file.clone(),
-        directory: job.directory.clone(),
-        arguments: job
-            .arguments
-            .iter()
-            .filter(|a| !rejected.contains(a))
-            .cloned()
-            .collect(),
-        flavour,
-    }
 }
 
 /// Every TU's result folded into one, in job order.
@@ -383,12 +471,19 @@ struct Merge<'a> {
     definitions: Vec<(u32, Definition)>,
     /// Per USR, the flavours whose body of it has been kept.
     defined: HashMap<u32, Vec<usize>>,
+    /// Per USR and flavour, the lowest job whose result to arrive so far
+    /// carries its body.
+    lowest: HashMap<(u32, usize), usize>,
     calls: Vec<Call>,
     parsed: usize,
     failed: usize,
     errors: usize,
     tus_with_errors: usize,
     rejected: Vec<String>,
+    /// Results written to the cache, and the first reason one was not.
+    stored: usize,
+    not_stored: usize,
+    first_not_stored: Option<String>,
 }
 
 impl<'a> Merge<'a> {
@@ -401,21 +496,42 @@ impl<'a> Merge<'a> {
             next: 0,
             definitions: Vec::new(),
             defined: HashMap::new(),
+            lowest: HashMap::new(),
             calls: Vec::new(),
             parsed: 0,
             failed: 0,
             errors: 0,
             tus_with_errors: 0,
             rejected: Vec::new(),
+            stored: 0,
+            not_stored: 0,
+            first_not_stored: None,
         }
     }
 
     /// Take job `i`'s outcome, in whatever order they come.
+    ///
+    /// A body some lower job has already brought in is dropped on arrival
+    /// rather than when its turn comes: the fold would skip it anyway, since
+    /// the lower job is folded first. This is what keeps a cached result
+    /// waiting behind a TU still being parsed from holding every header body
+    /// its neighbours already hold — a cache hit is complete, so after an edit
+    /// to one file the hits past it would otherwise wait whole (~40 MB more at
+    /// the peak on jemalloc, edit to `src/ckh.c`).
     fn arrive(&mut self, i: usize, mut outcome: Outcome) {
         if let Outcome::Parsed(parsed) = &mut outcome {
             if self.strings.adopt(parsed).is_none() {
                 outcome = Outcome::Failed("its result named strings it did not send".into());
             }
+        }
+        if let Outcome::Parsed(parsed) = &mut outcome {
+            let flavour = self.flavours[i];
+            let lowest = &mut self.lowest;
+            parsed.walked.retain(|walked| {
+                let first = lowest.entry((walked.usr, flavour)).or_insert(i);
+                *first = (*first).min(i);
+                *first == i
+            });
         }
         self.waiting.insert(i, outcome);
         while let Some(outcome) = self.waiting.remove(&self.next) {
@@ -438,6 +554,15 @@ impl<'a> Merge<'a> {
             }
         };
         self.parsed += 1;
+        match result.cached {
+            Cached::NotAsked => {}
+            Cached::Stored => self.stored += 1,
+            Cached::NotStored(reason) => {
+                log::debug!("[clang-index] {} not cached: {reason}", job.file.display());
+                self.not_stored += 1;
+                self.first_not_stored.get_or_insert(reason);
+            }
+        }
         for (argument, text) in result.rejected {
             if !self.rejected.contains(&argument) {
                 log::info!(
@@ -488,7 +613,7 @@ impl<'a> Merge<'a> {
         );
     }
 
-    fn finish(self, flavour_count: usize, started: Instant) -> Report {
+    fn finish(self, flavour_count: usize, cached: usize, started: Instant) -> Report {
         debug_assert!(
             self.waiting.is_empty() && self.next == self.jobs.len(),
             "every job's outcome is in before the merge finishes"
@@ -502,12 +627,25 @@ impl<'a> Merge<'a> {
                 shared
             );
         }
+        if self.stored + self.not_stored > 0 {
+            log::info!(
+                "[clang-index] {} result(s) cached, {} not{}",
+                self.stored,
+                self.not_stored,
+                self.first_not_stored
+                    .as_deref()
+                    .map(|r| format!(" (the first because {r})"))
+                    .unwrap_or_default()
+            );
+        }
         drop(self.defined);
+        drop(self.lowest);
         let (graph, external_calls) = build_graph(self.definitions, self.calls, &self.strings);
         log::info!(
-            "[clang-index] {} TU(s) parsed ({} failed, {} with {} error diagnostic(s)) in \
-             {:.1?}: {} function(s), {} edge(s), {} call(s) out of the project",
+            "[clang-index] {} TU(s) read ({} from the cache, {} failed, {} with {} error \
+             diagnostic(s)) in {:.1?}: {} function(s), {} edge(s), {} call(s) out of the project",
             self.parsed,
+            cached,
             self.failed,
             self.tus_with_errors,
             self.errors,
@@ -524,6 +662,7 @@ impl<'a> Merge<'a> {
             tus_with_errors: self.tus_with_errors,
             external_calls,
             rejected_arguments: self.rejected,
+            cached,
         }
     }
 }
@@ -535,9 +674,15 @@ impl<'a> Merge<'a> {
 /// has walked: a later TU of one of those skips the body, which is what keeps
 /// a header's inline functions from being walked once per includer, while a TU
 /// of another flavour walks it again for the calls that build makes.
+///
+/// A request that is to be cached is walked whole regardless (see `cache`),
+/// and what this parser had already walked is cut from the reply afterwards
+/// rather than skipped: the entry needs every body, the merge only the ones
+/// no earlier job of this parser sent.
 pub(crate) struct Parser {
     scope: Scope,
     walked: HashMap<String, Vec<usize>>,
+    files: cache::Files,
 }
 
 impl Parser {
@@ -545,11 +690,13 @@ impl Parser {
         Self {
             scope: Scope::new(root),
             walked: HashMap::new(),
+            files: cache::Files::default(),
         }
     }
 
     pub(crate) fn parse(&mut self, index: &Index<'_>, request: &Request) -> Outcome {
         let started = Instant::now();
+        let started_at = SystemTime::now();
         let tu = index
             .parser(&request.file)
             .arguments(&request.arguments)
@@ -582,18 +729,40 @@ impl Parser {
             scope: &mut self.scope,
             seen: &mut self.walked,
             flavour: request.flavour,
+            complete: request.store.as_ref().map(|_| HashSet::new()),
             strings: LocalStrings::default(),
             out: Vec::new(),
+            known: Vec::new(),
         };
         walk_translation_unit(tu.get_entity(), &mut walk);
-        Outcome::Parsed(Parsed {
+        let (strings, walked, known) = (walk.strings.list, walk.out, walk.known);
+        let mut parsed = Parsed {
             errors,
             error_samples,
             rejected,
-            strings: walk.strings.list,
-            walked: walk.out,
+            strings,
+            walked,
             elapsed_ms: started.elapsed().as_millis() as u64,
-        })
+            cached: Cached::NotAsked,
+        };
+        if let Some(store) = &request.store {
+            parsed.cached = if errors > 0 {
+                Cached::NotStored(format!("{errors} error(s) in the parse"))
+            } else {
+                let inputs = cache::inclusions(&tu, &request.directory);
+                match cache::save(store, &inputs, started_at, &parsed, &mut self.files) {
+                    Ok(()) => Cached::Stored,
+                    Err(reason) => Cached::NotStored(reason),
+                }
+            };
+            // The bodies an earlier job of this parser already sent, which the
+            // merge would drop. The strings only they named stay in the table,
+            // unreferenced; renumbering a few extra costs less than a second
+            // table.
+            let mut known = known.into_iter();
+            parsed.walked.retain(|_| !known.next().unwrap_or(false));
+        }
+        Outcome::Parsed(parsed)
     }
 }
 
@@ -603,9 +772,15 @@ struct Walk<'a> {
     seen: &'a mut HashMap<String, Vec<usize>>,
     /// The flavour of the TU being walked.
     flavour: usize,
+    /// When the result is to be cached, the USRs walked in this TU: every
+    /// body is walked once, whether or not `seen` has it.
+    complete: Option<HashSet<String>>,
     /// What `out` names, numbered.
     strings: LocalStrings,
     out: Vec<Walked>,
+    /// Per entry of `out`, whether `seen` already had it — only ever true
+    /// when `complete` is set, since otherwise it would not have been walked.
+    known: Vec<bool>,
 }
 
 impl Report {
@@ -617,6 +792,7 @@ impl Report {
             with_errors: self.tus_with_errors,
             external_calls: self.external_calls,
             rejected_arguments: self.rejected_arguments.clone(),
+            cached: self.cached,
         }
     }
 }
@@ -710,17 +886,24 @@ fn walk_translation_unit(root: Entity<'_>, walk: &mut Walk<'_>) {
 
 /// Record a definition and every call in its body, unless this parser has
 /// already walked the same USR in the same flavour. One walked in another
-/// flavour is walked again, since it may be different code there.
+/// flavour is walked again, since it may be different code there. A walk to be
+/// cached records every definition once, whatever the parser has seen.
 fn record_definition(entity: Entity<'_>, walk: &mut Walk<'_>) {
     let Some(usr) = entity.get_usr().map(|usr| usr.0) else {
         return;
     };
-    if walk
+    let known = walk
         .seen
         .get(&usr)
-        .is_some_and(|flavours| flavours.contains(&walk.flavour))
-    {
-        return;
+        .is_some_and(|flavours| flavours.contains(&walk.flavour));
+    match &mut walk.complete {
+        Some(this_tu) => {
+            if this_tu.contains(&usr) {
+                return;
+            }
+        }
+        None if known => return,
+        None => {}
     }
     let Some(location) = location_of(entity, walk.scope, &mut walk.strings) else {
         // Defined outside the project.
@@ -776,7 +959,13 @@ fn record_definition(entity: Entity<'_>, walk: &mut Walk<'_>) {
     });
 
     let number = walk.strings.number(&usr);
-    walk.seen.entry(usr).or_default().push(walk.flavour);
+    if let Some(this_tu) = &mut walk.complete {
+        this_tu.insert(usr.clone());
+    }
+    if !known {
+        walk.seen.entry(usr).or_default().push(walk.flavour);
+    }
+    walk.known.push(known);
     walk.out.push(Walked {
         usr: number,
         name,

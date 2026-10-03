@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use clang_index::{index, index_with, Cancel, Job, Options, Report, WorkerCommand};
 use compdb::CompileCommand;
@@ -46,6 +46,10 @@ fn main() {
         (
             "a_binary_that_is_not_a_worker_parses_in_process",
             a_binary_that_is_not_a_worker_parses_in_process,
+        ),
+        (
+            "cached_and_parsed_results_merge_to_the_uncached_graph",
+            cached_and_parsed_results_merge_to_the_uncached_graph,
         ),
     ];
     let filter = std::env::args().skip(1).find(|a| !a.starts_with('-'));
@@ -328,4 +332,93 @@ fn a_binary_that_is_not_a_worker_parses_in_process() {
     };
     let report = index_with(root, &jobs, &options, &Cancel::default(), |_, _| {}).unwrap();
     assert_eq!((report.parsed, report.failed), (4, 0));
+}
+
+/// Set every file under `dir` an hour into the past, so the cache trusts it.
+fn age(dir: &Path) {
+    let then = SystemTime::now() - Duration::from_secs(3600);
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            age(&path);
+        } else {
+            let file = std::fs::File::options().write(true).open(&path).unwrap();
+            file.set_modified(then).unwrap();
+        }
+    }
+}
+
+/// The determinism the cache has to keep: a parser walks a header's body only
+/// the first time it meets it, so a parsed TU's result depends on what its
+/// worker parsed before, where a cached one is complete. With some TUs
+/// answered from the cache and the rest spread over workers — the first TU
+/// edited, a middle one, both — the merge must still come to the graph a run
+/// without a cache builds of the same tree. The cases that need an entry to be
+/// complete are those where the lowest TU to define a header body is no longer
+/// the one that walked it: that TU stops including the header, or the run asks
+/// for a subset of the jobs, as a `--flavour` run does.
+fn cached_and_parsed_results_merge_to_the_uncached_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let jobs = project(root, 12);
+    age(root);
+    for workers in [0, 3] {
+        let cached = Options {
+            cache: true,
+            ..options(workers)
+        };
+        let run = || index_with(root, &jobs, &cached, &Cancel::default(), |_, _| {}).unwrap();
+        let _ = std::fs::remove_dir_all(root.join(".cache"));
+        let expected = fingerprint(&index(root, &jobs, |_, _| {}).unwrap());
+
+        let cold = run();
+        assert_eq!((cold.cached, fingerprint(&cold)), (0, expected.clone()));
+        let warm = run();
+        assert_eq!((warm.cached, fingerprint(&warm)), (13, expected));
+
+        let subset = &jobs[4..];
+        let expected = fingerprint(&index(root, subset, |_, _| {}).unwrap());
+        let options = &cached;
+        let part = index_with(root, subset, options, &Cancel::default(), |_, _| {}).unwrap();
+        assert_eq!(
+            (part.cached, fingerprint(&part)),
+            (9, expected),
+            "{workers} worker(s)"
+        );
+
+        for edited in [&["defs.c"][..], &["c5.c"], &["defs.c", "c0.c", "c7.c"]] {
+            for file in edited {
+                let path = root.join(file);
+                let mut text = std::fs::read_to_string(&path).unwrap();
+                text.push_str("/* edited */\n");
+                std::fs::write(&path, text).unwrap();
+            }
+            age(root);
+            let expected = fingerprint(&index(root, &jobs, |_, _| {}).unwrap());
+            let mixed = run();
+            assert_eq!(
+                mixed.cached,
+                13 - edited.len(),
+                "{workers} worker(s), {edited:?}"
+            );
+            assert_eq!(
+                fingerprint(&mixed),
+                expected,
+                "{workers} worker(s), {edited:?}"
+            );
+        }
+
+        // The lowest TU of each flavour stops defining `pick`; the next is a
+        // hit, and has to have the body.
+        for file in ["c0.c", "c1.c"] {
+            write(root, file, "void shared(int x) { (void)x; }\n");
+        }
+        age(root);
+        let expected = fingerprint(&index(root, &jobs, |_, _| {}).unwrap());
+        let mixed = run();
+        assert_eq!(mixed.cached, 11, "{workers} worker(s)");
+        assert_eq!(fingerprint(&mixed), expected, "{workers} worker(s)");
+        project(root, 12);
+        age(root);
+    }
 }
