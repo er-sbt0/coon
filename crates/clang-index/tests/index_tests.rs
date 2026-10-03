@@ -531,3 +531,121 @@ fn the_summary_counts_translation_units() {
     assert!(report.errors >= 1);
     assert_eq!(summary.quality(), model::ParseQuality::Poor);
 }
+
+/// A header whose inline function calls a different thing per build, and two
+/// TUs that include it.
+fn write_flavoured_header(root: &Path) {
+    std::fs::create_dir_all(root.join("include")).unwrap();
+    write(
+        root,
+        "include/pick.h",
+        "void call_a(void);\n\
+         void call_b(void);\n\
+         void always(void);\n\
+         static inline void pick(void) {\n\
+         #ifdef FLAV_A\n\
+             call_a();\n\
+         #else\n\
+             call_b();\n\
+         #endif\n\
+             always();\n\
+         }\n",
+    );
+    write(
+        root,
+        "defs.c",
+        "void call_a(void) {}\nvoid call_b(void) {}\nvoid always(void) {}\n",
+    );
+}
+
+#[test]
+fn a_header_body_is_walked_once_per_flavour() {
+    let _guard = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_flavoured_header(root);
+    write(root, "a.c", "#include \"pick.h\"\nvoid a_main(void) { pick(); }\n");
+    write(root, "b.c", "#include \"pick.h\"\nvoid b_main(void) { pick(); }\n");
+
+    // Two builds of the one database, as a run without `--flavour` sees it.
+    let jobs = vec![
+        job_with(root, "a.c", &["cc", "-Iinclude", "-DFLAV_A"]),
+        job_with(root, "b.c", &["cc", "-Iinclude"]),
+        job_with(root, "defs.c", &["cc", "-Iinclude"]),
+    ];
+    let report = index(root, &jobs, |_, _| {}).unwrap();
+
+    // One node, carrying the calls of both builds; the call both builds make
+    // is the same site and so one edge.
+    assert_eq!(
+        sites(&report.graph),
+        set(&[
+            "a_main -> pick @ a.c:2",
+            "b_main -> pick @ b.c:2",
+            "pick -> call_a @ pick.h:6",
+            "pick -> call_b @ pick.h:8",
+            "pick -> always @ pick.h:10",
+        ])
+    );
+    let picks = report
+        .graph
+        .functions()
+        .filter(|f| f.qualified_name == "pick")
+        .count();
+    assert_eq!(picks, 1);
+    assert_eq!(report.external_calls, 0);
+}
+
+#[test]
+fn a_header_body_is_walked_once_within_a_flavour() {
+    let _guard = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_flavoured_header(root);
+    // The same flavour — no `-D` tells them apart — though `a.c` defines the
+    // macro itself. A flavour is taken to be one piece of code, so the second
+    // includer's body is not walked: this is the skip that keeps a header from
+    // being read once per includer, and what it costs when a TU breaks the
+    // assumption.
+    write(
+        root,
+        "a.c",
+        "#define FLAV_A\n#include \"pick.h\"\nvoid a_main(void) { pick(); }\n",
+    );
+    write(root, "b.c", "#include \"pick.h\"\nvoid b_main(void) { pick(); }\n");
+
+    let jobs = vec![job(root, "a.c"), job(root, "b.c"), job(root, "defs.c")];
+    let report = index(root, &jobs, |_, _| {}).unwrap();
+
+    assert_eq!(
+        sites(&report.graph),
+        set(&[
+            "a_main -> pick @ a.c:3",
+            "b_main -> pick @ b.c:2",
+            "pick -> call_a @ pick.h:6",
+            "pick -> always @ pick.h:10",
+        ])
+    );
+}
+
+#[test]
+fn an_external_call_two_flavours_make_is_counted_once() {
+    let _guard = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir(root.join("include")).unwrap();
+    write(
+        root,
+        "include/ext.h",
+        "void elsewhere(void);\nstatic inline void wrap(void) { elsewhere(); }\n",
+    );
+    write(root, "a.c", "#include \"ext.h\"\nvoid a_main(void) { wrap(); }\n");
+    write(root, "b.c", "#include \"ext.h\"\nvoid b_main(void) { wrap(); }\n");
+
+    let jobs = vec![
+        job_with(root, "a.c", &["cc", "-Iinclude", "-DONE"]),
+        job_with(root, "b.c", &["cc", "-Iinclude", "-DTWO"]),
+    ];
+    let report = index(root, &jobs, |_, _| {}).unwrap();
+    assert_eq!(report.external_calls, 1);
+}

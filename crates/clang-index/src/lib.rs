@@ -18,6 +18,13 @@
 //! tells overloads apart, and makes a `static` function's identity include its
 //! file. The `SymbolId` the rest of the app sees is still built the usual way
 //! from the definition, by [`FunctionNode::new`].
+//!
+//! A USR names a function, not a body. Within one build a header's inline
+//! function is the same code in every TU that includes it, so its body is
+//! walked once; but a database is often several builds, and the same function
+//! under `-DJEMALLOC_UNIT_TEST` can call what the library build does not. So a
+//! body is walked once per *flavour* (see `lsp::compile_commands::FlavourKey`)
+//! and the calls of every flavour land on the one node.
 
 pub mod args;
 
@@ -49,7 +56,9 @@ pub struct Report {
     /// in doubt, where `errors` may be one header counted once per includer.
     pub tus_with_errors: usize,
     /// Calls whose callee has no definition in the project — libc, the system
-    /// headers, or a function the build declares and never defines.
+    /// headers, or a function the build declares and never defines. Counted per
+    /// call site, so a header's call that two flavours both make counts once,
+    /// just as it is one edge when its callee is in the project.
     pub external_calls: usize,
     /// Arguments libclang refused, in the order first met: gcc flags clang does
     /// not have. Not counted in `errors`, since the code was read regardless.
@@ -72,6 +81,11 @@ struct Call {
 
 /// Everything collected so far, keyed by USR.
 ///
+/// `defined` holds, per USR, the flavours whose definition of it has been
+/// walked: a later TU of one of those skips the body, which is what keeps a
+/// header's inline functions from being walked once per includer, while a TU of
+/// another flavour walks it again for the calls that build makes.
+///
 /// The definitions are a list in the order they were first seen — parse order,
 /// then source order within a TU — rather than a map, because the graph is
 /// built by walking them, and a `HashMap` walks in a different order every
@@ -81,8 +95,10 @@ struct Call {
 #[derive(Default)]
 struct Collected {
     definitions: Vec<(String, Definition)>,
-    defined: HashSet<String>,
+    defined: HashMap<String, Vec<usize>>,
     calls: Vec<Call>,
+    /// The flavour of the TU being walked, as an index into the run's flavours.
+    flavour: usize,
 }
 
 /// Parse every job in order and build the call graph of what they define.
@@ -93,9 +109,10 @@ struct Collected {
 /// each TU.
 ///
 /// The jobs are parsed in the order given, and the first TU to define a USR
-/// is the one its node comes from — a header's inline function is defined in
-/// every TU that includes it, and within one build they are the same code — so
-/// a sorted job list gives the same graph every run.
+/// is the one its node's location comes from, so a sorted job list gives the
+/// same graph every run. Its calls are those of the first TU of each flavour
+/// to define it — a header's inline function is defined in every TU that
+/// includes it, and within one build they are the same code.
 pub fn index(
     root: &Path,
     jobs: &[Job],
@@ -114,6 +131,9 @@ pub fn index(
     // than once per file.
     let mut rejected: Vec<String> = Vec::new();
     let started = Instant::now();
+    // Flavours numbered in the order first met, so `Collected::defined` holds
+    // an index rather than a copy of the key per function.
+    let mut flavours: HashMap<&lsp::compile_commands::FlavourKey, usize> = HashMap::new();
 
     for (done, job) in jobs.iter().enumerate() {
         let tu_started = Instant::now();
@@ -160,6 +180,8 @@ pub fn index(
                 }
                 let before = (collected.definitions.len(), collected.calls.len());
                 scope.directory = job.directory.clone();
+                let next = flavours.len();
+                collected.flavour = *flavours.entry(&job.flavour).or_insert(next);
                 walk_translation_unit(tu.get_entity(), &mut scope, &mut collected);
                 log::debug!(
                     "[clang-index] {} in {:.0?}: {} new function(s), {} call(s), {} error(s)",
@@ -178,6 +200,15 @@ pub fn index(
         on_progress(done + 1, jobs.len());
     }
 
+    if flavours.len() > 1 {
+        let shared = collected.defined.values().filter(|f| f.len() > 1).count();
+        log::info!(
+            "[clang-index] {} build flavour(s) in one graph: {} function(s) defined under more \
+             than one, their calls unioned",
+            flavours.len(),
+            shared
+        );
+    }
     let (graph, external_calls) = build_graph(collected);
     log::info!(
         "[clang-index] {} TU(s) parsed ({} failed, {} with {} error diagnostic(s)) in {:.1?}: \
@@ -228,14 +259,25 @@ fn build_graph(collected: Collected) -> (CallGraph, usize) {
         ));
         ids.insert(usr, id);
     }
-    let mut external = 0usize;
+    // A call site met twice — a header body walked under two flavours — is one
+    // edge, because `add_call` keys an edge by its site; the external count is
+    // held to the same rule, so it does not grow with the number of flavours.
+    let mut external = HashSet::new();
     for call in collected.calls {
         match (ids.get(&call.caller), ids.get(&call.callee)) {
             (Some(&caller), Some(&callee)) => graph.add_call(caller, callee, call.location),
-            _ => external += 1,
+            _ => {
+                external.insert((
+                    call.caller,
+                    call.callee,
+                    call.location.file_path,
+                    call.location.line,
+                    call.location.column,
+                ));
+            }
         }
     }
-    (graph, external)
+    (graph, external.len())
 }
 
 fn is_function(kind: EntityKind) -> bool {
@@ -286,15 +328,19 @@ fn walk_translation_unit(root: Entity<'_>, scope: &mut Scope, out: &mut Collecte
     });
 }
 
-/// Record a definition and every call in its body, unless an earlier TU has
-/// already defined the same USR.
+/// Record a definition and every call in its body, unless an earlier TU of the
+/// same flavour has already defined the same USR. An earlier TU of another
+/// flavour only means the definition is known: the body is still walked, since
+/// it may be different code there.
 fn record_definition(entity: Entity<'_>, scope: &mut Scope, out: &mut Collected) {
     let Some(usr) = entity.get_usr().map(|usr| usr.0) else {
         return;
     };
-    if out.defined.contains(&usr) {
-        return;
-    }
+    let known = match out.defined.get(&usr) {
+        Some(flavours) if flavours.contains(&out.flavour) => return,
+        Some(_) => true,
+        None => false,
+    };
     let Some(location) = location_of(entity, scope) else {
         // Defined outside the project.
         return;
@@ -349,7 +395,13 @@ fn record_definition(entity: Entity<'_>, scope: &mut Scope, out: &mut Collected)
         EntityVisitResult::Recurse
     });
 
-    out.defined.insert(usr.clone());
+    if known {
+        if let Some(flavours) = out.defined.get_mut(&usr) {
+            flavours.push(out.flavour);
+        }
+        return;
+    }
+    out.defined.insert(usr.clone(), vec![out.flavour]);
     out.definitions.push((
         usr,
         Definition {

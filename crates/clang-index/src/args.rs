@@ -21,7 +21,7 @@
 
 use std::path::{Path, PathBuf};
 
-use lsp::compile_commands::CompileCommand;
+use lsp::compile_commands::{CompileCommand, FlavourKey};
 
 use crate::normalise;
 
@@ -33,6 +33,10 @@ pub struct Job {
     /// relative `-I` relative to.
     pub directory: PathBuf,
     pub arguments: Vec<String>,
+    /// Which build of the database this TU belongs to. A header's inline
+    /// function is walked once per flavour rather than once per run, because
+    /// two flavours can compile the same definition into different code.
+    pub flavour: FlavourKey,
 }
 
 impl Job {
@@ -51,6 +55,7 @@ impl Job {
             file,
             directory: directory.to_path_buf(),
             arguments,
+            flavour: entry.flavour_key(),
         }
     }
 }
