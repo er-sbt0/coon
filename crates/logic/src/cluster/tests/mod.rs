@@ -3,6 +3,7 @@ use model::{FunctionNode, Location};
 
 mod invariants;
 mod known_answers;
+mod metamorphic;
 mod oracle;
 
 /// Distinct lines keep the generated `SymbolId`s distinct.
