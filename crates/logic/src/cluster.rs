@@ -39,11 +39,21 @@
 //! cannot see a module smaller than about √(2m) calls' worth inside a much
 //! larger program. Those show at the finer rungs, which is what they are for.
 //!
-//! It is fully deterministic: nodes are indexed in symbol-id order and swept in
-//! that order, candidate communities are tried in ascending id, and a move needs
-//! a strictly better gain, so a tie keeps a node where it is. Two runs over the
-//! same graph produce byte-identical output, and no seeding or history is
-//! needed to get it — which is why there is none.
+//! It is fully deterministic: nodes are indexed in [`visit_key`] order — by
+//! qualified name, then definition site — and swept in that order, candidate
+//! communities are tried in ascending index, and a move needs a strictly better
+//! gain, so a tie keeps a node where it is. Two runs over the same graph
+//! produce byte-identical output, and no seeding or history is needed to get
+//! it — which is why there is none.
+//!
+//! The order is deliberately not symbol-id order. A greedy sweep's answer
+//! depends on the order it visits in — not only between tied groupings but
+//! between local optima of different quality — and a `SymbolId` is a hash of
+//! the qualified name *and the file and line* it is defined at. Swept in id
+//! order, adding a line above a function reshuffled the map, and so did
+//! checking the project out at another path; salting the ids of one 60-function
+//! graph sixteen ways changed its opening rung fourteen times. A name moves only
+//! when someone renames it.
 //!
 //! **Isolated functions are left out of the clustering entirely.** A function
 //! with no calls in either direction gets no cluster at all, and
@@ -577,9 +587,9 @@ pub struct ClusterId(pub u32);
 /// The clusters at one level partition the clustered symbols — every clustered
 /// symbol is in exactly one of them — so any member chosen by a rule that looks
 /// only at the member set picks out its cluster uniquely within that level. The
-/// lowest member by uuid is the cheapest such rule, and it is already the one
-/// `build_clustering` uses to order clusters within a level, so the anchor is
-/// simply the first entry of [`Cluster::members`]. A level plus that anchor is
+/// first member in [`visit_key`] order is the cheapest such rule, and it is
+/// already the one `build_clustering` uses to order clusters within a level,
+/// so the anchor is simply the first entry of [`Cluster::members`]. A level plus that anchor is
 /// therefore something a frontend can hold across a recompute, and it goes on
 /// naming the same group for as long as that group keeps its lowest member.
 ///
@@ -594,7 +604,7 @@ pub struct ClusterId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClusterKey {
     pub level: usize,
-    /// The cluster's lowest member, ordered by uuid bytes — the same ordering
+    /// The cluster's first member in [`visit_key`] order — the same ordering
     /// every other ordering in this module descends from.
     pub anchor: SymbolId,
 }
@@ -610,8 +620,8 @@ pub struct Cluster {
     /// The one or two clusters one level finer that merged into this one; empty
     /// at level 0.
     pub children: Vec<ClusterId>,
-    /// Every leaf function under this cluster, transitively, ordered by symbol
-    /// id so two runs produce byte-identical output.
+    /// Every leaf function under this cluster, transitively, in [`visit_key`]
+    /// order so two runs produce byte-identical output.
     pub members: Vec<SymbolId>,
     pub entry_point: Option<SymbolId>,
     pub label: String,
@@ -905,7 +915,7 @@ fn build_base_graph(graph: &CallGraph, scope: Option<&HashSet<SymbolId>>) -> Bas
         .collect();
     // Every downstream ordering — the visit order, member lists, cluster ids —
     // descends from this sort, which is what makes two runs byte-identical.
-    all.sort_unstable_by_key(|s| s.0);
+    all.sort_unstable_by_key(|symbol| visit_key(graph, symbol));
 
     let position: HashMap<SymbolId, usize> = all.iter().enumerate().map(|(i, s)| (*s, i)).collect();
 
@@ -2217,7 +2227,7 @@ fn build_clustering(graph: &CallGraph, symbols: &[SymbolId], ladder: &[Vec<usize
     }
 
     // Assign ids finest-to-coarsest, clusters within a level ordered by their
-    // lowest member — which, given the index order, is the lowest symbol id.
+    // lowest member — which, given the index order, is the first by `visit_key`.
     let mut ids: Vec<Vec<Option<ClusterId>>> = Vec::with_capacity(members.len());
     let mut order: Vec<Vec<usize>> = Vec::with_capacity(members.len());
     let mut next_id = 0u32;
@@ -2451,6 +2461,33 @@ fn tie_break_key<'g>(graph: &'g CallGraph, symbol: &SymbolId) -> (&'g str, u32, 
     (
         location.map(|l| l.file_path.as_str()).unwrap_or_default(),
         location.map(|l| l.line).unwrap_or(u32::MAX),
+        uuid_bytes::Bytes(*symbol.0.as_bytes()),
+    )
+}
+
+/// The order functions are indexed, and so visited, in: by qualified name, then
+/// by where they are defined for two that share one — a `static` helper of the
+/// same name in two files, or two overloads — and by uuid only for two that
+/// share all three, which two distinct `SymbolId`s cannot.
+///
+/// Not the symbol id, because that is a hash of the definition site: see the
+/// module documentation. A path or a line breaks a tie between equal names and
+/// does nothing else, so moving code around a file reorders nothing.
+fn visit_key<'g>(
+    graph: &'g CallGraph,
+    symbol: &SymbolId,
+) -> (&'g str, &'g str, u32, uuid_bytes::Bytes) {
+    let function = graph.get_function(symbol);
+    (
+        function
+            .map(|f| f.qualified_name.as_str())
+            .unwrap_or_default(),
+        function
+            .map(|f| f.definition_location.file_path.as_str())
+            .unwrap_or_default(),
+        function
+            .map(|f| f.definition_location.line)
+            .unwrap_or(u32::MAX),
         uuid_bytes::Bytes(*symbol.0.as_bytes()),
     )
 }

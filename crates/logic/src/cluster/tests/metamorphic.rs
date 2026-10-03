@@ -11,14 +11,14 @@ use super::known_answers::{clique, graph_of};
 use super::*;
 use model::CallEdge;
 
-/// The same graph rebuilt: the functions `keep` keeps, under the same names
-/// and definition sites, and each call turned into whatever `calls` makes of
-/// it. A `salt` goes into every qualified name, which changes every
-/// `SymbolId` — and so the order every sweep visits in — and nothing a test
-/// reads by name.
+/// The same graph rebuilt: the functions `keep` keeps, each defined as
+/// `define` rewrites it, and each call turned into whatever `calls` makes of
+/// it. A test compares functions by display name, so `define` can move a
+/// function, or change its qualified name, and so its `SymbolId`, without the
+/// comparison noticing.
 fn rebuild(
     graph: &CallGraph,
-    salt: Option<&str>,
+    define: impl Fn(&FunctionNode) -> FunctionNode,
     keep: impl Fn(&SymbolId) -> bool,
     calls: impl Fn(&CallEdge) -> Vec<(SymbolId, SymbolId, Location)>,
 ) -> CallGraph {
@@ -27,15 +27,7 @@ fn rebuild(
     let mut functions: Vec<_> = graph.functions().filter(|f| keep(&f.id)).collect();
     functions.sort_by(|a, b| a.name.cmp(&b.name));
     for function in functions {
-        let qualified = match salt {
-            Some(salt) => format!("{}#{salt}", function.qualified_name),
-            None => function.qualified_name.clone(),
-        };
-        let id = rebuilt.add_function(FunctionNode::new(
-            function.name.clone(),
-            qualified,
-            function.definition_location.clone(),
-        ));
+        let id = rebuilt.add_function(define(function));
         ids.insert(function.id, id);
     }
     for edge in graph.edges() {
@@ -46,6 +38,31 @@ fn rebuild(
         }
     }
     rebuilt
+}
+
+fn as_is(function: &FunctionNode) -> FunctionNode {
+    FunctionNode::new(
+        function.name.clone(),
+        function.qualified_name.clone(),
+        function.definition_location.clone(),
+    )
+}
+
+/// Each function under a qualified name prefixed by a hash of `salt` and its
+/// name, so that every salt sorts the program into an unrelated order — the
+/// order the sweeps visit in — while every display name stays put.
+fn shuffled(salt: u64) -> impl Fn(&FunctionNode) -> FunctionNode {
+    move |function| {
+        let mut hash = salt ^ 0xcbf2_9ce4_8422_2325;
+        for byte in function.name.bytes() {
+            hash = (hash ^ byte as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+        FunctionNode::new(
+            function.name.clone(),
+            format!("{hash:016x}::{}", function.qualified_name),
+            function.definition_location.clone(),
+        )
+    }
 }
 
 fn same_calls(edge: &CallEdge) -> Vec<(SymbolId, SymbolId, Location)> {
@@ -96,7 +113,7 @@ fn reversing_every_call_changes_no_grouping() {
     report(differences(|graph| {
         rebuild(
             graph,
-            None,
+            as_is,
             |_| true,
             |edge| vec![(edge.callee, edge.caller, edge.call_location.clone())],
         )
@@ -113,7 +130,7 @@ fn calling_everything_k_times_as_often_changes_no_grouping() {
         report(differences(|graph| {
             rebuild(
                 graph,
-                None,
+                as_is,
                 |_| true,
                 |edge| {
                     (0..k)
@@ -135,7 +152,7 @@ fn calling_everything_k_times_as_often_changes_no_grouping() {
 #[test]
 fn isolated_functions_and_recursion_change_nothing() {
     report(differences(|graph| {
-        let mut changed = rebuild(graph, None, |_| true, same_calls);
+        let mut changed = rebuild(graph, as_is, |_| true, same_calls);
         let ids: Vec<SymbolId> = changed.function_ids().copied().collect();
         for (i, id) in ids.iter().enumerate().step_by(3) {
             changed.add_call(
@@ -178,7 +195,7 @@ fn a_scoped_clustering_is_the_clustering_of_the_scope_alone() {
             ),
         ];
         for (which, scope) in &scopes {
-            let alone = rebuild(&graph, None, |id| scope.contains(id), same_calls);
+            let alone = rebuild(&graph, as_is, |id| scope.contains(id), same_calls);
             for settings in settings_matrix() {
                 let scoped = shape(&graph, &Clustering::compute_within(&graph, scope, settings));
                 let whole = shape(&alone, &Clustering::compute(&alone, settings));
@@ -195,12 +212,79 @@ fn a_scoped_clustering_is_the_clustering_of_the_scope_alone() {
 
 // -- the order symbols are visited in ----------------------------------------
 
+/// A `SymbolId` hashes the definition's file and line, so an edit above a
+/// function, or the same project checked out somewhere else, gives every
+/// function a new id. The map must not notice: the order the sweeps visit in
+/// is by name, and a definition site only breaks a tie between equal names.
+/// Each function moves by a different amount, so the order by line changes
+/// too, and the path moves under all of them.
+#[test]
+fn moving_every_definition_changes_no_grouping() {
+    report(differences(|graph| {
+        rebuild(
+            graph,
+            |function| {
+                let at = &function.definition_location;
+                let shift = function.name.bytes().map(u32::from).sum::<u32>() * 37 % 1000;
+                FunctionNode::new(
+                    function.name.clone(),
+                    function.qualified_name.clone(),
+                    Location::new(
+                        format!("/elsewhere/{}", at.file_path),
+                        at.line * 7 + shift,
+                        0,
+                    ),
+                )
+            },
+            |_| true,
+            same_calls,
+        )
+    }));
+}
+
+/// The same `static` helper in two files, and two overloads in one: equal
+/// qualified names, which the order breaks by file and then by line. Two
+/// copies of a program whose functions all share their names with the
+/// other's, clustered once in each file order: the boxes must be the same up
+/// to which file each copy lives in.
+#[test]
+fn functions_sharing_a_name_are_ordered_by_where_they_are_defined() {
+    let mut graph = CallGraph::new();
+    let mut site = 1u32;
+    for file in ["src/a.c", "src/b.c"] {
+        let ids: Vec<SymbolId> = ["init", "parse", "emit", "free"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| add_in(&mut graph, name, file, i as u32 + 1))
+            .collect();
+        for i in 0..ids.len() {
+            for j in i + 1..ids.len() {
+                site += 1;
+                call(&mut graph, ids[i], ids[j], site);
+            }
+        }
+    }
+    let ordered = Clustering::compute(&graph, ClusterMethod::Modularity);
+    let mut keys: Vec<_> = graph
+        .function_ids()
+        .map(|id| visit_key(&graph, id))
+        .collect();
+    keys.sort();
+    let files: Vec<&str> = keys.iter().map(|key| key.1).collect();
+    assert_eq!(
+        files,
+        ["src/a.c", "src/b.c", "src/a.c", "src/b.c", "src/a.c", "src/b.c", "src/a.c", "src/b.c"],
+        "equal names fall back to the file"
+    );
+    assert!(!ordered.is_empty());
+}
+
 /// Every sweep visits functions in symbol-id order, and a symbol id is a hash
 /// — so the order is arbitrary, and an answer that depended on it would be
 /// an accident of naming. Where the best grouping is unique, the methods must
 /// find it from any order. Each fixture is one of `known_answers`, where that
-/// uniqueness was established by exhaustive search; sixteen salts give
-/// sixteen unrelated orders.
+/// uniqueness was established by exhaustive search; sixteen salted names
+/// give sixteen unrelated orders.
 #[test]
 fn a_unique_answer_does_not_depend_on_the_order_symbols_are_visited_in() {
     let two_triangles = {
@@ -262,7 +346,7 @@ fn a_unique_answer_does_not_depend_on_the_order_symbols_are_visited_in() {
         for &settings in settings {
             let expected = opening(graph, settings);
             for salt in 0..16 {
-                let salted = rebuild(graph, Some(&salt.to_string()), |_| true, same_calls);
+                let salted = rebuild(graph, shuffled(salt), |_| true, same_calls);
                 let got = opening(&salted, settings);
                 if got != expected {
                     failures.push(format!(
@@ -274,4 +358,3 @@ fn a_unique_answer_does_not_depend_on_the_order_symbols_are_visited_in() {
     }
     report(failures);
 }
-
