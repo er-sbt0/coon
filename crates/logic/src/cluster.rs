@@ -1660,11 +1660,12 @@ fn refine(mover: &Mover) -> (Vec<usize>, usize) {
 /// that run one. So the read-off is held to the same rule as a Louvain move:
 /// two attractors are united only if the quotient stays a DAG, and a node
 /// drains into the best system that keeps it one, falling through to the next
-/// by flow and staying alone if none does. Systems are formed first, in index
-/// order, and then the rest are placed, in index order, so the result is a
-/// function of the flow alone. A node whose column reaches no attractor —
-/// which only happens when [`MARKOV_MAX_ITERATIONS`] ran out first — is left
-/// as a box of its own.
+/// by flow and staying alone if none does. Uniting and draining are swept
+/// together, each in index order, until neither moves anything, so the result
+/// is a function of the flow alone and a union refused for a cycle that a
+/// later drain dissolves is made after all. A node whose column reaches no
+/// attractor — which only happens when [`MARKOV_MAX_ITERATIONS`] ran out
+/// first — is left as a box of its own.
 fn markov_pass(graph: &WeightedGraph, inflation: f64) -> (Vec<usize>, usize) {
     let n = graph.node_count();
     let flow = markov_flow(graph, inflation);
@@ -1681,57 +1682,35 @@ fn markov_pass(graph: &WeightedGraph, inflation: f64) -> (Vec<usize>, usize) {
     let mut members: Vec<Vec<usize>> = (0..n).map(|node| vec![node]).collect();
     let mut scratch = CycleScratch::new(n);
 
-    // Attractors that feed each other are one system. Mutual flow rather than
-    // one-way, because a column that has not quite settled can still carry a
-    // trace towards an attractor it will not end up with.
-    for node in 0..n {
-        if !attractor[node] {
-            continue;
-        }
-        for &(other, _) in &flow[node] {
-            if other <= node || !attractor[other] || !holds(&flow[other], node) {
-                continue;
-            }
-            let (mine, theirs) = (group[other], group[node]);
-            if mine == theirs {
-                continue;
-            }
-            let after = |member: usize| {
-                if group[member] == mine {
-                    theirs
-                } else {
-                    group[member]
-                }
-            };
-            if joins_a_cycle(graph, after, &members, &members[mine], theirs, &mut scratch) {
-                continue;
-            }
-            let moving = std::mem::take(&mut members[mine]);
-            for &member in &moving {
-                group[member] = theirs;
-            }
-            members[theirs].extend(moving);
-        }
-    }
-
-    // Everything else drains into the system it sends the most flow to, and
-    // failing that into the system it shares the most calls with. Settled flow
-    // is all or nothing — a column holds its whole mass on one attractor —
-    // so when the flow's answer would close a cycle there is no second answer
-    // in the flow to fall through to, and the node's own calls are asked
-    // instead, the way the singleton fold asks them at the top. `BTreeMap`s
-    // so equal weights fall to the lower system, and stable sorts keep that
-    // order among ties.
+    // Attractors that feed each other are one system, and everything else
+    // drains into the system it sends the most flow to, failing that into the
+    // system it shares the most calls with. Settled flow is all or nothing — a
+    // column holds its whole mass on one attractor — so when the flow's answer
+    // would close a cycle there is no second answer in the flow to fall
+    // through to, and the node's own calls are asked instead, the way the
+    // singleton fold asks them at the top. `BTreeMap`s so equal weights fall
+    // to the lower system, and stable sorts keep that order among ties.
     //
-    // Swept to a fixed point rather than once, because the cycle test is
-    // against the boxes as they stand: `a` calling `b` calling `d` cannot
-    // join `d`'s box while `b` is still outside it — that is a cycle between
-    // two boxes — and can once `b` is in. One sweep in index order left such
-    // nodes alone for no better reason than their position in the order.
+    // Both are swept to a fixed point together rather than once each, because
+    // the cycle test is against the boxes as they stand. `a` calling `b`
+    // calling `d` cannot join `d`'s box while `b` is still outside it — that
+    // is a cycle between two boxes — and can once `b` is in. The same holds of
+    // a union: a triangle `a → b → c` settles on `a` and `c` sharing the flow,
+    // and `{a c}` cannot be one system while `b` sits outside it, calling and
+    // called. Uniting first and draining after split every such triangle in
+    // two; retried after the drains, the union finds `b` already in and goes
+    // through.
     let mut by_flow: BTreeMap<usize, f64> = BTreeMap::new();
     let mut by_calls: BTreeMap<usize, f64> = BTreeMap::new();
     for _ in 0..MAX_SWEEPS {
-        let mut moved = false;
+        let mut moved = unite_attractors(
+            graph,
+            &flow,
+            &attractor,
+            &mut group,
+            &mut members,
+            &mut scratch,
+        );
         for node in 0..n {
             if attractor[node] || group[node] != node {
                 continue;
@@ -1756,6 +1735,56 @@ fn markov_pass(graph: &WeightedGraph, inflation: f64) -> (Vec<usize>, usize) {
     }
 
     renumber(&group)
+}
+
+/// Unite every pair of attractors that feed each other and are not yet one
+/// system, where the DAG rule allows it — see [`markov_pass`]. Mutual flow
+/// rather than one-way, because a column that has not quite settled can still
+/// carry a trace towards an attractor it will not end up with. Returns whether
+/// it united any.
+fn unite_attractors(
+    graph: &WeightedGraph,
+    flow: &[Vec<(usize, f64)>],
+    attractor: &[bool],
+    group: &mut [usize],
+    members: &mut [Vec<usize>],
+    scratch: &mut CycleScratch,
+) -> bool {
+    let holds = |column: &[(usize, f64)], row: usize| {
+        column.binary_search_by_key(&row, |entry| entry.0).is_ok()
+    };
+    let mut united = false;
+    for node in 0..graph.node_count() {
+        if !attractor[node] {
+            continue;
+        }
+        for &(other, _) in &flow[node] {
+            if other <= node || !attractor[other] || !holds(&flow[other], node) {
+                continue;
+            }
+            let (mine, theirs) = (group[other], group[node]);
+            if mine == theirs {
+                continue;
+            }
+            let after = |member: usize| {
+                if group[member] == mine {
+                    theirs
+                } else {
+                    group[member]
+                }
+            };
+            if joins_a_cycle(graph, after, members, &members[mine], theirs, scratch) {
+                continue;
+            }
+            let moving = std::mem::take(&mut members[mine]);
+            for &member in &moving {
+                group[member] = theirs;
+            }
+            members[theirs].extend(moving);
+            united = true;
+        }
+    }
+    united
 }
 
 /// Place one node that is not an attractor into the best system the DAG rule

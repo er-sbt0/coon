@@ -248,13 +248,10 @@ fn planted_groups_come_back_with_their_weights() {
 /// settles on two attractors, its first and last member, sharing it half and
 /// half — MCL's overlap case, which reads as one cluster. But the two are
 /// only one box with the middle member in it: `p1 → p2 → p3` makes `{p1 p3}`
-/// and `{p2}` call each other. `markov_pass` unites attractors before
-/// anything drains, so it refuses the union as a cycle, then drains `p2`
-/// into `p1` and leaves `{p1 p2} {p3}`: six boxes, three of them alone. The
-/// drain is swept to a fixed point for exactly this ordering problem; the
-/// union is not.
+/// and `{p2}` call each other. Uniting the attractors before anything had
+/// drained refused the union as a cycle, drained `p2` into `p1`, and left
+/// `{p1 p2} {p3}` — six boxes, three of them alone.
 #[test]
-#[ignore = "finding: markov_pass refuses an attractor union a later drain would make legal"]
 fn mcl_unites_two_attractors_of_one_triangle() {
     let mut calls = clique(&["p1", "p2", "p3"], 1);
     calls.extend(clique(&["q1", "q2", "q3"], 1));
