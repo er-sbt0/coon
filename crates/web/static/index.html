@@ -97,17 +97,20 @@
     </div>
     <!-- Which calls to a function with no body in the build are drawn. A
          setting the canvas needs read out: under "project" a leaf may be a
-         declaration rather than a function that calls nothing. libclang only,
-         so hidden until a snapshot says the backend can choose. -->
-    <div class="pill segmented labelled" id="bodiless-control" role="group"
-         aria-label="Calls to functions with no body" hidden>
-      <span class="segmented-label" title="Calls to functions with no body in the build">no body</span>
-      <button data-bodiless="Drop" aria-pressed="false"
-              title="Leave out calls to functions the build does not define">hide</button>
-      <button data-bodiless="Project" aria-pressed="false"
-              title="Draw calls to functions the project declares, as a leaf at the declaration">project</button>
-      <button data-bodiless="All" aria-pressed="false"
-              title="Also draw calls into libc and system headers">all</button>
+         declaration rather than a function that calls nothing. The pill reads
+         out the choice, the list behind it says what each one means. libclang
+         only, so hidden until a snapshot says the backend can choose. -->
+    <div class="pill-menu" id="bodiless-menu" hidden>
+      <button class="pill" id="bodiless-control" aria-haspopup="true" aria-expanded="false"
+              aria-controls="bodiless-panel" title="Calls to functions with no body in the build">
+        <span class="stepper-label">no body</span>
+        <b id="bodiless-value">project</b>
+        <svg class="caret" width="8" height="8" viewBox="0 0 8 8" aria-hidden="true">
+          <path d="M1 2.5L4 5.5 7 2.5" stroke="currentColor" stroke-width="1.2" fill="none"/>
+        </svg>
+      </button>
+      <div id="bodiless-panel" class="pill-panel" role="radiogroup"
+           aria-label="Calls to functions with no body" hidden></div>
     </div>
     <button class="pill" id="refresh-btn" title="Refresh workspace symbols">Refresh</button>
   </div>

@@ -2137,9 +2137,9 @@ function buildCommands() {
 // handed to each workspace. That snapshot usually arrives mid-load; core
 // applies a choice made then when the load ends.
 const BODILESS_CHOICES = [
-  { id: 'Drop', label: 'Leave Out', hint: 'only functions the build defines' },
-  { id: 'Project', label: 'Keep Project Declarations', hint: 'a leaf at the project header that declares it' },
-  { id: 'All', label: 'Keep All', hint: 'libc and system headers too' },
+  { id: 'Drop', short: 'hide', label: 'Leave Out', hint: 'only functions the build defines' },
+  { id: 'Project', short: 'project', label: 'Keep Project Declarations', hint: 'a leaf at the project header that declares it' },
+  { id: 'All', short: 'all', label: 'Keep All', hint: 'libc and system headers too' },
 ];
 
 function restoreBodilessCallees() {
@@ -2156,21 +2156,70 @@ function setBodilessCallees(id) {
   sendCommand({ SetBodilessCallees: id });
 }
 
-// The toolbar's segmented control: shown only where the backend can choose,
-// with the live choice lit — the same reading as the orientation control.
-const bodilessControlEl = $('bodiless-control');
+// The toolbar's drop-down: the pill reads out the live choice, the list behind
+// it says what each one means. Shown only where the backend can choose.
+const bodilessMenuEl   = $('bodiless-menu');
+const bodilessToggleEl = $('bodiless-control');
+const bodilessPanelEl  = $('bodiless-panel');
 
 function updateBodilessControl() {
-  bodilessControlEl.hidden = !capabilities?.bodiless_callees;
-  bodilessControlEl.querySelectorAll('button[data-bodiless]').forEach((button) => {
-    button.setAttribute('aria-pressed', String(button.dataset.bodiless === bodilessCallees));
-  });
+  bodilessMenuEl.hidden = !capabilities?.bodiless_callees;
+  if (bodilessMenuEl.hidden) closeBodilessPanel();
+  const live = BODILESS_CHOICES.find((c) => c.id === bodilessCallees);
+  $('bodiless-value').textContent = live?.short ?? '\u2014';
+  bodilessToggleEl.title = live
+    ? `Calls to functions with no body in the build: ${live.hint}`
+    : 'Calls to functions with no body in the build';
+  renderBodilessPanel();
 }
 
-bodilessControlEl.querySelectorAll('button[data-bodiless]').forEach((button) => {
-  button.addEventListener('click', () => {
-    if (button.dataset.bodiless !== bodilessCallees) setBodilessCallees(button.dataset.bodiless);
-  });
+function renderBodilessPanel() {
+  if (bodilessPanelEl.hidden) return;
+  bodilessPanelEl.innerHTML = '';
+  for (const choice of BODILESS_CHOICES) {
+    const row = document.createElement('button');
+    row.className = 'method-row';
+    row.type = 'button';
+    row.setAttribute('role', 'radio');
+    row.setAttribute('aria-checked', String(choice.id === bodilessCallees));
+    const name = document.createElement('span');
+    name.className = 'method-name';
+    name.textContent = choice.label;
+    const why = document.createElement('span');
+    why.className = 'method-why';
+    why.textContent = choice.hint;
+    row.append(name, why);
+    row.addEventListener('click', () => {
+      if (choice.id !== bodilessCallees) setBodilessCallees(choice.id);
+      closeBodilessPanel();
+      bodilessToggleEl.focus();
+    });
+    bodilessPanelEl.appendChild(row);
+  }
+}
+
+function openBodilessPanel() {
+  bodilessPanelEl.hidden = false;
+  bodilessToggleEl.setAttribute('aria-expanded', 'true');
+  renderBodilessPanel();
+}
+
+function closeBodilessPanel() {
+  bodilessPanelEl.hidden = true;
+  bodilessToggleEl.setAttribute('aria-expanded', 'false');
+}
+
+bodilessToggleEl.addEventListener('click', () => {
+  if (bodilessPanelEl.hidden) openBodilessPanel(); else closeBodilessPanel();
+});
+// Closed by clicking away or by Escape, as the cluster panel is.
+document.addEventListener('pointerdown', (e) => {
+  if (!bodilessPanelEl.hidden && !bodilessMenuEl.contains(e.target)) closeBodilessPanel();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape' || bodilessPanelEl.hidden || CoonPalette.isOpen()) return;
+  closeBodilessPanel();
+  bodilessToggleEl.focus();
 });
 
 /// Whether the backend can refresh: true, false, or undefined before the first

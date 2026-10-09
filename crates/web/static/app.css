@@ -450,7 +450,7 @@ body.resizing { cursor: col-resize; user-select: none; }
 }
 .pill-menu > .pill[aria-expanded="true"] .caret { transform: rotate(180deg); }
 
-#cluster-panel {
+#cluster-panel, .pill-panel {
   position: absolute;
   top: calc(100% + var(--sp-1));
   right: 0;
@@ -613,10 +613,12 @@ body.resizing { cursor: col-resize; user-select: none; }
   color: var(--accent);
 }
 
-/* A segmented control whose options are words rather than glyphs, read under
-   a label: as wide as each word needs. */
-.pill.segmented.labelled button { width: auto; padding: 0 var(--sp-2); }
-.pill.segmented .segmented-label { padding: 0 var(--sp-1) 0 var(--sp-2); }
+/* The bodiless-callees list: the cluster panel's frame, narrower, holding
+   one radio row per choice. */
+.pill-menu[hidden] { display: none; }
+#bodiless-control b { color: var(--text); font-weight: 600; }
+#bodiless-panel { width: 260px; padding: var(--sp-2); }
+#bodiless-panel .method-row + .method-row { margin-top: 2px; }
 
 #palette { position: fixed; inset: 0; z-index: 1000; }
 #palette[hidden] { display: none; }
