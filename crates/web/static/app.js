@@ -226,6 +226,7 @@ function handleSnapshot(msg) {
   capabilities    = msg.capabilities ?? null;
   bodilessCallees = msg.bodiless_callees ?? null;
   restoreBodilessCallees();
+  updateBodilessControl();
   if (readyShown) showReady();
   // The demo has nothing to reload from, so it gets no button that does
   // nothing. Before the first snapshot the button stays, as it always was.
@@ -2154,6 +2155,23 @@ function setBodilessCallees(id) {
   savePrefs({ bodilessCallees: id });
   sendCommand({ SetBodilessCallees: id });
 }
+
+// The toolbar's segmented control: shown only where the backend can choose,
+// with the live choice lit — the same reading as the orientation control.
+const bodilessControlEl = $('bodiless-control');
+
+function updateBodilessControl() {
+  bodilessControlEl.hidden = !capabilities?.bodiless_callees;
+  bodilessControlEl.querySelectorAll('button[data-bodiless]').forEach((button) => {
+    button.setAttribute('aria-pressed', String(button.dataset.bodiless === bodilessCallees));
+  });
+}
+
+bodilessControlEl.querySelectorAll('button[data-bodiless]').forEach((button) => {
+  button.addEventListener('click', () => {
+    if (button.dataset.bodiless !== bodilessCallees) setBodilessCallees(button.dataset.bodiless);
+  });
+});
 
 /// Whether the backend can refresh: true, false, or undefined before the first
 /// snapshot has said — which is treated as yes, the way it always was.
