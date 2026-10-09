@@ -130,11 +130,13 @@ pub fn spawn_bridge(backend: Backend, project_path: &str, options: LoaderOptions
 /// graph arrives with all its edges. What it has instead is a way to ask for
 /// the whole load again — `Command::Refresh`, through
 /// [`LspBridge::send_reload`] — and the task stays alive between loads to hear
-/// it. Same project, same options, every time: a refresh re-reads the build as
-/// it now stands on disk, `compile_commands.json` included, and is not a way
-/// to pick a different one.
+/// it. Same project and build every time: a refresh re-reads the build as it
+/// now stands on disk, `compile_commands.json` included, and is not a way to
+/// pick a different one. What a reload does carry is which bodiless callees to
+/// keep (`Command::SetBodilessCallees`), since that is a reading of the build
+/// rather than a choice of it; with the parse cache warm it costs no parse.
 ///
-/// The task loads once on spawn and then once per `()` on the reload channel,
+/// The task loads once on spawn and then once per message on the reload channel,
 /// until the bridge, and with it the sender, is dropped. It does not coalesce
 /// requests itself: the bridge never sends one while a load is running (see
 /// [`LspBridge::load_in_progress`]), so every request is one parse. Draining
@@ -143,9 +145,11 @@ pub fn spawn_bridge(backend: Backend, project_path: &str, options: LoaderOptions
 /// it.
 pub fn spawn_libclang_bridge(project_path: &str, options: LoaderOptions) -> LspBridge {
     let (ui_msg_tx, ui_msg_rx) = mpsc::unbounded_channel::<LspUiMessage>();
-    let (reload_tx, mut reload_rx) = mpsc::unbounded_channel::<()>();
+    let (reload_tx, mut reload_rx) = mpsc::unbounded_channel::<model::BodilessCallees>();
     let project_path = std::path::PathBuf::from(project_path);
+    let loading_with = options.bodiless_callees;
     tokio::spawn(async move {
+        let mut options = options;
         loop {
             if let Err(e) =
                 libclang_loader_task(project_path.clone(), options.clone(), ui_msg_tx.clone())
@@ -156,13 +160,14 @@ pub fn spawn_libclang_bridge(project_path: &str, options: LoaderOptions) -> LspB
                     "{e:#}"
                 ))));
             }
-            if reload_rx.recv().await.is_none() {
+            let Some(bodiless) = reload_rx.recv().await else {
                 break;
-            }
+            };
+            options.bodiless_callees = bodiless;
             log::info!("[libclang] reloading {}", project_path.display());
         }
     });
-    LspBridge::new_with_reloader(ui_msg_rx, reload_tx)
+    LspBridge::new_with_reloader(ui_msg_rx, reload_tx, loading_with)
 }
 
 async fn libclang_loader_task(
@@ -210,11 +215,15 @@ async fn libclang_loader_task(
     let cancel = clang_index::Cancel::default();
     let _cancel_on_drop = CancelOnDrop(cancel.clone());
     let progress_tx = ui_msg_tx.clone();
+    let index_options = clang_index::Options {
+        bodiless_callees: options.bodiless_callees,
+        ..clang_index::Options::from_env()
+    };
     let report = tokio::task::spawn_blocking(move || {
         clang_index::index_with(
             &project_path,
             &jobs,
-            &clang_index::Options::from_env(),
+            &index_options,
             &cancel,
             |done, total| {
                 let _ = progress_tx.send(LspUiMessage::Progress(LspLoadPhase::IndexingProject {

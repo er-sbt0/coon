@@ -578,6 +578,7 @@ impl CoreApp {
             Command::ExpandOrCollapse => self.cmd_expand_or_collapse(),
             Command::FindReferences => self.cmd_find_references(),
             Command::Refresh => self.cmd_refresh(),
+            Command::SetBodilessCallees(bodiless) => self.cmd_set_bodiless_callees(bodiless),
             Command::ToggleCallDirection => self.cmd_toggle_call_direction(),
             Command::SetCallDirection(direction) => self.cmd_set_call_direction(direction),
             Command::SetGraphDepth(depth) => self.cmd_set_graph_depth(depth),
@@ -652,6 +653,9 @@ impl CoreApp {
         if let Some(graph) = self.lsp.take_graphs().pop() {
             self.replace_graph(graph);
         }
+
+        // A setting changed while the last load ran is applied now it is over.
+        events.extend(self.reload_if_owed());
 
         // Emit current LSP phase as a progress event
         events.push(AppEvent::LspProgress(self.lsp.status().clone()));
@@ -966,6 +970,33 @@ impl CoreApp {
         } else {
             AppEvent::ReferencesFound { symbol_id, count }
         })
+    }
+
+    fn cmd_set_bodiless_callees(&mut self, bodiless: model::BodilessCallees) -> Vec<AppEvent> {
+        if !self.lsp.capabilities().bodiless_callees {
+            return self
+                .lsp
+                .unsupported(Capability::BodilessCallees)
+                .event()
+                .into_iter()
+                .collect();
+        }
+        self.lsp.set_bodiless_callees(bodiless);
+        self.reload_if_owed()
+    }
+
+    /// Load the build again if the graph on screen was loaded to other
+    /// bodiless-callee settings than the ones wanted — at once if nothing is
+    /// running, or from `tick` when the running load ends.
+    fn reload_if_owed(&mut self) -> Vec<AppEvent> {
+        if !self.lsp.reload_owed() {
+            return Vec::new();
+        }
+        log::info!(
+            "CoreApp: reloading to keep {:?} bodiless callees",
+            self.lsp.bodiless_callees()
+        );
+        self.lsp.send_reload().event().into_iter().collect()
     }
 
     fn cmd_refresh(&mut self) -> Vec<AppEvent> {
@@ -4526,13 +4557,13 @@ mod tests {
     ) -> (
         CoreApp,
         mpsc::UnboundedSender<model::LspUiMessage>,
-        mpsc::UnboundedReceiver<()>,
+        mpsc::UnboundedReceiver<model::BodilessCallees>,
     ) {
         let (tx, rx) = mpsc::unbounded_channel();
         let (reload_tx, reload_rx) = mpsc::unbounded_channel();
         let mut app = CoreApp::new_with_lsp(
             CallGraph::new(),
-            LspBridge::new_with_reloader(rx, reload_tx),
+            LspBridge::new_with_reloader(rx, reload_tx, model::BodilessCallees::default()),
         );
         deliver(&tx, graph);
         tick_until_settled(&mut app);
@@ -4630,7 +4661,7 @@ mod tests {
         let (reload_tx, mut reload_rx) = mpsc::unbounded_channel();
         let mut app = CoreApp::new_with_lsp(
             CallGraph::new(),
-            LspBridge::new_with_reloader(rx, reload_tx),
+            LspBridge::new_with_reloader(rx, reload_tx, model::BodilessCallees::default()),
         );
         app.tick();
         assert_eq!(shapes(&app.dispatch(Command::Refresh)), ["AlreadyLoading"]);
@@ -4658,6 +4689,78 @@ mod tests {
         app.tick();
         assert_eq!(app.call_graph.node_count(), 6, "a failure keeps the graph");
         assert_eq!(shapes(&app.dispatch(Command::Refresh)), ["LspProgress"]);
+    }
+
+    /// Choosing which bodiless callees to keep loads the build again to that
+    /// setting, and choosing what is already loaded asks nothing.
+    #[test]
+    fn choosing_bodiless_callees_reloads_with_them() {
+        use model::BodilessCallees;
+        let (graph, _, _) = two_triangles();
+        let (mut app, tx, mut reload_rx) = reloadable_app(graph);
+        assert!(app.capabilities().bodiless_callees);
+
+        let same = Command::SetBodilessCallees(BodilessCallees::default());
+        assert!(app.dispatch(same).is_empty());
+        assert!(reload_rx.try_recv().is_err(), "already loaded that way");
+
+        let events = app.dispatch(Command::SetBodilessCallees(BodilessCallees::All));
+        assert_eq!(shapes(&events), ["LspProgress"]);
+        assert_eq!(reload_rx.try_recv().ok(), Some(BodilessCallees::All));
+        assert!(app.loading());
+        let snapshot = serde_json::to_value(crate::protocol::snapshot_of(&app)).unwrap();
+        assert_eq!(snapshot["bodiless_callees"], "All");
+
+        let (graph, _, _) = two_triangles();
+        deliver(&tx, graph);
+        tick_until_settled(&mut app);
+        assert!(reload_rx.try_recv().is_err(), "one load, and it is done");
+        // A refresh keeps the setting.
+        app.dispatch(Command::Refresh);
+        assert_eq!(reload_rx.try_recv().ok(), Some(BodilessCallees::All));
+    }
+
+    /// A setting chosen while a load runs — which is when a remembered one is
+    /// restored — is applied when that load ends, once, with the last choice.
+    #[test]
+    fn bodiless_callees_chosen_during_a_load_apply_when_it_ends() {
+        use model::BodilessCallees;
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (reload_tx, mut reload_rx) = mpsc::unbounded_channel();
+        let mut app = CoreApp::new_with_lsp(
+            CallGraph::new(),
+            LspBridge::new_with_reloader(rx, reload_tx, BodilessCallees::Project),
+        );
+        app.tick();
+        assert!(app
+            .dispatch(Command::SetBodilessCallees(BodilessCallees::All))
+            .is_empty());
+        assert!(app
+            .dispatch(Command::SetBodilessCallees(BodilessCallees::Drop))
+            .is_empty());
+        assert!(reload_rx.try_recv().is_err(), "nothing asked mid-load");
+
+        let (graph, _, _) = two_triangles();
+        deliver(&tx, graph);
+        app.tick();
+        assert_eq!(reload_rx.try_recv().ok(), Some(BodilessCallees::Drop));
+        assert!(app.loading(), "the graph that landed is not the one wanted");
+        let (graph, _, _) = two_triangles();
+        deliver(&tx, graph);
+        tick_until_settled(&mut app);
+        assert!(reload_rx.try_recv().is_err(), "applied once");
+    }
+
+    /// Only a backend that knows which functions have a body can choose.
+    #[test]
+    fn bodiless_callees_are_not_offered_without_a_parse() {
+        let mut demo = CoreApp::new_with_lsp(CallGraph::new(), LspBridge::new());
+        assert!(!demo.capabilities().bodiless_callees);
+        assert!(demo
+            .dispatch(Command::SetBodilessCallees(model::BodilessCallees::All))
+            .is_empty());
+        assert_eq!(demo.lsp.bodiless_callees(), model::BodilessCallees::default());
+        assert!(!BackendCapabilities::CLANGD.bodiless_callees);
     }
 
     /// A clangd bridge is capable before it is wired: the worker arriving late

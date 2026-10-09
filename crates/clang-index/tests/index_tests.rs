@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use clang_index::{index, index_with, Cancel, Job, Options, Report};
 use compdb::CompileCommand;
-use model::CallGraph;
+use model::{BodilessCallees, CallGraph};
 
 /// libclang allows one `Clang` per process at a time, and the test harness runs
 /// tests on parallel threads.
@@ -667,8 +667,98 @@ fn an_external_call_two_flavours_make_is_counted_once() {
         job_with(root, "a.c", &["cc", "-Iinclude", "-DONE"]),
         job_with(root, "b.c", &["cc", "-Iinclude", "-DTWO"]),
     ];
-    let report = index(root, &jobs, |_, _| {}).unwrap();
+    let report = index_keeping(root, &jobs, BodilessCallees::Drop, false);
     assert_eq!(report.external_calls, 1);
+}
+
+/// A serial run in this process that keeps `bodiless` callees, cached or not.
+fn index_keeping(root: &Path, jobs: &[Job], bodiless: BodilessCallees, cache: bool) -> Report {
+    let options = Options {
+        workers: 0,
+        cache,
+        bodiless_callees: bodiless,
+        ..Options::default()
+    };
+    index_with(root, jobs, &options, &Cancel::default(), |_, _| {}).unwrap()
+}
+
+/// A project whose `main` calls one function it defines, one a project header
+/// declares and nothing defines, and one a header outside the project
+/// declares — the shape of a unit test calling `jet_mallctl` and `strchr`.
+fn write_bodiless_project(root: &Path, outside: &Path) -> Vec<Job> {
+    std::fs::create_dir(root.join("include")).unwrap();
+    write(root, "include/api.h", "int api_call(int);\n");
+    write(outside, "libc.h", "int lib_call(int);\n");
+    write(
+        root,
+        "main.c",
+        "#include \"api.h\"\n#include \"libc.h\"\n\
+         static int mine(int x) { return __builtin_clz((unsigned)x); }\n\
+         int main(void) { return mine(api_call(lib_call(1))); }\n",
+    );
+    let outside = format!("-I{}", outside.display());
+    vec![job_with(root, "main.c", &["cc", "-Iinclude", &outside])]
+}
+
+#[test]
+fn bodiless_callees_are_kept_as_far_as_the_setting_says() {
+    let _guard = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let jobs = write_bodiless_project(root, outside.path());
+
+    let drop = index_keeping(root, &jobs, BodilessCallees::Drop, false);
+    assert_eq!(pairs(&drop.graph), set(&["main(main.c) -> mine(main.c)"]));
+    // The builtin is left out under every setting: the compiler declared it.
+    assert_eq!(drop.external_calls, 3);
+
+    let project = index_keeping(root, &jobs, BodilessCallees::Project, false);
+    assert_eq!(
+        pairs(&project.graph),
+        set(&[
+            "main(main.c) -> mine(main.c)",
+            "main(main.c) -> api_call(api.h)",
+        ])
+    );
+    assert_eq!(project.external_calls, 2);
+    // A leaf at its declaration: that is all there is of it.
+    let api = project.graph.find_function_by_name("api_call").unwrap();
+    assert_eq!(api.definition_location.line, 1);
+    assert!(api.definition_location.file_path.ends_with("include/api.h"));
+
+    let all = index_keeping(root, &jobs, BodilessCallees::All, false);
+    assert_eq!(
+        pairs(&all.graph),
+        set(&[
+            "main(main.c) -> mine(main.c)",
+            "main(main.c) -> api_call(api.h)",
+            "main(main.c) -> lib_call(libc.h)",
+        ])
+    );
+    assert_eq!(all.external_calls, 1);
+}
+
+/// The setting is read after the merge, so one cache entry answers all three
+/// — and a hit answers them exactly as a parse does.
+#[test]
+fn a_cached_parse_answers_every_bodiless_setting() {
+    let _guard = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let jobs = write_bodiless_project(root, outside.path());
+    age(root);
+    age(outside.path());
+
+    for bodiless in BodilessCallees::ALL {
+        let parsed = index_keeping(root, &jobs, bodiless, false);
+        let cold = index_keeping(root, &jobs, bodiless, true);
+        let warm = index_keeping(root, &jobs, bodiless, true);
+        assert_eq!(warm.cached, 1, "{bodiless:?}: answered from the cache");
+        assert_eq!(fingerprint(&cold), fingerprint(&parsed), "{bodiless:?}");
+        assert_eq!(fingerprint(&warm), fingerprint(&parsed), "{bodiless:?}");
+    }
 }
 
 // ── The on-disk cache ────────────────────────────────────────────────────────

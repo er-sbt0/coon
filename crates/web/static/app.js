@@ -167,6 +167,8 @@ let selectedClusterId = null;         // the box pointed at on the map, if it is
 let lastFitKey       = null;                      // refit only on root/direction change
 let parseReport      = null;          // how much of the build was parsed; null under clangd
 let capabilities     = null;          // what the backend can be asked; null until the first snapshot
+let bodilessCallees  = null;          // which calls to a function with no body the graph keeps
+let bodilessRestored = false;         // whether the remembered choice has been handed over yet
 let readyShown       = false;         // whether the status line is the ready line, to redraw it
 
 const MAX_FIT_ZOOM = 1.15;
@@ -222,6 +224,8 @@ function handleSnapshot(msg) {
   activeWorkspace = msg.active_workspace ?? 0;
   parseReport     = msg.parse ?? null;
   capabilities    = msg.capabilities ?? null;
+  bodilessCallees = msg.bodiless_callees ?? null;
+  restoreBodilessCallees();
   if (readyShown) showReady();
   // The demo has nothing to reload from, so it gets no button that does
   // nothing. Before the first snapshot the button stays, as it always was.
@@ -2082,6 +2086,20 @@ function buildCommands() {
     { id: 'lsp.refs', label: 'LSP: Find References', disabled: !selectedNodeId || capabilities?.references === false, run: () => sendCommand('FindReferences') },
   ];
 
+  // Absent rather than greyed under clangd, which cannot choose: its replies
+  // are held to the project root and say nothing about bodies.
+  if (capabilities?.bodiless_callees) {
+    BODILESS_CHOICES.forEach((choice) => {
+      cmds.push({
+        id: `project.bodiless.${choice.id}`,
+        label: `Project: Calls Without a Body \u2014 ${choice.label}`,
+        hint: choice.hint,
+        disabled: choice.id === bodilessCallees,
+        run: () => setBodilessCallees(choice.id),
+      });
+    });
+  }
+
   // One entry per clustering method, so a method added in `logic` is reachable
   // without the client knowing anything about it but its name.
   clusterMethods.forEach((method) => {
@@ -2112,6 +2130,31 @@ function buildCommands() {
 /// The backend does the rendering and hands back `{ filename, contents }`;
 /// `GraphExported` below is where it lands. Nothing is drawn or re-fetched, so
 /// this costs no snapshot.
+// Which calls to a function with no body in the build become edges. Project-
+// wide, not per workspace — it decides what the graph is — so it is restored
+// once, on the first snapshot that says the backend can choose, rather than
+// handed to each workspace. That snapshot usually arrives mid-load; core
+// applies a choice made then when the load ends.
+const BODILESS_CHOICES = [
+  { id: 'Drop', label: 'Leave Out', hint: 'only functions the build defines' },
+  { id: 'Project', label: 'Keep Project Declarations', hint: 'a leaf at the project header that declares it' },
+  { id: 'All', label: 'Keep All', hint: 'libc and system headers too' },
+];
+
+function restoreBodilessCallees() {
+  if (bodilessRestored || !capabilities?.bodiless_callees) return;
+  bodilessRestored = true;
+  const wanted = prefs().bodilessCallees;
+  if (wanted && wanted !== bodilessCallees && BODILESS_CHOICES.some((c) => c.id === wanted)) {
+    sendCommand({ SetBodilessCallees: wanted });
+  }
+}
+
+function setBodilessCallees(id) {
+  savePrefs({ bodilessCallees: id });
+  sendCommand({ SetBodilessCallees: id });
+}
+
 /// Whether the backend can refresh: true, false, or undefined before the first
 /// snapshot has said — which is treated as yes, the way it always was.
 function canRefresh() {

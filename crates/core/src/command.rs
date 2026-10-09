@@ -1,5 +1,5 @@
 use logic::{ClusterKey, ClusterMethod, ClusterSettings};
-use model::{CallDirection, SymbolId};
+use model::{BodilessCallees, CallDirection, SymbolId};
 
 use crate::export::ExportFormat;
 use crate::layout::{GraphDepth, LayoutOrientation};
@@ -22,6 +22,13 @@ pub enum Command {
     FindReferences,
     /// Refresh workspace symbols from clangd.
     Refresh,
+    /// Choose which calls to a function with no body in the build become
+    /// edges, the callee a leaf at its declaration. Project-wide rather than
+    /// per workspace, because it decides what the graph *is*: the libclang
+    /// backend loads the build again to apply it (a cache hit per TU, so no
+    /// parse), and one asked for during a load is applied when it ends.
+    /// Absolute, for the reason `SetCallDirection` is.
+    SetBodilessCallees(BodilessCallees),
     /// Toggle between outgoing and incoming call direction.
     ToggleCallDirection,
     /// Read the graph in this direction — callees or callers.

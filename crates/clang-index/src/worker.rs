@@ -34,7 +34,7 @@ pub const ARGUMENT: &str = "--coon-clang-index-worker";
 /// The line a worker writes once it is ready for requests. A process that does
 /// not write it in time is not a worker — a binary that forgot to call
 /// [`run_if_worker`] and started being itself instead.
-pub(crate) const READY: &str = "coon-clang-index-worker ready 2";
+pub(crate) const READY: &str = "coon-clang-index-worker ready 3";
 
 /// A worker's answer to one request.
 #[derive(Debug, Serialize, Deserialize)]

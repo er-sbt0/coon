@@ -157,6 +157,10 @@ pub enum ServerMsg<'a> {
         /// out a command this one cannot answer instead of offering it and
         /// saying nothing. On the snapshot for the same reason `parse` is.
         capabilities: crate::lsp_bridge::BackendCapabilities,
+        /// Which calls to a function with no body the graph keeps, or is
+        /// being reloaded to keep. Meaningful only where
+        /// `capabilities.bodiless_callees` is set.
+        bodiless_callees: model::BodilessCallees,
     },
     /// A single `AppEvent` forwarded verbatim for status display.
     Event { event: AppEvent },
@@ -294,6 +298,7 @@ pub fn snapshot_of(core: &CoreApp) -> ServerMsg<'_> {
         selected: core.selected_function,
         parse: core.lsp.parse_summary().map(WireParse::of),
         capabilities: core.capabilities(),
+        bodiless_callees: core.lsp.bodiless_callees(),
     }
 }
 

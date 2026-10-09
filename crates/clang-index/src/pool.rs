@@ -70,6 +70,10 @@ pub struct Options {
     /// are unchanged (see `cache`). Off by default, which is what the tests
     /// get; [`Options::from_env`] turns it on.
     pub cache: bool,
+    /// Which calls to a function with no body in the build become edges.
+    /// Read only once every TU is in, so it is not part of a cache key: one
+    /// cached parse answers all three.
+    pub bodiless_callees: model::BodilessCallees,
 }
 
 /// A program and the arguments that make it a worker. The project root is
@@ -101,6 +105,7 @@ impl Default for Options {
             timeout: DEFAULT_TIMEOUT,
             worker: WorkerCommand::current_exe(),
             cache: false,
+            bodiless_callees: model::BodilessCallees::default(),
         }
     }
 }

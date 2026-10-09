@@ -6,7 +6,8 @@ use tokio::sync::{mpsc, oneshot, Notify};
 
 use lsp::{LspRequest, LspResponse};
 use model::{
-    lsp_status::LspLoadPhase, lsp_status::LspUiMessage, CallDirection, CallGraph, SymbolId,
+    lsp_status::LspLoadPhase, lsp_status::LspUiMessage, BodilessCallees, CallDirection, CallGraph,
+    SymbolId,
 };
 
 use crate::events::AppEvent;
@@ -77,6 +78,11 @@ pub struct BackendCapabilities {
     /// Reloading what is on screen from the backend (`Command::Refresh`):
     /// a fresh symbol query under clangd, a whole re-parse under libclang.
     pub refresh: bool,
+    /// Choosing which calls to a function with no body become edges
+    /// (`Command::SetBodilessCallees`). Only a backend that knows which
+    /// functions the build defines can choose; clangd's replies are held to
+    /// the project root and say nothing about bodies.
+    pub bodiless_callees: bool,
 }
 
 impl BackendCapabilities {
@@ -86,6 +92,7 @@ impl BackendCapabilities {
         references: true,
         symbol_query: true,
         refresh: true,
+        bodiless_callees: false,
     };
 
     /// A graph delivered whole, with nothing behind it to ask: the demo graph.
@@ -98,6 +105,7 @@ impl BackendCapabilities {
         references: true,
         symbol_query: false,
         refresh: false,
+        bodiless_callees: false,
     };
 
     /// libclang: a whole graph, and a loader that can be asked to read the
@@ -105,6 +113,7 @@ impl BackendCapabilities {
     /// [`LspBridge::send_reload`].
     pub const LIBCLANG: Self = Self {
         refresh: true,
+        bodiless_callees: true,
         ..Self::WHOLE_GRAPH
     };
 
@@ -124,6 +133,7 @@ impl BackendCapabilities {
             Capability::References => self.references,
             Capability::SymbolQuery => self.symbol_query,
             Capability::Refresh => self.refresh,
+            Capability::BodilessCallees => self.bodiless_callees,
         }
     }
 }
@@ -136,6 +146,7 @@ pub enum Capability {
     References,
     SymbolQuery,
     Refresh,
+    BodilessCallees,
 }
 
 /// What became of a request, and the one thing the frontend is told about it.
@@ -358,7 +369,14 @@ pub struct LspBridge {
     /// Asks a whole-graph loader to read the build again. `None` for clangd,
     /// whose refresh is a symbol query, and for the demo, which has no loader.
     /// See [`LspBridge::send_reload`].
-    reload_tx: Option<mpsc::UnboundedSender<()>>,
+    reload_tx: Option<mpsc::UnboundedSender<BodilessCallees>>,
+    /// Which calls to a bodiless function the graph should keep: what the
+    /// next load is asked for. See [`LspBridge::set_bodiless_callees`].
+    bodiless_callees: BodilessCallees,
+    /// What the last load was asked for — the one on screen, or the one
+    /// running. Differs from `bodiless_callees` only while a change waits for
+    /// a running load to finish.
+    loaded_bodiless_callees: BodilessCallees,
     /// One-shot channel to receive the LSP request/response channels once the loader is ready
     channels_rx: Option<
         oneshot::Receiver<(
@@ -394,6 +412,8 @@ impl LspBridge {
             arrived_graphs: Vec::new(),
             parse_summary: None,
             reload_tx: None,
+            bodiless_callees: BodilessCallees::default(),
+            loaded_bodiless_callees: BodilessCallees::default(),
             channels_rx: None,
         }
     }
@@ -411,14 +431,19 @@ impl LspBridge {
 
     /// Create an `LspBridge` that hears from a whole-graph loader which can be
     /// asked to load again: libclang. `reload_tx` is the loader's ear — one
-    /// `()` is one more parse of the build. See [`LspBridge::send_reload`].
+    /// message is one more parse of the build, keeping the bodiless callees it
+    /// names. `loading_with` is what the load already running was spawned
+    /// with. See [`LspBridge::send_reload`].
     pub fn new_with_reloader(
         loader_rx: mpsc::UnboundedReceiver<LspUiMessage>,
-        reload_tx: mpsc::UnboundedSender<()>,
+        reload_tx: mpsc::UnboundedSender<BodilessCallees>,
+        loading_with: BodilessCallees,
     ) -> Self {
         Self {
             capabilities: BackendCapabilities::LIBCLANG,
             reload_tx: Some(reload_tx),
+            bodiless_callees: loading_with,
+            loaded_bodiless_callees: loading_with,
             ..Self::new_with_status(loader_rx)
         }
     }
@@ -444,6 +469,8 @@ impl LspBridge {
             arrived_graphs: Vec::new(),
             parse_summary: None,
             reload_tx: None,
+            bodiless_callees: BodilessCallees::default(),
+            loaded_bodiless_callees: BodilessCallees::default(),
             channels_rx: Some(channels_rx),
         }
     }
@@ -836,15 +863,46 @@ impl LspBridge {
         let Some(reload_tx) = &self.reload_tx else {
             return SendOutcome::Declined;
         };
-        if reload_tx.send(()).is_err() {
+        if reload_tx.send(self.bodiless_callees).is_err() {
             // The loader task is gone — it only stops when this bridge does,
             // or when it panicked, which the log has already said.
             log::error!("core::LspBridge the loader is not listening for a reload");
             return SendOutcome::Failed(Some(AppEvent::FailedToSendRequest));
         }
-        log::info!("core::LspBridge asked the loader to read the build again");
+        log::info!(
+            "core::LspBridge asked the loader to read the build again, keeping {:?} bodiless callees",
+            self.bodiless_callees
+        );
+        self.loaded_bodiless_callees = self.bodiless_callees;
         self.status = LspLoadPhase::DiscoveringFiles;
         SendOutcome::Sent(Some(AppEvent::LspProgress(self.status.clone())))
+    }
+
+    /// Which calls to a function with no body the graph keeps — or will, once
+    /// a load asked for it lands.
+    pub fn bodiless_callees(&self) -> BodilessCallees {
+        self.bodiless_callees
+    }
+
+    /// Keep these bodiless callees from the next load on. Asks nothing of the
+    /// loader by itself: [`LspBridge::reload_owed`] says when a load is due.
+    pub fn set_bodiless_callees(&mut self, bodiless: BodilessCallees) {
+        self.bodiless_callees = bodiless;
+    }
+
+    /// Whether the graph on screen was loaded to other settings than the ones
+    /// now wanted, and nothing is running that would bring it up to date.
+    ///
+    /// A change made while a load runs waits for it rather than being
+    /// refused: the loader takes one request at a time (see
+    /// [`LspBridge::send_reload`]), and a setting the user picked during the
+    /// first load — which is when a remembered one is restored — must still
+    /// land.
+    pub fn reload_owed(&self) -> bool {
+        self.capabilities.bodiless_callees
+            && self.reload_tx.is_some()
+            && self.bodiless_callees != self.loaded_bodiless_callees
+            && !self.load_in_progress()
     }
 
     /// Send a workspace symbols request.

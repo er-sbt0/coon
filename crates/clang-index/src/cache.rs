@@ -74,7 +74,7 @@ pub(crate) const FORMAT: u32 = 1;
 /// result — which entities count as definitions, which references as calls,
 /// how a location or a name is spelled — or the cache hands back the old
 /// extraction's results as this one's.
-pub(crate) const EXTRACTION: u32 = 1;
+pub(crate) const EXTRACTION: u32 = 4;
 
 /// How recent a file's mtime may be, against the start of the parse that read
 /// it, before it is not trusted. A file written during the parse may have been

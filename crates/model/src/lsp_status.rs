@@ -62,7 +62,9 @@ pub struct ParseSummary {
     /// Parsed TUs with at least one error, whose bodies may have been read
     /// incompletely — usually a missing include or define.
     pub with_errors: usize,
-    /// Calls to functions the project does not define: libc, system headers.
+    /// Calls left out of the graph because their callee has no body in the
+    /// build and [`BodilessCallees`] did not keep it: libc and system headers,
+    /// or with `Drop` also what a project header declares and nothing defines.
     pub external_calls: usize,
     /// Compiler arguments libclang refused and parsed without.
     pub rejected_arguments: Vec<String>,
@@ -70,6 +72,60 @@ pub struct ParseSummary {
     /// nothing they read had changed.
     #[serde(default)]
     pub cached: usize,
+}
+
+/// Which calls to a function with no body in the build become edges.
+///
+/// A backend that parses the build knows which functions it defines, and a call
+/// whose callee it never saw a body for — libc, a system header, or a function
+/// a project header declares and no TU of this database compiles — has nothing
+/// behind it to draw but the declaration. Whether to draw that is a question
+/// about what the reader wants to see, not about the code, so it is a setting:
+/// jemalloc's unit tests call `jet_mallctl`, which only a `-DJEMALLOC_JET`
+/// compile of `src/` defines, and a database without that compile either shows
+/// the call ending at `jemalloc.h` or does not show it at all.
+///
+/// The callee becomes a leaf at its declaration, since nothing says what it
+/// calls. clangd answers the middle one by construction (its call replies are
+/// held to the project root), which is why that is the default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BodilessCallees {
+    /// Only calls between functions the build defines.
+    Drop,
+    /// Also calls to functions declared under the project root.
+    #[default]
+    Project,
+    /// Also calls to everything else the build declares: libc, system headers.
+    All,
+}
+
+impl BodilessCallees {
+    pub const ALL: [Self; 3] = [Self::Drop, Self::Project, Self::All];
+
+    /// Whether a callee with no body becomes a node, given whether its
+    /// declaration is under the project root.
+    pub fn keeps(self, in_project: bool) -> bool {
+        match self {
+            Self::Drop => false,
+            Self::Project => in_project,
+            Self::All => true,
+        }
+    }
+}
+
+impl std::str::FromStr for BodilessCallees {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "drop" => Ok(Self::Drop),
+            "project" => Ok(Self::Project),
+            "all" => Ok(Self::All),
+            other => Err(format!(
+                "`{other}` is not a choice; expected `drop`, `project` or `all`"
+            )),
+        }
+    }
 }
 
 /// How far a [`ParseSummary`] should be trusted, for how loudly to show it.

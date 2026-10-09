@@ -242,8 +242,11 @@ fn main() {
                 }
             }
             log::info!("[desktop] starting {:?} loader for {}", args.backend, path);
+            // Bodiless callees start at their default: the client restores a
+            // remembered choice, and one made during this load lands after it.
             let options = LoaderOptions {
                 flavour: args.flavour.clone(),
+                ..LoaderOptions::default()
             };
             CoreApp::new_with_lsp(CallGraph::new(), spawn_bridge(args.backend, path, options))
         }

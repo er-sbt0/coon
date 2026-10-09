@@ -1,7 +1,7 @@
 //! Load a project through the real bootstrap and print what came out.
 //!
 //! ```text
-//! cargo run -p core --example load -- <project> [--flavour <file>] [--dump <out>] [--functions <out>] [--backend libclang|clangd]
+//! cargo run -p core --example load -- <project> [--flavour <file>] [--dump <out>] [--functions <out>] [--backend libclang|clangd] [--bodiless drop|project|all]
 //! ```
 //!
 //! The desktop app needs a display and the deprecated CLI deliberately has no
@@ -61,6 +61,17 @@ async fn run() {
                 Some(file) => functions = Some(file.into()),
                 None => {
                     eprintln!("--functions needs a file");
+                    std::process::exit(2);
+                }
+            },
+            "--bodiless" => match args.next().map(|b| b.parse()) {
+                Some(Ok(b)) => options.bodiless_callees = b,
+                Some(Err(message)) => {
+                    eprintln!("{message}");
+                    std::process::exit(2);
+                }
+                None => {
+                    eprintln!("--bodiless needs `drop`, `project` or `all`");
                     std::process::exit(2);
                 }
             },

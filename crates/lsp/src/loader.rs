@@ -91,6 +91,11 @@ pub struct LoaderOptions {
     /// once. See [`compdb::Flavour`] for why that is a choice and
     /// not a default.
     pub flavour: Option<PathBuf>,
+    /// Which calls to a function with no body in the build the first load
+    /// keeps. Read by the libclang loader only: clangd's call replies are held
+    /// to the project root and cannot be told otherwise. A later load is asked
+    /// for its own, through the bridge.
+    pub bodiless_callees: model::BodilessCallees,
 }
 
 /// What [`choose_build`] settled on: the project's files, and what clangd has

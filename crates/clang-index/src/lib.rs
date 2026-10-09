@@ -44,7 +44,7 @@ use std::time::{Instant, SystemTime};
 
 use clang::diagnostic::Severity;
 use clang::{Clang, Entity, EntityKind, EntityVisitResult, Index};
-use model::{CallGraph, FunctionNode, Location, ParseSummary};
+use model::{BodilessCallees, CallGraph, FunctionNode, Location, ParseSummary};
 use serde::{Deserialize, Serialize};
 
 pub use args::Job;
@@ -86,6 +86,25 @@ struct Definition {
     name: String,
     qualified_name: String,
     location: Site,
+}
+
+/// A function some body calls, as its declaration names it: what a callee with
+/// no body in the build becomes a node from, if [`BodilessCallees`] keeps it.
+///
+/// Recorded for every callee, defined or not, since a TU cannot know whether
+/// another one defines it; the merge keeps the first per USR in job order and
+/// `build_graph` reads only those it has no definition for. Every string a
+/// number in the table it travels with.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Declared {
+    usr: u32,
+    name: u32,
+    qualified_name: u32,
+    /// The first declaration in the TU — the canonical one — which for a
+    /// library function is its header, wherever later redeclarations are.
+    location: Site,
+    /// Whether that declaration is under the project root.
+    in_project: bool,
 }
 
 /// One call, by USR on both ends, every string a number in the run's
@@ -144,6 +163,14 @@ pub(crate) struct Parsed {
     strings: Vec<String>,
     /// The definitions whose bodies this parse walked, in source order.
     walked: Vec<Walked>,
+    /// Every function those bodies call, once each.
+    ///
+    /// Per TU rather than per body, so a callee named by a thousand bodies is
+    /// one entry. It stays deterministic all the same: the lowest job to call
+    /// a function always walks a body that calls it — a parser skips a body
+    /// only after walking it in an earlier job, which calls it too — so the
+    /// lowest job holding an entry is the same whoever parsed what.
+    declared: Vec<Declared>,
     elapsed_ms: u64,
     /// Whether the result was cached, when it was asked to be.
     #[serde(default)]
@@ -212,6 +239,12 @@ impl Strings {
                 renumber(callee)?;
                 renumber(&mut location.0)?;
             }
+        }
+        for declared in &mut parsed.declared {
+            renumber(&mut declared.usr)?;
+            renumber(&mut declared.name)?;
+            renumber(&mut declared.qualified_name)?;
+            renumber(&mut declared.location.0)?;
         }
         Some(())
     }
@@ -362,7 +395,7 @@ pub fn index_with(
             merge.arrive(i, outcome)
         })?;
     }
-    Ok(merge.finish(numbers.len(), hits, started))
+    Ok(merge.finish(numbers.len(), hits, started, options.bodiless_callees))
 }
 
 /// What a run has to parse, and how to ask for each.
@@ -475,6 +508,8 @@ struct Merge<'a> {
     /// carries its body.
     lowest: HashMap<(u32, usize), usize>,
     calls: Vec<Call>,
+    /// Per callee USR, its declaration as the lowest job to call it saw it.
+    declared: HashMap<u32, Declared>,
     parsed: usize,
     failed: usize,
     errors: usize,
@@ -498,6 +533,7 @@ impl<'a> Merge<'a> {
             defined: HashMap::new(),
             lowest: HashMap::new(),
             calls: Vec::new(),
+            declared: HashMap::new(),
             parsed: 0,
             failed: 0,
             errors: 0,
@@ -579,6 +615,9 @@ impl<'a> Merge<'a> {
             self.tus_with_errors += 1;
         }
         let before = (self.definitions.len(), self.calls.len());
+        for declared in result.declared {
+            self.declared.entry(declared.usr).or_insert(declared);
+        }
         for walked in result.walked {
             let kept = self.defined.entry(walked.usr).or_default();
             if kept.contains(&flavour) {
@@ -613,7 +652,13 @@ impl<'a> Merge<'a> {
         );
     }
 
-    fn finish(self, flavour_count: usize, cached: usize, started: Instant) -> Report {
+    fn finish(
+        self,
+        flavour_count: usize,
+        cached: usize,
+        started: Instant,
+        bodiless: BodilessCallees,
+    ) -> Report {
         debug_assert!(
             self.waiting.is_empty() && self.next == self.jobs.len(),
             "every job's outcome is in before the merge finishes"
@@ -640,10 +685,18 @@ impl<'a> Merge<'a> {
         }
         drop(self.defined);
         drop(self.lowest);
-        let (graph, external_calls) = build_graph(self.definitions, self.calls, &self.strings);
+        let built = build_graph(
+            self.definitions,
+            self.calls,
+            &self.declared,
+            &self.strings,
+            bodiless,
+        );
+        let (graph, external_calls) = (built.graph, built.dropped);
         log::info!(
             "[clang-index] {} TU(s) read ({} from the cache, {} failed, {} with {} error \
-             diagnostic(s)) in {:.1?}: {} function(s), {} edge(s), {} call(s) out of the project",
+             diagnostic(s)) in {:.1?}: {} function(s), {} of them declared only, {} edge(s), \
+             {} call(s) left out (bodiless callees: {:?})",
             self.parsed,
             cached,
             self.failed,
@@ -651,8 +704,10 @@ impl<'a> Merge<'a> {
             self.errors,
             started.elapsed(),
             graph.node_count(),
+            built.declared_only,
             graph.edge_count(),
-            external_calls
+            external_calls,
+            bodiless
         );
         Report {
             graph,
@@ -733,15 +788,19 @@ impl Parser {
             strings: LocalStrings::default(),
             out: Vec::new(),
             known: Vec::new(),
+            callees: HashSet::new(),
+            declared: Vec::new(),
         };
         walk_translation_unit(tu.get_entity(), &mut walk);
-        let (strings, walked, known) = (walk.strings.list, walk.out, walk.known);
+        let (strings, walked, known, declared) =
+            (walk.strings.list, walk.out, walk.known, walk.declared);
         let mut parsed = Parsed {
             errors,
             error_samples,
             rejected,
             strings,
             walked,
+            declared,
             elapsed_ms: started.elapsed().as_millis() as u64,
             cached: Cached::NotAsked,
         };
@@ -781,6 +840,10 @@ struct Walk<'a> {
     /// Per entry of `out`, whether `seen` already had it — only ever true
     /// when `complete` is set, since otherwise it would not have been walked.
     known: Vec<bool>,
+    /// The USRs `declared` holds.
+    callees: HashSet<String>,
+    /// Every function a walked body calls, once each.
+    declared: Vec<Declared>,
 }
 
 impl Report {
@@ -797,13 +860,25 @@ impl Report {
     }
 }
 
-/// Turn what was collected into a graph, keeping only calls between two
-/// functions the project defines.
+/// What [`build_graph`] made.
+struct Built {
+    graph: CallGraph,
+    /// Calls left out: their callee has no body and `bodiless` did not keep it.
+    dropped: usize,
+    /// Nodes made from a declaration rather than a definition.
+    declared_only: usize,
+}
+
+/// Turn what was collected into a graph: every call between two functions the
+/// build defines, and a call to one it only declares if `bodiless` keeps it —
+/// the callee then a leaf at its declaration.
 fn build_graph(
     definitions: Vec<(u32, Definition)>,
     calls: Vec<Call>,
+    declared: &HashMap<u32, Declared>,
     strings: &Strings,
-) -> (CallGraph, usize) {
+    bodiless: BodilessCallees,
+) -> Built {
     let text = strings.by_number();
     let location = |site: Site| Location {
         file_path: text[site.0 as usize].to_owned(),
@@ -821,19 +896,45 @@ fn build_graph(
         ));
         ids[usr as usize] = Some(id);
     }
+    let defined = graph.node_count();
     // A call site met twice — a header body walked under two flavours — is one
-    // edge, because `add_call` keys an edge by its site; the external count is
+    // edge, because `add_call` keys an edge by its site; the dropped count is
     // held to the same rule, so it does not grow with the number of flavours.
-    let mut external = HashSet::new();
+    // A declared-only node is made the first time a kept call reaches it, so
+    // the order nodes are made in is the calls' order, which is job order.
+    let mut dropped = HashSet::new();
     for call in calls {
-        match (ids[call.caller as usize], ids[call.callee as usize]) {
-            (Some(caller), Some(callee)) => graph.add_call(caller, callee, location(call.location)),
-            _ => {
-                external.insert((call.caller, call.callee, call.location));
+        let Some(caller) = ids[call.caller as usize] else {
+            continue;
+        };
+        let callee = match ids[call.callee as usize] {
+            Some(callee) => Some(callee),
+            None => declared
+                .get(&call.callee)
+                .filter(|d| bodiless.keeps(d.in_project))
+                .map(|d| {
+                    let id = graph.add_function(FunctionNode::new(
+                        text[d.name as usize].to_owned(),
+                        text[d.qualified_name as usize].to_owned(),
+                        location(d.location),
+                    ));
+                    ids[call.callee as usize] = Some(id);
+                    id
+                }),
+        };
+        match callee {
+            Some(callee) => graph.add_call(caller, callee, location(call.location)),
+            None => {
+                dropped.insert((call.caller, call.callee, call.location));
             }
         }
     }
-    (graph, external.len())
+    let declared_only = graph.node_count() - defined;
+    Built {
+        graph,
+        dropped: dropped.len(),
+        declared_only,
+    }
 }
 
 fn is_function(kind: EntityKind) -> bool {
@@ -915,6 +1016,7 @@ fn record_definition(entity: Entity<'_>, walk: &mut Walk<'_>) {
     let qualified_name = qualify(entity, &name);
     let scope = &mut *walk.scope;
     let strings = &mut walk.strings;
+    let (named, declared) = (&mut walk.callees, &mut walk.declared);
     let mut calls = Vec::new();
 
     // A *reference* to a function, not only a call of it: that is what clangd's
@@ -948,11 +1050,17 @@ fn record_definition(entity: Entity<'_>, walk: &mut Walk<'_>) {
             // USR is not the template's — and the template is the definition
             // that was recorded.
             let callee = callee.get_template().unwrap_or(callee);
-            let Some(callee) = callee.get_usr() else {
+            let Some(usr) = callee.get_usr() else {
                 continue;
             };
             if let Some(location) = location_of(child, scope, strings) {
-                calls.push((strings.number(&callee.0), location));
+                calls.push((strings.number(&usr.0), location));
+                if !named.contains(&usr.0) {
+                    if let Some(d) = declaration_of(callee, &usr.0, scope, strings) {
+                        declared.push(d);
+                    }
+                    named.insert(usr.0);
+                }
             }
         }
         EntityVisitResult::Recurse
@@ -1012,6 +1120,51 @@ fn location_of(entity: Entity<'_>, scope: &mut Scope, strings: &mut LocalStrings
     ))
 }
 
+/// How `callee`'s canonical declaration names it, for a node made from it.
+///
+/// `None` for what the compiler declared rather than the source (see
+/// [`is_implicit`]), which is left out whatever `BodilessCallees` says, since
+/// nothing in the source spells it and clangd shows none of it.
+fn declaration_of(
+    callee: Entity<'_>,
+    usr: &str,
+    scope: &mut Scope,
+    strings: &mut LocalStrings,
+) -> Option<Declared> {
+    let canonical = callee.get_canonical_entity();
+    if is_implicit(canonical) {
+        return None;
+    }
+    let name = canonical.get_name()?;
+    let location = canonical.get_location()?.get_file_location();
+    let (path, in_project) = scope.locate(&location.file?.get_path());
+    let file = strings.number(path);
+    let qualified_name = qualify(canonical, &name);
+    Some(Declared {
+        usr: strings.number(usr),
+        name: strings.number(&name),
+        qualified_name: strings.number(&qualified_name),
+        location: Site(file, location.line, location.column),
+        in_project,
+    })
+}
+
+/// Whether `entity` is a function the compiler declared rather than the
+/// source: a builtin (`__builtin_clz`, `__atomic_thread_fence`), which clang
+/// declares where it is first used — so at a call, in whichever file that
+/// was — or a member declared implicitly, a default constructor or a copy
+/// assignment, which sits on its class's name.
+///
+/// libclang has no query for it; what gives one away is its extent, which is
+/// at most the one name it sits on, where anything written spans at least a
+/// name and the two brackets of a parameter list. Tokenised once per callee
+/// per TU, not per call.
+fn is_implicit(entity: Entity<'_>) -> bool {
+    entity
+        .get_range()
+        .is_none_or(|range| range.tokenize().len() < 3)
+}
+
 /// The project root, and a cache of which files libclang names lie under it.
 ///
 /// A path is canonicalised once, the first time it is seen: a TU names the same
@@ -1027,7 +1180,9 @@ struct Scope {
     root: PathBuf,
     /// The directory of the TU being walked, which a relative path is under.
     directory: PathBuf,
-    files: HashMap<PathBuf, Option<String>>,
+    /// Per path as libclang spelled it, the canonical path and whether it is
+    /// under the root.
+    files: HashMap<PathBuf, (String, bool)>,
 }
 
 impl Scope {
@@ -1041,6 +1196,14 @@ impl Scope {
 
     /// The path to report for `path`, if it is project code.
     fn resolve(&mut self, path: &Path) -> Option<&str> {
+        match self.locate(path) {
+            (path, true) => Some(path),
+            (_, false) => None,
+        }
+    }
+
+    /// The path to report for `path`, and whether it is project code.
+    fn locate(&mut self, path: &Path) -> (&str, bool) {
         let joined;
         let path = if path.is_relative() {
             joined = self.directory.join(path);
@@ -1050,12 +1213,12 @@ impl Scope {
         };
         if !self.files.contains_key(path) {
             let canonical = path.canonicalize().unwrap_or_else(|_| normalise(path));
-            let resolved = canonical
-                .starts_with(&self.root)
-                .then(|| canonical.to_string_lossy().into_owned());
-            self.files.insert(path.to_path_buf(), resolved);
+            let in_project = canonical.starts_with(&self.root);
+            let text = canonical.to_string_lossy().into_owned();
+            self.files.insert(path.to_path_buf(), (text, in_project));
         }
-        self.files[path].as_deref()
+        let (text, in_project) = &self.files[path];
+        (text, *in_project)
     }
 }
 
